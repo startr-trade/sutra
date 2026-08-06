@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Script-task showcase — fully declarative, no application code. One synchronous flow whose
+  <bpmn:scriptTask>s each name a file in the module's scripts/ folder. Each script is rendered by the
+  engine matching its file extension (like a template serviceTask, no scriptFormat needed), and its
+  render — a JSON object — merges (typed) into the instance variables. Unlike a template (whose render
+  becomes the reply), a script impacts instance STATE; here the final reply is a Handlebars TEMPLATE
+  service task that echoes the script-derived variables.
+
+    startEvent (XML ApprovalRequest on script-showcase-request)
+    then ScriptMeta     : Handlebars scriptTask, derive-metadata.hbs, merges correlationId/processedAt/scriptEngine
+    then ScriptDecision : Handlebars scriptTask, derive-decision.hbs, merges autoApprove (boolean) +
+                          correlationEcho (re-reads the FIRST script's correlationId — script-on-script state)
+    then Reply          : Handlebars template serviceTask (script-reply.hbs) + native reply
+    then End
+-->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0"
+                  id="Definitions_script_showcase"
+                  targetNamespace="urn:sutra:module:approval:1.0.0">
+
+  <bpmn:process id="script-showcase" name="Script task showcase" isExecutable="true">
+
+    <!-- Typed variables — the script-merged state the reply template reads (autoApprove arrives as a
+         JSON boolean, proving the merge is TYPED, not stringly). -->
+    <bpmn:extensionElements>
+      <q:variables>
+        <q:variable name="correlationId" type="string"/>    <!-- ScriptMeta's {{uuid}} render -->
+        <q:variable name="processedAt" type="string"/>      <!-- ScriptMeta's {{now}} render -->
+        <q:variable name="scriptEngine" type="string"/>
+        <q:variable name="autoApprove" type="boolean"/>     <!-- merged as a typed JSON boolean -->
+        <q:variable name="correlationEcho" type="string"/>  <!-- ScriptDecision re-reads correlationId -->
+        <q:variable name="scriptEngine2" type="string"/>
+      </q:variables>
+    </bpmn:extensionElements>
+
+    <bpmn:startEvent id="Start" name="ApprovalRequest received">
+      <bpmn:extensionElements>
+        <q:source channel="script-showcase-request" messageTypeValue="ApprovalRequest"/>
+      </bpmn:extensionElements>
+      <bpmn:outgoing>F1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="F1" sourceRef="Start" targetRef="ScriptMeta"/>
+
+    <bpmn:scriptTask id="ScriptMeta" name="Derive metadata (script)">
+      <bpmn:script>derive-metadata.hbs</bpmn:script>
+      <bpmn:incoming>F1</bpmn:incoming><bpmn:outgoing>F2</bpmn:outgoing>
+    </bpmn:scriptTask>
+    <bpmn:sequenceFlow id="F2" sourceRef="ScriptMeta" targetRef="ScriptDecision"/>
+
+    <bpmn:scriptTask id="ScriptDecision" name="Derive decision (Handlebars script)">
+      <bpmn:script>derive-decision.hbs</bpmn:script>
+      <bpmn:incoming>F2</bpmn:incoming><bpmn:outgoing>F3</bpmn:outgoing>
+    </bpmn:scriptTask>
+    <bpmn:sequenceFlow id="F3" sourceRef="ScriptDecision" targetRef="Reply"/>
+
+    <bpmn:serviceTask id="Reply" name="Reply (Handlebars template)" implementation="script-reply.hbs">
+      <bpmn:extensionElements>
+        <q:reply mode="native" contentType="application/xml"/>
+      </bpmn:extensionElements>
+      <bpmn:incoming>F3</bpmn:incoming><bpmn:outgoing>F4</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F4" sourceRef="Reply" targetRef="End"/>
+
+    <bpmn:endEvent id="End" name="Done">
+      <bpmn:incoming>F4</bpmn:incoming>
+    </bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>

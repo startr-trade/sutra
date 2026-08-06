@@ -1,0 +1,38 @@
+[package]
+name = "sutra-executor"
+description = "Synchronous token-graph executor (the SYNC execution subset)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+sutra-bpmn = { path = "../sutra-bpmn" }
+sutra-feel = { path = "../sutra-feel" }
+sutra-dmn = { path = "../sutra-dmn" }
+sutra-srl = { path = "../sutra-srl" }
+sutra-templates = { path = "../sutra-templates" }
+# The `Sensitive<T>` debug-leak backstop lives in the leaf `sutra-crypto` (shared by the executor,
+# channels, and persistence); re-exported here as `sutra_executor::Sensitive` for compatibility.
+sutra-crypto = { path = "../sutra-crypto" }
+serde_json = { workspace = true }
+bigdecimal = { workspace = true }
+getrandom = { workspace = true }
+sha2 = { workspace = true }
+time = { workspace = true }
+tracing = { workspace = true }
+# The async, dyn-safe store SPI. `async-trait` boxes the trait futures so
+# `Rc<dyn DataStore>` stays object-safe; `async-recursion` boxes the mutually-recursive async
+# dispatch chain (run_node ↔ sub-process runners). The executor stays tokio-free — its futures
+# are runtime-agnostic and driven by the caller's runtime (the channel-engine actor's LocalSet).
+async-trait = { workspace = true }
+async-recursion = { workspace = true }
+# Traceparent bridge (telemetry.rs): SpanContext parse/format + the span-LINK
+# helper delivery-side call sites (sutra-channels' outbox send) attach through.
+opentelemetry = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+
+[dev-dependencies]
+# The SPI is async, so the executor's unit/integration tests drive futures via
+# `#[tokio::test]` on a current-thread runtime (matching the actor's single-threaded model).
+tokio = { version = "1", features = ["rt", "macros"] }

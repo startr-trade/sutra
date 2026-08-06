@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Fixture process — trimmed from examples/money-transfer's balance-query.bpmn: a start
+     event, a data task, a service-task reply, and an end event. -->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0"
+                  id="Definitions_fixture"
+                  targetNamespace="urn:sutra:module:mini-package:1.0.0">
+
+  <bpmn:dataStore id="accountsStore" name="accounts"/>
+
+  <bpmn:process id="balance-query" name="Balance query" isExecutable="true">
+    <bpmn:dataObject id="doAccount" name="account"/>
+
+    <bpmn:dataStoreReference id="dsrAccount" name="accounts" dataStoreRef="accountsStore">
+      <bpmn:extensionElements><q:store key="payload.accountId"/></bpmn:extensionElements>
+    </bpmn:dataStoreReference>
+
+    <bpmn:startEvent id="Start" name="BalanceQuery received">
+      <bpmn:extensionElements>
+        <q:source channel="balance" messageTypeValue="BalanceQuery"/>
+      </bpmn:extensionElements>
+      <bpmn:outgoing>B1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="B1" sourceRef="Start" targetRef="Load"/>
+
+    <bpmn:serviceTask id="Load" name="Load account (read-only)">
+      <bpmn:incoming>B1</bpmn:incoming><bpmn:outgoing>B2</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:sourceRef>dsrAccount</bpmn:sourceRef>
+        <bpmn:targetRef>doAccount</bpmn:targetRef>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="B2" sourceRef="Load" targetRef="Reply"/>
+
+    <bpmn:serviceTask id="Reply" name="Reply Balance" implementation="reply.hbs">
+      <bpmn:extensionElements>
+        <q:reply mode="native" contentType="application/xml"/>
+      </bpmn:extensionElements>
+      <bpmn:incoming>B2</bpmn:incoming><bpmn:outgoing>B3</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="B3" sourceRef="Reply" targetRef="End"/>
+
+    <bpmn:endEvent id="End" name="Done"><bpmn:incoming>B3</bpmn:incoming></bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>

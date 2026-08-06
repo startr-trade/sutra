@@ -1,0 +1,7 @@
+{{!-- Renders the path-coverage report. `coverageReport` is the map the coverage:report:transfer engine op
+   built: {process, percentage, covered, total, coveredPaths[], uncoveredPaths[]}. The template only renders — the
+   percentage/counts were computed engine-side against the declared <q:coverage> paths and the covered-set. --}}
+<CoverageReport process="{{coverageReport.process}}" percentage="{{coverageReport.percentage}}" covered="{{coverageReport.covered}}" total="{{coverageReport.total}}">
+{{#each coverageReport.coveredPaths as |p|}}<covered>{{p}}</covered>{{/each}}
+{{#each coverageReport.uncoveredPaths as |p|}}<uncovered>{{p}}</uncovered>{{/each}}
+</CoverageReport>

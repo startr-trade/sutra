@@ -1,0 +1,12 @@
+# Saturation-bench package (P1-6 Phase 0, docs/design/execution-scale-out.md §7). Sealed to
+# one .sutra by `assemble_dir`; labels are opaque selectors. Domain-neutral on purpose — this
+# package exists only to drive the tools/sutra-load-test/profiles/ saturation profiles, never
+# a real deployment. Structurally modeled on the engine's own conformance package
+# (rust/crates/sutra-engine/tests/resources/conformance/main/package.yaml) and the
+# approval-hold example (examples/approval-hold) — same shape, no schemas, no templates.
+labels:
+  "tenant": "default"
+  "module": "saturation-bench"
+  "version": "1.0.0"
+engine:
+  minContract: 1

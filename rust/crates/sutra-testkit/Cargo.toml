@@ -1,0 +1,55 @@
+[package]
+name = "sutra-testkit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# Test-only support library (never linked by production crates — added under
+# `[dev-dependencies]`). Two layers:
+#
+#   default            the container-reaping mechanism, kept in ONE place instead of
+#                      duplicating an at-exit hook across every crate's `tests/` tree.
+#   feature=conformance the reusable end-to-end harness (`sutra_testkit::conformance`) —
+#                      postgres/broker/engine-container fixtures, the DRY-variant composer,
+#                      the host + broker recorders and the tier-3 k8s plumbing. Promoted out
+#                      of sutra-conformance's `tests/all/support/` so a conformance suite in
+#                      ANOTHER workspace can drive it. Heavy deps (testcontainers, lapin,
+#                      kube-rs) hang off this feature ONLY, so the ~10 crates that dev-depend
+#                      on the reaper alone keep a light build.
+
+[dependencies]
+libc = "0.2"
+
+# ---- `conformance` feature deps — optional, so the default build pulls none of them --------
+# Engine-side crates the harness calls: `assemble_dir`/`PackageOptions` seal an example's
+# package dirs into `.sutra` archives on the host; `DEFAULT_SECRETS_DIR` is the canonical
+# in-container secrets mount point the `.secret()` builder bind-mounts at.
+sutra-loader = { path = "../sutra-loader", optional = true }
+sutra-envref-spi = { path = "../sutra-envref-spi", optional = true }
+# Database + broker fixtures. `rabbitmq` adds on top of the workspace `postgres`/`kafka`.
+testcontainers = { workspace = true, optional = true }
+testcontainers-modules = { workspace = true, features = ["rabbitmq"], optional = true }
+# AMQP 0.9.1 client for the broker fixture's publish / passive-declare / recorder helpers.
+lapin = { workspace = true, optional = true }
+# The tier-3 helpers read Services/Secrets/Nodes/Deployments through kube-rs (never a kubectl
+# shell); versions match sutra-conformance's, which is where these suites live.
+kube = { version = "4", default-features = false, features = ["client", "config", "rustls-tls"], optional = true }
+k8s-openapi = { version = "0.28", default-features = false, features = ["latest"], optional = true }
+# `wait_until` + the recorder/rollout polls; the engine readiness probe parses health JSON.
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "sync"], optional = true }
+serde_json = { workspace = true, optional = true }
+
+[features]
+default = []
+conformance = [
+    "dep:sutra-loader",
+    "dep:sutra-envref-spi",
+    "dep:testcontainers",
+    "dep:testcontainers-modules",
+    "dep:lapin",
+    "dep:kube",
+    "dep:k8s-openapi",
+    "dep:tokio",
+    "dep:serde_json",
+]

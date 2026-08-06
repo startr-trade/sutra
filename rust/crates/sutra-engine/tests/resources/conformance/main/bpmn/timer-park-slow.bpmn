@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Conformance (f) — the restart-survival flow: a LONGER intermediate timer so the first
+     engine can be shut down before due-at; the durable TIMER row must fire on the NEXT
+     engine (the due row is durable, not an in-process schedule). -->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0"
+                  id="Definitions_timer_park_slow"
+                  targetNamespace="urn:sutra:module:conf:1.0.0">
+  <bpmn:process id="timer-park-slow" name="Timer park (slow)" isExecutable="true">
+    <bpmn:startEvent id="Start">
+      <bpmn:extensionElements>
+        <q:source channel="timer-start-slow"/>
+      </bpmn:extensionElements>
+      <bpmn:outgoing>f1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="Start" targetRef="Wait"/>
+    <bpmn:intermediateCatchEvent id="Wait" name="Hold across the restart">
+      <bpmn:timerEventDefinition>
+        <bpmn:timeDuration>PT2S</bpmn:timeDuration>
+      </bpmn:timerEventDefinition>
+      <bpmn:incoming>f1</bpmn:incoming>
+      <bpmn:outgoing>f2</bpmn:outgoing>
+    </bpmn:intermediateCatchEvent>
+    <bpmn:sequenceFlow id="f2" sourceRef="Wait" targetRef="Notify"/>
+    <bpmn:sendTask id="Notify" name="Emit fired marker">
+      <bpmn:extensionElements>
+        <q:send destination="http://timer-done-slow.example/notify"/>
+      </bpmn:extensionElements>
+      <bpmn:incoming>f2</bpmn:incoming>
+      <bpmn:outgoing>f3</bpmn:outgoing>
+    </bpmn:sendTask>
+    <bpmn:sequenceFlow id="f3" sourceRef="Notify" targetRef="End"/>
+    <bpmn:endEvent id="End">
+      <bpmn:incoming>f3</bpmn:incoming>
+    </bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>

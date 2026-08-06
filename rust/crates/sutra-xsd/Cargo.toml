@@ -1,0 +1,15 @@
+[package]
+name = "sutra-xsd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "XSD-subset schema compiler with two back-ends: a streaming instance validator (collect-all violations, line:col) and navigation-shape emission for template/path checks. Scope: the Tier-1 runtime profile — the Standards-Editor schema idiom plus the module-codec authoring surface. Domain-neutral: names no message standard."
+
+[dependencies]
+quick-xml = { workspace = true }
+regex = { workspace = true }
+bigdecimal = { workspace = true }
+
+# No dev-dependencies: every fixture this crate's suite uses is XML it reads or writes inline,
+# so the test build adds nothing to the dependency graph.

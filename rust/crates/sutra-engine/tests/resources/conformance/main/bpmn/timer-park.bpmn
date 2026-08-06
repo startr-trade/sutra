@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Conformance (a)/(f) — an intermediate timer catch event PARKS a durable TIMER
+     waiting_event row; the poller fires it at due-at and the instance runs to
+     the end event. Duration is env-friendly-short; the restart test (f) relies on the
+     row being DURABLE (fires on a different engine process). -->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0"
+                  id="Definitions_timer_park"
+                  targetNamespace="urn:sutra:module:conf:1.0.0">
+  <bpmn:process id="timer-park" name="Timer park" isExecutable="true">
+    <bpmn:startEvent id="Start">
+      <bpmn:extensionElements>
+        <q:source channel="timer-start"/>
+      </bpmn:extensionElements>
+      <bpmn:outgoing>f1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="Start" targetRef="Wait"/>
+    <bpmn:intermediateCatchEvent id="Wait" name="Hold until due">
+      <bpmn:timerEventDefinition>
+        <!-- PT3S: wide enough that the immediate post-park assertions observe WAITING
+             before the poller fires, even with a slow first dispatch under
+             parallel-suite load (cold pool + admission queries ~0.3-1s). -->
+        <bpmn:timeDuration>PT3S</bpmn:timeDuration>
+      </bpmn:timerEventDefinition>
+      <bpmn:incoming>f1</bpmn:incoming>
+      <bpmn:outgoing>f2</bpmn:outgoing>
+    </bpmn:intermediateCatchEvent>
+    <bpmn:sequenceFlow id="f2" sourceRef="Wait" targetRef="Notify"/>
+    <bpmn:sendTask id="Notify" name="Emit fired marker">
+      <bpmn:extensionElements>
+        <q:send destination="http://timer-done.example/notify"/>
+      </bpmn:extensionElements>
+      <bpmn:incoming>f2</bpmn:incoming>
+      <bpmn:outgoing>f3</bpmn:outgoing>
+    </bpmn:sendTask>
+    <bpmn:sequenceFlow id="f3" sourceRef="Notify" targetRef="End"/>
+    <bpmn:endEvent id="End">
+      <bpmn:incoming>f3</bpmn:incoming>
+    </bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>

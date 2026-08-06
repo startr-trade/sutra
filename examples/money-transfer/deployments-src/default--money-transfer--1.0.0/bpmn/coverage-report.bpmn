@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Path-coverage ADMIN flow (READ side) for the money-transfer module. The business process (transfer.bpmn)
+  only DECLARES its <q:coverage> routes; the engine marks the ones each run walks into the module's
+  `coverage` data-store. This flow exposes that covered-set over http:
+
+    CoverageQuery (POST /channels/coverage-query) -> serviceTask coverage:report:transfer
+      -> Handlebars <CoverageReport …/>   (percentage, covered/total, the covered + uncovered path ids)
+
+  `coverage:report:<process>` is a RESERVED serviceTask implementation handled inline by the engine (no
+  bean, no template): it builds the covered/uncovered breakdown of the target process's declared paths into
+  the `coverageReport` variable. The target process (`transfer`) is resolved within THIS module; the
+  coverage store is looked up BY NAME ("coverage"), so this flow needs no <bpmn:dataStoreReference>. The
+  reset counterpart lives in its own file (coverage-reset.bpmn) — one process per file, so node ids never
+  collide across the module's definitions. See the book's *Coverage: declared routes as the compliance
+  signal* chapter.
+-->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0"
+                  id="Definitions_coverage_report"
+                  targetNamespace="urn:sutra:module:money-transfer:1.0.0">
+
+  <bpmn:process id="coverage-report" name="Coverage report (transfer)" isExecutable="true">
+
+    <bpmn:extensionElements>
+      <q:variables>
+        <q:variable name="coverageReport" type="object"/>  <!-- {process, percentage, covered, total, coveredPaths[], uncoveredPaths[]} -->
+      </q:variables>
+    </bpmn:extensionElements>
+
+    <bpmn:startEvent id="Start" name="CoverageQuery received">
+      <bpmn:extensionElements>
+        <q:source channel="coverage-query" messageTypeValue="CoverageQuery"/>
+      </bpmn:extensionElements>
+      <bpmn:outgoing>CR1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="CR1" sourceRef="Start" targetRef="Report"/>
+
+    <!-- Reserved engine op — builds the covered/uncovered report of `transfer` into `coverageReport`. -->
+    <bpmn:serviceTask id="Report" name="Build coverage report" implementation="coverage:report:transfer">
+      <bpmn:incoming>CR1</bpmn:incoming><bpmn:outgoing>CR2</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="CR2" sourceRef="Report" targetRef="Reply"/>
+
+    <bpmn:serviceTask id="Reply" name="Reply CoverageReport" implementation="coverage-report.hbs">
+      <bpmn:extensionElements>
+        <q:reply mode="native" contentType="application/xml"/>
+      </bpmn:extensionElements>
+      <bpmn:incoming>CR2</bpmn:incoming><bpmn:outgoing>CR3</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="CR3" sourceRef="Reply" targetRef="End"/>
+
+    <bpmn:endEvent id="End" name="Done"><bpmn:incoming>CR3</bpmn:incoming></bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>

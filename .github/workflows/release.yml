@@ -1,0 +1,440 @@
+name: Release
+
+# Fires on a semver tag (`v*`). `main` never publishes anything.
+#
+# Ships EXACTLY two runtime artifact families — nothing else in the workspace is a
+# user-facing deliverable:
+#
+#   1. the engine container image  — ghcr.io/startr-trade/sutra   (built from the
+#      `sutra-dist` binary crate via rust/Dockerfile; multi-arch amd64 + arm64,
+#      cosign-signed, SPDX SBOM attested + attached)
+#   2. the `sutra` CLI binaries    — sutra-cli, static musl for linux x86_64/aarch64 and
+#      an MSVC build for Windows x86_64, tar.gz/zip + SHA256SUMS as Release assets
+#
+# Plus one library publish: sutra-feel then sutra-dmn to crates.io (guarded on the token
+# secret being configured). Every other crate in the workspace is engine-internal or
+# development tooling and is never built, uploaded, or referenced here.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re-)release, e.g. v1.0.0"
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  IMAGE_NAME: ghcr.io/startr-trade/sutra
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Gate. crates.io publishing is irreversible, so it waits on this.
+  # ---------------------------------------------------------------------------
+  test:
+    name: verify (make lint + make test)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          key: release-verify
+      - run: make lint
+      - run: make test
+
+  # ---------------------------------------------------------------------------
+  # 1. Engine image — multi-arch, signed, SBOM'd.
+  # ---------------------------------------------------------------------------
+  image:
+    name: engine image (linux/amd64 + linux/arm64)
+    runs-on: ubuntu-latest
+    # The arm64 leg is built under QEMU emulation (see the NOTE below): a full Rust
+    # workspace compile plus `cargo install cargo-chef` emulated is slow. Six hours is the
+    # hosted-runner ceiling and this deliberately uses it.
+    timeout-minutes: 360
+    permissions:
+      contents: read
+      packages: write # push to ghcr.io
+      id-token: write # cosign keyless (Sigstore OIDC)
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+      version: ${{ steps.rel.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      # NOTE ON QEMU: binfmt emulation is the simplest correct way to produce a linux/arm64
+      # image from a single hosted runner, and it is what this workflow does. It is also
+      # SLOW for a Rust build — the arm64 leg recompiles the whole dependency graph
+      # (plus librdkafka's vendored C sources) under emulation.
+      # If the arm64 leg starts timing out, the drop-in replacement is a native split
+      # build: one job on `ubuntu-latest` for amd64, one on `ubuntu-24.04-arm` for arm64,
+      # each pushing by digest (`outputs: type=image,push-by-digest=true`), then a final
+      # `docker buildx imagetools create` to fuse the manifest list. That removes QEMU
+      # entirely and cuts the arm64 leg to native speed.
+      - name: Set up QEMU (arm64 emulation)
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Resolved explicitly rather than with metadata-action's `type=semver`, which reads
+      # github.ref: on a workflow_dispatch re-release the ref is a BRANCH, so type=semver
+      # would emit no tags at all and the push would be a silent no-op.
+      - name: Resolve release tag
+        id: rel
+        run: |
+          set -eu
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          case "$tag" in
+            v*) ;;
+            *) echo "::error::expected a v-prefixed semver tag, got '$tag'"; exit 1 ;;
+          esac
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+          # A tag containing '-' is a pre-release (v1.0.0-rc.1) and must NOT move `latest`.
+          case "$tag" in
+            *-*) echo "latest=false" >> "$GITHUB_OUTPUT" ;;
+            *)   echo "latest=true"  >> "$GITHUB_OUTPUT" ;;
+          esac
+
+      - name: Compute image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=${{ steps.rel.outputs.version }}
+            type=raw,value=latest,enable=${{ steps.rel.outputs.latest == 'true' }}
+          labels: |
+            org.opencontainers.image.title=sutra-engine
+            org.opencontainers.image.description=Sutra — a Rust-native, message-native BPMN 2.0 workflow engine
+            org.opencontainers.image.licenses=MIT OR Apache-2.0
+
+      # Build context is rust/ — the Dockerfile COPYs Cargo.toml / Cargo.lock / crates from
+      # the context root. `CARGO_PROFILE` is left at the Dockerfile default (`release`:
+      # thin-LTO, one codegen unit, stripped, distroless runtime). The fast `release-it`
+      # profile is an integration-test convenience and is never shipped.
+      - name: Build + push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ./rust
+          file: ./rust/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: true
+          # SBOM is produced below by anchore/sbom-action (SPDX) and cosign-attested, so
+          # buildkit's own SBOM attestation is off to avoid two competing SBOM predicates.
+          sbom: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      # Keyless (Sigstore / Fulcio): the signing identity IS this workflow's OIDC identity —
+      # no long-lived key material anywhere. Signs the manifest-list digest, which is what
+      # `cosign verify ghcr.io/startr-trade/sutra:<tag>` resolves to.
+      - name: Sign the image (cosign keyless)
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: cosign sign --yes "${IMAGE_NAME}@${DIGEST}"
+
+      - name: Generate SPDX SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+          format: spdx-json
+          output-file: sbom.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Attest the SBOM to the image digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          cosign attest --yes \
+            --predicate sbom.spdx.json \
+            --type spdxjson \
+            "${IMAGE_NAME}@${DIGEST}"
+
+      # Handed to the `release` job, which attaches it to the GitHub Release alongside the
+      # CLI archives (so consumers get the SBOM without needing cosign).
+      - name: Upload SBOM for the Release job
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: sbom.spdx.json
+          if-no-files-found: error
+
+      - name: Job summary
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          {
+            echo "### Engine image"
+            echo
+            echo '```'
+            echo "${IMAGE_NAME}@${DIGEST}"
+            echo '```'
+            echo
+            echo "Tags: \`${{ steps.meta.outputs.tags }}\`"
+            echo
+            echo "Verify:"
+            echo '```sh'
+            echo "cosign verify ${IMAGE_NAME}@${DIGEST} \\"
+            echo "  --certificate-identity-regexp '^https://github.com/${{ github.repository }}/' \\"
+            echo "  --certificate-oidc-issuer https://token.actions.githubusercontent.com"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # 2. `sutra` CLI binaries.
+  # ---------------------------------------------------------------------------
+  cli:
+    name: sutra CLI (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    # Every target in this matrix is a required deliverable — a broken target fails the
+    # release rather than silently shipping a partial asset set.
+    continue-on-error: false
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Static musl. The sutra-cli dependency tree's only native-code dependency is
+          # `ring` (the rustls crypto provider) — sqlx/postgres, reqwest, kube and
+          # k8s-openapi are all pure Rust with rustls, and `openssl-probe` only reads cert
+          # paths (no libssl linkage). ring needs a C toolchain for the target, which
+          # `musl-tools` supplies for the host arch.
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            use_cross: false
+            archive: tar.gz
+          # ...but musl-tools does NOT cross-compile to aarch64, and ring's build script
+          # needs a real aarch64-musl C compiler. `cross` supplies exactly that in a
+          # container image (a true cross-compile — not emulation, so it runs at native
+          # x86 speed).
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            use_cross: true
+            archive: tar.gz
+          # Windows: the MSVC dependency tree adds only schannel + windows-sys (pure-Rust
+          # bindings to system libraries, no C build), and the CLI's few unix-only bits are
+          # `#[cfg(unix)]`-gated. No native-dep blocker on this target.
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            use_cross: false
+            archive: zip
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          key: cli-${{ matrix.target }}
+
+      - name: Install musl toolchain
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
+
+      - name: Install cross
+        if: matrix.use_cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      # `-p sutra-cli` builds the single `sutra` binary. The release profile already sets
+      # `strip = true` (rust/Cargo.toml), so the emitted binary is stripped — no separate
+      # strip step (and no per-target binutils) is needed.
+      - name: Build (cross)
+        if: matrix.use_cross
+        working-directory: rust
+        run: cross build --release --locked -p sutra-cli --target ${{ matrix.target }}
+
+      - name: Build (cargo)
+        if: ${{ !matrix.use_cross }}
+        working-directory: rust
+        run: cargo build --release --locked -p sutra-cli --target ${{ matrix.target }}
+
+      - name: Resolve release tag
+        id: tag
+        shell: bash
+        run: echo "tag=${{ github.event.inputs.tag || github.ref_name }}" >> "$GITHUB_OUTPUT"
+
+      - name: Package (tar.gz)
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -eu
+          stage="sutra-${TAG}-${TARGET}"
+          mkdir -p "dist/${stage}"
+          cp "rust/target/${TARGET}/release/sutra" "dist/${stage}/"
+          cp LICENSE-MIT LICENSE-APACHE README.md "dist/${stage}/"
+          tar -czf "dist/${stage}.tar.gz" -C dist "${stage}"
+          rm -rf "dist/${stage}"
+          ls -l dist
+
+      - name: Package (zip)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $stage = "sutra-$env:TAG-$env:TARGET"
+          New-Item -ItemType Directory -Force -Path "dist/$stage" | Out-Null
+          Copy-Item "rust/target/$env:TARGET/release/sutra.exe" "dist/$stage/"
+          Copy-Item LICENSE-MIT, LICENSE-APACHE, README.md "dist/$stage/"
+          Compress-Archive -Path "dist/$stage/*" -DestinationPath "dist/$stage.zip"
+          Remove-Item -Recurse -Force "dist/$stage"
+          Get-ChildItem dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cli-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # 3. GitHub Release — CLI archives + SHA256SUMS + the image SBOM.
+  # ---------------------------------------------------------------------------
+  release:
+    name: GitHub Release assets
+    needs: [cli, image]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write # create the release / upload assets
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Download CLI archives
+        uses: actions/download-artifact@v4
+        with:
+          pattern: cli-*
+          merge-multiple: true
+          path: dist
+
+      - name: Download SBOM
+        uses: actions/download-artifact@v4
+        with:
+          name: sbom
+          path: dist
+
+      # Bare filenames (no ./ prefix, no directories) so a consumer can
+      # `sha256sum --ignore-missing -c SHA256SUMS` from the directory it downloaded into —
+      # which is exactly what scripts/install.sh does.
+      - name: Compute SHA256SUMS
+        working-directory: dist
+        run: |
+          set -eu
+          rm -f SHA256SUMS
+          sha256sum -- * > ../SHA256SUMS
+          mv ../SHA256SUMS .
+          cat SHA256SUMS
+
+      - name: Create / update the Release and upload assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -eu
+          # A tag containing '-' is a pre-release (v1.0.0-rc.1).
+          prerelease=""
+          case "$TAG" in *-*) prerelease="--prerelease" ;; esac
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" \
+              --title "$TAG" \
+              --generate-notes \
+              --verify-tag \
+              $prerelease
+          fi
+          gh release upload "$TAG" dist/* --clobber
+
+  # ---------------------------------------------------------------------------
+  # 4. crates.io — the two library crates, in dependency order.
+  # ---------------------------------------------------------------------------
+  #
+  # PREREQUISITES (checked once, before the first real tag — cargo will refuse otherwise):
+  #   * rust/crates/sutra-feel/Cargo.toml and rust/crates/sutra-dmn/Cargo.toml must set
+  #     `publish = true` in their own [package] table. Both currently inherit
+  #     `publish.workspace = true`, and [workspace.package] sets `publish = false`.
+  #   * sutra-dmn's dependency on sutra-feel must carry a version, not just a path:
+  #     `sutra-feel = { path = "../sutra-feel", version = "..." }` — cargo rejects
+  #     version-less path dependencies at publish time.
+  #   * `CRATES_IO_TOKEN` must exist as a repository secret. Without it this job runs and
+  #     reports a skip; it never fails the release.
+  crates-publish:
+    name: crates.io (sutra-feel → sutra-dmn)
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      # The `secrets` context is not available in a step-level `if:`, so the token is
+      # surfaced through `env` and the guard tests `env.CRATES_IO_TOKEN != ''` — the
+      # same "skip unless configured" semantics, expressed in a context that `if:` can read.
+      CRATES_IO_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Skip notice
+        if: ${{ env.CRATES_IO_TOKEN == '' }}
+        run: echo "::notice::CRATES_IO_TOKEN is not configured — skipping the crates.io publish."
+
+      # Dependency order matters: sutra-dmn depends on sutra-feel. Modern cargo blocks on
+      # index propagation after the first publish, so no manual sleep is needed.
+      - name: Publish sutra-feel
+        if: ${{ env.CRATES_IO_TOKEN != '' }}
+        working-directory: rust
+        run: cargo publish --locked -p sutra-feel --token "$CRATES_IO_TOKEN"
+
+      - name: Publish sutra-dmn
+        if: ${{ env.CRATES_IO_TOKEN != '' }}
+        working-directory: rust
+        run: cargo publish --locked -p sutra-dmn --token "$CRATES_IO_TOKEN"

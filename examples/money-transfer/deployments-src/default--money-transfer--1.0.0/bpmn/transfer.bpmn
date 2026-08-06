@@ -1,0 +1,232 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Money-transfer ACID ledger — a fully declarative transfer flow. Every logical step is a
+  VISIBLE node, so the diagram is self-documenting.
+
+  Full ACID (the book's *Data stores* chapter walks this in detail):
+    A(tomicity)   — the debit + credit run inside a <bpmn:transaction> sub-process: both commit or
+                    neither (a cancel end event, or an error in Persist, rolls the whole scope back).
+    C(onsistency) — the "Valid?" gateway rejects a frozen account or insufficient funds BEFORE any write.
+    I(solation)   — LoadFrom/LoadTo read the rows FOR UPDATE (q:store forUpdate="true"): a pessimistic
+                    row lock serializes concurrent transfers touching the same account (no lost update).
+                    Combined with the transfer-request channel's singleton/exclusive consumer.
+    D(urability)  — the sql `accounts` store persists new balances; a later instance sees them.
+
+  Flow (arrows written as "then" to keep the XML comment legal):
+    startEvent (TransferRequest on transfer-request) then <transaction> "Transfer":
+        SubStart then LoadFrom then LoadTo then gateway "Valid?":
+          (ok)      Compute then Persist then SubEnd (normal end -> COMMIT)
+          (invalid) DecideReason then a cancel end event (-> ROLLBACK, no writes commit)
+    On normal completion: Transfer then OkReply (Handlebars -> TransferAccepted) then End.
+    On cancel: the cancel boundary event on Transfer then RejectReply (Handlebars -> TransferRejected) then End.
+
+  Target syntax note: <q:store>, forUpdate/field, <q:assignment>, and the <bpmn:transaction> + cancel
+  wiring follow the shapes described in the book's *Data stores* chapter.
+-->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                  xmlns:q="urn:sutra:q:1.0"
+                  id="Definitions_transfer"
+                  targetNamespace="urn:sutra:module:money-transfer:1.0.0">
+
+  <!-- Definitions-scope durable store, referenced BY NAME from datastores.yaml (`accounts`). -->
+  <bpmn:dataStore id="accountsStore" name="accounts"/>
+
+  <bpmn:process id="transfer" name="Money transfer (ACID)" isExecutable="true">
+
+    <!-- The inbound TransferRequest is decoded into the `payload` variable (q:source default), so its
+         fields are referenced as payload.fromId / payload.toId / payload.amount, resolved against the
+         channel codec's message type. The process variables below are set by the data tasks; they are
+         declared here so the deploy-time template/FEEL validators know them (object -> ANY, which
+         permits field navigation like fromAccount.balance / account.balance). -->
+    <bpmn:extensionElements>
+      <q:variables>
+        <q:variable name="fromAccount" type="object"/>  <!-- {balance, frozen} read from the store -->
+        <q:variable name="toAccount"   type="object"/>
+        <q:variable name="newFrom"     type="number"/>   <!-- computed by Compute, rendered by OkReply -->
+        <q:variable name="newTo"       type="number"/>
+        <q:variable name="reason"      type="string"/>   <!-- set by DecideReason, rendered by RejectReply -->
+      </q:variables>
+
+      <!-- Path coverage (compliance metric) — the two business OUTCOMES of a transfer, declared as the
+           OUTER-process routes so they are traced on the top-level instance (the accept/reject BRANCH is
+           taken inside the transaction, but its outcome surfaces as either the transaction's normal
+           outgoing flow or its cancel-boundary flow). A run is "covered" when its fired-flow trace
+           contains the path's flows as an ordered subsequence, so the intake flow (http/queue/kafka) that
+           precedes them is irrelevant — any transport that commits covers `accept`, any that cancels
+           covers `reject`. The coverage:report op (coverage.bpmn) reads the covered-set; the money-transfer
+           ACID IT itself drives BOTH branches, so a report after it shows 100% (see the book's
+           *Coverage: declared routes as the compliance signal* chapter). -->
+      <q:coverage path="accept" flows="Flow_TxToOk Flow_OkToEnd"/>          <!-- committed: transaction -> OkReply -> End -->
+      <q:coverage path="reject" flows="Flow_CancelToReject Flow_RejectToEnd"/> <!-- cancelled: cancel boundary -> RejectReply -> End -->
+    </bpmn:extensionElements>
+
+    <!-- Intake 1 — the http transfer-request channel (single-node, request/response; MoneyTransferIT). -->
+    <bpmn:startEvent id="Start" name="TransferRequest received (http)">
+      <bpmn:extensionElements>
+        <q:source channel="transfer-request" messageTypeValue="TransferRequest"/>
+      </bpmn:extensionElements>
+      <bpmn:outgoing>Flow_StartToTx</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="Flow_StartToTx" sourceRef="Start" targetRef="Transfer"/>
+
+    <!-- Intake 2 — the rabbitmq transfer-queue channel (the multi-replica singleton ledger channel). A
+         <q:source> binds exactly ONE channel + one message type (a start event handles one message type),
+         so a second intake is a second visible start event, converging on the SAME atomic <bpmn:transaction>.
+         Its consumer runs on exactly one replica via the per-channel singleton — MoneyTransferMultiReplicaIT. -->
+    <bpmn:startEvent id="StartQueue" name="TransferRequest received (queue)">
+      <bpmn:extensionElements>
+        <q:source channel="transfer-queue" messageTypeValue="TransferRequest"/>
+      </bpmn:extensionElements>
+      <bpmn:outgoing>Flow_QueueToTx</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="Flow_QueueToTx" sourceRef="StartQueue" targetRef="Transfer"/>
+
+    <!-- Intake 3 — the kafka transfer-topic channel (a second multi-replica singleton ledger channel). -->
+    <bpmn:startEvent id="StartKafka" name="TransferRequest received (kafka)">
+      <bpmn:extensionElements>
+        <q:source channel="transfer-topic" messageTypeValue="TransferRequest"/>
+      </bpmn:extensionElements>
+      <bpmn:outgoing>Flow_KafkaToTx</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="Flow_KafkaToTx" sourceRef="StartKafka" targetRef="Transfer"/>
+
+    <!-- ================= The atomic work: a transaction sub-process ================= -->
+    <bpmn:transaction id="Transfer" name="Transfer">
+      <bpmn:incoming>Flow_StartToTx</bpmn:incoming>
+      <bpmn:incoming>Flow_QueueToTx</bpmn:incoming>
+      <bpmn:incoming>Flow_KafkaToTx</bpmn:incoming>
+      <bpmn:outgoing>Flow_TxToOk</bpmn:outgoing>
+
+      <!-- Store references — one key per reference (see the book's *Data stores* chapter). The READ
+           references take a pessimistic FOR UPDATE lock (Isolation); the WRITE references target the
+           .balance field of the same key, committed in the same transaction as the reads. -->
+      <bpmn:dataStoreReference id="dsrFrom" name="accounts" dataStoreRef="accountsStore">
+        <bpmn:extensionElements><q:store key="payload.fromId" forUpdate="true"/></bpmn:extensionElements>
+      </bpmn:dataStoreReference>
+      <bpmn:dataStoreReference id="dsrTo" name="accounts" dataStoreRef="accountsStore">
+        <bpmn:extensionElements><q:store key="payload.toId" forUpdate="true"/></bpmn:extensionElements>
+      </bpmn:dataStoreReference>
+      <bpmn:dataStoreReference id="dsrFromBalance" name="accounts" dataStoreRef="accountsStore">
+        <bpmn:extensionElements><q:store key="payload.fromId" field="balance"/></bpmn:extensionElements>
+      </bpmn:dataStoreReference>
+      <bpmn:dataStoreReference id="dsrToBalance" name="accounts" dataStoreRef="accountsStore">
+        <bpmn:extensionElements><q:store key="payload.toId" field="balance"/></bpmn:extensionElements>
+      </bpmn:dataStoreReference>
+
+      <!-- Data objects: names are the process-variable names the associations map. -->
+      <bpmn:dataObject id="doFromAccount" name="fromAccount"/>  <!-- map {balance, frozen} -->
+      <bpmn:dataObject id="doToAccount"   name="toAccount"/>    <!-- map {balance, frozen} -->
+      <bpmn:dataObject id="doNewFrom"     name="newFrom"/>      <!-- number -->
+      <bpmn:dataObject id="doNewTo"       name="newTo"/>        <!-- number -->
+
+      <bpmn:startEvent id="SubStart"><bpmn:outgoing>TF1</bpmn:outgoing></bpmn:startEvent>
+      <bpmn:sequenceFlow id="TF1" sourceRef="SubStart" targetRef="LoadFrom"/>
+
+      <!-- LoadFrom: data task (no impl) — store read (FOR UPDATE) of accounts[fromId] -> fromAccount. -->
+      <bpmn:serviceTask id="LoadFrom" name="Load from-account (lock)">
+        <bpmn:incoming>TF1</bpmn:incoming><bpmn:outgoing>TF2</bpmn:outgoing>
+        <bpmn:dataInputAssociation>
+          <bpmn:sourceRef>dsrFrom</bpmn:sourceRef>
+          <bpmn:targetRef>doFromAccount</bpmn:targetRef>
+        </bpmn:dataInputAssociation>
+      </bpmn:serviceTask>
+      <bpmn:sequenceFlow id="TF2" sourceRef="LoadFrom" targetRef="LoadTo"/>
+
+      <!-- LoadTo: store read (FOR UPDATE) of accounts[toId] -> toAccount. -->
+      <bpmn:serviceTask id="LoadTo" name="Load to-account (lock)">
+        <bpmn:incoming>TF2</bpmn:incoming><bpmn:outgoing>TF3</bpmn:outgoing>
+        <bpmn:dataInputAssociation>
+          <bpmn:sourceRef>dsrTo</bpmn:sourceRef>
+          <bpmn:targetRef>doToAccount</bpmn:targetRef>
+        </bpmn:dataInputAssociation>
+      </bpmn:serviceTask>
+      <bpmn:sequenceFlow id="TF3" sourceRef="LoadTo" targetRef="Valid"/>
+
+      <!-- Valid? exclusive gateway — Consistency check with VISIBLE FEEL on the flows. -->
+      <bpmn:exclusiveGateway id="Valid" name="Valid?" default="TF_ok"/>
+      <bpmn:sequenceFlow id="TF_invalid" name="invalid" sourceRef="Valid" targetRef="DecideReason">
+        <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">fromAccount.frozen or toAccount.frozen or fromAccount.balance &lt; payload.amount</bpmn:conditionExpression>
+      </bpmn:sequenceFlow>
+      <!-- ok = else (the gateway default): not frozen and sufficient funds. -->
+      <bpmn:sequenceFlow id="TF_ok" name="ok" sourceRef="Valid" targetRef="Compute"/>
+
+      <!-- Compute: data-assignment node (no impl) — two FEEL assignments, no persistence yet. Each
+           <bpmn:assignment> pairs a FEEL <from> expression with a <to> target variable. -->
+      <bpmn:serviceTask id="Compute" name="Compute new balances">
+        <bpmn:incoming>TF_ok</bpmn:incoming><bpmn:outgoing>TF4</bpmn:outgoing>
+        <bpmn:dataInputAssociation>
+          <bpmn:assignment><bpmn:from>fromAccount.balance - payload.amount</bpmn:from><bpmn:to>newFrom</bpmn:to></bpmn:assignment>
+          <bpmn:assignment><bpmn:from>toAccount.balance + payload.amount</bpmn:from><bpmn:to>newTo</bpmn:to></bpmn:assignment>
+        </bpmn:dataInputAssociation>
+      </bpmn:serviceTask>
+      <bpmn:sequenceFlow id="TF4" sourceRef="Compute" targetRef="Persist"/>
+
+      <!-- Persist: data task (no impl) — writes both balances to the store in the SAME transaction. -->
+      <bpmn:serviceTask id="Persist" name="Persist new balances">
+        <bpmn:incoming>TF4</bpmn:incoming><bpmn:outgoing>TF5</bpmn:outgoing>
+        <bpmn:dataOutputAssociation>
+          <bpmn:sourceRef>doNewFrom</bpmn:sourceRef>
+          <bpmn:targetRef>dsrFromBalance</bpmn:targetRef>
+        </bpmn:dataOutputAssociation>
+        <bpmn:dataOutputAssociation>
+          <bpmn:sourceRef>doNewTo</bpmn:sourceRef>
+          <bpmn:targetRef>dsrToBalance</bpmn:targetRef>
+        </bpmn:dataOutputAssociation>
+      </bpmn:serviceTask>
+      <bpmn:sequenceFlow id="TF5" sourceRef="Persist" targetRef="SubEnd"/>
+
+      <!-- SubEnd: normal end -> COMMITS the transaction (both writes). -->
+      <bpmn:endEvent id="SubEnd" name="Committed"><bpmn:incoming>TF5</bpmn:incoming></bpmn:endEvent>
+
+      <!-- Invalid branch: decide the reject reason (FEEL), then CANCEL the transaction (no writes commit). -->
+      <bpmn:serviceTask id="DecideReason" name="Decide reject reason">
+        <bpmn:incoming>TF_invalid</bpmn:incoming><bpmn:outgoing>TF_cancel</bpmn:outgoing>
+        <bpmn:dataInputAssociation>
+          <bpmn:assignment>
+            <bpmn:from>if fromAccount.frozen or toAccount.frozen then "frozen-account" else "insufficient-funds"</bpmn:from>
+            <bpmn:to>reason</bpmn:to>
+          </bpmn:assignment>
+        </bpmn:dataInputAssociation>
+      </bpmn:serviceTask>
+      <bpmn:sequenceFlow id="TF_cancel" sourceRef="DecideReason" targetRef="TxCancel"/>
+
+      <bpmn:endEvent id="TxCancel" name="Reject (cancel)">
+        <bpmn:incoming>TF_cancel</bpmn:incoming>
+        <bpmn:cancelEventDefinition/>
+      </bpmn:endEvent>
+    </bpmn:transaction>
+
+    <!-- Cancel boundary event on the transaction — routes the cancelled (rejected) path out. A cancel
+         boundary event may only attach to a <bpmn:transaction>. -->
+    <bpmn:boundaryEvent id="TxCancelled" name="rejected" attachedToRef="Transfer">
+      <bpmn:cancelEventDefinition/>
+      <bpmn:outgoing>Flow_CancelToReject</bpmn:outgoing>
+    </bpmn:boundaryEvent>
+
+    <!-- ok path: the committed transaction -> render TransferAccepted (Handlebars) as the reply. -->
+    <bpmn:sequenceFlow id="Flow_TxToOk" sourceRef="Transfer" targetRef="OkReply"/>
+    <bpmn:serviceTask id="OkReply" name="Reply TransferAccepted" implementation="transfer-result.hbs">
+      <bpmn:extensionElements>
+        <q:reply mode="native" contentType="application/xml"/>
+      </bpmn:extensionElements>
+      <bpmn:incoming>Flow_TxToOk</bpmn:incoming><bpmn:outgoing>Flow_OkToEnd</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="Flow_OkToEnd" sourceRef="OkReply" targetRef="End"/>
+
+    <!-- cancel path: render TransferRejected (Handlebars) as the reply. -->
+    <bpmn:sequenceFlow id="Flow_CancelToReject" sourceRef="TxCancelled" targetRef="RejectReply"/>
+    <bpmn:serviceTask id="RejectReply" name="Reply TransferRejected" implementation="transfer-rejected.hbs">
+      <bpmn:extensionElements>
+        <q:reply mode="native" contentType="application/xml"/>
+      </bpmn:extensionElements>
+      <bpmn:incoming>Flow_CancelToReject</bpmn:incoming><bpmn:outgoing>Flow_RejectToEnd</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="Flow_RejectToEnd" sourceRef="RejectReply" targetRef="End"/>
+
+    <bpmn:endEvent id="End" name="Done">
+      <bpmn:incoming>Flow_OkToEnd</bpmn:incoming>
+      <bpmn:incoming>Flow_RejectToEnd</bpmn:incoming>
+    </bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>

@@ -1,0 +1,3 @@
+{{!-- Renders the balance reply. accountId comes from the BalanceQuery payload; account.balance is the
+   value read from the accounts store by the Load task. The template only renders — no arithmetic. --}}
+<Balance accountId="{{payload.accountId}}" balance="{{account.balance}}"/>

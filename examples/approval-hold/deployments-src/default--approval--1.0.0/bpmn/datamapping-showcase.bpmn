@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Data-flow showcase (the declarative data-mapping layer) — no application code. Visible data-assignment
+  nodes (serviceTasks with FEEL <bpmn:assignment>s and NO implementation) compute process variables in
+  the diagram itself, a scoped <q:param> feeds the reply template a per-invocation derived input, and a
+  strict Handlebars template replies natively.
+
+    startEvent (XML ApprovalRequest on datamapping-showcase-request)
+    then Seed   : data task, amount := 1500
+    then Derive : data task, riskBand := if amount >= 1000 then "high" else "low"  (FEEL if/then/else)
+    then Reply  : Handlebars template serviceTask (datamap-reply.hbs) with a scoped
+                  <q:param name="riskNote" expression='riskBand + "-band"'/> — evaluated once for the
+                  render, never persisted to instance state — + native reply
+    then End
+
+  NAMED GAP: there is no declarative carrier for SCOPED task I/O. Template tasks fail closed on
+  data associations, and data/script/businessRule tasks run against the shared scope, so per-task
+  read/write restriction cannot be demonstrated until the serviceTask-as-channel-call contract
+  defines scoping for channel-bound service tasks. The channel + process names are kept to
+  preserve the IT surface.
+-->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0"
+                  id="Definitions_datamapping_showcase"
+                  targetNamespace="urn:sutra:module:approval:1.0.0">
+
+  <bpmn:process id="datamapping-showcase" name="Declarative data-flow showcase" isExecutable="true">
+
+    <!-- Typed variables — a numeric comparison on `amount` type-checks at deploy time. -->
+    <bpmn:extensionElements>
+      <q:variables>
+        <q:variable name="amount" type="number"/>     <!-- Seed -->
+        <q:variable name="riskBand" type="string"/>   <!-- Derive -->
+      </q:variables>
+    </bpmn:extensionElements>
+
+    <bpmn:startEvent id="Start" name="ApprovalRequest received">
+      <bpmn:extensionElements>
+        <q:source channel="datamapping-showcase-request" messageTypeValue="ApprovalRequest"/>
+      </bpmn:extensionElements>
+      <bpmn:outgoing>F1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="F1" sourceRef="Start" targetRef="Seed"/>
+
+    <bpmn:serviceTask id="Seed" name="Seed (FEEL data assignment)">
+      <bpmn:incoming>F1</bpmn:incoming><bpmn:outgoing>F2</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>1500</bpmn:from><bpmn:to>amount</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F2" sourceRef="Seed" targetRef="Derive"/>
+
+    <bpmn:serviceTask id="Derive" name="Derive (FEEL if/then/else)">
+      <bpmn:incoming>F2</bpmn:incoming><bpmn:outgoing>F3</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment>
+          <bpmn:from>if amount >= 1000 then "high" else "low"</bpmn:from>
+          <bpmn:to>riskBand</bpmn:to>
+        </bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F3" sourceRef="Derive" targetRef="Reply"/>
+
+    <!-- The scoped param overlays the render model for THIS invocation only (q.xsd ParamType) — the
+         template reads {{riskNote}} like a variable, but nothing is persisted to instance state. -->
+    <bpmn:serviceTask id="Reply" name="Reply (Handlebars template)" implementation="datamap-reply.hbs">
+      <bpmn:extensionElements>
+        <q:param name="riskNote" expression='riskBand + "-band"'/>
+        <q:reply mode="native" contentType="application/xml"/>
+      </bpmn:extensionElements>
+      <bpmn:incoming>F3</bpmn:incoming><bpmn:outgoing>F4</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F4" sourceRef="Reply" targetRef="End"/>
+
+    <bpmn:endEvent id="End" name="Done"><bpmn:incoming>F4</bpmn:incoming></bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>

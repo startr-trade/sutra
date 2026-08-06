@@ -1,0 +1,12 @@
+[package]
+name = "sutra-bpmn"
+description = "BPMN 2.0 + q: extension model & loader"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+quick-xml = { workspace = true }
+regex = { workspace = true }
+time = { workspace = true }

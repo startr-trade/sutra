@@ -1,0 +1,136 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  AUTHORED FIXTURE — not a published schema. See provenance.md.
+
+  Standards-Editor-style shape (one global Document root over a named envelope type, named
+  simple types carrying every facet family, no imports/includes/groups) written to exercise the
+  compiler and the shape emitter across the SAME construct families a registered message
+  definition does:
+
+    * nested sequences (Document -> OrderMessage -> Header -> ...)
+    * a repeated element (Line, maxOccurs="unbounded")
+    * a choice-typed container (PartyIdentification)
+    * simpleContent + required attribute (MonetaryAmount / Ccy)
+    * a decimal restriction chain reached only through simpleContent (the coercion case a
+      builtin-attribute scan cannot see)
+    * "numeric text" — digits restricting xs:string, which must stay String, not Number
+    * enumerations, patterns, minLength/maxLength, xs:length, dateTime / date / boolean builtins
+-->
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           targetNamespace="urn:sutra:test:order.001.001.01"
+           xmlns="urn:sutra:test:order.001.001.01"
+           elementFormDefault="qualified">
+
+  <xs:element name="Document" type="Document"/>
+
+  <xs:complexType name="Document">
+    <xs:sequence>
+      <xs:element name="OrderMessage" type="OrderMessage"/>
+    </xs:sequence>
+  </xs:complexType>
+
+  <xs:complexType name="OrderMessage">
+    <xs:sequence>
+      <xs:element name="Header" type="Header"/>
+      <xs:element name="Line" type="OrderLine" maxOccurs="unbounded"/>
+    </xs:sequence>
+  </xs:complexType>
+
+  <xs:complexType name="Header">
+    <xs:sequence>
+      <xs:element name="MessageId" type="Max35Text"/>
+      <xs:element name="CreatedAt" type="xs:dateTime"/>
+      <xs:element name="LineCount" type="Max15NumericText"/>
+      <xs:element name="TotalAmount" type="MonetaryAmount"/>
+      <xs:element name="Batched" type="xs:boolean" minOccurs="0"/>
+      <xs:element name="Buyer" type="PartyDetails"/>
+    </xs:sequence>
+  </xs:complexType>
+
+  <xs:complexType name="PartyDetails">
+    <xs:sequence>
+      <xs:element name="Name" type="Max35Text"/>
+      <xs:element name="Id" type="PartyIdentification"/>
+    </xs:sequence>
+  </xs:complexType>
+
+  <!-- Choice content: the container is open (a missing branch sibling is not a typo) while
+       every branch member stays declared. -->
+  <xs:complexType name="PartyIdentification">
+    <xs:choice>
+      <xs:element name="AccountRef" type="AccountReference"/>
+      <xs:element name="RegistryId" type="Max35Text"/>
+    </xs:choice>
+  </xs:complexType>
+
+  <xs:complexType name="OrderLine">
+    <xs:sequence>
+      <xs:element name="Sku" type="SkuCode"/>
+      <xs:element name="Quantity" type="xs:integer"/>
+      <xs:element name="UnitPrice" type="MonetaryAmount"/>
+      <xs:element name="Status" type="LineStatusCode" minOccurs="0"/>
+      <xs:element name="DueDate" type="xs:date" minOccurs="0"/>
+    </xs:sequence>
+  </xs:complexType>
+
+  <!-- simpleContent + required attribute: declares as an OPEN object (text + attribute
+       projection), and the value side reaches xs:decimal only through the named chain. -->
+  <xs:complexType name="MonetaryAmount">
+    <xs:simpleContent>
+      <xs:extension base="AmountValue">
+        <xs:attribute name="Ccy" type="CurrencyCode" use="required"/>
+      </xs:extension>
+    </xs:simpleContent>
+  </xs:complexType>
+
+  <xs:simpleType name="AmountValue">
+    <xs:restriction base="xs:decimal">
+      <xs:fractionDigits value="5"/>
+      <xs:totalDigits value="18"/>
+      <xs:minInclusive value="0"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <xs:simpleType name="CurrencyCode">
+    <xs:restriction base="xs:string">
+      <xs:length value="3"/>
+      <xs:pattern value="[A-Z]{3,3}"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <!-- Digits restricting xs:string: TEXT, never a number, however numeric it looks. -->
+  <xs:simpleType name="Max15NumericText">
+    <xs:restriction base="xs:string">
+      <xs:pattern value="[0-9]{1,15}"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <xs:simpleType name="Max35Text">
+    <xs:restriction base="xs:string">
+      <xs:minLength value="1"/>
+      <xs:maxLength value="35"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <xs:simpleType name="SkuCode">
+    <xs:restriction base="xs:string">
+      <xs:length value="8"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <xs:simpleType name="LineStatusCode">
+    <xs:restriction base="xs:string">
+      <xs:enumeration value="OPEN"/>
+      <xs:enumeration value="PICK"/>
+      <xs:enumeration value="SHIP"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <xs:complexType name="AccountReference">
+    <xs:sequence>
+      <xs:element name="Primary" type="Max35Text" minOccurs="0"/>
+      <xs:element name="Alternate" type="Max35Text" minOccurs="0"/>
+    </xs:sequence>
+  </xs:complexType>
+
+</xs:schema>

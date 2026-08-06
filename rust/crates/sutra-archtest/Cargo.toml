@@ -1,0 +1,9 @@
+[package]
+name = "sutra-archtest"
+description = "The Rust domain-neutrality enforcement gate. A structural test that fails the build when a forbidden business-domain literal (SWIFT/FedNow/ISO 20022/HL7/NACHA/…) leaks into the neutral execution + model + language core."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]

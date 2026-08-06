@@ -1,0 +1,5 @@
+# Local load-test artefacts. CI uploads these as GH Actions artifacts; never
+# committed. Keep this dir tracked so a fresh clone has the layout, with just
+# a .gitkeep + this rule.
+results/*
+!results/.gitkeep

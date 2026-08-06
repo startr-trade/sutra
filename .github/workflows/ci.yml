@@ -1,0 +1,148 @@
+name: CI
+
+# Pull-request / main-branch gate. Mirrors the LOCAL gate chain exactly by calling the
+# repo-root `make` targets (one source of truth — `make help` lists them), so a contributor
+# who is green locally is green here:
+#
+#   make lint   → cargo clippy --workspace --all-targets -- -D warnings
+#                 + cargo test -p sutra-archtest   (the domain-neutrality gate)
+#   make test   → cargo test --workspace                                 (tier-1, no Docker)
+#   make audit  → cargo audit + cargo deny check   (rust/deny.toml, rust/.cargo/audit.toml)
+#
+# `cargo fmt --all --check` is run directly: the Makefile has no `fmt` target (formatting is
+# not part of the local `lint` chain), and adding one is a source-repo decision, not a CI one.
+#
+# WHY THERE ARE NO DOCKER JOBS HERE
+# --------------------------------
+# The suite is tiered (rust/TESTING.md):
+#   tier-1  no Docker              — this workflow
+#   tier-2  Docker/testcontainers  — spins PostgreSQL, MySQL/MariaDB, SQL Server, RabbitMQ,
+#                                    Kafka and LocalStack fixtures per suite; tens of minutes
+#                                    on a 2-core hosted runner and prone to resource-starvation
+#                                    flakes (which is exactly why the local target pins
+#                                    `--test-threads=4 --no-fail-fast`).
+#   tier-3  k8s conformance        — needs a kind cluster provisioned by OpenTofu; heavy and
+#                                    stateful, and a *milestone* gate by design.
+# Running tier-2 on every PR would make the common path slow and flaky for signal that tier-1
+# + clippy already cover for the vast majority of changes. Tier-2 runs nightly
+# (.github/workflows/nightly.yml); tier-3 stays local/self-hosted (decision D4 in the CI/CD
+# design).
+#
+# Also deliberately absent: `make catalog-check`. The generated impact-analysis catalog is
+# git-ignored in this repo (`/catalog/`), so there is no committed baseline to diff against.
+# Re-add a catalog job if the catalog ever becomes a committed artifact.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # CI builds are one-shot; incremental artifacts only bloat the cache.
+  CARGO_INCREMENTAL: "0"
+  # Debug info is the bulk of a debug-profile build: a full `cargo test` of this workspace
+  # produces ~35 GB of artifacts with it on, which EXCEEDS a hosted runner's free disk and
+  # makes rust-lld die with `signal 7 [Bus error]` mid-link (ENOSPC on an mmap'd output page
+  # surfaces as SIGBUS, not a clean "no space" error — observed 2026-08-03). Nothing here
+  # needs a debugger or backtrace line numbers, so drop it for both the dev and test profiles;
+  # panics still name the failing test. Local dev is unaffected (env-scoped to CI).
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      # No build cache: rustfmt compiles nothing.
+      - name: cargo fmt --check
+        working-directory: rust
+        run: cargo fmt --all --check
+
+  lint:
+    name: clippy + domain-neutrality (make lint)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          key: lint
+      # Hosted runners ship ~25 GB of preinstalled toolchains we never use (dotnet, android
+      # SDK, GHC, CodeQL bundles). Reclaiming them up front is what keeps the link step from
+      # running the disk to zero on a cold cache; cheap (~20 s) next to a 10-minute build.
+      - name: Free disk space
+        run: |
+          df -h / | tail -1
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost /opt/hostedtoolcache/CodeQL || true
+          sudo docker image prune -af >/dev/null 2>&1 || true
+          df -h / | tail -1
+      # librdkafka (Kafka transport) vendors its C sources and builds them via mklove;
+      # `make` + a C++ compiler are the only extra tools it needs (see rust/Dockerfile).
+      # ubuntu-latest ships both — this is an assertion, not an install.
+      - name: Verify C/C++ build tooling (librdkafka vendored build)
+        run: |
+          command -v make >/dev/null || { echo "::error::make is missing"; exit 1; }
+          command -v g++  >/dev/null || { echo "::error::g++ is missing";  exit 1; }
+      - name: make lint
+        run: make lint
+
+  test:
+    name: tier-1 tests (make test)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          key: test
+      # Hosted runners ship ~25 GB of preinstalled toolchains we never use (dotnet, android
+      # SDK, GHC, CodeQL bundles). Reclaiming them up front is what keeps the link step from
+      # running the disk to zero on a cold cache; cheap (~20 s) next to a 10-minute build.
+      - name: Free disk space
+        run: |
+          df -h / | tail -1
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost /opt/hostedtoolcache/CodeQL || true
+          sudo docker image prune -af >/dev/null 2>&1 || true
+          df -h / | tail -1
+      - name: make test
+        run: make test
+
+  audit:
+    name: supply chain (make audit)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      # cargo-audit + cargo-deny read the resolved lockfile only (no rustc), so this job
+      # needs no build cache — just the two prebuilt binaries.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit,cargo-deny
+      - name: make audit
+        run: make audit

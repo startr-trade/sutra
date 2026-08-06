@@ -1,0 +1,24 @@
+[package]
+name = "sutra-transport-dapr"
+description = "The Dapr pub/sub vendor transport — inbound: the Dapr sidecar POSTs subscribed topics as CloudEvents-binary HTTP to a `POST /dapr/{topic}` route merged onto the engine's shared listener (same `TransportChannels::inbound_router` seam as sutra-transport-http, no leader election — Dapr's sidecar push IS the delivery guarantee); outbound: a `dapr://<pubsub>/<topic>` destination is rewritten to a POST against the local sidecar's `http://localhost:<port>/v1.0/publish/<pubsub>/<topic>` and delegated to sutra-channels' rustls HttpSink. Self-registers a TransportFactory via inventory."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+sutra-channels = { path = "../sutra-channels" }
+sutra-transport-spi = { path = "../sutra-transport-spi" }
+axum = { version = "0.8", default-features = false }
+inventory = "0.3.24"
+async-trait = { workspace = true }
+tracing = { workspace = true }
+time = { workspace = true }
+# Only to name the SPI's uniform spawn signature types (`Option<PgPool>`, `Handle`); dapr uses
+# neither a datasource nor a spawn runtime (push-based over the shared HTTP listener, like the
+# HTTP transport). Same sqlx build as the rest of the tree so the `PgPool` type matches.
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "uuid"] }
+tokio = { version = "1", features = ["rt"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }

@@ -1,0 +1,20 @@
+# Cross-process coverage — the worked example.
+# URN (derived from the path `orders/e2e.yaml`): urn:sutra:coverage:orders:e2e
+correlations:
+  - id: transfer                      # mnemonic, unique under this file's URN
+    key: txnId                        # default hop key — a hop sets its own `key` only when its leg differs
+    links:                            # each hop connects two instances by its (effective) key
+      - { from: p1:sendMessage,       to: p2:startEvent }                # p1↔p2 leg — key=txnId
+      - { from: p2:sendReplyMessage,  to: p1:imec1 }                     # reply of p1↔p2 leg — key=txnId
+      - { from: p2:sendMessage,       to: p3:startEvent, key: p2p3Ref }  # p2↔p3 leg — DIFFERENT key
+      - { from: p3:sendReplyMessage1, to: p2:imec1,      key: p2p3Ref }  # reply of p2↔p3 leg
+      - { from: p3:sendReplyMessage2, to: p2:imec1,      key: p2p3Ref }
+    coverages:                        # mnemonic path ids, unique under the file URN
+      - path: reply1                  # fq: urn:sutra:coverage:orders:e2e:reply1
+        segments: { p1: [startSeq, noErrorsSequence, sequence2, endSeq],
+                    p2: [startSeq, seq1, seq2, endSeq],
+                    p3: [startSeq, seq1, endSeq1] }
+      - path: reply2                  # fq: …:reply2 — a FULL, self-contained path (no inheritance)
+        segments: { p1: [startSeq, noErrorsSequence, sequence2, endSeq],
+                    p2: [startSeq, seq1, seq2, endSeq],
+                    p3: [startSeq, seq2, endSeq2] }

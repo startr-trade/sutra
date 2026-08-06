@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  generated-by: sutra create app (edit freely — this file is yours)
+
+  Message roots of the `sample` codec:
+    SampleRequest — the sample process's inbound message (bpmn/sample.bpmn).
+    CoverageQuery / CoverageReset — the coverage ADMIN messages, ready for
+      `sutra coverage init bpmn/sample.bpmn` (see the workspace README).
+-->
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema" elementFormDefault="qualified">
+
+  <xs:element name="SampleRequest">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element name="note" type="xs:string"/>
+      </xs:sequence>
+    </xs:complexType>
+  </xs:element>
+
+  <xs:element name="CoverageQuery">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element name="process" type="xs:string"/>
+      </xs:sequence>
+    </xs:complexType>
+  </xs:element>
+
+  <xs:element name="CoverageReset">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element name="process" type="xs:string"/>
+      </xs:sequence>
+    </xs:complexType>
+  </xs:element>
+</xs:schema>

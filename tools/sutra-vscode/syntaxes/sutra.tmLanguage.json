@@ -1,0 +1,81 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "sutra",
+  "scopeName": "source.sutra",
+  "patterns": [
+    { "include": "#comment" },
+    { "include": "#cdata" },
+    { "include": "#tag" }
+  ],
+  "repository": {
+    "comment": {
+      "name": "comment.block.sutra",
+      "begin": "<!--",
+      "end": "-->"
+    },
+    "cdata": {
+      "name": "string.unquoted.cdata.sutra",
+      "begin": "<!\\[CDATA\\[",
+      "end": "\\]\\]>",
+      "patterns": [
+        { "include": "#feel" }
+      ]
+    },
+    "feel": {
+      "patterns": [
+        {
+          "name": "keyword.control.feel.sutra",
+          "match": "\\b(if|then|else|for|in|return|some|every|satisfies|and|or|not|true|false|null)\\b"
+        },
+        {
+          "name": "variable.other.payload.feel.sutra",
+          "match": "\\b(payload|context|now|today)\\.[A-Za-z_][A-Za-z0-9_]*"
+        },
+        {
+          "name": "constant.numeric.feel.sutra",
+          "match": "\\b[0-9]+(\\.[0-9]+)?\\b"
+        },
+        {
+          "name": "string.quoted.double.feel.sutra",
+          "begin": "\"",
+          "end": "\""
+        }
+      ]
+    },
+    "tag": {
+      "begin": "(</?)([a-zA-Z_][a-zA-Z0-9_\\-]*:)?([a-zA-Z_][a-zA-Z0-9_\\-]*)",
+      "beginCaptures": {
+        "1": { "name": "punctuation.definition.tag.sutra" },
+        "2": { "name": "entity.name.tag.namespace.sutra" },
+        "3": { "name": "entity.name.tag.sutra" }
+      },
+      "end": "(/?>)",
+      "endCaptures": {
+        "1": { "name": "punctuation.definition.tag.sutra" }
+      },
+      "patterns": [
+        { "include": "#attribute" }
+      ]
+    },
+    "attribute": {
+      "patterns": [
+        {
+          "match": "([a-zA-Z_][a-zA-Z0-9_\\-]*)\\s*(=)\\s*(\"[^\"]*\")",
+          "captures": {
+            "1": { "name": "entity.other.attribute-name.sutra" },
+            "2": { "name": "punctuation.separator.key-value.sutra" },
+            "3": { "name": "string.quoted.double.sutra" }
+          }
+        },
+        {
+          "match": "([a-zA-Z_][a-zA-Z0-9_\\-]*)\\s*(=)\\s*('[^']*')",
+          "captures": {
+            "1": { "name": "entity.other.attribute-name.sutra" },
+            "2": { "name": "punctuation.separator.key-value.sutra" },
+            "3": { "name": "string.quoted.single.sutra" }
+          }
+        }
+      ]
+    }
+  }
+}

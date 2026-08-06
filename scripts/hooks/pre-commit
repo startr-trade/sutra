@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+#
+# Sutra pre-commit hook — catalog-regen convenience.
+#
+# OPTIONAL / opt-in local DX. Keeps the generated catalog (emitted by
+# rust/crates/sutra-catalog-gen) in sync with staged rust/crates/** changes, so `make catalog-check` (the real CI gate / backstop) is
+# less likely to surprise you at push time. Not installed anywhere automatically —
+# run `make install-hooks` once per clone/worktree to opt in (.git/hooks/ is not
+# tracked, so it must be reinstalled after a fresh clone).
+#
+# Fast-exit: `make catalog` runs `cargo run --release -p sutra-cli -- catalog`, which
+# syn-parses the whole Rust workspace — too slow to pay on every commit. This hook
+# only regenerates when the commit actually stages changes under rust/crates/;
+# every other commit (docs, plan files, non-Rust scripts, etc.) exits immediately.
+#
+# Bypass for a single commit: git commit --no-verify
+
+set -euo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "$REPO_ROOT"
+
+# Anything staged (added/copied/modified/renamed/deleted) under rust/crates/?
+staged_crate_changes="$(git diff --cached --name-only --diff-filter=ACMRD -- rust/crates/)"
+
+if [[ -z "$staged_crate_changes" ]]; then
+    exit 0
+fi
+
+echo "pre-commit: staged rust/crates/ changes — regenerating the catalog (make catalog)..." >&2
+
+make --no-print-directory catalog
+
+# Stage whatever `make catalog` wrote — the Makefile owns the output location.
+git add -- "$(make --no-print-directory print-catalog-output)"
+
+exit 0

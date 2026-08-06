@@ -1,0 +1,22 @@
+[package]
+name = "sutra-transport-spi"
+description = "The transport SPI + shared cluster substrate (domain-neutrality refactor): the DB-lease leader election, the engine-actor intake adapter, and the inventory-collected TransportChannels/TransportFactory seam vendor transport crates self-register through — so sutra-engine composes transports GENERICALLY and names no broker."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+sutra-channels = { path = "../sutra-channels" }
+sutra-persistence = { path = "../sutra-persistence" }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "uuid"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+tracing = { workspace = true }
+uuid = { version = "1", features = ["v4"] }
+inventory = "0.3.24"
+async-trait = { workspace = true }
+# For the neutral `inbound_router()` capability hook — a transport that serves inbound over
+# the process's shared HTTP listener (HTTP today) contributes its routes as an axum Router;
+# the SPI names no protocol, and broker transports take the default `None`. axum is neutral
+# (a web framework, not a vendor), already in the tree via sutra-channels.
+axum = { version = "0.8", default-features = false }

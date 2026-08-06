@@ -1,0 +1,5 @@
+{{! Script task, Handlebars engine (chosen by the .hbs extension). Runs after derive-metadata.hbs
+    in the flow, so it can read the correlationId that script merged into the variables — a script building
+    on a prior script's state. Renders a JSON object; its entries (a boolean + strings) merge, typed, into
+    the instance variables. }}
+{"autoApprove": true, "correlationEcho": "{{correlationId}}", "scriptEngine2": "handlebars"}

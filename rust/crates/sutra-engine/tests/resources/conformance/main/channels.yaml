@@ -1,0 +1,79 @@
+# Conformance channels — timers + channel-call.
+# Inbound channels are schema-less or json; every outbound `bind:` names a destination the
+# outbox dispatcher would deliver to — enqueue rows are the observable here.
+channels:
+  # (a)/(f) — activation of the intermediate-timer flow.
+  - name: timer-start
+    transport: http
+    bind: "POST /channels/timer-start"
+    auth:
+      scheme: apikey
+      apikey:
+        value: conformance-key
+        header: X-Api-Key
+
+  # (f) — activation of the slow-timer flow (survives an engine restart).
+  - name: timer-start-slow
+    transport: http
+    bind: "POST /channels/timer-start-slow"
+    auth:
+      scheme: apikey
+      apikey:
+        value: conformance-key
+        header: X-Api-Key
+
+  # (b) — activation of the channel-call + timer-boundary flow.
+  - name: call-timeout-start
+    transport: http
+    bind: "POST /channels/call-timeout-start"
+    auth:
+      scheme: apikey
+      apikey:
+        value: conformance-key
+        header: X-Api-Key
+
+  # (c)/(e) — activation of the channel-call + correlated-response flow (json payloads).
+  - name: call-resp-start
+    transport: http
+    bind: "POST /channels/call-resp-start"
+    codec: json
+    auth:
+      scheme: apikey
+      apikey:
+        value: conformance-key
+        header: X-Api-Key
+
+  # (c) — the correlated RESPONSE relay channel the channel-call task subscribes to.
+  - name: call-response
+    transport: http
+    bind: "POST /channels/call-response"
+    codec: json
+    auth:
+      scheme: apikey
+      apikey:
+        value: conformance-key
+        header: X-Api-Key
+
+  # respond-and-continue — activation of the continue-reply flow. The sync caller gets the
+  # flushed reply; the tail runs detached on the poller (destination http://continue-tail.example/).
+  - name: continue-start
+    transport: http
+    bind: "POST /channels/continue-start"
+    codec: json
+    auth:
+      scheme: apikey
+      apikey:
+        value: conformance-key
+        header: X-Api-Key
+
+  # (b) — the outbound channel the call-timeout flow's request goes to.
+  - name: callout
+    direction: outbound
+    transport: http
+    bind: "http://callout.example/req"
+
+  # (c) — the outbound channel the call-response flow's request goes to.
+  - name: callout2
+    direction: outbound
+    transport: http
+    bind: "http://callout2.example/req"

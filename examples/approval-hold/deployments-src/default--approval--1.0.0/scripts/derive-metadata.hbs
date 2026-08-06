@@ -1,0 +1,5 @@
+{{!-- Script task, Handlebars engine (chosen by the .hbs extension). Rendered against the process
+   variables; the render MUST be a JSON object, whose entries merge (typed) into the instance variables.
+   Here it derives correlation metadata from the engine-supplied {{uuid}} / {{now}} helpers. Unlike a template
+   (whose render becomes the <q:reply>), a script's output updates instance state and emits no reply. --}}
+{"correlationId": "{{uuid}}", "processedAt": "{{now}}", "scriptEngine": "handlebars"}

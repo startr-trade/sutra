@@ -1,0 +1,6 @@
+# Codec manifest for the `approval` codec. The codec name is this folder name, so it registers as
+# urn:sutra:module:approval:1.0.0:approval (unchanged from the pre-folder layout) — the channels bind
+# that URN. The schema files are discovered by convention: every *.xsd under this folder composes the
+# codec (here approval.xsd, declaring the ApprovalRequest + ApprovalDecision roots).
+schemaKind: xsd
+formats: [xml, json, yaml]

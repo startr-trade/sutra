@@ -1,0 +1,6 @@
+# Codec manifest for the `transfer` codec. The codec name is this folder name, so it registers as
+# urn:sutra:module:money-transfer:1.0.0:transfer — the channels bind that URN. The schema files are
+# discovered by convention: every *.xsd under this folder composes the codec (here transfer.xsd,
+# declaring the TransferRequest + BalanceQuery roots).
+schemaKind: xsd
+formats: [xml, json, yaml]

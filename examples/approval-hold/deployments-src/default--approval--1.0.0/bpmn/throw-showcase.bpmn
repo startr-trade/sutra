@@ -1,0 +1,126 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Throw-event showcase — fully declarative, no application code. One synchronous flow exercising three
+  intermediate THROW flavours plus their synchronous catch targets — emit-and-continue, the token never
+  waits. Every step is a FEEL data-assignment node; the reply is a Handlebars template service task.
+
+    startEvent (XML ApprovalRequest on throw-showcase-request)
+    then Prep        : data task, stage := "prepped"
+    then LinkThrow   : intermediateThrowEvent <linkEventDefinition name="stage2"/>  — an intra-process GOTO
+                       (it has NO outgoing flow; the only way Guarded runs is the link jump below, which
+                        is exactly what proves the goto fired)
+    LinkCatch        : intermediateCatchEvent <linkEventDefinition name="stage2"/>  — the jump target
+    then Guarded     : data task, guarded := "ok"; carries a NON-INTERRUPTING escalation boundary
+    then EscThrow    : intermediateThrowEvent <escalationEventDefinition escalationRef="esc-review"/>
+                       — routes to the escalation boundary handler AND (non-interrupting) continues
+    boundary EscB    : escalation boundary (esc-review) → EscHandler (data task, escalationHandled := true)
+    then SignalThrow : intermediateThrowEvent <signalEventDefinition signalRef="sig-audited"/>
+                       — a broadcast with no <q:send> (no subscriber in scope): emits nothing, continues
+    then Reply       : Handlebars template serviceTask (throw-reply.hbs) echoing the evidence each
+                       construct produced + native reply
+    then End
+
+  The handler branch fires BEFORE the raising flow's continuation is enqueued (routeEscalation), so
+  escalationHandled is always set when Reply renders — and the strict Handlebars engine would fail the
+  render loudly if that ordering ever regressed.
+
+  Note: the message-throw flavour (<q:send> → outbox) is covered by the ThrowEventTest unit test — it
+  emits to an external destination, so it is out of scope for a self-contained Testcontainers IT.
+-->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0"
+                  id="Definitions_throw_showcase"
+                  targetNamespace="urn:sutra:module:approval:1.0.0">
+
+  <bpmn:escalation id="esc-review" name="Manual review" escalationCode="REVIEW"/>
+  <bpmn:signal id="sig-audited" name="Audited"/>
+
+  <bpmn:process id="throw-showcase" name="Throw event showcase" isExecutable="true">
+
+    <!-- Typed variables — the evidence trail the reply template reads. -->
+    <bpmn:extensionElements>
+      <q:variables>
+        <q:variable name="stage" type="string"/>                <!-- Prep ran -->
+        <q:variable name="guarded" type="string"/>              <!-- the link goto landed -->
+        <q:variable name="escalationHandled" type="boolean"/>   <!-- the boundary handler ran -->
+      </q:variables>
+    </bpmn:extensionElements>
+
+    <bpmn:startEvent id="Start" name="ApprovalRequest received">
+      <bpmn:extensionElements>
+        <q:source channel="throw-showcase-request" messageTypeValue="ApprovalRequest"/>
+      </bpmn:extensionElements>
+      <bpmn:outgoing>F1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="F1" sourceRef="Start" targetRef="Prep"/>
+
+    <bpmn:serviceTask id="Prep" name="Prep (FEEL data assignment)">
+      <bpmn:incoming>F1</bpmn:incoming><bpmn:outgoing>F2</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>"prepped"</bpmn:from><bpmn:to>stage</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F2" sourceRef="Prep" targetRef="LinkThrow"/>
+
+    <!-- Link throw: an intra-process goto to the like-named link catch. No outgoing flow. -->
+    <bpmn:intermediateThrowEvent id="LinkThrow" name="goto stage2">
+      <bpmn:incoming>F2</bpmn:incoming>
+      <bpmn:linkEventDefinition name="stage2"/>
+    </bpmn:intermediateThrowEvent>
+
+    <!-- Link catch: the jump target. No incoming flow; the flow resumes here. -->
+    <bpmn:intermediateCatchEvent id="LinkCatch" name="stage2">
+      <bpmn:linkEventDefinition name="stage2"/>
+      <bpmn:outgoing>F3</bpmn:outgoing>
+    </bpmn:intermediateCatchEvent>
+    <bpmn:sequenceFlow id="F3" sourceRef="LinkCatch" targetRef="Guarded"/>
+
+    <!-- Reachable ONLY via the link goto — a set `guarded` is proof the jump worked. -->
+    <bpmn:serviceTask id="Guarded" name="Guarded (FEEL data assignment)">
+      <bpmn:incoming>F3</bpmn:incoming><bpmn:outgoing>F4</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>"ok"</bpmn:from><bpmn:to>guarded</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F4" sourceRef="Guarded" targetRef="EscThrow"/>
+
+    <!-- Non-interrupting escalation boundary on Guarded — catches the escalation thrown below by code. -->
+    <bpmn:boundaryEvent id="EscB" name="review" attachedToRef="Guarded" cancelActivity="false">
+      <bpmn:escalationEventDefinition escalationRef="esc-review"/>
+      <bpmn:outgoing>FB</bpmn:outgoing>
+    </bpmn:boundaryEvent>
+    <bpmn:sequenceFlow id="FB" sourceRef="EscB" targetRef="EscHandler"/>
+    <bpmn:serviceTask id="EscHandler" name="Escalation handler (FEEL data assignment)">
+      <bpmn:incoming>FB</bpmn:incoming><bpmn:outgoing>FBE</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>true</bpmn:from><bpmn:to>escalationHandled</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="FBE" sourceRef="EscHandler" targetRef="HandlerEnd"/>
+    <bpmn:endEvent id="HandlerEnd" name="Handled"><bpmn:incoming>FBE</bpmn:incoming></bpmn:endEvent>
+
+    <!-- Escalation throw: routes to EscB's handler and (non-interrupting) continues down F5. -->
+    <bpmn:intermediateThrowEvent id="EscThrow" name="raise review">
+      <bpmn:incoming>F4</bpmn:incoming><bpmn:outgoing>F5</bpmn:outgoing>
+      <bpmn:escalationEventDefinition escalationRef="esc-review"/>
+    </bpmn:intermediateThrowEvent>
+    <bpmn:sequenceFlow id="F5" sourceRef="EscThrow" targetRef="SignalThrow"/>
+
+    <!-- Signal throw: a broadcast with no <q:send> — emits nothing, the token continues. -->
+    <bpmn:intermediateThrowEvent id="SignalThrow" name="broadcast audited">
+      <bpmn:incoming>F5</bpmn:incoming><bpmn:outgoing>F6</bpmn:outgoing>
+      <bpmn:signalEventDefinition signalRef="sig-audited"/>
+    </bpmn:intermediateThrowEvent>
+    <bpmn:sequenceFlow id="F6" sourceRef="SignalThrow" targetRef="Reply"/>
+
+    <bpmn:serviceTask id="Reply" name="Reply (Handlebars template)" implementation="throw-reply.hbs">
+      <bpmn:extensionElements>
+        <q:reply mode="native" contentType="application/xml"/>
+      </bpmn:extensionElements>
+      <bpmn:incoming>F6</bpmn:incoming><bpmn:outgoing>F7</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F7" sourceRef="Reply" targetRef="End"/>
+
+    <bpmn:endEvent id="End" name="Done"><bpmn:incoming>F7</bpmn:incoming></bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>

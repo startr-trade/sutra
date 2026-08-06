@@ -1,0 +1,18 @@
+[package]
+name = "sutra-envref-vault"
+description = "HashiCorp Vault (KV-v2) envref resolver — extracted from the neutral engine (domain-neutrality refactor): the `vault:<mount>/<path>#<key>` SchemeResolver, self-registering as an EnvRefResolverEntry via inventory so sutra-dist bundles it without the neutral sutra-engine naming vaultrs."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+sutra-envref-spi = { path = "../sutra-envref-spi" }
+inventory = "0.3.24"
+vaultrs = { workspace = true }
+serde_json = { workspace = true }
+tokio = { version = "1", features = ["rt", "net", "time"] }
+
+[dev-dependencies]
+sutra-testkit = { path = "../sutra-testkit" }
+testcontainers = { workspace = true }

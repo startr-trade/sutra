@@ -1,0 +1,16 @@
+# C6 cross-process coverage artifact — urn:sutra:coverage:orders:e2e
+correlations:
+  - id: transfer
+    key: txnId
+    links:
+      - { from: p1:sendMessage, to: p2:startEvent }
+      - { from: p2:sendReplyMessage, to: p1:imec1 }
+    coverages:
+      - path: reply1
+        segments:
+          p1: [startSeq, noErrorsSequence, endSeq]
+          p2: [startSeq, seq1, endSeq]
+      - path: reply2
+        segments:
+          p1: [startSeq, noErrorsSequence, endSeq]
+          p2: [startSeq, seq2, endSeq]

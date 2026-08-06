@@ -1,0 +1,56 @@
+# Channels for the saturation-bench fixture package (docs/design/execution-scale-out.md §7).
+# Every channel is HTTP + apikey, matching the rest of tools/sutra-load-test/'s fixtures. Two
+# channels (spawn-in, relay-in) decode a generic JSON body (`codec: json`, no compiled schema)
+# because hold-relay.bpmn's <q:alias> reads `payload.key`; work-in and timer-in never read
+# `payload`, so they stay schema-less (no `codec:` key), matching the conformance package's
+# timer-start channel.
+#
+# Routing is <q:source>-driven (no `process:` pin): work-in and timer-in each name a start
+# event's channel directly; spawn-in names hold-relay's start event. relay-in has NO
+# subscribing start event, so an inbound message on it is a channel-delivered RELAY, resolved
+# against hold-relay's live alias index (same `key` value the spawn carried).
+channels:
+  # burst-start — run-to-end.bpmn's start. Stateless: spawn, one FEEL assignment, done.
+  - name: work-in
+    transport: http
+    bind: "POST /channels/work-in"
+    auth:
+      scheme: apikey
+      apikey:
+        value: saturation-bench-key
+        header: X-Api-Key
+
+  # steady-park-resume / correlation-heavy — hold-relay.bpmn's start. Spawns + parks, keyed by
+  # the JSON body's `key` field (the <q:alias> correlation expression is payload.key).
+  - name: spawn-in
+    transport: http
+    bind: "POST /channels/spawn-in"
+    codec: json
+    auth:
+      scheme: apikey
+      apikey:
+        value: saturation-bench-key
+        header: X-Api-Key
+
+  # steady-park-resume / correlation-heavy — the correlated relay. No start event subscribes;
+  # the dispatcher resolves it against hold-relay's live alias index by the same `key` value.
+  - name: relay-in
+    transport: http
+    bind: "POST /channels/relay-in"
+    codec: json
+    auth:
+      scheme: apikey
+      apikey:
+        value: saturation-bench-key
+        header: X-Api-Key
+
+  # timer-storm — timer-storm.bpmn's start. Schema-less (the flow never reads `payload`), same
+  # shape as the conformance package's timer-start channel.
+  - name: timer-in
+    transport: http
+    bind: "POST /channels/timer-in"
+    auth:
+      scheme: apikey
+      apikey:
+        value: saturation-bench-key
+        header: X-Api-Key

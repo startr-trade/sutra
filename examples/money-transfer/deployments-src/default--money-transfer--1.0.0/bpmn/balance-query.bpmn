@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Balance query — the read-only counterpart of the transfer flow, proving durable cross-instance state:
+  after a transfer commits, a later BalanceQuery instance reads the persisted balance from the SAME
+  `accounts` store. The simplest reply process: read one item, render it.
+
+    startEvent (BalanceQuery on the balance channel)
+    then Load  : a data task (no impl) reading accounts[accountId] -> var `account` (map {balance, frozen})
+    then Reply : a Handlebars serviceTask rendering <Balance .../> (native reply)
+    then End
+-->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0"
+                  id="Definitions_balance"
+                  targetNamespace="urn:sutra:module:money-transfer:1.0.0">
+
+  <!-- Same durable store the transfer flow writes; referenced BY NAME from datastores.yaml. -->
+  <bpmn:dataStore id="accountsStore" name="accounts"/>
+
+  <bpmn:process id="balance-query" name="Balance query" isExecutable="true">
+
+    <!-- `account` is set by the Load data task (the store item {balance, frozen}); declared (T4) so the
+         balance.hbs template validator knows it (object -> ANY permits account.balance navigation). -->
+    <bpmn:extensionElements>
+      <q:variables>
+        <q:variable name="account" type="object"/>
+      </q:variables>
+    </bpmn:extensionElements>
+
+    <bpmn:dataObject id="doAccount" name="account"/>  <!-- map {balance, frozen} -->
+
+    <!-- Read-only store reference — no forUpdate (a balance read takes no lock). The key is the
+         accountId field of the decoded BalanceQuery payload. -->
+    <bpmn:dataStoreReference id="dsrAccount" name="accounts" dataStoreRef="accountsStore">
+      <bpmn:extensionElements><q:store key="payload.accountId"/></bpmn:extensionElements>
+    </bpmn:dataStoreReference>
+
+    <bpmn:startEvent id="Start" name="BalanceQuery received">
+      <bpmn:extensionElements>
+        <q:source channel="balance" messageTypeValue="BalanceQuery"/>
+      </bpmn:extensionElements>
+      <bpmn:outgoing>B1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="B1" sourceRef="Start" targetRef="Load"/>
+
+    <bpmn:serviceTask id="Load" name="Load account (read-only)">
+      <bpmn:incoming>B1</bpmn:incoming><bpmn:outgoing>B2</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:sourceRef>dsrAccount</bpmn:sourceRef>
+        <bpmn:targetRef>doAccount</bpmn:targetRef>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="B2" sourceRef="Load" targetRef="Reply"/>
+
+    <bpmn:serviceTask id="Reply" name="Reply Balance" implementation="balance.hbs">
+      <bpmn:extensionElements>
+        <q:reply mode="native" contentType="application/xml"/>
+      </bpmn:extensionElements>
+      <bpmn:incoming>B2</bpmn:incoming><bpmn:outgoing>B3</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="B3" sourceRef="Reply" targetRef="End"/>
+
+    <bpmn:endEvent id="End" name="Done"><bpmn:incoming>B3</bpmn:incoming></bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>

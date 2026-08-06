@@ -1,0 +1,47 @@
+# generated-by: sutra create app (edit freely — this file is yours)
+#
+# Local deploy: the sutra engine image + its internal PostgreSQL + the deployments mount.
+# Workflow (see ../README.md):
+#   1. author under packages/<pkg>/          (standalone deployment package)
+#   2. sutra package packages/<pkg>          (seals it into a .sutra archive)
+#   3. drop the .sutra into ./deployments/   (the engine watches this mount)
+#   4. ./smoke.sh                            (health-gated smoke + a sample channel POST)
+#
+# The engine's host port is DYNAMIC — never assume a fixed host port. Discover it with:
+#   docker compose -f deploy/compose.yaml port engine 8080
+
+services:
+  engine:
+    # The sutra engine image — one generic image; behaviour comes entirely from the mounted
+    # deployments. Override with SUTRA_ENGINE_IMAGE (e.g. a locally built tag).
+    image: ${SUTRA_ENGINE_IMAGE:-sutra-engine:latest}
+    environment:
+      # Deployment source root: the engine loads its work from this mount. It consumes
+      # packaged .sutra archives dropped into the directory; add/remove = deploy/undeploy.
+      SUTRA_DEPLOYMENTS_DIR: /deployments
+      # Container-internal listen port (the host side stays dynamic, see `ports`).
+      SUTRA_HTTP_PORT: "8080"
+      # ENGINE-INTERNAL datasource (instances / outbox / leases / audit) — never a package's
+      # business store: those declare their OWN connections in the package's datastores.yaml.
+      SUTRA_DATASOURCE_URL: postgres://engine-db:5432/sutra
+      SUTRA_DATASOURCE_USERNAME: sutra
+      SUTRA_DATASOURCE_PASSWORD: ${ENGINE_DB_PASSWORD:-sutra-dev-only}
+    volumes:
+      - ./deployments:/deployments:ro
+    ports:
+      - "127.0.0.1::8080"   # dynamic host port, loopback only
+    depends_on:
+      engine-db:
+        condition: service_healthy
+
+  engine-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: sutra
+      POSTGRES_USER: sutra
+      POSTGRES_PASSWORD: ${ENGINE_DB_PASSWORD:-sutra-dev-only}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sutra -d sutra"]
+      interval: 2s
+      timeout: 3s
+      retries: 30

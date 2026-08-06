@@ -1,0 +1,12 @@
+[package]
+name = "sutra-redactor-spi"
+description = "The content-redactor SPI — the ContentRedactor trait, the inventory-collected RedactorRegistry, the fail-closed run wrapper, and the shared decoded-payload pointer helpers. Vendor-neutral: names no standard; each sutra-redactor-<standard> crate inventory::submit!s a RedactorEntry (implementing IS registering), mirroring the codec/transport/envref SPIs."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+inventory = "0.3.24"
+sutra-executor = { path = "../sutra-executor" }
+sutra-feel = { path = "../sutra-feel" }

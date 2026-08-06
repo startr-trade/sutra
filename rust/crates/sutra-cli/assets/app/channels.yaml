@@ -1,0 +1,24 @@
+# generated-by: sutra create app (edit freely — this file is yours)
+#
+# Channels for the %%PACKAGE%% package. A channel binds a transport endpoint to the packaged
+# processes: the engine decodes inbound bytes with the channel's codec and routes the message to
+# the start event whose <q:source> subscribes to (channel, messageType). Here: a SampleRequest
+# POSTed to /channels/sample-in runs the sample process (bpmn/sample.bpmn), whose validation
+# gateway replies <Accepted…> or <Rejected…>.
+
+channels:
+  - name: sample-in                          # <q:source channel="sample-in"/> in bpmn/sample.bpmn
+    transport: http                          # http | rabbitmq | kafka
+    bind: "POST /channels/sample-in"         # http bind: "<METHOD> <path>"
+    codec: "schemas/sample"                  # archive-local codec id — compiled from schemas/sample/*.xsd
+    cloudevents-mode: none                   # none | binary | structured
+    # Optional per-channel wiring (all fields commented with their meaning):
+    #idempotency-key-header: X-Message-Id    # dedupe key header (at-most-once intake)
+    #singleton: true                         # one active consumer across N replicas (leader-gated)
+    #max-concurrent-instances: 100           # concurrency cap
+    #auth:                                   # inbound auth on http binds
+    #  scheme: apikey                        # apikey | bearer | mtls
+    #  apikey:
+    #    value: ${SAMPLE_API_KEY}            # ${ENV} secret reference, resolved at channel startup —
+    #    header: X-Api-Key                   # never a literal secret (package-time validation rejects
+    #                                        # literals; local demos may relax that at lint time)

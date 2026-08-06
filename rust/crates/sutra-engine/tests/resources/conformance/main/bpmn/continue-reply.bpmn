@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Conformance — respond-and-continue. The `Reply` serviceTask carries
+     <q:reply continue="true">: it flushes the reply body to the SYNC caller immediately, then the
+     instance PARKS (a due-now self-resume marker on the reply node) and the timer poller runs the
+     tail (the `TailNotify` send) asynchronously — durable, crash-safe, and exactly-once.
+     Observable end-to-end: the POST returns the rendered reply body right away (200), and the
+     tail's send lands on the capture sink shortly after (proving the poller self-resumed it). -->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0"
+                  id="Definitions_continue_reply"
+                  targetNamespace="urn:sutra:module:conf:1.0.0">
+  <bpmn:process id="continue-reply" name="Respond and continue" isExecutable="true">
+    <bpmn:startEvent id="Start">
+      <bpmn:extensionElements>
+        <q:source channel="continue-start"/>
+      </bpmn:extensionElements>
+      <bpmn:outgoing>c1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="c1" sourceRef="Start" targetRef="Reply"/>
+
+    <!-- continue="true": build + flush the reply body to the caller, then PARK and self-resume. -->
+    <bpmn:serviceTask id="Reply" name="Flush reply, then continue" implementation="continue-ack.hbs">
+      <bpmn:extensionElements>
+        <q:reply mode="native" continue="true" contentType="application/json"/>
+      </bpmn:extensionElements>
+      <bpmn:incoming>c1</bpmn:incoming>
+      <bpmn:outgoing>c2</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="c2" sourceRef="Reply" targetRef="TailNotify"/>
+
+    <!-- The tail: it runs ONLY after the reply flush, on the poller's self-resume. A delivered
+         send here can only have ridden the detached tail (nothing else targets this destination). -->
+    <bpmn:sendTask id="TailNotify" name="Emit tail marker (runs after the reply flush)">
+      <bpmn:extensionElements>
+        <q:send destination="http://continue-tail.example/notify"/>
+      </bpmn:extensionElements>
+      <bpmn:incoming>c2</bpmn:incoming>
+      <bpmn:outgoing>c3</bpmn:outgoing>
+    </bpmn:sendTask>
+    <bpmn:sequenceFlow id="c3" sourceRef="TailNotify" targetRef="End"/>
+    <bpmn:endEvent id="End">
+      <bpmn:incoming>c3</bpmn:incoming>
+    </bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>

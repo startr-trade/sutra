@@ -1,0 +1,18 @@
+[package]
+name = "sutra-codec-schema"
+description = "Schema-backed codecs (structural/XSD, json-schema) + the package schema-codec loader — built on demand from a deployment archive's user schema; over sutra-codec-spi + sutra-formats."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+sutra-codec-spi = { path = "../sutra-codec-spi" }
+sutra-formats = { path = "../sutra-formats" }
+sutra-xsd = { path = "../sutra-xsd" }
+# The schema-BUNDLE kind registry (`schemaKind: <kind>` served by a codec crate) — the same
+# inventory pull model the built-in codec/format registries use.
+inventory = "0.3.24"
+quick-xml = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml_ng = "0.10"

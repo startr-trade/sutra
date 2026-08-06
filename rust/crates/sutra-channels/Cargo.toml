@@ -1,0 +1,54 @@
+[package]
+name = "sutra-channels"
+description = "Channels & the intake pipeline (channels.yaml, decode → validate → dispatch → ack) + axum HTTP transport + the outbox delivery spine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+default = ["transport"]
+# The async transport spine — the axum HTTP intake, the hyper HTTP sink, and the tokio-driven
+# dispatcher / outbox loop / audit dispatcher. OFF (`--no-default-features`) leaves the pure channel
+# MODEL (config/channels.yaml parse, codes, registry, sink::scheme_of) — the only part the
+# deploy-time lint consumes — compiling WITHOUT tokio/axum/hyper, hence to `wasm32-*`.
+transport = ["dep:axum", "dep:tokio", "dep:http-body-util", "dep:hyper", "dep:hyper-util", "dep:hyper-rustls"]
+
+[dependencies]
+# The dyn-safe async form of the persistence-facing trait seams (InstanceBridge,
+# InboxStore, ConcurrencyStore, IncidentSink — execution scale-out Phase 3). Runtime-agnostic
+# and wasm-clean, so it lives in the always-compiled model layer, not behind `transport`.
+async-trait = { workspace = true }
+sutra-bpmn = { path = "../sutra-bpmn" }
+sutra-codec-spi = { path = "../sutra-codec-spi" }
+sutra-dmn = { path = "../sutra-dmn" }
+sutra-executor = { path = "../sutra-executor" }
+sutra-feel = { path = "../sutra-feel" }
+sutra-redactor-spi = { path = "../sutra-redactor-spi" }
+sutra-srl = { path = "../sutra-srl" }
+serde_json = { workspace = true }
+serde_yaml_ng = "0.10"
+sha2 = { workspace = true }
+getrandom = { workspace = true }
+# CloudEvents structured `data_base64` decode.
+base64 = { workspace = true }
+time = { workspace = true }
+axum = { version = "0.8", optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-util"], optional = true }
+tracing = { workspace = true }
+# The outbound HTTP sink — reuses the hyper stack already in the tree (axum's server side);
+# rustls with native roots for the https scheme (ring backend, same family as sqlx).
+http-body-util = { version = "0.1", optional = true }
+hyper = { version = "1", features = ["client", "http1"], optional = true }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"], optional = true }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "native-tokio", "ring", "tls12"], optional = true }
+
+[dev-dependencies]
+sutra-formats = { path = "../sutra-formats" }
+sutra-testkit = { path = "../sutra-testkit" }
+bigdecimal = { workspace = true }
+quick-xml = { workspace = true }
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+testcontainers = { workspace = true }
+testcontainers-modules = { workspace = true }

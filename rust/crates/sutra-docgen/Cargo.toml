@@ -1,0 +1,27 @@
+[package]
+name = "sutra-docgen"
+description = "Authored-artifact documentation LIBRARY — recurses a folder of user-authored deployment artifacts (BPMN, DMN/SRL rules, Handlebars/XSLT templates, channels.yaml, package.yaml) and emits a deterministic markdown catalog, reusing the engine's own BPMN/DMN loaders so the docs reflect exactly what the engine loads; shipped through the CLI as `sutra docgen`"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+# Reuse the engine's OWN parsers (constraint: docs must reflect exactly what the engine loads).
+sutra-bpmn = { path = "../sutra-bpmn" }
+sutra-dmn = { path = "../sutra-dmn" }
+sutra-srl = { path = "../sutra-srl" }
+# channels.yaml / package.yaml / rules-manifest.yaml / template-manifest.yaml are plain,
+# loosely-typed authoring YAML — parsed generically here rather than pulling in
+# sutra-loader/sutra-channels (which would drag the whole engine's dependency graph, incl.
+# sutra-executor, into a standalone documentation CLI that must also work on an arbitrary
+# folder with no engine crates in scope at all).
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+anyhow = "1"
+# --check regenerates into a temp dir and diffs against the committed catalog (mirrors
+# sutra-catalog-gen's --check discipline).
+tempfile = "3"
+
+[dev-dependencies]
+tempfile = "3"

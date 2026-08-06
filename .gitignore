@@ -1,0 +1,80 @@
+# ===========================================================================
+# .gitignore for the PUBLIC Sutra repository (github.com/startr-trade/sutra)
+#
+# Copy this file to the NEW repo's root as `.gitignore`.
+#
+# It does two jobs:
+#   1. Ignore build / dev / generated artifacts (normal).
+#   2. Belt-and-suspenders: refuse to track INTERNAL content, so even an
+#      accidental `git add` cannot leak sales / planning material into a
+#      public commit. The PRIMARY guard is that internal files should be
+#      physically absent from the public tree (see public-manifest.md);
+#      the INTERNAL block below is the safety net.
+# ===========================================================================
+
+# --- Rust build output ---
+/target/
+rust/target/
+**/*.rs.bk
+
+# --- Node / JS tooling (VS Code extension, modeler plugin, future UI) ---
+node_modules/
+dist/
+*.vsix
+
+# --- mdBook output ---
+book/
+docs/book/
+
+# --- Generated impact-analysis catalog (populated on demand by `make catalog` / CI) ---
+/catalog/
+
+# --- Python bytecode caches (dev scripts) ---
+__pycache__/
+*.pyc
+
+# --- OpenTofu / Terraform ---
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!terraform.tfvars.example
+
+# --- OS / IDE ---
+.DS_Store
+Thumbs.db
+.idea/
+*.iml
+.vscode/
+.project
+.classpath
+.settings/
+
+# --- Secrets / local env ---
+.env
+*.log
+
+# --- Claude Code / local dev ---
+.claude/
+
+# ===========================================================================
+# INTERNAL — NEVER PUBLISH  (safety net: these should not exist in the public
+# tree at all; if they do, this stops them being committed)
+# ===========================================================================
+/STATUS.md
+/docs/gtm/
+/docs/plan/
+/docs/fyi/
+/docs/changelog/
+/docs/release-notes/
+/reference/
+/mkdocs.yml
+/docker-compose.docs.yml
+/scripts/publish/
+
+# The DMN-TCK corpus (OMG ASL-2.0) is cloned on demand for the conformance sweep and must
+# NEVER be committed: third-party, ~100 MB, licensed separately from this repo. The harness
+# default is <target-dir>/dmn-tck (already covered by target/); these also catch a manual
+# clone placed anywhere in the tree.
+dmn-tck/
+tck/

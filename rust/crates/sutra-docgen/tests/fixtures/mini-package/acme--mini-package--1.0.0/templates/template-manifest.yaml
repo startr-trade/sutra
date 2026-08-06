@@ -1,0 +1,5 @@
+templates:
+  - file: reply.hbs
+    inputMessageType: BalanceQuery
+    outputMessageType: BalanceReply
+    contentType: application/xml

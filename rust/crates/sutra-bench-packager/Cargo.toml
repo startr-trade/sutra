@@ -1,0 +1,10 @@
+[package]
+name = "sutra-bench-packager"
+description = "Bench-harness helper: seals a deployment-package directory into a .sutra archive by calling sutra_loader::assemble_dir directly, mirroring `sutra package <dir> --out <dir>` byte-for-byte (package.rs is a thin wrapper over the same function). Exists ONLY so rust/bench/ can build a packager with `cargo build -p sutra-bench-packager --release` without force-linking the builtin codec set — the real `sutra` CLI force-links every built-in codec unconditionally for codec-URN completeness, which this crate's dependency graph never touches. Not a substitute for `sutra-cli` outside the bench harness."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+sutra-loader = { path = "../sutra-loader" }

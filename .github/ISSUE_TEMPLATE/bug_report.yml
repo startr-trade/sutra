@@ -1,0 +1,60 @@
+name: Bug report
+description: Something does not work the way it is documented to work.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please search existing issues first — including closed ones.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what you got instead.
+      placeholder: |
+        1. …
+        2. …
+        Expected: …
+        Actual: …
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproducer
+      description: >
+        The smallest thing that shows the problem — a BPMN/DMN snippet, a failing test, a
+        `sutra` command, or a link to a repository. Bugs with a reproducer get fixed first.
+    validations:
+      required: false
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: "`sutra --version`, or the engine image tag / commit."
+      placeholder: "v1.0.0 (or ghcr.io/startr-trade/sutra:1.0.0)"
+    validations:
+      required: true
+
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: OS + architecture, and how you are running Sutra.
+      placeholder: "Ubuntu 24.04 x86_64, engine image on kind"
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: >
+        Relevant output. `RUST_LOG=debug` gives much more detail.
+        Please redact secrets and any real payload data.
+      render: text
+    validations:
+      required: false

@@ -1,0 +1,19 @@
+[book]
+title = "Sutra"
+description = "A Rust-native, message-native workflow engine built on BPMN 2.0"
+authors = ["The Sutra Authors"]
+language = "en"
+src = "src"
+
+[output.html]
+default-theme = "rust"
+preferred-dark-theme = "ayu"
+git-repository-url = "https://github.com/startr-trade/sutra"
+edit-url-template = "https://github.com/startr-trade/sutra/edit/main/docs/{path}"
+
+[output.html.fold]
+enable = true
+level = 1
+
+[output.html.search]
+enable = true

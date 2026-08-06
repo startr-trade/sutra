@@ -1,0 +1,193 @@
+{
+  "name": "QExtensions",
+  "uri": "urn:sutra:q:1.0",
+  "prefix": "q",
+  "xml": {
+    "tagAlias": "lowerCase"
+  },
+  "associations": [],
+  "types": [
+    {
+      "name": "Source",
+      "superClass": [ "Element" ],
+      "meta": { "allowedIn": [ "bpmn:StartEvent" ] },
+      "properties": [
+        { "name": "channel", "isAttr": true, "type": "String" },
+        { "name": "ack", "isAttr": true, "type": "String", "default": "on-persist" },
+        { "name": "dedupKey", "isAttr": true, "type": "String" },
+        { "name": "type", "isAttr": true, "type": "String" },
+        { "name": "dataClass", "isAttr": true, "type": "String", "default": "none" }
+      ]
+    },
+    {
+      "name": "Reply",
+      "superClass": [ "Element" ],
+      "meta": { "allowedIn": [ "bpmn:EndEvent" ] },
+      "properties": [
+        { "name": "mode", "isAttr": true, "type": "String", "default": "native" },
+        { "name": "destination", "isAttr": true, "type": "String" },
+        { "name": "contentType", "isAttr": true, "type": "String" },
+        { "name": "required", "isAttr": true, "type": "Boolean", "default": false },
+        { "name": "type", "isAttr": true, "type": "String" },
+        { "name": "source", "isAttr": true, "type": "String" },
+        { "name": "subject", "isAttr": true, "type": "String" },
+        { "name": "datacontenttype", "isAttr": true, "type": "String" },
+        { "name": "auth", "isAttr": true, "type": "String" },
+        { "name": "authSecretRef", "isAttr": true, "type": "String" },
+        { "name": "authHeader", "isAttr": true, "type": "String" }
+      ]
+    },
+    {
+      "name": "Validators",
+      "superClass": [ "Element" ],
+      "properties": [
+        { "name": "source", "isAttr": true, "type": "String" },
+        { "name": "scope", "isAttr": true, "type": "String" },
+        { "name": "when", "isAttr": true, "type": "String" },
+        { "name": "consolidate", "isAttr": true, "type": "Boolean", "default": true }
+      ]
+    },
+    {
+      "name": "Alias",
+      "superClass": [ "Element" ],
+      "properties": [
+        { "name": "name", "isAttr": true, "type": "String" },
+        { "name": "expression", "isAttr": true, "type": "String" },
+        { "name": "unique", "isAttr": true, "type": "Boolean", "default": false },
+        { "name": "onConflict", "isAttr": true, "type": "String" },
+        { "name": "multi", "isAttr": true, "type": "Boolean", "default": false }
+      ]
+    },
+    {
+      "name": "Dispatch",
+      "superClass": [ "Element" ],
+      "meta": { "allowedIn": [ "bpmn:CallActivity" ] },
+      "properties": [
+        { "name": "default", "isAttr": true, "type": "String" },
+        { "name": "onNoMatch", "isAttr": true, "type": "String", "default": "error" },
+        { "name": "cases", "isMany": true, "type": "Case" }
+      ]
+    },
+    {
+      "name": "Case",
+      "superClass": [ "Element" ],
+      "properties": [
+        { "name": "when", "isAttr": true, "type": "String" },
+        { "name": "calledElement", "isAttr": true, "type": "String" },
+        { "name": "scope", "isAttr": true, "type": "String" }
+      ]
+    },
+    {
+      "name": "OnValidation",
+      "superClass": [ "Element" ],
+      "properties": [
+        { "name": "mode", "isAttr": true, "type": "String" },
+        { "name": "errorCode", "isAttr": true, "type": "String" }
+      ]
+    },
+    {
+      "name": "Audit",
+      "superClass": [ "Element" ],
+      "meta": {
+        "allowedIn": [
+          "bpmn:Process",
+          "bpmn:ServiceTask",
+          "bpmn:Task",
+          "bpmn:UserTask",
+          "bpmn:EndEvent",
+          "bpmn:CallActivity",
+          "bpmn:ExclusiveGateway"
+        ]
+      },
+      "properties": [
+        { "name": "sink", "isAttr": true, "type": "String", "default": "sql" },
+        { "name": "target", "isAttr": true, "type": "String" },
+        { "name": "capture", "isAttr": true, "type": "String", "default": "payload" }
+      ]
+    },
+    {
+      "name": "Input",
+      "superClass": [ "Element" ],
+      "meta": { "allowedIn": [ "bpmn:StartEvent" ] },
+      "properties": [
+        { "name": "name", "isAttr": true, "type": "String", "default": "payload" },
+        { "name": "codec", "isAttr": true, "type": "String" },
+        { "name": "accept", "isAttr": true, "type": "String", "default": "*" },
+        { "name": "validators", "isMany": true, "type": "Validators" }
+      ]
+    }
+  ],
+  "enumerations": [
+    {
+      "name": "AckMode",
+      "literalValues": [
+        { "name": "OnPersist", "value": "on-persist" },
+        { "name": "OnComplete", "value": "on-complete" }
+      ]
+    },
+    {
+      "name": "DataClass",
+      "literalValues": [
+        { "name": "None", "value": "none" },
+        { "name": "Pii",  "value": "pii" },
+        { "name": "Pci",  "value": "pci" },
+        { "name": "Phi",  "value": "phi" },
+        { "name": "Financial", "value": "financial" }
+      ]
+    },
+    {
+      "name": "ReplyMode",
+      "literalValues": [
+        { "name": "Native", "value": "native" },
+        { "name": "CloudEventBinary", "value": "cloudevent-binary" },
+        { "name": "CloudEventStructured", "value": "cloudevent-structured" },
+        { "name": "MatchInbound", "value": "match-inbound" }
+      ]
+    },
+    {
+      "name": "OutboundAuthScheme",
+      "literalValues": [
+        { "name": "Mtls",   "value": "mtls" },
+        { "name": "Bearer", "value": "bearer" },
+        { "name": "ApiKey", "value": "apikey" }
+      ]
+    },
+    {
+      "name": "AliasConflict",
+      "literalValues": [
+        { "name": "Reject", "value": "reject" },
+        { "name": "Correlate", "value": "correlate" }
+      ]
+    },
+    {
+      "name": "OnNoMatch",
+      "literalValues": [
+        { "name": "Error", "value": "error" },
+        { "name": "Skip",  "value": "skip" }
+      ]
+    },
+    {
+      "name": "OnValidationMode",
+      "literalValues": [
+        { "name": "Route",  "value": "route" },
+        { "name": "Reject", "value": "reject" },
+        { "name": "Error",  "value": "error" }
+      ]
+    },
+    {
+      "name": "AuditCapture",
+      "literalValues": [
+        { "name": "None", "value": "none" },
+        { "name": "Metadata", "value": "metadata" },
+        { "name": "Payload", "value": "payload" }
+      ]
+    },
+    {
+      "name": "Scope",
+      "literalValues": [
+        { "name": "Common", "value": "common" },
+        { "name": "Tenant", "value": "tenant" }
+      ]
+    }
+  ]
+}

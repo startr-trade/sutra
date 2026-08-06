@@ -1,0 +1,67 @@
+[package]
+name = "sutra-datastore"
+description = "Business data-store providers on the (store_name, store_key) cutover model. Multi-dialect: sqlx/PostgreSQL reference + MySQL/MariaDB (sqlx) + SQL Server (tiberius)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+# All four SQL dialects are supported. PostgreSQL is the reference
+# dialect and always compiles; MySQL/MariaDB and MSSQL are feature-gated but ON by default
+# so a plain `cargo build` carries the full dialect matrix. `--no-default-features` gives a
+# lean PG-only build. Mirrors sutra-persistence's dialect gating.
+default = ["mysql", "mssql"]
+# The SQL PROVIDERS (PostgreSQL reference dialect + the async runtime): sqlx + tokio. OFF for a
+# parse-only build (`--no-default-features`), so the `datastores.yaml` loader (`config`) — the only
+# part the deploy-time lint uses — compiles WITHOUT sqlx/tokio, and hence to `wasm32-*`.
+providers = ["dep:sqlx", "dep:tokio"]
+# MySQL + MariaDB (one dialect module: MariaDB 10.6+/11 speaks the same SQL surface).
+mysql = ["providers", "sqlx/mysql"]
+# Microsoft SQL Server 2022 via the TDS client stack (sqlx has no MSSQL driver).
+mssql = ["providers", "dep:tiberius", "dep:tokio-util"]
+
+[dependencies]
+# The declared-field vocabulary the schema PROJECTION is derived from (`FieldDecl`/`FieldShape`/
+# `FieldFacets` + `Schema::fields_of`). Pure-Rust and dependency-light (quick-xml/regex/bigdecimal,
+# no I/O, no async), so it rides the `--no-default-features` parse-only build to `wasm32-*` with
+# the rest of the config/projection path; the sqlx/tokio providers stay feature-gated below.
+sutra-xsd = { path = "../sutra-xsd" }
+serde_json = { workspace = true }
+serde_yaml = "0.9"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres"], optional = true }
+tokio = { version = "1", features = ["sync", "rt", "net"], optional = true }
+# MSSQL dialect (feature `mssql`): TDS 7.3+ protocol client, TLS via rustls. The datastore
+# binds only String/i64 (store_value + rev), so tiberius's `time` mappings aren't needed
+# here. tokio (net, already on) supplies the TCP socket; tokio-util the AsyncRead/Write
+# compatibility wrapper tiberius expects.
+tiberius = { version = "0.12", default-features = false, features = ["tds73", "rustls"], optional = true }
+tokio-util = { version = "0.7", features = ["compat"], optional = true }
+
+[dev-dependencies]
+sutra-testkit = { path = "../sutra-testkit" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+# Reused container-per-dialect harness for the MySQL/MariaDB/MSSQL suites (dev-only).
+testcontainers = { version = "0.25", features = ["blocking"] }
+testcontainers-modules = { version = "0.13", features = ["mysql", "mariadb", "mssql_server"] }
+
+[[test]]
+name = "pg_datastore"
+path = "tests/pg_datastore.rs"
+
+[[test]]
+name = "mysql_datastore"
+path = "tests/mysql_datastore/main.rs"
+required-features = ["mysql"]
+
+# MariaDB rides the MySQL dialect module; its suite re-runs the identical test
+# sources against a mariadb:11 container to prove the shared dialect genuinely holds.
+[[test]]
+name = "mariadb_datastore"
+path = "tests/mariadb_datastore/main.rs"
+required-features = ["mysql"]
+
+[[test]]
+name = "mssql_datastore"
+path = "tests/mssql_datastore/main.rs"
+required-features = ["mssql"]

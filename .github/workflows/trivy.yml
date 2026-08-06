@@ -1,0 +1,86 @@
+name: Trivy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "41 4 * * 1" # weekly, Monday 04:41 UTC
+
+permissions:
+  contents: read
+
+jobs:
+  # Fast: scan the repo tree for vulnerable dependencies (Cargo.lock), leaked
+  # secrets, and IaC misconfig (Dockerfile / OpenTofu). Runs on every push + PR.
+  fs:
+    name: filesystem (deps · secrets · IaC)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v5
+      - name: Trivy filesystem scan
+        uses: aquasecurity/trivy-action@0.28.0 # pin; bump as needed
+        with:
+          scan-type: fs
+          scanners: vuln,secret,misconfig
+          format: sarif
+          output: trivy-fs.sarif
+          severity: CRITICAL,HIGH
+      - name: Upload SARIF to code scanning
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-fs.sarif
+          category: trivy-fs
+
+  # Expensive: build the engine image and scan its OS packages + bundled binary.
+  # Only on main + the weekly schedule — a full release build is too heavy for
+  # every PR. Once releases publish an image, prefer scanning the pushed tag
+  # instead of rebuilding here.
+  image:
+    name: engine image
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v5
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+      # GHA-backed layer cache, same pattern as release.yml/nightly.yml: the chef-cook
+      # dependency layer dominates this build and only changes with the lockfile. Its own
+      # `scope=` because tag-ref caches (release's) are not readable from main/scheduled
+      # runs — this cache is saved on main pushes and read back by the weekly schedule.
+      - name: Build engine image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./rust
+          file: ./rust/Dockerfile
+          tags: sutra-engine:ci
+          push: false
+          load: true
+          cache-from: type=gha,scope=trivy-image
+          cache-to: type=gha,mode=max,scope=trivy-image
+      - name: Trivy image scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: image
+          image-ref: sutra-engine:ci
+          format: sarif
+          output: trivy-image.sarif
+          severity: CRITICAL,HIGH
+      - name: Upload SARIF to code scanning
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-image.sarif
+          category: trivy-image
+
+# NOTE: these jobs report findings to the Security tab (SARIF upload) rather than
+# hard-failing the build. Add `exit-code: 1` to a Trivy step if you want it to gate.
+# SARIF upload to code scanning is free on public repos (see codeql.yml).

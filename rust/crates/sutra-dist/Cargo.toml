@@ -1,0 +1,80 @@
+[package]
+name = "sutra-dist"
+description = "The deployable engine DISTRIBUTION — the composition root. It force-links the bundled builtin codecs + formats + the feature-selected transports and runs the domain-neutral sutra-engine library. Produces the `sutra-engine` binary. The only crate that names concrete codec/transport impls."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+sutra-engine = { path = "../sutra-engine" }
+# Force-linked built-in payload codecs — bundled by the BINARY so their `inventory`
+# registrations ship (the neutral engine collects them generically via
+# builtin_codecs()/builtin_formats()). See main.rs. This is the composition boundary: concrete
+# impls are named HERE, never in the neutral engine library.
+#
+# The PUBLIC distribution bundles the schema-less FORMATS only (json/xml/yaml/csv/raw). Every
+# message-standard codec is a PROPRIETARY extension crate living in a separate repository that
+# composes this one as a submodule and force-links its own codecs into its own composition root
+# — which is precisely what the codec SPI exists for. Nothing here needs to change to add one.
+sutra-formats = { path = "../sutra-formats" }
+# No built-in REDACTOR crate is bundled. A redactor is inherently data-domain-specific (it knows
+# what a sensitive field looks like), so every concrete one is an extension crate that
+# `inventory::submit!`s a `sutra_redactor_spi::RedactorEntry` and gets force-linked by whichever
+# distribution wants it. The deployment-scoped `sutra-redactor-template` needs no force-link at
+# all — the archive supplies its template and the assembly instantiates it directly.
+
+# Force-linked vendor envref resolver crates — the `vault:` + `aws-secrets:` + `azure-kv:` +
+# `gcp-secret:` secret-ref schemes. Each self-registers a `sutra_envref_spi::EnvRefResolverEntry`
+# via `inventory`; the neutral engine collects them generically through
+# `ResolverRegistry::with_builtins()` and names no vendor (no vaultrs / AWS SDK / Azure SDK / GCP
+# SDK in sutra-engine — the azure/gcp resolvers talk REST over reqwest/rustls, no vendor SDK).
+# Named HERE, the composition boundary — see main.rs (`use sutra_envref_vault as _;`). Always
+# bundled (like the codecs), not feature-gated.
+sutra-envref-vault = { path = "../sutra-envref-vault" }
+sutra-envref-aws = { path = "../sutra-envref-aws" }
+sutra-envref-azure = { path = "../sutra-envref-azure" }
+sutra-envref-gcp = { path = "../sutra-envref-gcp" }
+# The transports — OPTIONAL behind same-named cargo features; the BINARY selects the bundled set
+# (main.rs force-links the enabled ones). A hardened / air-gapped build (`--no-default-features
+# --features file`) links NONE of rdkafka/aws-sdk/google-cloud/lapin/fe2o3.
+sutra-transport-http = { path = "../sutra-transport-http", optional = true }
+sutra-transport-kafka = { path = "../sutra-transport-kafka", optional = true }
+sutra-transport-sqs = { path = "../sutra-transport-sqs", optional = true }
+sutra-transport-gcp-pubsub = { path = "../sutra-transport-gcp-pubsub", optional = true }
+sutra-transport-rabbitmq = { path = "../sutra-transport-rabbitmq", optional = true }
+sutra-transport-amqp = { path = "../sutra-transport-amqp", optional = true }
+sutra-transport-file = { path = "../sutra-transport-file", optional = true }
+sutra-transport-dapr = { path = "../sutra-transport-dapr", optional = true }
+sutra-transport-knative = { path = "../sutra-transport-knative", optional = true }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time"] }
+tracing = { workspace = true }
+
+# Transport bundling — one feature per transport, each pulling its optional crate. `default`
+# bundles HTTP + the five network brokers + file + dapr + knative (the general image). A
+# hardened / air-gapped build uses `--no-default-features` + only the transports it needs.
+[features]
+default = ["http", "kafka", "rabbitmq", "aws-sqs", "gcp-pubsub", "amqp", "file", "dapr", "knative"]
+http = ["dep:sutra-transport-http"]
+kafka = ["dep:sutra-transport-kafka"]
+rabbitmq = ["dep:sutra-transport-rabbitmq"]
+aws-sqs = ["dep:sutra-transport-sqs"]
+gcp-pubsub = ["dep:sutra-transport-gcp-pubsub"]
+amqp = ["dep:sutra-transport-amqp"]
+file = ["dep:sutra-transport-file"]
+dapr = ["dep:sutra-transport-dapr"]
+knative = ["dep:sutra-transport-knative"]
+
+[dev-dependencies]
+# The bundle-completeness tests (moved here — the distribution layer) resolve the assembled set.
+sutra-channels = { path = "../sutra-channels" }
+sutra-codec-spi = { path = "../sutra-codec-spi" }
+sutra-transport-spi = { path = "../sutra-transport-spi" }
+# The envref bundle test resolves the assembled scheme set via `ResolverRegistry::with_builtins()`.
+sutra-envref-spi = { path = "../sutra-envref-spi" }
+
+# The deployed binary keeps the name `sutra-engine` so the image path + k8s/conformance entrypoints
+# are unchanged; only the built package (`-p sutra-dist`) differs.
+[[bin]]
+name = "sutra-engine"
+path = "src/main.rs"

@@ -1,0 +1,129 @@
+# Channels for the `default` tenant's money-transfer module, 1.0.0. Path-derived identity
+# (tenant=default, module=money-transfer, version=1.0.0). Both channels use the package's user
+# structural codec compiled from schemas/transfer/transfer.xsd — a user codec is referenced by its
+# path-derived URN `urn:<path from schemas/>`, so schemas/transfer/ → codec: urn:transfer
+# (covering the TransferRequest + BalanceQuery roots).
+#
+# Routing is <q:source>-driven (no `process:` pin): the engine matches the decoded message type to a
+# subscribing start event (transfer-request -> TransferRequest -> transfer/Start; balance ->
+# BalanceQuery -> balance-query/Start).
+
+channels:
+  # Activation channel — a TransferRequest runs the atomic transfer process (transfer.bpmn).
+  #
+  # SINGLETON / SERIAL — this channel drives the single writable ledger process, so it declares the
+  # serialization contract that gives Isolation (serializable, no lost update); the book's
+  # *Data stores* chapter walks the full ACID story:
+  #   consumer: exclusive   -> cluster-wide single active consumer (a broker exclusive / single-active
+  #                            consumer on a queue transport; zero engine coordination)
+  #   singleton: true       -> per-channel singleton — one active consumer across N replicas
+  #   prefetch-count: 1      -> deliver one message at a time (queue flow control)
+  #   ack-mode: on-complete  -> ack only after the instance completes, so the next message is not read
+  #                            past the one in flight (order-preserving, no reject/redeliver churn)
+  #
+  # NOTE (transport): the IT posts synchronously over HTTP (MoneyTransferIT), so transport is `http`
+  # here for reachability. prefetch-count / ack-mode are QUEUE-transport flow-control semantics and are
+  # inert on http — they declare the serialization CONTRACT this channel needs. On http the effective
+  # single-writer guarantee comes from `singleton: true` PLUS the transaction scope + FOR UPDATE row
+  # locks in transfer.bpmn (Atomicity + Isolation are DB-enforced, independent of transport). Swap
+  # transport to a queue (e.g. sutra-trigger-kafka / -amqp) to make prefetch/ack-mode real broker
+  # flow control. See the summary flag for the guessed key names.
+  - name: transfer-request
+    transport: http
+    bind: "POST /channels/transfer-request"
+    codec: urn:transfer
+    cloudevents-mode: none
+    consumer: exclusive
+    singleton: true
+    prefetch-count: 1
+    ack-mode: on-complete
+    auth:
+      scheme: apikey
+      apikey:
+        value: transfer-demo-key
+        header: X-Api-Key
+
+  # Multi-replica singleton ledger channel — the SAME atomic transfer process (transfer.bpmn), but
+  # driven over RabbitMQ instead of http. `singleton: true` on a QUEUE transport is leader-gated: the
+  # consumer activates on exactly ONE replica via the engine per-channel DB-lease leader election (lease
+  # role sutra-channel:default:transfer-queue over the engine-internal Postgres `lease` table);
+  # the other replicas stand by and take over automatically on failover. This is what serializes the
+  # single writable ledger across N replicas WITHOUT pinning a pod or splitting the module — proven by
+  # MoneyTransferMultiReplicaIT (N replicas, concurrent transfers, no lost update). Contrast the http
+  # `transfer-request` above: http is request/response (load-balanced, NOT leader-gated) and gets its
+  # single-writer guarantee from the <bpmn:transaction> scope + row lock instead.
+  - name: transfer-queue
+    transport: rabbitmq
+    codec: urn:transfer
+    cloudevents-mode: none
+    singleton: true                    # per-channel singleton (leader-gated on a queue transport)
+    host: rabbit                       # broker network alias (IT) / k8s Service name
+    port: 5672
+    username: ${RABBITMQ_USERNAME}     # 15-factor secret REFERENCE — resolved at channel startup, never a literal
+    password: ${RABBITMQ_PASSWORD}     # (no guest, no loopback backdoor — a real broker service account)
+    queue: transfer-queue-q            # must pre-exist (trigger declares it passively)
+    prefetch-count: 1                  # one message at a time — queue flow control
+    # Fire-and-forget queue (no synchronous reply): ack once the inbound is durably persisted, then run
+    # the transfer asynchronously. (on-complete suits a request/response flow where "complete" = reply
+    # sent; a no-reply queue would stall waiting for that signal.) No-lost-update still holds — the
+    # singleton gives one consumer and the transaction's FOR UPDATE row lock serialises the writes.
+    ack-mode: on-persist
+    # CREDS: a real broker service account, supplied as ${ENV} secret references and resolved at channel
+    # startup (RabbitMqTriggerSource resolves ${ENV} via SecretRefs / k8s:secret via the AuthRefResolver
+    # chain). The IT provisions the `mtransfer` broker user; the k8s deploy provisions it via a Secret. No
+    # guest user, no loopback_users=none backdoor.
+
+  # A SECOND multi-replica singleton ledger channel — the same atomic transfer process, over Kafka. Proves
+  # the per-channel singleton is transport-agnostic: `singleton: true` is leader-gated regardless of
+  # transport (the engine per-channel DB-lease election), independent of Kafka's own per-partition consumer
+  # groups. One consumer group + the engine lease => exactly one replica consumes across the cluster.
+  - name: transfer-topic
+    transport: kafka
+    codec: urn:transfer
+    cloudevents-mode: none
+    singleton: true                    # per-channel singleton (leader-gated on a queue transport)
+    bootstrap.servers: kafka:9092      # in-cluster INTERNAL listener (k8s Service name)
+    topic: transfer-topic
+    group.id: money-transfer
+    auto.offset.reset: earliest        # read from the start so a late-activating leader misses nothing
+
+  # Read-only query channel — a BalanceQuery reads accounts[accountId] and replies a Balance
+  # (balance-query.bpmn). No writes, so it is NOT a singleton: it scales across all replicas.
+  - name: balance
+    transport: http
+    bind: "POST /channels/balance"
+    codec: urn:transfer
+    cloudevents-mode: none
+    auth:
+      scheme: apikey
+      apikey:
+        value: transfer-demo-key
+        header: X-Api-Key
+
+  # Coverage ADMIN channels (compliance metric read/reset — coverage.bpmn). Both are plain read/reset ops
+  # against the module's `coverage` data-store, so like `balance` they are NOT singletons and scale across
+  # all replicas (the covered-set is a shared durable store, not per-replica state).
+  #
+  # coverage-query -> CoverageQuery -> coverage-report/Start -> coverage:report:transfer -> <CoverageReport/>
+  - name: coverage-query
+    transport: http
+    bind: "POST /channels/coverage-query"
+    codec: urn:transfer
+    cloudevents-mode: none
+    auth:
+      scheme: apikey
+      apikey:
+        value: transfer-demo-key
+        header: X-Api-Key
+
+  # coverage-reset -> CoverageReset -> coverage-reset/Start -> coverage:reset:transfer -> <CoverageReset/>
+  - name: coverage-reset
+    transport: http
+    bind: "POST /channels/coverage-reset"
+    codec: urn:transfer
+    cloudevents-mode: none
+    auth:
+      scheme: apikey
+      apikey:
+        value: transfer-demo-key
+        header: X-Api-Key

@@ -1,0 +1,19 @@
+# cargo-audit configuration for the Sutra Rust workspace (paired with deny.toml).
+#
+# `cargo audit` (run by `make audit`) scans Cargo.lock against the RustSec DB. Unmaintained
+# advisories stay as WARNINGS here (non-fatal) — the "unmaintained = WARN" posture — so they
+# remain visible on every run. Only VULNERABILITY advisories that have been triaged and
+# accepted / tracked are listed below; the full rationale is in deny.toml. Keep this list
+# identical to deny.toml's `[advisories] ignore`.
+
+[advisories]
+ignore = [
+    "RUSTSEC-2023-0071",  # rsa 0.9.10 Marvin timing (SHIPPED via sqlx-mysql; no fix; trusted DB link)
+    "RUSTSEC-2026-0099",  # rustls-webpki 0.101.7 name-constraint (MSSQL/tiberius TLS; upstream-blocked)
+    "RUSTSEC-2026-0098",  # rustls-webpki 0.101.7 URI name-constraint (MSSQL/tiberius TLS; upstream-blocked)
+    "RUSTSEC-2026-0104",  # rustls-webpki 0.101.7 CRL-parse panic (MSSQL/tiberius TLS; upstream-blocked)
+    "RUSTSEC-2026-0145",  # astral-tokio-tar 0.5.6 PAX desync (DEV/TEST only via testcontainers)
+    "RUSTSEC-2026-0112",  # astral-tokio-tar 0.5.6 PAX desync (DEV/TEST only via testcontainers)
+    "RUSTSEC-2026-0066",  # astral-tokio-tar 0.5.6 PAX validation (DEV/TEST only via testcontainers)
+    "RUSTSEC-2026-0113",  # astral-tokio-tar 0.5.6 symlink chmod (DEV/TEST only via testcontainers)
+]

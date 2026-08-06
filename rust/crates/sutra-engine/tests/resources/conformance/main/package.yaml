@@ -1,0 +1,8 @@
+# Conformance package (timers + channel-call). Sealed to one .sutra by
+# `assemble_dir`; labels are opaque selectors.
+labels:
+  "tenant": "default"
+  "module": "conf"
+  "version": "1.0.0"
+engine:
+  minContract: 1

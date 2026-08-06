@@ -1,0 +1,24 @@
+-- F1 (channel-call <q:retry> reachability): the BPMN node that emitted each outbox entry.
+--
+-- Until now the outbox knew WHICH instance an entry belonged to but not WHICH node emitted it.
+-- Channel-call task retries need the node linkage for two writes that are both keyed
+-- (deployment_id, instance_id, node_id):
+--
+--   * WITHDRAWAL — when a call attempt dies (its timeout fired, or its delivery terminally
+--     poisoned) and the task backoff-parks for a re-drive, the DEAD attempt's request rows are
+--     deleted inside the same step transaction. Delivering a superseded request would race the
+--     re-drive's fresh emission into a double-submit, and poisoning one later would mis-fire a
+--     failure against the LIVE attempt — withdrawal closes both by construction. This is a
+--     deliberate, narrow exception to "the outbox never deletes undelivered rows": a withdrawn
+--     obligation is not an undelivered one, and the durable record of the failure lives in the
+--     instance snapshot (`sutra.retryWait.<nodeId>`) and the poison incident row.
+--
+--   * POISON EVIDENCE — the engine accepts a "delivery poisoned" wake for a parked channel-call
+--     only against a durable poisoned row for that exact (instance, node); the in-process
+--     notification alone is never trusted.
+--
+-- NULLable: rows enqueued before this migration (and rows whose emitting node the enqueue path
+-- did not stamp) carry NULL and are simply never matched by either query — the pre-F1 behaviour.
+-- No new index: both queries lead with (deployment_id, instance_id), which V601 already indexes.
+
+ALTER TABLE outbox_entry ADD COLUMN node_id VARCHAR(255);

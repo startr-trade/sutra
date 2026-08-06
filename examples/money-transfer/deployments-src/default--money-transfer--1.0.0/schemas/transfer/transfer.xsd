@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Custom module schema for the money-transfer example. One XSD, FOUR root elements = the message types
+  the StructuralCodec covers:
+
+    TransferRequest  — starts a transfer instance (fromId, toId, amount)
+    BalanceQuery     — read-only balance lookup (accountId)
+    CoverageQuery    — admin: report the transfer process's path-coverage (coverage.bpmn -> coverage:report)
+    CoverageReset    — admin: clear the transfer process's covered-set   (coverage.bpmn -> coverage:reset)
+
+  The engine registers this file (folder base name "transfer") as the version-scoped codec
+  urn:sutra:module:money-transfer:1.0.0:transfer (moduleNamespace + folder base name), referenced from
+  channels.yaml. JSON/YAML inbound is transcoded into this XSD's targetNamespace and validated against
+  it (Tier-1 structural). `amount` is decimal (money), so FEEL arithmetic in transfer.bpmn is numeric.
+-->
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           targetNamespace="urn:sutra:transfer"
+           xmlns="urn:sutra:transfer"
+           elementFormDefault="qualified">
+
+  <xs:element name="TransferRequest">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element name="fromId" type="xs:string"/>
+        <xs:element name="toId"   type="xs:string"/>
+        <xs:element name="amount" type="xs:decimal"/>
+      </xs:sequence>
+    </xs:complexType>
+  </xs:element>
+
+  <xs:element name="BalanceQuery">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element name="accountId" type="xs:string"/>
+      </xs:sequence>
+    </xs:complexType>
+  </xs:element>
+
+  <!-- Admin ops. The coverage target (process `transfer`) is fixed in the coverage.bpmn serviceTask
+       implementation ("coverage:report:transfer" / "coverage:reset:transfer"), so `process` here is a
+       human-facing echo of intent, not dynamic routing — it makes the request self-describing. -->
+  <xs:element name="CoverageQuery">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element name="process" type="xs:string"/>
+      </xs:sequence>
+    </xs:complexType>
+  </xs:element>
+
+  <xs:element name="CoverageReset">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element name="process" type="xs:string"/>
+      </xs:sequence>
+    </xs:complexType>
+  </xs:element>
+
+</xs:schema>

@@ -1,0 +1,145 @@
+{
+  "name": "sutra-vscode",
+  "displayName": "sutra BPMN tools",
+  "description": "LSP-backed editor support for sutra BPMN files with q:* extensions",
+  "version": "0.1.0-snapshot",
+  "publisher": "startr-trade",
+  "private": true,
+  "license": "Apache-2.0",
+  "engines": {
+    "vscode": "^1.85.0",
+    "node": ">=18"
+  },
+  "categories": [
+    "Programming Languages",
+    "Linters"
+  ],
+  "main": "./client/out/extension.js",
+  "activationEvents": [
+    "onLanguage:sutra"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "sutra",
+        "aliases": [
+          "BPMN",
+          "sutra"
+        ],
+        "extensions": [
+          ".bpmn"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "sutra",
+        "scopeName": "source.sutra",
+        "path": "./syntaxes/sutra.tmLanguage.json"
+      }
+    ],
+    "commands": [
+      {
+        "command": "sutra.openBpmnPreview",
+        "title": "sutra: Open BPMN preview",
+        "category": "sutra"
+      },
+      {
+        "command": "sutra.refreshAliasIndex",
+        "title": "sutra: Refresh alias index",
+        "category": "sutra",
+        "icon": "$(refresh)"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "sutra.refreshAliasIndex",
+          "when": "view == sutra.aliasIndex",
+          "group": "navigation"
+        }
+      ],
+      "editor/title": [
+        {
+          "command": "sutra.openBpmnPreview",
+          "when": "resourceLangId == sutra",
+          "group": "navigation"
+        }
+      ]
+    },
+    "customEditors": [
+      {
+        "viewType": "sutra.bpmnPreview",
+        "displayName": "sutra BPMN preview",
+        "selector": [
+          {
+            "filenamePattern": "*.bpmn"
+          }
+        ],
+        "priority": "option"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "sutra-explorer",
+          "title": "sutra",
+          "icon": "client/media/sutra-icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "sutra-explorer": [
+        {
+          "id": "sutra.aliasIndex",
+          "name": "Alias index",
+          "contextualTitle": "sutra"
+        }
+      ]
+    },
+    "configuration": {
+      "type": "object",
+      "title": "sutra",
+      "properties": {
+        "sutra.trace.server": {
+          "type": "string",
+          "enum": [
+            "off",
+            "messages",
+            "verbose"
+          ],
+          "default": "off",
+          "description": "Traces communication between VS Code and the sutra language server."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build:wasm": "cargo build -p sutra-lint-core --target wasm32-unknown-unknown --release --manifest-path ../../rust/Cargo.toml && wasm-bindgen --target nodejs --out-dir server/src/generated ../../rust/target/wasm32-unknown-unknown/release/sutra_lint_core.wasm",
+    "build": "tsc -b ./server ./client",
+    "postbuild": "node ./scripts/copy-generated.cjs",
+    "watch": "tsc -b -w ./server ./client",
+    "lint": "eslint server/src client/src --ext .ts",
+    "test": "vitest run --root server",
+    "test:watch": "vitest --root server",
+    "clean": "rm -rf server/out client/out",
+    "package": "vsce package",
+    "vscode:prepublish": "npm run build"
+  },
+  "dependencies": {
+    "bpmn-js": "^17.11.1",
+    "vscode-languageclient": "^9.0.1",
+    "vscode-languageserver": "^9.0.1",
+    "vscode-languageserver-textdocument": "^1.0.11"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.0",
+    "@types/vscode": "^1.85.0",
+    "@typescript-eslint/eslint-plugin": "^6.13.0",
+    "@typescript-eslint/parser": "^6.13.0",
+    "eslint": "^8.55.0",
+    "typescript": "^5.3.2",
+    "vitest": "^1.0.4"
+  }
+}

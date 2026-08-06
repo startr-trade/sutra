@@ -1,0 +1,83 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  AUTHORED FIXTURE — not a published schema. See provenance.md.
+
+  A second Standards-Editor-style definition, deliberately shaped DIFFERENTLY from
+  `order.001.001.01` so the fixture sweep is not one schema twice: the root's own type is
+  inline rather than named, the choice sits directly under the envelope, the repeated element
+  is bounded (maxOccurs="9") rather than unbounded, and the decimal facets are reached without
+  simpleContent.
+-->
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           targetNamespace="urn:sutra:test:invoice.002.001.01"
+           xmlns="urn:sutra:test:invoice.002.001.01"
+           elementFormDefault="qualified">
+
+  <xs:element name="Document">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element name="InvoiceSettlement" type="InvoiceSettlement"/>
+      </xs:sequence>
+    </xs:complexType>
+  </xs:element>
+
+  <xs:complexType name="InvoiceSettlement">
+    <xs:sequence>
+      <xs:element name="InvoiceId" type="Max35Text"/>
+      <xs:element name="SettledOn" type="xs:date"/>
+      <xs:element name="Net" type="SignedDecimal"/>
+      <xs:element name="Disputed" type="xs:boolean" minOccurs="0"/>
+      <xs:element name="Reason" type="SettlementReason" minOccurs="0"/>
+      <xs:element name="Attachment" type="Attachment" minOccurs="0" maxOccurs="9"/>
+    </xs:sequence>
+  </xs:complexType>
+
+  <!-- Choice directly under a named type: opens THIS container, not the envelope. -->
+  <xs:complexType name="SettlementReason">
+    <xs:choice>
+      <xs:element name="Code" type="ReasonCode"/>
+      <xs:element name="Narrative" type="Max20Text"/>
+    </xs:choice>
+  </xs:complexType>
+
+  <xs:complexType name="Attachment">
+    <xs:sequence>
+      <xs:element name="Name" type="Max20Text"/>
+      <xs:element name="Bytes" type="xs:base64Binary"/>
+    </xs:sequence>
+  </xs:complexType>
+
+  <xs:simpleType name="SignedDecimal">
+    <xs:restriction base="xs:decimal">
+      <xs:fractionDigits value="2"/>
+      <xs:totalDigits value="12"/>
+      <xs:minInclusive value="-1000000"/>
+      <xs:maxInclusive value="1000000"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <xs:simpleType name="ReasonCode">
+    <xs:restriction base="xs:string">
+      <xs:length value="4"/>
+      <xs:enumeration value="DUPL"/>
+      <xs:enumeration value="SHRT"/>
+      <xs:enumeration value="OVER"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <xs:simpleType name="Max35Text">
+    <xs:restriction base="xs:string">
+      <xs:minLength value="1"/>
+      <xs:maxLength value="35"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <!-- A restriction CHAIN (Max20Text -> Max35Text -> xs:string): the facet-merge path, where
+       the tightest facet wins and the builtin is only reached at the end of the walk. -->
+  <xs:simpleType name="Max20Text">
+    <xs:restriction base="Max35Text">
+      <xs:maxLength value="20"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+</xs:schema>

@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Path-coverage ADMIN flow (RESET side) for the money-transfer module — the counterpart of
+  coverage-report.bpmn. Clears the transfer process's covered-set so a fresh compliance run starts at 0%:
+
+    CoverageReset (POST /channels/coverage-reset) -> serviceTask coverage:reset:transfer
+      -> Handlebars <CoverageReset …/>    (how many marks were cleared)
+
+  `coverage:reset:<process>` is a RESERVED serviceTask implementation handled inline by the engine (no bean,
+  no template): it deletes the target process's covered-set and reports the count into the `coverageReset`
+  variable. One process per file (see coverage-report.bpmn) keeps node ids from colliding across the
+  module's <bpmn:definitions>. See the book's *Coverage: declared routes as the compliance signal*
+  chapter.
+-->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0"
+                  id="Definitions_coverage_reset"
+                  targetNamespace="urn:sutra:module:money-transfer:1.0.0">
+
+  <bpmn:process id="coverage-reset" name="Coverage reset (transfer)" isExecutable="true">
+
+    <bpmn:extensionElements>
+      <q:variables>
+        <q:variable name="coverageReset" type="object"/>  <!-- {process, cleared, total} -->
+      </q:variables>
+    </bpmn:extensionElements>
+
+    <bpmn:startEvent id="Start" name="CoverageReset received">
+      <bpmn:extensionElements>
+        <q:source channel="coverage-reset" messageTypeValue="CoverageReset"/>
+      </bpmn:extensionElements>
+      <bpmn:outgoing>XR1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="XR1" sourceRef="Start" targetRef="Reset"/>
+
+    <!-- Reserved engine op — deletes `transfer`'s covered-set (-> 0%) into `coverageReset`. -->
+    <bpmn:serviceTask id="Reset" name="Clear coverage" implementation="coverage:reset:transfer">
+      <bpmn:incoming>XR1</bpmn:incoming><bpmn:outgoing>XR2</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="XR2" sourceRef="Reset" targetRef="Reply"/>
+
+    <bpmn:serviceTask id="Reply" name="Reply CoverageReset" implementation="coverage-reset.hbs">
+      <bpmn:extensionElements>
+        <q:reply mode="native" contentType="application/xml"/>
+      </bpmn:extensionElements>
+      <bpmn:incoming>XR2</bpmn:incoming><bpmn:outgoing>XR3</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="XR3" sourceRef="Reply" targetRef="End"/>
+
+    <bpmn:endEvent id="End" name="Done"><bpmn:incoming>XR3</bpmn:incoming></bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>

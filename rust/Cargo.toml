@@ -1,0 +1,192 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/sutra-feel",
+    "crates/sutra-dmn",
+    "crates/sutra-srl",
+    "crates/sutra-bpmn",
+    "crates/sutra-templates",
+    "crates/sutra-executor",
+    "crates/sutra-persistence",
+    "crates/sutra-loader",
+    "crates/sutra-bench-packager",
+    "crates/sutra-lint-core",
+    "crates/sutra-datastore",
+    "crates/sutra-engine",
+    "crates/sutra-codec-spi",
+    "crates/sutra-formats",
+    "crates/sutra-codec-schema",
+    "crates/sutra-openapi",
+    "crates/sutra-dist",
+    "crates/sutra-channels",
+    "crates/sutra-cli",
+    "crates/sutra-xsd",
+    "crates/sutra-schema-gen",
+    "crates/sutra-testkit",
+    "crates/sutra-catalog-gen",
+    "crates/sutra-docgen",
+    "crates/sutra-conformance",
+    "crates/sutra-archtest",
+    "crates/sutra-transport-spi",
+    "crates/sutra-crypto",
+    "crates/sutra-envref-spi",
+    "crates/sutra-envref-vault",
+    "crates/sutra-envref-aws",
+    "crates/sutra-envref-azure",
+    "crates/sutra-envref-gcp",
+    "crates/sutra-transport-http",
+    "crates/sutra-transport-kafka",
+    "crates/sutra-transport-sqs",
+    "crates/sutra-transport-gcp-pubsub",
+    "crates/sutra-transport-rabbitmq",
+    "crates/sutra-transport-amqp",
+    "crates/sutra-transport-file",
+    "crates/sutra-transport-dapr",
+    "crates/sutra-transport-knative",
+    "crates/sutra-redactor-spi",
+    "crates/sutra-redactor-template",
+
+]
+
+# Footprint credibility: the release profile for the shipped engine image. `strip`
+# drops symbols (the biggest size win over the debug binary); `lto = "thin"` + `codegen-units
+# = 1` trade build time for a smaller, faster binary. opt-level stays the default 3 (the FEEL
+# hot path wants speed, not size — `opt-level = "z"` is a tracked evaluation, not the default).
+# This is the ONLY profile that needs the full lto + single-codegen-unit passes: the SHIPPED
+# artifact (footprint credibility) and benchmarking (accurate perf). Everything else uses
+# `release-it` below.
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1
+
+# Fast IT / dev-image profile: `release`-level optimisation (opt-level 3, stripped) but WITHOUT
+# `lto` + `codegen-units = 1`, which are the dominant BUILD-TIME cost (thin-LTO adds a whole-graph
+# link pass; `codegen-units = 1` serialises intra-crate codegen). Used for the k8s-IT engine image
+# and local iteration — the binary is a few MB larger and marginally slower, which is irrelevant
+# for functional integration testing. Compiles roughly 2× faster than `release`. Build the IT image
+# with `--build-arg CARGO_PROFILE=release-it` (see rust/Dockerfile) or `make image-it`.
+[profile.release-it]
+inherits = "release"
+lto = false
+codegen-units = 16
+
+[workspace.package]
+version = "0.2.0-rc.1"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/startr-trade/sutra"
+# Workspace default stays unpublished; sutra-feel and sutra-dmn are the two crates that
+# override this with `publish = true` in their own [package] (crates.io-facing surface —
+# everything else in this workspace is engine-internal and stays off crates.io).
+publish = false
+
+[workspace.dependencies]
+bigdecimal = "0.4"
+regex = "1"
+fancy-regex = "0.16"
+time = { version = "0.3", features = ["parsing", "formatting", "macros", "large-dates"] }
+# Temporal literals (sutra-feel only): real IANA tz-database resolution for `@Region/City`
+# zone-qualified FEEL temporal literals — DST-correct offset-at-date lookups, replacing the
+# earlier pragmatic allow-list. `db` bundles the IANA database at compile time (no host tzdata
+# dependency, deterministic across environments/containers).
+time-tz = { version = "2", features = ["db"] }
+getrandom = "0.2"
+quick-xml = "0.41"
+num-bigint = "0.4"
+num-traits = "0.2"
+handlebars = "6"
+serde_json = { version = "1", features = ["arbitrary_precision"] }
+sha2 = "0.10"
+tracing = "0.1"
+# The `.sutra` deployment-archive container — ZIP read/write.
+# Deflate via the pure-Rust zlib-rs backend only; every other default feature (aes, bzip2,
+# zstd, xz, time, …) stays off. The deterministic-output discipline (byte-sorted entries,
+# epoch timestamps, no extra fields) is enforced by sutra-loader's archive writer, not here.
+zip = { version = "8", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+# The RabbitMQ AMQP 0.9.1 client — mature, tokio-compatible.
+lapin = "2"
+# Kafka transport: the Kafka client is rdkafka (librdkafka binding). Chosen over the
+# pure-Rust crates because the inbound consumer needs consumer-group coordination + broker-side
+# offset commit, which the pure-Rust clients (rskafka is partition-level, no groups) do not
+# provide. The engine image is glibc/Debian (not musl) so the vendored librdkafka C build is the
+# friendly case. `default-features = false` (no `cmake-build`) uses librdkafka's own mklove
+# `configure`, which passes `--disable-{curl,ssl,gssapi,zlib,zstd}` for a truly minimal PLAINTEXT
+# build — NO curl/ssl/sasl/zlib C headers needed (the Kafka transport carries no channel-YAML
+# credentials; the broker authenticates and this build is PLAINTEXT). librdkafka's cmake path
+# keeps WITH_CURL coupled and breaks without libcurl-dev, so mklove is both leaner and more
+# portable; the only new builder-stage tool is `make` (a C compiler is already required by
+# ring). See rust/Dockerfile.
+rdkafka = { version = "0.39", default-features = false, features = ["tokio"] }
+# Dependency-free Stream polling for lapin's Consumer (no futures-util).
+futures-core = "0.3"
+# AWS SQS transport: the official AWS SDK for SQS + its config loader. `aws-config`
+# supplies the static-credentials provider + BehaviorVersion; the SQS client is built from
+# an explicit config (region + static credentials + optional endpoint override for
+# LocalStack) so no credential-chain network probe runs at boot. TLS is pinned to the ring
+# rustls provider (`default-https-client` off) — the tree already links ring (hyper-rustls,
+# sqlx) and has no nasm for aws-lc-rs; the ring connector is wired via `aws-smithy-http-client`.
+aws-config = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
+aws-sdk-sqs = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
+aws-smithy-http-client = { version = "1", default-features = false, features = ["rustls-ring"] }
+aws-credential-types = "1"
+# The AWS Secrets Manager client backing the `aws-secrets:` envref scheme
+# resolver. Same `default-features = false` + `rt-tokio` posture as aws-sdk-sqs — the client is
+# built through `aws-config::defaults(...).region(...)` and wired to the ring rustls
+# `aws-smithy-http-client` above, so no native-tls/aws-lc-rs enters and no credential-chain
+# probe runs at construction (the region is read fail-closed from AWS_REGION/AWS_DEFAULT_REGION).
+aws-sdk-secretsmanager = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
+# GCP Pub/Sub transport: the yoshidan google-cloud-pubsub client — the gRPC
+# Publisher/Subscriber pair with a first-class `PUBSUB_EMULATOR_HOST` path for the
+# testcontainers emulator. `default-features = false` drops the optional `auth` feature
+# (and with it google-cloud-auth's native-tls/openssl); the gax transport already rides
+# tonic + `tls-webpki-roots` (rustls, same family as the rest of the tree), and the
+# emulator connection is plaintext. Real-GCP credential wiring is deferred.
+google-cloud-pubsub = { version = "0.30", default-features = false }
+google-cloud-googleapis = { version = "0.16", default-features = false, features = ["pubsub"] }
+google-cloud-gax = "0.19"
+# AMQP 1.0 transport: the native pure-Rust AMQP 1.0 client (serde_amqp + tokio).
+# Distinct from lapin (AMQP 0.9.1 / rabbitmq): AMQP 1.0 speaks application-properties + native
+# accepted/released/rejected dispositions. Targets Artemis / Azure Service Bus / Solace / Qpid.
+fe2o3-amqp = "0.15"
+fe2o3-amqp-types = "0.14"
+# CloudEvents: standard Base64 decode for structured `data_base64`.
+base64 = "0.22"
+# HashiCorp Vault KV-v2 secret resolver — the `vault:<mount>/<path>#<key>` envref
+# scheme. rustls transport (no openssl) to match the ring/rustls stack already in the tree;
+# native-tls default is off. The AWS resolver (`aws-secrets:`) rides aws-sdk-secretsmanager
+# above; the Azure and GCP resolvers ride reqwest below — the registry makes each scheme a
+# drop-in `register()`.
+vaultrs = { version = "0.7", default-features = false, features = ["rustls"] }
+# The Azure Key Vault (`azure-kv:`) + GCP Secret Manager (`gcp-secret:`) envref
+# resolvers talk to their vendor REST APIs directly over reqwest — the Azure/GCP Rust SDKs risk
+# pulling native-tls, which is exactly why they were deferred; the tree is rustls/ring ONLY. This is
+# the SAME line sutra-cli uses (default-features off + rustls-tls), so the TLS stack stays ring
+# (rustls 0.23 → ring; no native-tls / openssl-sys / aws-lc-sys). The `json` feature is for the
+# small token/secret response bodies.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+# RS256 JWT signing for the GCP service-account OAuth2 jwt-bearer flow. The
+# crypto backend is `ring` (already in the tree via rustls) — rustls-clean, no aws-lc / openssl.
+jsonwebtoken = "9"
+# Broker/database containers for the Rust integration suites (dev-dependency only).
+testcontainers = { version = "0.25", features = ["blocking"] }
+testcontainers-modules = { version = "0.13", features = ["postgres", "kafka"] }
+# OTLP telemetry — the current opentelemetry-rust family (0.32-line;
+# tracing-opentelemetry pairs its 0.33 with opentelemetry 0.32). gRPC transport via
+# tonic — the endpoint (`SUTRA_TELEMETRY_OTLP_ENDPOINT`, or the standard
+# `OTEL_EXPORTER_OTLP_ENDPOINT`) is the collector's gRPC port 4317.
+opentelemetry = "0.32"
+opentelemetry_sdk = "0.32"
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["grpc-tonic", "trace", "metrics", "logs", "internal-logs"] }
+tracing-opentelemetry = "0.33"
+opentelemetry-appender-tracing = "0.32"
+# Dev-only: the in-process OTLP gRPC receiver the telemetry integration test asserts against.
+opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic", "trace", "metrics", "logs"] }
+tonic = "0.14"
+tokio-stream = { version = "0.1", features = ["net"] }
+# The executor SPI (DataStore/DataStoreTx/CoverageStore) is async + dyn-safe via
+# async-trait's boxed futures (native RPITIT is not dyn-safe). The `?Send` form keeps the
+# executor's Rc-based, single-threaded futures !Send (they run on the actor's current-thread
+# LocalSet). async-recursion boxes the mutually-recursive async dispatch (run_node ↔ sub-runners).
+async-trait = "0.1"
+async-recursion = "1"

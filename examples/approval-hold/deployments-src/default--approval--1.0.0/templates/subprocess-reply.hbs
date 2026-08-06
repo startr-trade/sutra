@@ -1,0 +1,5 @@
+{{!-- Reply template for the subprocess-showcase flow. Runs in the OUTER process, after the
+   embedded sub-process, and echoes the variables the sub-process's inner tasks set (riskScore by a FEEL
+   data assignment, decision by the approval-decide.dmn table) — proving the embedded flow expanded
+   inline and shared the parent's variable scope. --}}
+<SubProcessShowcase riskScore="{{riskScore}}" decision="{{decision}}"/>

@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Saturation-bench fixture (docs/design/execution-scale-out.md §7, `burst-start` profile) — a
+  minimal RUN-TO-END flow: spawn, one FEEL data assignment, done. No wait node and no
+  <q:reply> template — the engine's default channel ack (202 Accepted once the step commits,
+  rust/crates/sutra-channels/src/http.rs) is the observed response. This isolates pure shard
+  parallelism with no claims in play (the design's §7 table).
+
+  Structurally modeled on the approval-hold example's data-assignment task
+  (examples/approval-hold/deployments-src/default--approval--1.0.0/bpmn/template-showcase.bpmn,
+  the "Prep" node) — the same no-implementation-serviceTask + <bpmn:assignment> shape, already
+  proven in that package.
+-->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0"
+                  id="Definitions_run_to_end"
+                  targetNamespace="urn:sutra:module:saturation-bench:1.0.0">
+
+  <bpmn:process id="run-to-end" name="Run to end" isExecutable="true">
+
+    <bpmn:extensionElements>
+      <q:variables>
+        <q:variable name="status" type="string"/>
+      </q:variables>
+    </bpmn:extensionElements>
+
+    <bpmn:startEvent id="Start" name="work-in received">
+      <bpmn:extensionElements>
+        <q:source channel="work-in"/>
+      </bpmn:extensionElements>
+      <bpmn:outgoing>F1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="F1" sourceRef="Start" targetRef="Work"/>
+
+    <!-- Data task: a serviceTask with NO implementation whose FEEL <bpmn:assignment> IS its
+         behaviour — no template render, no external call, no wait. -->
+    <bpmn:serviceTask id="Work" name="Do the work (FEEL data assignment)">
+      <bpmn:incoming>F1</bpmn:incoming><bpmn:outgoing>F2</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>"done"</bpmn:from><bpmn:to>status</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F2" sourceRef="Work" targetRef="End"/>
+
+    <bpmn:endEvent id="End" name="Done">
+      <bpmn:incoming>F2</bpmn:incoming>
+    </bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>

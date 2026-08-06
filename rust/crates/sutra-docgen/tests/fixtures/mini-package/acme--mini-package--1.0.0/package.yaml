@@ -1,0 +1,8 @@
+# Fixture deployment package for sutra-docgen's integration tests — a trimmed-down mirror of
+# the real approval-hold/money-transfer examples' shape (not a real deployment).
+labels:
+  "module": "mini-package"
+  "tenant": "acme"
+  "version": "1.0.0"
+engine:
+  minContract: 1

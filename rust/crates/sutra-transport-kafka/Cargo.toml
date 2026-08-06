@@ -1,0 +1,26 @@
+[package]
+name = "sutra-transport-kafka"
+description = "Kafka vendor transport — extracted from the neutral engine (domain-neutrality refactor): the KafkaTriggerSource/KafkaMessageSink pair + the consumer-lifecycle manager, self-registering as a TransportFactory via inventory so sutra-engine bundles it without naming the broker."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+sutra-channels = { path = "../sutra-channels" }
+sutra-transport-spi = { path = "../sutra-transport-spi" }
+sutra-persistence = { path = "../sutra-persistence" }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "uuid"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
+tracing = { workspace = true }
+inventory = "0.3.24"
+async-trait = { workspace = true }
+time = { workspace = true }
+# Kafka transport (source + sink): librdkafka binding — consumer-group + offset-commit
+# semantics the pure-Rust clients lack. PLAINTEXT-only vendored build (see workspace dep).
+rdkafka = { workspace = true }
+
+[dev-dependencies]
+sutra-testkit = { path = "../sutra-testkit" }
+testcontainers = { workspace = true }
+testcontainers-modules = { workspace = true, features = ["kafka"] }

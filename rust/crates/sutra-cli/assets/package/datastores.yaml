@@ -1,0 +1,18 @@
+# generated-by: sutra create (edit freely — this file is yours)
+#
+# Data-store declarations for this deployment package. A BPMN <bpmn:dataStore> /
+# <bpmn:dataStoreReference> references a store BY NAME. The package OWNS its stores: each
+# store declares its own connection (env-indirected — no literal secrets) and keeps its
+# schema/seed SQL in migrations/<store>/, run against the store's own connection on first use.
+
+datastores: []
+
+#datastores:
+#  - name: my-store                           # the name BPMN references
+#    type: sql                               # sql | file
+#    sql:
+#      url-ref: env:MY_STORE_DB_URL           # the store's OWN connection (env-indirected)
+#      username-ref: env:MY_STORE_DB_USER
+#      password-ref: env:MY_STORE_DB_PASSWORD
+#      migrations: migrations/my-store        # idempotent SQL, package-relative
+#    dataClass: operational                   # sensitivity tag: financial | personal | operational

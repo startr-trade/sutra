@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Conformance (d) — a channel-call task WITHOUT a timer boundary or <q:timeout> is a
+     package/load-time error: the engine must refuse to boot this module. -->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0"
+                  id="Definitions_bad_call"
+                  targetNamespace="urn:sutra:module:conf:1.0.0">
+  <bpmn:process id="bad-call" name="Channel call without timeout" isExecutable="true">
+    <bpmn:startEvent id="Start">
+      <bpmn:extensionElements>
+        <q:source channel="bad-start"/>
+      </bpmn:extensionElements>
+      <bpmn:outgoing>f1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="Start" targetRef="CallOut"/>
+    <bpmn:serviceTask id="CallOut" implementation="channel:callout">
+      <bpmn:extensionElements>
+        <q:alias name="callKey" expression="event.idempotencyKey"/>
+      </bpmn:extensionElements>
+      <bpmn:incoming>f1</bpmn:incoming>
+      <bpmn:outgoing>f2</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="f2" sourceRef="CallOut" targetRef="End"/>
+    <bpmn:endEvent id="End">
+      <bpmn:incoming>f2</bpmn:incoming>
+    </bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>

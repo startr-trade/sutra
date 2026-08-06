@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Fixture decision — trimmed from examples/approval-hold's approval-decide.dmn. -->
+<definitions xmlns="https://www.omg.org/spec/DMN/20230324/MODEL/"
+             namespace="urn:sutra:module:mini-package:decide">
+  <decision id="decide" name="Balance sufficiency check">
+    <decisionTable hitPolicy="FIRST">
+      <input id="i_balance"><inputExpression typeRef="number"><text>account.balance</text></inputExpression></input>
+      <output id="o_decision" name="decision" typeRef="string"/>
+      <rule id="r_ok">
+        <inputEntry><text>&gt;= 0</text></inputEntry>
+        <outputEntry><text>"sufficient"</text></outputEntry>
+      </rule>
+      <rule id="r_low">
+        <inputEntry><text>-</text></inputEntry>
+        <outputEntry><text>"insufficient"</text></outputEntry>
+      </rule>
+    </decisionTable>
+  </decision>
+</definitions>

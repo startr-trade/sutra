@@ -1,0 +1,20 @@
+[package]
+name = "sutra-transport-http"
+description = "The HTTP channel transport — the engine's native, always-present inbound transport, behind the SAME neutral TransportChannels SPI as the vendor brokers (domain-neutrality refactor). It binds `transport: http` channels to axum routes and self-registers a TransportFactory via inventory, so channel bind/activate is protocol-neutral: HTTP is not special-cased. Unlike the vendor transports it is neutral (no lock-in) and always force-linked."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+sutra-channels = { path = "../sutra-channels" }
+sutra-transport-spi = { path = "../sutra-transport-spi" }
+axum = { version = "0.8", default-features = false }
+inventory = "0.3.24"
+async-trait = { workspace = true }
+tracing = { workspace = true }
+# Only to name the SPI's uniform spawn signature types (`Option<PgPool>`, `Handle`); HTTP
+# uses neither a datasource nor a spawn runtime. Same sqlx build as the rest of the tree so
+# the `PgPool` type matches the SPI's `TransportSpawn` fn-pointer type.
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "uuid"] }
+tokio = { version = "1", features = ["rt"] }

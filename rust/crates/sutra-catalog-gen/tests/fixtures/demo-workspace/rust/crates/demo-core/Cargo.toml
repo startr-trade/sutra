@@ -1,0 +1,5 @@
+[package]
+name = "demo-core"
+description = "Fixture core crate — types the app crate references"
+version = "0.1.0"
+edition = "2021"

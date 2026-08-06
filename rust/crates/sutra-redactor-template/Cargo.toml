@@ -1,0 +1,13 @@
+[package]
+name = "sutra-redactor-template"
+description = "Archive-supplied Handlebars ContentRedactor — HbsContentRedactor wraps a user-supplied .hbs template, compiled/checked at deploy time, whose rendered output is newline-delimited RFC 6901 JSON-Pointers. The counterpart to a force-linked sutra-redactor-<kind> extension crate: NOT a built-in, does not inventory::submit! — instantiated directly by the deploy-time assembly from the archive's <q:redactor> template body, so a deployment can bring its own redactor."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+sutra-redactor-spi = { path = "../sutra-redactor-spi" }
+sutra-executor = { path = "../sutra-executor" }
+sutra-feel = { path = "../sutra-feel" }
+sutra-templates = { path = "../sutra-templates" }

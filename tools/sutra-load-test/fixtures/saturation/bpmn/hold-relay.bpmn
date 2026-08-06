@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Saturation-bench fixture (docs/design/execution-scale-out.md §7, `steady-park-resume` and
+  `correlation-heavy` profiles) — the stateful wait-state relay, end to end. A direct
+  structural clone of the approval-hold example
+  (examples/approval-hold/deployments-src/default--approval--1.0.0/bpmn/approval-hold.bpmn),
+  renamed to neutral vocabulary: spawn-in mints + parks a hold-relay instance, keyed by the
+  JSON body's `key` field (unique, onConflict=correlate); a later relay-in message carrying
+  the same `key` correlates and resumes it; then End.
+
+  steady-park-resume drives one spawn + one correlated relay per iteration (a fresh `key`
+  each time — see profiles/steady-park-resume.js). correlation-heavy drives a small, fixed
+  pool of `key`s with a much higher rate of relay-in attempts than spawn-in calls, to isolate
+  the handoff path / hot-shard skew / claim-bounce behaviour (see
+  profiles/correlation-heavy.js for the pool mechanics — this BPMN is unchanged between the
+  two profiles).
+-->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0"
+                  id="Definitions_hold_relay"
+                  targetNamespace="urn:sutra:module:saturation-bench:1.0.0">
+
+  <bpmn:process id="hold-relay" name="Hold and relay" isExecutable="true">
+
+    <bpmn:startEvent id="Start" name="spawn-in received">
+      <bpmn:extensionElements>
+        <q:source channel="spawn-in"/>
+        <!-- Correlation key: unique across live instances. onConflict=correlate names
+             relay-in as the resume path for an already-live key — the exact approval-hold
+             pattern (a duplicate spawn-in while the key is live is rejected today; v1's
+             onConflict=correlate does not yet signal-route the duplicate itself, see
+             rust/crates/sutra-channels/src/dispatch.rs record_alias_row — the relay-in
+             channel is the only resume path this fixture relies on). -->
+        <q:alias name="key" expression="payload.key" unique="true" onConflict="correlate"/>
+      </bpmn:extensionElements>
+      <bpmn:outgoing>F1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="F1" sourceRef="Start" targetRef="Hold"/>
+
+    <!-- The wait: a plain userTask makes the process stateful. Its <q:source> names the
+         channel a correlated relay arrives on. No <q:timeout> needed — only a channel-CALL
+         serviceTask (implementation="channel:...") requires one; a userTask wait does not
+         (see the engine's own bad-missing-timeout conformance fixture, which fails ONLY the
+         channel:-call shape). -->
+    <bpmn:userTask id="Hold" name="Hold for a correlated relay">
+      <bpmn:extensionElements>
+        <q:source channel="relay-in"/>
+      </bpmn:extensionElements>
+      <bpmn:incoming>F1</bpmn:incoming>
+      <bpmn:outgoing>F2</bpmn:outgoing>
+    </bpmn:userTask>
+    <bpmn:sequenceFlow id="F2" sourceRef="Hold" targetRef="End"/>
+
+    <bpmn:endEvent id="End" name="Relayed">
+      <bpmn:incoming>F2</bpmn:incoming>
+    </bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>

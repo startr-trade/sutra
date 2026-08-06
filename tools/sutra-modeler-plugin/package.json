@@ -1,0 +1,40 @@
+{
+  "name": "@startr-trade/sutra-modeler-plugin",
+  "version": "0.2.0",
+  "description": "bpmn-js extension for modelling q:* BPMN elements (sutra q-namespace) with live FEEL expression preview.",
+  "type": "module",
+  "main": "src/index.js",
+  "module": "src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./moddle": "./src/moddle/q-moddle.json"
+  },
+  "files": [
+    "src/"
+  ],
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "keywords": [
+    "bpmn",
+    "bpmn-js",
+    "sutra",
+    "startr-trade",
+    "modeler-plugin"
+  ],
+  "author": "The Sutra Authors",
+  "license": "Apache-2.0",
+  "dependencies": {
+    "@bpmn-io/feelin": "^6.1.0",
+    "bpmn-js": "^17.0.0",
+    "bpmn-js-properties-panel": "^5.0.0",
+    "min-dash": "^4.1.0",
+    "inferno": "^7.4.0"
+  },
+  "devDependencies": {
+    "bpmn-moddle": "^9.0.0",
+    "jsdom": "^24.0.0",
+    "vitest": "^1.5.0"
+  }
+}

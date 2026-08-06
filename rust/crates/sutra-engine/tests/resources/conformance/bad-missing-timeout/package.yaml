@@ -1,0 +1,8 @@
+# Conformance NEGATIVE package: a channel-call task without a timeout — must be refused
+# at package time.
+labels:
+  "tenant": "default"
+  "module": "conf"
+  "version": "1.0.0"
+engine:
+  minContract: 1

@@ -1,0 +1,5 @@
+{{!-- Reply template for the script-showcase flow. Echoes the variables the two scriptTasks
+   merged into instance state: autoApprove is a typed boolean, correlationId is the FIRST script's
+   {{uuid}} render, and correlationEcho is the SECOND script re-reading it — script building on a prior
+   script's state. Strict rendering: any missing variable fails the render (deliberate). --}}
+<ScriptShowcase autoApprove="{{autoApprove}}" correlationId="{{correlationId}}" correlationEcho="{{correlationEcho}}" engines="{{scriptEngine}}+{{scriptEngine2}}"/>

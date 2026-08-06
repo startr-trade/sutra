@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta
+    http-equiv="Content-Security-Policy"
+    content="default-src 'none'; style-src ${CSP_SOURCE} 'unsafe-inline'; script-src ${CSP_SOURCE} 'unsafe-inline'; img-src ${CSP_SOURCE} data:; font-src ${CSP_SOURCE} data:;" />
+  <title>BPMN preview</title>
+  <style>
+    html, body, #canvas {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      background: var(--vscode-editor-background, #1e1e1e);
+      color: var(--vscode-editor-foreground, #cccccc);
+      font-family: var(--vscode-font-family, sans-serif);
+    }
+    #status {
+      position: absolute;
+      top: 8px;
+      right: 12px;
+      padding: 4px 10px;
+      border-radius: 4px;
+      background: var(--vscode-editorWidget-background, #252526);
+      border: 1px solid var(--vscode-editorWidget-border, #3c3c3c);
+      font-size: 11px;
+      opacity: 0.85;
+      pointer-events: none;
+    }
+    #status.error { color: var(--vscode-errorForeground, #f48771); }
+  </style>
+</head>
+<body>
+  <div id="canvas"></div>
+  <div id="status">Loading…</div>
+  <script src="${BPMN_VIEWER_URI}"></script>
+  <script>
+    (function () {
+      const vscode = acquireVsCodeApi();
+      const statusEl = document.getElementById('status');
+      const setStatus = (msg, isError) => {
+        statusEl.textContent = msg;
+        statusEl.classList.toggle('error', !!isError);
+      };
+
+      let viewer = null;
+      try {
+        // BpmnJS is the UMD global exposed by bpmn-viewer.production.min.js
+        if (typeof BpmnJS === 'undefined') {
+          throw new Error('bpmn-js global (BpmnJS) is not available');
+        }
+        viewer = new BpmnJS({ container: '#canvas' });
+        setStatus('Ready');
+      } catch (err) {
+        setStatus('Viewer init failed: ' + (err && err.message ? err.message : String(err)), true);
+        vscode.postMessage({ type: 'bpmn:import-error', message: String(err && err.message ? err.message : err) });
+      }
+
+      window.addEventListener('message', async (event) => {
+        const msg = event.data;
+        if (!msg || msg.type !== 'bpmn:source' || !viewer) return;
+        try {
+          const result = await viewer.importXML(msg.text);
+          // Fit to viewport once import succeeds.
+          try { viewer.get('canvas').zoom('fit-viewport'); } catch (_) { /* noop */ }
+          if (result.warnings && result.warnings.length) {
+            setStatus('Rendered with ' + result.warnings.length + ' warning(s)');
+          } else {
+            setStatus('Rendered');
+          }
+        } catch (err) {
+          const text = err && err.message ? err.message : String(err);
+          setStatus('Import failed: ' + text, true);
+          vscode.postMessage({ type: 'bpmn:import-error', message: text });
+        }
+      });
+
+      vscode.postMessage({ type: 'webview:ready' });
+    })();
+  </script>
+</body>
+</html>

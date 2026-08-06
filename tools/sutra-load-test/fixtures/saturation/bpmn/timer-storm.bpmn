@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Saturation-bench fixture (docs/design/execution-scale-out.md §7, `timer-storm` profile) —
+  arm a durable timer per spawn; the poller fires it at due-at and the instance completes.
+  Structurally modeled on the engine's own conformance fixture
+  (rust/crates/sutra-engine/tests/resources/conformance/main/bpmn/timer-park.bpmn), dropping
+  its optional send-marker task — drain is measured externally, by polling
+  GET /sutra/instances?status=WAITING (rust/bench/saturation-matrix.sh), not by a captured
+  notify.
+
+  PT2S is fixed and short so that arming k instances in a tight burst window puts their
+  due-at timestamps within the same handful of poller ticks — the "storm". NOTE: the poller
+  fires due timers in batches of 32 per 500 ms tick PER DEPLOYMENT
+  (rust/crates/sutra-engine/src/timer.rs — TimerPollerConfig::default, cited in the design's
+  §7 table) — that ceiling (~64 fires/s) is a property of TODAY's single poller loop, not of
+  engine saturation. A drain-rate plateau near there is the poller's own ceiling; don't misread
+  it as the shard-scaling result Phase 4 tunes.
+-->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0"
+                  id="Definitions_timer_storm"
+                  targetNamespace="urn:sutra:module:saturation-bench:1.0.0">
+
+  <bpmn:process id="timer-storm" name="Timer storm" isExecutable="true">
+
+    <bpmn:startEvent id="Start" name="timer-in received">
+      <bpmn:extensionElements>
+        <q:source channel="timer-in"/>
+      </bpmn:extensionElements>
+      <bpmn:outgoing>F1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="F1" sourceRef="Start" targetRef="Wait"/>
+
+    <bpmn:intermediateCatchEvent id="Wait" name="Hold until due">
+      <bpmn:timerEventDefinition>
+        <bpmn:timeDuration>PT2S</bpmn:timeDuration>
+      </bpmn:timerEventDefinition>
+      <bpmn:incoming>F1</bpmn:incoming>
+      <bpmn:outgoing>F2</bpmn:outgoing>
+    </bpmn:intermediateCatchEvent>
+    <bpmn:sequenceFlow id="F2" sourceRef="Wait" targetRef="End"/>
+
+    <bpmn:endEvent id="End" name="Fired">
+      <bpmn:incoming>F2</bpmn:incoming>
+    </bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>

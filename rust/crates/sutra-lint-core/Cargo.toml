@@ -1,0 +1,31 @@
+[package]
+name = "sutra-lint-core"
+description = "The pure, I/O-free deploy-time BPMN lint core (`validate_deployment` + its diagnostics), carved to compile to WASM so the VS Code LSP runs the SAME checks as `sutra lint` — in-editor == deploy-time by construction. Exposes a wasm-bindgen `lint(requestJson) -> diagnosticsJson` entry over an in-memory deployment. Depends only on the model/parse layer of the workspace (channels/datastore transport + provider features OFF)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# `cdylib` is the wasm-bindgen artifact the VS Code LSP loads; `rlib` keeps the crate usable as a
+# normal Rust library (the native round-trip test + any in-tree consumer link the rlib).
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# The lint lives in sutra-loader; it in turn pulls only the MODEL/parse layer of channels +
+# datastore (their `transport`/`providers` features stay OFF here — sutra-loader declares them
+# default-features = false), so this crate carries no tokio/axum/hyper/sqlx and targets wasm.
+sutra-loader = { path = "../sutra-loader" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# wasm-bindgen + getrandom `js` belong to wasm32-unknown-unknown ONLY (the wasm-bindgen target).
+# The native build (rlib + tests) links none of it, so the native crate is unchanged; wasm32-wasip1
+# keeps building the plain lib (the P1 carve) with no wasm-bindgen and the WASI getrandom backend.
+#   - wasm-bindgen: the JS boundary the VS Code LSP loads; only meaningful on unknown-unknown.
+#   - getrandom 0.2 hard-`compile_error!`s on unknown-unknown without a backend (reached only via
+#     FEEL uuid/random/now, never the lint path — but it must still LINK). The `js` backend applies
+#     to unknown-unknown; wasip1 uses the WASI backend and needs no fix.
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+wasm-bindgen = "0.2"
+getrandom = { version = "0.2", features = ["js"] }

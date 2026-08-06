@@ -1,0 +1,4 @@
+{{!-- Renders the rejected-transfer reply. The template does NO arithmetic — `reason` ("frozen-account" or
+   "insufficient-funds") was decided by the DecideReason FEEL assignment on the invalid branch before
+   the transaction cancelled; fromId/toId/amount come from the TransferRequest payload. --}}
+<TransferRejected from="{{payload.fromId}}" to="{{payload.toId}}" amount="{{payload.amount}}" reason="{{reason}}"/>

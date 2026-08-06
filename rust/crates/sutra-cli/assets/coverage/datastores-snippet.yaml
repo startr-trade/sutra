@@ -1,0 +1,11 @@
+  # Where path-coverage marks are persisted (generated-by: sutra coverage init).
+  # The engine OWNS this store's schema — one row per declared <q:coverage> path, flipped the
+  # first time a run walks it, plus the cross-process reconstruction fragments — and applies that
+  # schema to this connection on first use. You supply no coverage SQL and no `migrations:` key;
+  # what this declaration chooses is the DATABASE the marks live in. Pointing it at an existing
+  # store's connection is safe: the coverage tables are its own.
+  - name: coverage
+    type: sql
+    sql:
+%%SQL_PROPS%%
+    dataClass: operational   # a metric, not customer/financial data.

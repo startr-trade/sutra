@@ -1,0 +1,95 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Template-engine showcase — fully declarative (no application code anywhere in this example).
+  One process exercises BOTH template engines: a FEEL data-assignment node derives which engine should
+  answer, a visible exclusive gateway routes on it, and each branch is a template service task (engine
+  chosen by the file extension) carrying <q:reply mode="native"> — its render IS the HTTP response.
+
+    startEvent (XML ApprovalRequest on showcase-request)
+    then Prep       : a data task (serviceTask with FEEL <bpmn:assignment>s, no implementation) —
+                      prepped := "ok" and engineChoice := "xslt" | "hbs" from the E2EId
+    then PickEngine : exclusiveGateway on engineChoice (default: Handlebars)
+      engineChoice = "xslt" then RenderXslt : XSLT template serviceTask (transform.xsl) + native reply
+      otherwise           then RenderHbs  : Handlebars template serviceTask (greeting.hbs) + native reply
+    then End
+
+  Both templates also echo `prepped`, proving the FEEL data-assignment node fed the render model.
+  NOTE: one-flow render AGGREGATION (both engines' output in one reply) is not expressible — a
+  template render lands as `responseBody` BYTES, and no declarative construct re-reads those bytes
+  as a string. Aggregation awaits the serviceTask-as-channel-call contract; the gateway design
+  keeps both engines observable, one per request.
+-->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0"
+                  id="Definitions_showcase"
+                  targetNamespace="urn:sutra:module:approval:1.0.0">
+
+  <bpmn:process id="template-showcase" name="Template engine showcase" isExecutable="true">
+
+    <!-- Typed variables — the templates' declared inputs; the deploy-time TemplateInputValidator
+         fail-closes on any template root not declared here (or an alias/payload/fixed root). -->
+    <bpmn:extensionElements>
+      <q:variables>
+        <q:variable name="prepped" type="string"/>       <!-- set by Prep, echoed by both templates -->
+        <q:variable name="engineChoice" type="string"/>  <!-- "xslt" | "hbs", the gateway's routing key -->
+      </q:variables>
+    </bpmn:extensionElements>
+
+    <bpmn:startEvent id="Start" name="ApprovalRequest received">
+      <bpmn:extensionElements>
+        <q:source channel="showcase-request" messageTypeValue="ApprovalRequest"/>
+      </bpmn:extensionElements>
+      <bpmn:outgoing>F1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="F1" sourceRef="Start" targetRef="Prep"/>
+
+    <!-- Data task: a serviceTask with NO implementation whose FEEL <bpmn:assignment>s ARE its
+         behaviour. -->
+    <bpmn:serviceTask id="Prep" name="Prep (FEEL data assignments)">
+      <bpmn:incoming>F1</bpmn:incoming><bpmn:outgoing>F2</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>"ok"</bpmn:from><bpmn:to>prepped</bpmn:to></bpmn:assignment>
+        <bpmn:assignment>
+          <bpmn:from>if contains(payload.E2EId, "XSLT") then "xslt" else "hbs"</bpmn:from>
+          <bpmn:to>engineChoice</bpmn:to>
+        </bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F2" sourceRef="Prep" targetRef="PickEngine"/>
+
+    <!-- Visible engine choice — FEEL condition, Handlebars as the default flow. -->
+    <bpmn:exclusiveGateway id="PickEngine" name="Which engine?" default="FHbs">
+      <bpmn:incoming>F2</bpmn:incoming>
+      <bpmn:outgoing>FXslt</bpmn:outgoing>
+      <bpmn:outgoing>FHbs</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:sequenceFlow id="FXslt" sourceRef="PickEngine" targetRef="RenderXslt">
+      <bpmn:conditionExpression>engineChoice = "xslt"</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="FHbs" sourceRef="PickEngine" targetRef="RenderHbs"/>
+
+    <!-- XSLT branch: the inbound message is the transform SOURCE document; the decoded payload and the
+         scalar variables (prepped) arrive as <xsl:param>s. The render is the native HTTP reply. -->
+    <bpmn:serviceTask id="RenderXslt" name="Render + reply (XSLT)" implementation="transform.xsl">
+      <bpmn:extensionElements>
+        <q:reply mode="native" contentType="application/xml"/>
+      </bpmn:extensionElements>
+      <bpmn:incoming>FXslt</bpmn:incoming><bpmn:outgoing>F5</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F5" sourceRef="RenderXslt" targetRef="End"/>
+
+    <!-- Handlebars branch: rendered strict (a missing value fails the render, engine-enforced). -->
+    <bpmn:serviceTask id="RenderHbs" name="Render + reply (Handlebars)" implementation="greeting.hbs">
+      <bpmn:extensionElements>
+        <q:reply mode="native" contentType="application/xml"/>
+      </bpmn:extensionElements>
+      <bpmn:incoming>FHbs</bpmn:incoming><bpmn:outgoing>F6</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F6" sourceRef="RenderHbs" targetRef="End"/>
+
+    <bpmn:endEvent id="End" name="Done">
+      <bpmn:incoming>F5</bpmn:incoming>
+      <bpmn:incoming>F6</bpmn:incoming>
+    </bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>

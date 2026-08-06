@@ -1,0 +1,5 @@
+rules:
+  - file: decide.dmn
+    messageTypes: [BalanceQuery]
+  - file: extra.srl
+    messageTypes: [BalanceQuery]

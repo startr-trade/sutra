@@ -1,0 +1,662 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  sutra q: namespace extensions for BPMN 2.0
+
+  Adopted at M0 freeze (2026-05-20). This XSD is the authoritative shape definition for
+  every <q:*> element that appears inside <bpmn:extensionElements>. The engine's parser
+  validates BPMN files against this XSD; editor plugins (sutra-modeler-plugin) load it to
+  drive property panels and live validation.
+
+  Frozen surface — changes are semver-major and batched at wave boundaries per
+  docs/calendar-schedule.md "freeze gates".
+-->
+<xsd:schema xmlns:xsd="http://www.w3.org/2001/XMLSchema"
+            xmlns:q="urn:sutra:q:1.0"
+            targetNamespace="urn:sutra:q:1.0"
+            elementFormDefault="qualified"
+            attributeFormDefault="unqualified"
+            version="1.0">
+
+  <!-- ===================== Source / inbound channel ===================== -->
+
+  <xsd:element name="source" type="q:SourceType">
+    <xsd:annotation>
+      <xsd:documentation>
+        The consolidated inbound trigger on a Message Start Event (absorbs the former q:input).
+        Binds the start event to one inbound channel, declares the message type it handles
+        (messageTypeValue / messageTypePattern), the payload variable name, and the validator chain
+        (nested q:validators). The codec is NOT declared here — it is bound on the channel YAML
+        (YAML-authoritative); declaring @codec on q:source is a parse error. At most one q:source per
+        start event: it names the single message type the start event handles, forcing the downstream
+        flow to a finite outcome. The channel name resolves to a tenant via the tenant channel YAML.
+      </xsd:documentation>
+    </xsd:annotation>
+  </xsd:element>
+
+  <xsd:complexType name="SourceType">
+    <xsd:sequence>
+      <xsd:element ref="q:validators" minOccurs="0" maxOccurs="1"/>
+      <xsd:element ref="q:redactors" minOccurs="0" maxOccurs="1"/>
+    </xsd:sequence>
+    <xsd:attribute name="channel" type="xsd:string" use="required"/>
+    <xsd:attribute name="name" type="xsd:string" default="payload">
+      <xsd:annotation>
+        <xsd:documentation>
+          Process-variable name the decoded payload is projected under (FEEL-visible as
+          &lt;name&gt;.* and &lt;name&gt;.validation). Defaults to "payload".
+        </xsd:documentation>
+      </xsd:annotation>
+    </xsd:attribute>
+    <xsd:attribute name="ack" type="q:AckMode" default="on-persist"/>
+    <xsd:attribute name="dedupKey" type="xsd:string">
+      <xsd:annotation>
+        <xsd:documentation>
+          Expression to extract a DUPLICATE-DETECTION value (a "dedup key") for inbox dedup,
+          e.g. header.X-Request-Id, amqp.message-id, ce.id, or body.&lt;path&gt; (a body.&lt;path&gt;
+          form drives inbox dedup post-decode). Renamed from the misnamed "idempotencyKey": a dedup
+          key detects redelivery of the SAME message; it does NOT, on its own, assert that the
+          process is safe to retry — that assertion is the process-level &lt;q:process
+          idempotent="true|false"&gt; boolean. When CloudEvents wrap mode is configured for the
+          channel and type="" is set below, dedupKey defaults to ce.id. Declaring the retired
+          @idempotencyKey attribute is a deploy-time error (SUTRA.PARSE.Q_SOURCE.IDEMPOTENCY_KEY_RENAMED).
+        </xsd:documentation>
+      </xsd:annotation>
+    </xsd:attribute>
+    <xsd:attribute name="type" type="xsd:string">
+      <xsd:annotation>
+        <xsd:documentation>
+          Optional CloudEvents type. When set, enables CE detection on the channel and exposes
+          event.* in FEEL contexts. Compose with cloudevents.mode in channel config.
+        </xsd:documentation>
+      </xsd:annotation>
+    </xsd:attribute>
+    <xsd:attribute name="dataClass" type="q:DataClass" default="none">
+      <xsd:annotation>
+        <xsd:documentation>
+          Per docs/15-factor.md GDPR retention design — drives PayloadRedactor policy selection
+          and audit expiry rules.
+        </xsd:documentation>
+      </xsd:annotation>
+    </xsd:attribute>
+    <xsd:attribute name="messageTypeValue" type="xsd:string">
+      <xsd:annotation>
+        <xsd:documentation>
+          Subscribe this start event to a single concrete codec message type — the exact value the
+          codec reports (DecodeResult.messageType), e.g. "pacs.008.001.14". When set, the engine routes
+          a decoded inbound here only when its messageType equals this value. Mutually exclusive with
+          messageTypePattern. Absent both = the start event accepts any type the channel's codec yields.
+        </xsd:documentation>
+      </xsd:annotation>
+    </xsd:attribute>
+    <xsd:attribute name="messageTypePattern" type="xsd:string">
+      <xsd:annotation>
+        <xsd:documentation>
+          Subscribe this start event to a family of codec message types via a regular expression
+          matched against the decoded messageType, e.g. "pacs\.008\..*". The pattern is anchored:
+          it must match the whole message type, not a substring. Mutually exclusive with
+          messageTypeValue.
+        </xsd:documentation>
+      </xsd:annotation>
+    </xsd:attribute>
+  </xsd:complexType>
+
+  <xsd:simpleType name="AckMode">
+    <xsd:restriction base="xsd:string">
+      <xsd:enumeration value="on-persist"/>
+      <xsd:enumeration value="on-complete"/>
+    </xsd:restriction>
+  </xsd:simpleType>
+
+  <xsd:simpleType name="DataClass">
+    <xsd:restriction base="xsd:string">
+      <xsd:enumeration value="none"/>
+      <xsd:enumeration value="pii"/>
+      <xsd:enumeration value="pci"/>
+      <xsd:enumeration value="phi"/>
+      <xsd:enumeration value="financial"/>
+    </xsd:restriction>
+  </xsd:simpleType>
+
+  <!-- ===================== Validators (container nested under q:source) ===================== -->
+
+  <xsd:element name="validators" type="q:ValidatorsContainerType">
+    <xsd:annotation>
+      <xsd:documentation>
+        The validator chain on a start event's q:source. A container holding an ordered, mixed list
+        of two validator kinds: q:complexValidator (a ruleset validating the whole payload) and
+        q:simpleValidator (a field content validator applied at a FEEL path).
+      </xsd:documentation>
+    </xsd:annotation>
+  </xsd:element>
+
+  <xsd:complexType name="ValidatorsContainerType">
+    <xsd:choice minOccurs="0" maxOccurs="unbounded">
+      <xsd:element ref="q:complexValidator"/>
+      <xsd:element ref="q:simpleValidator"/>
+    </xsd:choice>
+  </xsd:complexType>
+
+  <xsd:element name="complexValidator" type="q:ValidatorsType">
+    <xsd:annotation>
+      <xsd:documentation>
+        A ruleset validating the whole decoded payload. source="…" resolves to a .srl/.dmn rule
+        or a built-in structural validator.
+      </xsd:documentation>
+    </xsd:annotation>
+  </xsd:element>
+
+  <xsd:complexType name="ValidatorsType">
+    <xsd:attribute name="source" type="xsd:string" use="required"/>
+    <xsd:attribute name="scope" type="q:Scope"/>
+    <xsd:attribute name="when" type="xsd:string"/>
+    <xsd:attribute name="consolidate" type="xsd:boolean" default="true"/>
+  </xsd:complexType>
+
+  <xsd:element name="simpleValidator" type="q:ValidatorType">
+    <xsd:annotation>
+      <xsd:documentation>
+        A field content validator. ref="…" names a registered ContentValidator (iso-3166-country,
+        iso-4217-currency, iso-9362-bic, …); path="…" is a FEEL path (payload.body.…) resolved
+        against the decoded payload — the resolved value is what the validator checks.
+      </xsd:documentation>
+    </xsd:annotation>
+  </xsd:element>
+
+  <xsd:complexType name="ValidatorType">
+    <xsd:attribute name="ref" type="xsd:string" use="required"/>
+    <xsd:attribute name="path" type="xsd:string" use="required"/>
+    <xsd:attribute name="scope" type="q:Scope">
+      <xsd:annotation>
+        <xsd:documentation>
+          Explicit scope per docs/resource-layout.md — "common" / "tenant". Unscoped: tenant
+          first, then common (if inherited).
+        </xsd:documentation>
+      </xsd:annotation>
+    </xsd:attribute>
+    <xsd:attribute name="when" type="xsd:string"/>
+    <xsd:attribute name="consolidate" type="xsd:boolean" default="false"/>
+  </xsd:complexType>
+
+  <!-- ===================== Redactors (container nested under q:source) ===================== -->
+
+  <xsd:element name="redactors" type="q:RedactorsType">
+    <xsd:annotation>
+      <xsd:documentation>
+        The redactor chain on a start event's q:source. A container holding an ordered list of
+        q:redactor entries, each naming a registered ContentRedactor run over the decoded payload to
+        locate and mask sensitive spans.
+      </xsd:documentation>
+    </xsd:annotation>
+  </xsd:element>
+
+  <xsd:complexType name="RedactorsType">
+    <xsd:sequence>
+      <xsd:element ref="q:redactor" minOccurs="0" maxOccurs="unbounded"/>
+    </xsd:sequence>
+  </xsd:complexType>
+
+  <xsd:element name="redactor" type="q:RedactorType">
+    <xsd:annotation>
+      <xsd:documentation>
+        One entry in the redactor chain. @ref names the registered ContentRedactor to run over the
+        decoded payload.
+      </xsd:documentation>
+    </xsd:annotation>
+  </xsd:element>
+
+  <xsd:complexType name="RedactorType">
+    <xsd:attribute name="ref" type="xsd:string" use="required">
+      <xsd:annotation>
+        <xsd:documentation>
+          Names a registered ContentRedactor (e.g. pci, swift). The engine runs each named redactor
+          over the DECODED payload to locate sensitive spans, masking them in every observability
+          surface (audit, logs, diagnostics, inspect) and marking them for encryption at rest.
+        </xsd:documentation>
+      </xsd:annotation>
+    </xsd:attribute>
+  </xsd:complexType>
+
+  <!-- ===================== Reply / outbound ===================== -->
+
+  <xsd:element name="reply" type="q:ReplyType">
+    <xsd:annotation>
+      <xsd:documentation>
+        Declares an outbound reply. mode="native" (default) preserves the engine's symmetric-reply
+        behaviour. mode="cloudevent-binary" / "cloudevent-structured" / "match-inbound" enable CE
+        rendering. The reply destination is the captured override (from X-Callback-Handler /
+        Reply-To / etc.) falling back to the declared destination.
+      </xsd:documentation>
+    </xsd:annotation>
+  </xsd:element>
+
+  <xsd:complexType name="ReplyType">
+    <xsd:sequence>
+      <!-- Author-declared header attributes on the outbound reply; each
+           @value is a FEEL expression over the sending process context, resolved at dispatch and
+           carried as a transport header / broker application-property. A reply leg is itself a
+           coverage hop, so header carriage is symmetric with <q:send>. -->
+      <xsd:element ref="q:header" minOccurs="0" maxOccurs="unbounded"/>
+    </xsd:sequence>
+    <xsd:attribute name="mode" type="q:ReplyMode" default="native"/>
+    <xsd:attribute name="destination" type="xsd:string"/>
+    <xsd:attribute name="contentType" type="xsd:string"/>
+    <xsd:attribute name="messageType" type="xsd:string">
+      <xsd:annotation>
+        <xsd:documentation>
+          The message type this reply emits — the symmetric counterpart of
+          &lt;q:source messageType&gt;. Declared so it is statically checkable: T3 outbound validation
+          confirms it is in the reply channel codec's declaredMessageTypes() (emittable). A pacs.008
+          inbound flow may reply a different pacs.002. Absent = schema-less reply (lint warning).
+        </xsd:documentation>
+      </xsd:annotation>
+    </xsd:attribute>
+    <xsd:attribute name="required" type="xsd:boolean" default="false"/>
+    <xsd:attribute name="type" type="xsd:string"/>
+    <xsd:attribute name="source" type="xsd:string"/>
+    <xsd:attribute name="subject" type="xsd:string"/>
+    <xsd:attribute name="datacontenttype" type="xsd:string"/>
+    <xsd:attribute name="auth" type="q:OutboundAuthScheme"/>
+    <xsd:attribute name="authSecretRef" type="xsd:string"/>
+    <xsd:attribute name="authHeader" type="xsd:string"/>
+    <xsd:attribute name="continue" type="xsd:boolean" default="false">
+      <xsd:annotation>
+        <xsd:documentation>
+          Respond-and-continue (async reply-detach). On a &lt;bpmn:serviceTask&gt;,
+          @continue="true" flushes this reply to the caller AS SOON AS the task completes, then parks
+          the instance and self-resumes to run the remaining nodes asynchronously (durable: persist +
+          self-resume, crash-safe). The caller gets its answer without waiting for the tail. Default
+          false = today's behaviour (the reply rides the connection and the caller waits for the whole
+          process). Distinct from &lt;q:send&gt; (no reply) and ack-mode on-persist (a bare 202, no body).
+          Meaningful only on a non-terminal serviceTask — on an endEvent there is no tail to continue.
+        </xsd:documentation>
+      </xsd:annotation>
+    </xsd:attribute>
+  </xsd:complexType>
+
+  <xsd:element name="send" type="q:SendType">
+    <xsd:annotation>
+      <xsd:documentation>
+        Declares an unsolicited outbound message emitted by an intermediate throw event
+        (message/signal flavour). Structurally close to &lt;q:reply&gt; but a send targets its OWN
+        endpoint (there is no inbound caller to answer): declare exactly one of @destination (an
+        explicit endpoint URI) or @channel (a declared 'direction: outbound' channel — transport-neutral,
+        channels.yaml decides HTTP-callback vs broker queue). A reply, by contrast, answers (and may
+        inherit the reply-to of) the original caller — which, in an HTTP-POST flow that already replied
+        then auto-resumed, may no longer be listening. Emit-and-continue: the throw enqueues this to the
+        outbox and the token advances immediately.
+      </xsd:documentation>
+    </xsd:annotation>
+  </xsd:element>
+
+  <xsd:complexType name="SendType">
+    <xsd:sequence>
+      <!-- Author-declared header attributes on the outbound message; each
+           @value is a FEEL expression over the sending process context, resolved at dispatch and
+           carried as a transport header / broker application-property so a coverage hop key can
+           name a header the sender sets and the receiver correlates on. -->
+      <xsd:element ref="q:header" minOccurs="0" maxOccurs="unbounded"/>
+    </xsd:sequence>
+    <!-- Exactly one of @destination (an explicit endpoint URI) or @channel (a declared
+         'direction: outbound' channel in channels.yaml) is required; the parser fails closed
+         (SUTRA.PARSE.Q_SEND.CHANNEL_OR_DESTINATION) when neither or both is set. @channel keeps the
+         BPMN transport-neutral — channels.yaml decides HTTP-callback vs broker queue. See the
+         book's "Channels and transports" chapter. -->
+    <xsd:attribute name="destination" type="xsd:string"/>
+    <xsd:attribute name="channel" type="xsd:string"/>
+    <xsd:attribute name="mode" type="q:ReplyMode" default="native"/>
+    <xsd:attribute name="contentType" type="xsd:string"/>
+    <xsd:attribute name="messageType" type="xsd:string"/>
+    <xsd:attribute name="type" type="xsd:string"/>
+    <xsd:attribute name="source" type="xsd:string"/>
+    <xsd:attribute name="subject" type="xsd:string"/>
+    <xsd:attribute name="datacontenttype" type="xsd:string"/>
+    <xsd:attribute name="auth" type="q:OutboundAuthScheme"/>
+    <xsd:attribute name="authSecretRef" type="xsd:string"/>
+    <xsd:attribute name="authHeader" type="xsd:string"/>
+  </xsd:complexType>
+
+  <xsd:element name="header" type="q:HeaderType">
+    <xsd:annotation>
+      <xsd:documentation>
+        An author-declared header attribute set on an outbound &lt;q:send&gt; /
+        &lt;q:reply&gt; message. @name is the (opaque, domain-neutral) header/attribute name; @value is a
+        FEEL expression evaluated against the sending process context at dispatch. The resolved string
+        rides the wire as an HTTP header / Kafka record header / AMQP application-property / SQS message
+        attribute / Pub-Sub attribute — one concept across transports (the traceparent /
+        sutra-outbox-key carriage). Enables header-carried hop correlation keys; a null result is
+        omitted. Hop key ≠ idempotencyKey — this is correlation, not delivery dedup.
+      </xsd:documentation>
+    </xsd:annotation>
+  </xsd:element>
+
+  <xsd:complexType name="HeaderType">
+    <xsd:attribute name="name" type="xsd:string" use="required"/>
+    <xsd:attribute name="value" type="xsd:string" use="required"/>
+  </xsd:complexType>
+
+  <xsd:element name="store" type="q:StoreType">
+    <xsd:annotation>
+      <xsd:documentation>
+        Binds a &lt;bpmn:dataStoreReference&gt; to a durable key in a data store. Placed in the
+        reference's &lt;bpmn:extensionElements&gt;. @key is a FEEL expression evaluated against the
+        process variables to produce the row key (e.g. "fromId"); @forUpdate takes a pessimistic row
+        lock (SELECT ... FOR UPDATE) so concurrent transfers on one key serialise (Isolation); @field,
+        on a write, replaces just one field of the stored (map) value, preserving the rest;
+        @expect="unchanged", on a write, makes it an optimistic-concurrency compare-and-set — it commits only
+        if the row's revision still matches the one read earlier in this instance, else the instance fails with
+        SUTRA.RUNTIME.DATASTORE.CONFLICT (a lock-free alternative to @forUpdate for a scaled-out store). A data
+        task (a serviceTask with no @implementation) reads/writes these via its data associations.
+        See the book's "Data stores" chapter.
+      </xsd:documentation>
+    </xsd:annotation>
+  </xsd:element>
+
+  <xsd:complexType name="StoreType">
+    <xsd:attribute name="key" type="xsd:string" use="required"/>
+    <xsd:attribute name="forUpdate" type="xsd:boolean" default="false"/>
+    <xsd:attribute name="field" type="xsd:string"/>
+    <xsd:attribute name="expect" type="q:StoreExpect"/>
+  </xsd:complexType>
+
+  <xsd:simpleType name="StoreExpect">
+    <xsd:restriction base="xsd:string">
+      <xsd:enumeration value="unchanged"/>
+    </xsd:restriction>
+  </xsd:simpleType>
+
+  <xsd:simpleType name="ReplyMode">
+    <xsd:restriction base="xsd:string">
+      <xsd:enumeration value="native"/>
+      <xsd:enumeration value="cloudevent-binary"/>
+      <xsd:enumeration value="cloudevent-structured"/>
+      <xsd:enumeration value="match-inbound"/>
+    </xsd:restriction>
+  </xsd:simpleType>
+
+  <xsd:simpleType name="OutboundAuthScheme">
+    <xsd:restriction base="xsd:string">
+      <xsd:enumeration value="mtls"/>
+      <xsd:enumeration value="bearer"/>
+      <xsd:enumeration value="apikey"/>
+    </xsd:restriction>
+  </xsd:simpleType>
+
+  <!-- ===================== Alias / instance lookup ===================== -->
+
+  <xsd:element name="alias" type="q:AliasType">
+    <xsd:annotation>
+      <xsd:documentation>
+        Friendly key derived from FEEL expression. Replay-bound (re-evaluated on rehydration);
+        FeelDeterminism denylist applies. unique="true" + onConflict="correlate" routes signals
+        to existing instances. multi="true" indexes a list-valued expression.
+      </xsd:documentation>
+    </xsd:annotation>
+  </xsd:element>
+
+  <xsd:complexType name="AliasType">
+    <xsd:attribute name="name" type="xsd:string" use="required"/>
+    <xsd:attribute name="expression" type="xsd:string" use="required"/>
+    <xsd:attribute name="unique" type="xsd:boolean" default="false"/>
+    <xsd:attribute name="onConflict" type="q:AliasConflict"/>
+    <xsd:attribute name="multi" type="xsd:boolean" default="false"/>
+  </xsd:complexType>
+
+  <!-- ===================== Scoped service-task parameter ===================== -->
+  <xsd:element name="param" type="q:ParamType">
+    <xsd:annotation>
+      <xsd:documentation>
+        A scoped, per-invocation input on a &lt;bpmn:serviceTask&gt;. The expression is FEEL, evaluated
+        over the process variables once when the task runs; the result is overlaid on the render model
+        for THAT call only — read as a plain {name}, exactly like a process variable, but never
+        persisted to instance state.
+        Repeatable; a param shadows a same-named process variable for the invocation.
+      </xsd:documentation>
+    </xsd:annotation>
+  </xsd:element>
+
+  <xsd:complexType name="ParamType">
+    <xsd:attribute name="name" type="xsd:string" use="required"/>
+    <xsd:attribute name="expression" type="xsd:string" use="required"/>
+  </xsd:complexType>
+
+  <xsd:simpleType name="AliasConflict">
+    <xsd:restriction base="xsd:string">
+      <xsd:enumeration value="reject"/>
+      <xsd:enumeration value="correlate"/>
+    </xsd:restriction>
+  </xsd:simpleType>
+
+  <!-- ===================== Per-task retry policy ===================== -->
+
+  <xsd:element name="retry" type="q:RetryType">
+    <xsd:annotation>
+      <xsd:documentation>
+        Per-task retry policy on a &lt;bpmn:serviceTask&gt; — a REGISTERED-TASK service task, or a
+        CHANNEL-CALL service task (implementation="channel:…"). A failed attempt is re-attempted
+        up to @maxAttempts times, waiting min(@initialDelay × @backoffCoefficient^(n-1),
+        @maxDelay) before attempt n+1. The wait is a DURABLE TIMER park, not a sleep: the
+        instance is persisted with the failed task still pending and its attempt count recorded,
+        and the ordinary timer poller re-drives it — so a backoff never blocks the engine's
+        single-threaded actor and survives a restart or a replica hand-off.
+
+        What counts as a failed attempt: on a registered task, an uncaught task-function error.
+        On a channel-call task, the task-level failure set is the route-less q:timeout boundary
+        firing (classification SUTRA.DISPATCH.CHANNEL_CALL.TIMEOUT), and the request delivery
+        being terminally poisoned by the outbox attempt ceiling (classification
+        SUTRA.OUTBOUND.DELIVERY_ATTEMPTS_EXHAUSTED); the re-drive RE-EMITS the request as a
+        fresh outbox emission with a fresh idempotency key. A correlated BUSINESS response is
+        always a normal completion, never a retry trigger — the counterpart answered. The policy
+        is still not a delivery policy: each individual delivery attempt is governed by the
+        outbox dispatcher's sutra.outbox.retry.* curve; this policy decides whether the task
+        gets another request at all.
+
+        Placement is fail-closed (SUTRA.CONFIG.BPMN.RETRY_NOT_APPLICABLE). It is a load ERROR on:
+        anything that is not a serviceTask; a channel-call serviceTask whose timer boundary has
+        outgoing flows (a MODELLED timeout route always wins over a retry policy, which could
+        then never fire — declare the route-less q:timeout form instead); a serviceTask wrapped
+        in loop characteristics; and a serviceTask nested in an embedded/transaction/ad-hoc/event
+        sub-process (the inline runners cannot park mid-scope).
+
+        A BPMN error raised by the task is a MODELLED outcome — it routes to its boundary event and
+        is never retried. @nonRetryableCodes names classification codes that skip the remaining
+        attempts and fail the instance immediately; a failure classifies as the leading "CODE:"
+        token of its message when it has one, else as SUTRA.RUNTIME.TASK.UNCAUGHT.
+
+        A process containing a q:retry task is STATEFUL (never synchronous-eligible) — the retry
+        park needs a snapshot to land in.
+      </xsd:documentation>
+    </xsd:annotation>
+  </xsd:element>
+
+  <xsd:complexType name="RetryType">
+    <!-- Total attempts INCLUDING the first; 1 is an explicit "never retry". Required with no
+         default: an unbounded task retry is the failure mode this policy exists to remove. -->
+    <xsd:attribute name="maxAttempts" type="xsd:positiveInteger" use="required"/>
+    <xsd:attribute name="initialDelay" type="xsd:duration" default="PT1S"/>
+    <!-- Must be >= 1.0; 1.0 is a fixed delay. Below 1 would SHRINK the wait on each failure. -->
+    <xsd:attribute name="backoffCoefficient" type="xsd:decimal" default="2.0"/>
+    <!-- The ceiling the growing delay clamps at; must be >= @initialDelay. -->
+    <xsd:attribute name="maxDelay" type="xsd:duration" default="PT5M"/>
+    <!-- Comma-separated classification codes that fail immediately instead of retrying. -->
+    <xsd:attribute name="nonRetryableCodes" type="xsd:string"/>
+  </xsd:complexType>
+
+  <!-- ===================== Dispatch / dynamic call activity ===================== -->
+
+  <xsd:element name="dispatch" type="q:DispatchType"/>
+
+  <xsd:complexType name="DispatchType">
+    <xsd:sequence>
+      <xsd:element ref="q:case" minOccurs="1" maxOccurs="unbounded"/>
+    </xsd:sequence>
+    <xsd:attribute name="default" type="xsd:string"/>
+    <xsd:attribute name="onNoMatch" type="q:OnNoMatch" default="error"/>
+  </xsd:complexType>
+
+  <xsd:element name="case" type="q:CaseType"/>
+
+  <xsd:complexType name="CaseType">
+    <xsd:attribute name="when" type="xsd:string" use="required"/>
+    <xsd:attribute name="calledElement" type="xsd:string" use="required"/>
+    <xsd:attribute name="scope" type="q:Scope"/>
+  </xsd:complexType>
+
+  <xsd:simpleType name="OnNoMatch">
+    <xsd:restriction base="xsd:string">
+      <xsd:enumeration value="error"/>
+      <xsd:enumeration value="skip"/>
+    </xsd:restriction>
+  </xsd:simpleType>
+
+  <!-- ===================== Validation policy on payload structural failure ===================== -->
+
+  <xsd:element name="onValidation" type="q:OnValidationType"/>
+
+  <xsd:complexType name="OnValidationType">
+    <xsd:attribute name="mode" type="q:OnValidationMode" use="required"/>
+    <xsd:attribute name="errorCode" type="xsd:string"/>
+  </xsd:complexType>
+
+  <xsd:simpleType name="OnValidationMode">
+    <xsd:restriction base="xsd:string">
+      <xsd:enumeration value="route"/>
+      <xsd:enumeration value="reject"/>
+      <xsd:enumeration value="error"/>
+    </xsd:restriction>
+  </xsd:simpleType>
+
+  <!-- ===================== Process-level idempotency assertion ===================== -->
+
+  <xsd:element name="process" type="q:ProcessType">
+    <xsd:annotation>
+      <xsd:documentation>
+        Process-level configuration hung off the &lt;bpmn:process&gt;'s own
+        &lt;bpmn:extensionElements&gt;. Carries @idempotent, the retry-safety ASSERTION: idempotent="true"
+        means the author asserts re-executing this process on the same input converges to a single end
+        state, so an inbound delivery is safe to retry any number of times (redelivery converges). The
+        default is idempotent="false" (fail-closed) — an undeclared process is treated as
+        non-idempotent, and an execution failure on a non-idempotent process is consumed (ack, no
+        requeue) and recorded as a durable incident (SUTRA.INBOUND.NON_IDEMPOTENT_FAILURE) rather than
+        blind-redelivered-and-reprocessed. Distinct from &lt;q:source dedupKey&gt;: a dedup key detects a
+        redelivered duplicate; it never, on its own, asserts retry-safety.
+      </xsd:documentation>
+    </xsd:annotation>
+  </xsd:element>
+
+  <xsd:complexType name="ProcessType">
+    <xsd:attribute name="idempotent" type="xsd:boolean" default="false"/>
+  </xsd:complexType>
+
+  <!-- ===================== Audit configuration per process ===================== -->
+
+  <xsd:element name="audit" type="q:AuditType"/>
+
+  <xsd:complexType name="AuditType">
+    <xsd:attribute name="sink" type="xsd:string" default="sql"/>
+    <xsd:attribute name="target" type="xsd:string"/>
+    <xsd:attribute name="capture" type="q:AuditCapture" default="payload"/>
+  </xsd:complexType>
+
+  <xsd:simpleType name="AuditCapture">
+    <xsd:restriction base="xsd:string">
+      <xsd:enumeration value="none"/>
+      <xsd:enumeration value="metadata"/>
+      <xsd:enumeration value="payload"/>
+    </xsd:restriction>
+  </xsd:simpleType>
+
+  <!-- ===================== Shared types ===================== -->
+
+  <xsd:simpleType name="Scope">
+    <xsd:restriction base="xsd:string">
+      <xsd:enumeration value="common"/>
+      <xsd:enumeration value="tenant"/>
+    </xsd:restriction>
+  </xsd:simpleType>
+
+  <!-- ===================== Declared process variables (T4) ===================== -->
+
+  <xsd:element name="variables" type="q:VariablesType">
+    <xsd:annotation>
+      <xsd:documentation>
+        Process-level declaration of process variables (T4). Lives in the &lt;bpmn:process&gt;'s own
+        &lt;bpmn:extensionElements&gt;. Each &lt;q:variable&gt; names a variable and its scalar type
+        (string | number | boolean) or a schemas/ schema, so static navigation-to-schema validation can check
+        variable-rooted FEEL paths (e.g. a numeric comparison on a string variable is flagged at deploy).
+      </xsd:documentation>
+    </xsd:annotation>
+  </xsd:element>
+
+  <xsd:complexType name="VariablesType">
+    <xsd:sequence>
+      <xsd:element ref="q:variable" minOccurs="0" maxOccurs="unbounded"/>
+    </xsd:sequence>
+  </xsd:complexType>
+
+  <xsd:element name="variable" type="q:VariableType">
+    <xsd:annotation>
+      <xsd:documentation>
+        One declared process variable: @name plus either @type (a scalar) or @schema (a schemas/ file the
+        variable's value conforms to). @type is honoured for variable-rooted path validation; @schema binds
+        the variable to a message shape so template/navigation field reads on that variable are field-checked
+        at deploy (SSI — closed schema: unknown field is an ERROR; open schema: a WARN).
+
+        @transient marks a variable that is NEVER persisted to the instance store — it is held in
+        memory for the current execution and is gone on resume. Reading a @transient variable after a wait
+        state is a package-time validation ERROR (the value cannot survive the park). @sensitive marks a
+        variable whose value IS persisted (resume needs it) but MUST be redacted in logs, audit sinks and
+        diagnostics; the snapshot records the marking so downstream layers can redact.
+
+        @source (T4-2) declares the variable is a FEED-OFF from a channel's intake: its value is rendered
+        from the payload an intake node yields on that channel (a start event, an intermediate message catch,
+        or a userTask relay). This carries INITIALIZATION AWARENESS — a @source-bound variable is
+        "payload-initialized": it holds no value until that channel's payload arrives, distinct from an
+        in-instance variable the flow assigns. The engine fail-closes at load if @source names a channel no
+        intake node in the process subscribes to (via q:source channel), because such a variable could never
+        be initialized. Correlation keys needed BEFORE the payload use a q:alias, not a variable.
+
+        @subjectKey marks a (typically @sensitive) variable as a data-subject identifier (e.g. customerId).
+        Its value is blind-indexed (HMAC) so the instances holding a given subject can be enumerated for
+        GDPR disclosure and erasure.
+      </xsd:documentation>
+    </xsd:annotation>
+  </xsd:element>
+
+  <xsd:complexType name="VariableType">
+    <xsd:attribute name="name" type="xsd:string" use="required"/>
+    <xsd:attribute name="type" type="q:VariableScalarType"/>
+    <xsd:attribute name="schema" type="xsd:string"/>
+    <xsd:attribute name="source" type="xsd:string"/>
+    <xsd:attribute name="transient" type="xsd:boolean" default="false"/>
+    <xsd:attribute name="sensitive" type="xsd:boolean" default="false"/>
+    <xsd:attribute name="subjectKey" type="xsd:boolean" default="false"/>
+  </xsd:complexType>
+
+  <xsd:simpleType name="VariableScalarType">
+    <xsd:restriction base="xsd:string">
+      <xsd:enumeration value="string"/>
+      <xsd:enumeration value="number"/>
+      <xsd:enumeration value="boolean"/>
+    </xsd:restriction>
+  </xsd:simpleType>
+
+  <xsd:element name="coverage" type="q:CoverageType">
+    <xsd:annotation>
+      <xsd:documentation>
+        Path-coverage metric (opt-in) — declares one tracked compliance path through the process. Placed in the
+        &lt;bpmn:process&gt;'s &lt;bpmn:extensionElements&gt;, one &lt;q:coverage&gt; per path. @path is a stable
+        path id (unique within the process); @flows is the space-separated ordered list of sequence-flow (edge)
+        ids the path traverses (read off the rendered diagram). A path is covered when a running instance walks
+        every flow, in order. Co-located with the flow it measures, so it cannot drift and is frozen in the
+        module checksum. A callActivity/subProcess is a single step in the enclosing path; the nested process's
+        coverage is its own. See the book's "Coverage" chapter.
+      </xsd:documentation>
+    </xsd:annotation>
+  </xsd:element>
+
+  <xsd:complexType name="CoverageType">
+    <xsd:attribute name="path" type="xsd:string" use="required"/>
+    <xsd:attribute name="flows" type="xsd:string" use="required"/>
+  </xsd:complexType>
+
+</xsd:schema>

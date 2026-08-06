@@ -1,0 +1,105 @@
+[package]
+name = "sutra-cli"
+description = "The `sutra` command-line tool: schema migrations, BPMN inspectors, FEEL explain, scaffolding, coverage init/check"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "sutra"
+path = "src/main.rs"
+
+[dependencies]
+# Read-only route enumeration + scaffold verification over the engine's own model.
+sutra-bpmn = { path = "../sutra-bpmn" }
+sutra-feel = { path = "../sutra-feel" }
+sutra-loader = { path = "../sutra-loader" }
+# `sutra openapi` emits a deployment's generated OpenAPI surface offline (the same
+# projection the engine serves live). The generator + its input types (channels / datastore).
+sutra-openapi = { path = "../sutra-openapi" }
+sutra-channels = { path = "../sutra-channels" }
+sutra-datastore = { path = "../sutra-datastore" }
+sutra-persistence = { path = "../sutra-persistence" }
+# `sutra crypto provision-dek` — mint + KEK-wrap a per-tenant DEK into the data_key store (the
+# envelope KeyProvider's boot-load source). Same crypto seam the engine uses; the KEK ref resolves
+# through the envref registry's builtins (env:/secret:).
+sutra-crypto = { path = "../sutra-crypto" }
+sutra-envref-spi = { path = "../sutra-envref-spi" }
+# Cross-process coverage: the correlation-aware `sutra coverage check` reads the typed
+# coverage-metric store (`CoverageMetricStore` / `CoverageFragment` / `CoverageMetrics` /
+# `StoreError`, `InMemoryCoverageStore` for the union-find unit tests). Already in the CLI's
+# transitive tree via sutra-loader / sutra-persistence; a direct dep for the store-read plumbing.
+sutra-executor = { path = "../sutra-executor" }
+# Bundled builtin payload codecs (force-linked in main.rs) so `sutra` CLI codec resolution
+# (lint / package / simulate, via sutra-loader) sees the zero-config codec set via inventory.
+# Formats only: message-standard codecs are proprietary extension crates, and a deployment that
+# binds one is linted by the CLI of the distribution that bundles it.
+sutra-formats = { path = "../sutra-formats" }
+# `sutra test simulate` (F5, the P1-7 time-skipping CLI wrapper): boots a real
+# `sutra_engine::serve` with `EngineConfig::now_override` installed from Rust code, and reuses
+# `fast_forward_until`. This is a Rust-level construction, the SAME sanctioned pattern an app
+# author's own Testcontainers IT uses — the production `sutra-engine` binary's own
+# `EngineConfig::load()` (config file / `SUTRA_*` env) still never sets `now_override`, so the
+# "no operator-reachable path to a TestClock" invariant is unchanged.
+sutra-engine = { path = "../sutra-engine" }
+# `sutra test simulate` boots a REAL engine, which needs at least one transport bound for any
+# deployment's channels to work — HTTP, the baseline transport (mirrors `sutra-formats` above:
+# schema-less/transport-neutral pieces ship in the public distribution; a distribution that
+# wants Kafka/AMQP/etc. driven by `test simulate` links its own `sutra` binary variant with
+# those transports the way `sutra-dist`'s cargo features do). Force-linked in `main.rs`.
+sutra-transport-http = { path = "../sutra-transport-http" }
+
+# The generator LIBRARIES the CLI ships as subcommands (`sutra docgen`, `sutra schemagen`,
+# `sutra catalog`). None of them carries a binary target any more — the `sutra` binary is their
+# one entry point (workspace binaries: `sutra` + the engine's `sutra-engine`).
+sutra-catalog-gen = { path = "../sutra-catalog-gen" }
+sutra-docgen = { path = "../sutra-docgen" }
+sutra-schema-gen = { path = "../sutra-schema-gen" }
+
+quick-xml = { workspace = true }
+regex = { workspace = true }
+serde_json = { workspace = true }
+# Data-only YAML reads of channels.yaml / datastores.yaml when `coverage init`
+# wires the admin channels + store (same crate/posture as sutra-channels).
+serde_yaml_ng = "0.10"
+time = { workspace = true }
+tracing = { workspace = true }
+
+# New for the CLI: argument parsing + embedded SQL trees. `string` lets the command's name and
+# version be built at run time (the program name comes from argv[0], the version from whichever
+# distribution embeds this library) rather than being `&'static str` literals.
+clap = { version = "4", features = ["derive", "env", "string"] }
+# The PgCoverageStore→CoverageMetricStore adapter implements the executor's
+# `?Send` async store SPI (native RPITIT is not dyn-safe — same reason sutra-executor uses it).
+async-trait = { workspace = true }
+# `sutra deploy --wait` polls the engine's /sutra/deployments/{id} readiness endpoint.
+# Same feature set as the conformance harness (rustls, shared with the kube HTTP stack).
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+include_dir = "0.7"
+
+# `sutra deploy` / `sutra undeploy` — the native Kubernetes client: kube-rs with kubeconfig
+# contexts + rustls, NOT a kubectl shell-out. Client-only surface, no controller runtime;
+# k8s-openapi supplies the typed ConfigMap/Secret resources.
+kube = { version = "4", default-features = false, features = ["client", "config", "rustls-tls"] }
+k8s-openapi = { version = "0.28", default-features = false, features = ["latest"] }
+
+# Same sqlx line as sutra-persistence (the migrate library hands out PgConnection).
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio",
+    "postgres",
+    "time",
+] }
+tokio = { version = "1", features = ["rt", "macros"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[dev-dependencies]
+sutra-testkit = { path = "../sutra-testkit" }
+testcontainers = { workspace = true }
+testcontainers-modules = { workspace = true }
+# `test_simulate_it.rs`'s safety-refusal fixture seeds a dummy `instance_state` row directly.
+uuid = { version = "1", features = ["v4"] }
+# Mocked Kubernetes API layer for the deploy/undeploy unit tests — kube's documented
+# tower-test mock-service pattern (Client::new over a scripted Service; NO live cluster).
+http = "1"
+tower-test = "0.4"

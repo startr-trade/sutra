@@ -1,0 +1,16 @@
+[package]
+name = "sutra-envref-aws"
+description = "AWS Secrets Manager envref resolver — extracted from the neutral engine (domain-neutrality refactor): the `aws-secrets:<secret-id>[#<json-key>]` SchemeResolver, self-registering as an EnvRefResolverEntry via inventory so sutra-dist bundles it without the neutral sutra-engine naming the AWS SDK. TLS pinned to the ring rustls aws-smithy-http-client (no native-tls/aws-lc-rs)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+sutra-envref-spi = { path = "../sutra-envref-spi" }
+inventory = "0.3.24"
+aws-config = { workspace = true }
+aws-sdk-secretsmanager = { workspace = true }
+aws-smithy-http-client = { workspace = true }
+serde_json = { workspace = true }
+tokio = { version = "1", features = ["rt", "net", "time"] }

@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Approval-hold sample: the human-in-the-loop wait-state relay, end to end.
+
+  Flow (arrows written as "then" to keep the XML comment legal):
+    startEvent on the approval-request channel decodes + validates an ApprovalRequest and records the
+    correlation alias e2eId = payload.E2EId (unique, onConflict=correlate) in the durable alias index;
+    then userTask "AwaitDecision" on the approval-decision channel, where the instance PARKS (suspend
+    then persist snapshot). A later ApprovalDecision inbound on the approval-decision channel is a
+    channel-delivered RELAY: no start event subscribes, so the dispatcher runs the same two-tier
+    intake against the wait node's q:source, correlates by the process's q:alias (onConflict correlate)
+    via AliasStore.findLive, and RESUMES the parked instance; then endEvent "Done".
+
+  The alias is retired at completion, so a fresh ApprovalRequest with the same E2EId is accepted
+  again (whereas a duplicate WHILE the first is parked hits the unique-alias correlate guard).
+-->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0"
+                  id="Definitions_approval"
+                  targetNamespace="urn:sutra:module:approval:1.0.0">
+
+  <bpmn:process id="approval-hold" name="Approval Hold" isExecutable="true">
+
+    <bpmn:startEvent id="StartEvent_Request" name="ApprovalRequest received">
+      <bpmn:extensionElements>
+        <!-- The approval codec (schemas/approval.xsd) declares two message types; pin the one this start
+             event consumes so routing + payload navigation are statically verifiable. -->
+        <q:source channel="approval-request" messageTypeValue="ApprovalRequest"/>
+        <!-- Correlation key: unique across live instances, and onConflict=correlate so a second
+             request carrying the same E2EId while the first is still live is a correlate-collision
+             (rejected here; a channel-delivered relay on approval-decision is the resume path). -->
+        <q:alias name="e2eId" expression="payload.E2EId" unique="true" onConflict="correlate"/>
+      </bpmn:extensionElements>
+      <bpmn:outgoing>Flow_StartToHold</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="Flow_StartToHold" sourceRef="StartEvent_Request" targetRef="UserTask_AwaitDecision"/>
+
+    <!-- The hold: a wait node makes the process stateful. Its <q:source> names the relay channel
+         the human decision arrives on. -->
+    <bpmn:userTask id="UserTask_AwaitDecision" name="Await approval decision">
+      <bpmn:extensionElements>
+        <q:source channel="approval-decision"/>
+      </bpmn:extensionElements>
+      <bpmn:incoming>Flow_StartToHold</bpmn:incoming>
+      <bpmn:outgoing>Flow_HoldToEnd</bpmn:outgoing>
+    </bpmn:userTask>
+    <bpmn:sequenceFlow id="Flow_HoldToEnd" sourceRef="UserTask_AwaitDecision" targetRef="EndEvent_Done"/>
+
+    <bpmn:endEvent id="EndEvent_Done" name="Decision applied">
+      <bpmn:incoming>Flow_HoldToEnd</bpmn:incoming>
+    </bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>

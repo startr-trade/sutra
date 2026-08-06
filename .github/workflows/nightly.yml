@@ -1,0 +1,106 @@
+name: Nightly (tier-2 Docker suites)
+
+# The Docker/testcontainers tier, kept OUT of the PR gate (see the rationale block in
+# ci.yml). Best-effort nightly signal: `make test-docker` brings up PostgreSQL,
+# MySQL/MariaDB, SQL Server, RabbitMQ, Kafka and LocalStack fixtures via testcontainers.
+#
+# STATUS: stub — enabled on a schedule and on demand, but not a merge gate. A GitHub-hosted
+# 2-core / 7 GB runner is close to the floor for this tier; if it proves flaky, the options
+# in preference order are (a) a larger hosted runner, (b) a self-hosted Docker runner,
+# (c) narrow it with `make test-docker P=<crate>` per crate in a matrix.
+#
+# Tier-3 (k8s conformance, `make test-k8s`) is deliberately NOT here: it needs an
+# OpenTofu-provisioned kind cluster and remains a local/milestone gate.
+
+on:
+  schedule:
+    - cron: "17 2 * * *" # 02:17 UTC daily
+  workflow_dispatch:
+    inputs:
+      crate:
+        description: "Narrow to one crate (make test-docker P=<crate>); blank = whole workspace"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly-tier2
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  # See ci.yml: debug info blows the runner's disk and makes rust-lld die with SIGBUS mid-link.
+  # Tier-2 is worse than tier-1 here — it also pulls container images onto the same disk.
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+
+jobs:
+  tier2:
+    name: tier-2 (make test-docker)
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          key: tier2
+      # Reclaim the ~25 GB of unused preinstalled toolchains BEFORE building: tier-2 needs room
+      # for the test binaries AND every testcontainer image it pulls (postgres, mysql, mssql,
+      # rabbitmq, kafka, localstack).
+      - name: Free disk space
+        run: |
+          df -h / | tail -1
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost /opt/hostedtoolcache/CodeQL || true
+          df -h / | tail -1
+      # The sutra-conformance suite is an END-TO-END product gate: it boots the real engine
+      # image via testcontainers. That image is built locally by convention (`make image-it`
+      # pushes to a dev registry) and does NOT exist on a hosted runner — testcontainers then
+      # tries to PULL `sutra-rust-engine:dev` from Docker Hub and every conformance test dies
+      # with "pull access denied" (29 failures, observed 2026-08-03). Build it here, no push:
+      # testcontainers resolves images from the local daemon — which is what `load:` is for.
+      #
+      # Built through buildx with a GHA-backed layer cache, the same pattern release.yml
+      # uses: the Dockerfile's chef-cook layer — the entire dependency graph — dominates
+      # this build and only changes when the lockfile does, so on most nights it is a cache
+      # hit and only the workspace crates recompile. Its own `scope=` keeps the release-it
+      # layers from colliding with the release build's (different CARGO_PROFILE, different
+      # layers). Scheduled runs execute on main, so the cache this saves is the cache the
+      # next night can read.
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Build engine image (sutra-conformance fixture)
+        uses: docker/build-push-action@v6
+        with:
+          context: ./rust
+          file: ./rust/Dockerfile
+          build-args: |
+            CARGO_PROFILE=release-it
+          tags: sutra-rust-engine:dev
+          push: false
+          load: true
+          cache-from: type=gha,scope=nightly-release-it
+          cache-to: type=gha,mode=max,scope=nightly-release-it
+      - name: Verify engine image
+        run: |
+          docker image inspect sutra-rust-engine:dev --format 'engine image ready: {{.Id}}'
+      - name: Docker preflight
+        run: docker version
+      - name: make test-docker
+        run: |
+          if [ -n "${{ github.event.inputs.crate }}" ]; then
+            make test-docker TEST_THREADS=2 P="${{ github.event.inputs.crate }}"
+          else
+            make test-docker TEST_THREADS=2
+          fi
+      # testcontainers-rs ships no ryuk sidecar; reap anything a killed run leaked so the
+      # runner image is clean even on failure (a no-op on ephemeral hosted runners, but
+      # correct on self-hosted ones).
+      - name: Reap leaked fixtures
+        if: always()
+        run: make docker-clean

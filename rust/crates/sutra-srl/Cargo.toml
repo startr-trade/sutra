@@ -1,0 +1,10 @@
+[package]
+name = "sutra-srl"
+description = "Sutra Rule Language (.srl) — stateless, DRL-inspired rules DSL compiled onto FEEL"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+sutra-feel = { path = "../sutra-feel" }

@@ -1,0 +1,80 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  generated-by: sutra create bpmn %%PROCESS%% (validation policy: %%MODE%%; edit freely — this
+  file is yours; regeneration never touches it unless forced)
+
+  Validation-gateway wiring:
+
+    Start (%%MESSAGE_TYPE%% on %%CHANNEL%%) -> [Validation outcome?]
+      - rejected: %%CONDITION_DOC%% -> RejectReply (%%PROCESS%%-rejected.hbs)
+      - accepted (gateway default)  -> AcceptReply (%%PROCESS%%-accepted.hbs)
+
+  Intake validation runs before the graph: the codec's structural pass (tier "structural") and
+  any <q:validators> ruleset (tier "content") summarise into the `validation` variable —
+  outcome: OK | SOFT_ERRORS | FATAL, tier, firstReasonCode, firstIssue, issues[]. The
+  process-level <q:onValidation mode="route"> keeps failed payloads flowing INTO the graph so
+  the visible gateway owns the decision instead of a reject at the door.
+-->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                  xmlns:q="urn:sutra:q:1.0"
+                  id="Definitions_%%PROCESS_ID%%"
+                  targetNamespace="%%NAMESPACE%%">
+
+  <bpmn:process id="%%PROCESS%%" name="%%PROCESS_NAME%%" isExecutable="true">
+
+    <bpmn:extensionElements>
+      <!-- Shared message contract: declared once at process level, inherited by every intake
+           start event (a second transport intake needs no duplication). -->
+      <q:onValidation mode="route"/>
+      <!-- Business rulesets (rules/*.dmn in this package) plug in here:
+      <q:validators>
+        <q:complexValidator source="my-ruleset.dmn"/>
+      </q:validators>
+      -->
+    </bpmn:extensionElements>
+
+    <bpmn:startEvent id="Start" name="%%MESSAGE_TYPE%% received">
+      <bpmn:extensionElements>
+        <q:source channel="%%CHANNEL%%" messageTypeValue="%%MESSAGE_TYPE%%"/>
+      </bpmn:extensionElements>
+      <bpmn:outgoing>Flow_StartToOutcome</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="Flow_StartToOutcome" sourceRef="Start" targetRef="ValidationOutcome"/>
+
+    <!-- The validation gateway: reject-worthy outcomes exit right; everything else takes the
+         default (accepted) flow. -->
+    <bpmn:exclusiveGateway id="ValidationOutcome" name="Validation outcome?" default="Flow_Accepted">
+      <bpmn:incoming>Flow_StartToOutcome</bpmn:incoming>
+      <bpmn:outgoing>Flow_Rejected</bpmn:outgoing>
+      <bpmn:outgoing>Flow_Accepted</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+
+    <bpmn:sequenceFlow id="Flow_Rejected" name="rejected" sourceRef="ValidationOutcome" targetRef="RejectReply">
+      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">%%REJECT_CONDITION%%</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:serviceTask id="RejectReply" name="Reply rejected" implementation="%%PROCESS%%-rejected.hbs">
+      <bpmn:extensionElements>
+        <q:reply mode="native" contentType="application/xml"/>
+      </bpmn:extensionElements>
+      <bpmn:incoming>Flow_Rejected</bpmn:incoming>
+      <bpmn:outgoing>Flow_RejectToEnd</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="Flow_RejectToEnd" sourceRef="RejectReply" targetRef="End"/>
+
+    <bpmn:sequenceFlow id="Flow_Accepted" name="accepted" sourceRef="ValidationOutcome" targetRef="AcceptReply"/>
+    <bpmn:serviceTask id="AcceptReply" name="Reply accepted" implementation="%%PROCESS%%-accepted.hbs">
+      <bpmn:extensionElements>
+        <q:reply mode="native" contentType="application/xml"/>
+      </bpmn:extensionElements>
+      <bpmn:incoming>Flow_Accepted</bpmn:incoming>
+      <bpmn:outgoing>Flow_AcceptToEnd</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="Flow_AcceptToEnd" sourceRef="AcceptReply" targetRef="End"/>
+
+    <bpmn:endEvent id="End" name="Done">
+      <bpmn:incoming>Flow_RejectToEnd</bpmn:incoming>
+      <bpmn:incoming>Flow_AcceptToEnd</bpmn:incoming>
+    </bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>

@@ -1,0 +1,109 @@
+[package]
+name = "sutra-engine"
+description = "The Rust engine binary: config + resource loader + full assembly — persistence, datastores, executor, channels, suspend→resume bridge — behind the health endpoints"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+sutra-loader = { path = "../sutra-loader" }
+sutra-bpmn = { path = "../sutra-bpmn" }
+# The codec SPI + the schema-backed codec builders (StructuralCodec, used by assembly's deploy
+# path). The neutral engine LIBRARY names NO concrete business codec / format / transport — it
+# collects them generically via builtin_codecs()/builtin_formats()/transport_factories(). The
+# BINARY that bundles the concretes is `sutra-dist` (the composition root); this crate is a library.
+sutra-codec-spi = { path = "../sutra-codec-spi" }
+sutra-codec-schema = { path = "../sutra-codec-schema" }
+sutra-channels = { path = "../sutra-channels" }
+# The per-deployment OpenAPI 3.1 surface generator — projects each plan's channels +
+# modules + declared stores into the spec served at GET /sutra/deployments/{id}/openapi.
+sutra-openapi = { path = "../sutra-openapi" }
+# The transport SPI + shared cluster substrate (leadership election, EngineIntake, the
+# TransportChannels/TransportFactory inventory seam) — the engine drives channels generically
+# through this; the concrete transports are bundled by sutra-dist, not named here.
+sutra-transport-spi = { path = "../sutra-transport-spi" }
+sutra-executor = { path = "../sutra-executor" }
+# Archive-supplied Handlebars ContentRedactor (redactors/*.hbs → HbsContentRedactor) — the
+# deployment-scoped counterpart to the built-in redactor crates.
+# NOT a built-in (no inventory::submit!): assembly instantiates it directly at deploy time.
+sutra-redactor-template = { path = "../sutra-redactor-template" }
+# The vendor-neutral secret-reference (envref) SPI — the SchemeResolver contract + the neutral
+# env:/secret: builtins + the ResolverRegistry the config/assembly/otel paths resolve through.
+# The engine names NO vendor resolver (no vaultrs / AWS SDK): the vault: + aws-secrets: schemes
+# are self-registered EnvRefResolverEntry inventory submissions bundled by sutra-dist.
+sutra-envref-spi = { path = "../sutra-envref-spi" }
+sutra-datastore = { path = "../sutra-datastore" }
+# Declared-field enumeration (`Schema::fields_of`) for a data store's `structure:` block — the
+# plan-time step that turns a declared type into a store's column projection. Already in the graph
+# under sutra-codec-schema/sutra-datastore; named here because assembly compiles the package's own
+# XSD codec directly rather than through a codec.
+sutra-xsd = { path = "../sutra-xsd" }
+sutra-persistence = { path = "../sutra-persistence" }
+sutra-crypto = { path = "../sutra-crypto" }
+sutra-feel = { path = "../sutra-feel" }
+sutra-dmn = { path = "../sutra-dmn" }
+sutra-srl = { path = "../sutra-srl" }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json", "query"] }
+serde_json = { workspace = true }
+quick-xml = { workspace = true }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "uuid"] }
+time = { workspace = true }
+uuid = { version = "1", features = ["v4"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time"] }
+# The async DataStore/CoverageStore adapters over the sutra_datastore dialect stores.
+async-trait = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter", "fmt"] }
+# Admin-OIDC gating for the `/admin/*` surface. `jsonwebtoken` verifies the bearer JWT
+# (RS*/PS*/ES*/EdDSA against the JWKS; the crypto backend is `ring`, already in the tree via
+# rustls — no aws-lc / openssl); `reqwest` (rustls/ring, matching the workspace line) fetches a
+# remote JWKS URL. An inline JWKS delivered via `secret:` needs no fetch. Both are already
+# workspace-pinned and compiled elsewhere in the tree (cli / conformance / envref-gcp).
+jsonwebtoken = { workspace = true }
+reqwest = { workspace = true }
+# OTLP traces + metrics + logs export, layered onto the tracing facade.
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+opentelemetry-otlp = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+opentelemetry-appender-tracing = { workspace = true }
+
+[dev-dependencies]
+serde_yaml_ng = "0.10"
+# Drive the `/admin/*` router in-process (`ServiceExt::oneshot`) for the gate tests
+# (401/403/200) without binding a socket. Matches the axum 0.8 tower line used across the tree.
+tower = { version = "0.5", features = ["util"] }
+# The SDK `testing` feature exposes `InMemoryMetricExporter`, used by the
+# coverage-percent gauge tests (force_flush → read back the recorded synchronous gauge). Test
+# builds only — the shipped library never enables it.
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
+sutra-testkit = { path = "../sutra-testkit" }
+# Test-only: the engine integration tests (tests/all) boot a full runtime via serve(), so they
+# force-link the transports + formats to bind channels + resolve builtin_formats(). These are DEV
+# dependencies — the SHIPPED engine library names no concrete impl; the bundling for the deployed
+# binary lives in sutra-dist. The feature-selected (hardened) bundling is a sutra-dist concern; the
+# ITs always link the full set.
+sutra-formats = { path = "../sutra-formats" }
+sutra-transport-http = { path = "../sutra-transport-http" }
+sutra-transport-kafka = { path = "../sutra-transport-kafka" }
+sutra-transport-sqs = { path = "../sutra-transport-sqs" }
+sutra-transport-gcp-pubsub = { path = "../sutra-transport-gcp-pubsub" }
+sutra-transport-rabbitmq = { path = "../sutra-transport-rabbitmq" }
+sutra-transport-amqp = { path = "../sutra-transport-amqp" }
+sutra-transport-file = { path = "../sutra-transport-file" }
+# Raw RabbitMQ client for the leadership IT (queue declare + publish into the broker).
+# The per-broker conformance clients (rdkafka/aws/google/fe2o3) moved to their transport
+# crates with the conformance ITs (domain-neutrality refactor) — the engine bundles the
+# transports but no longer tests them directly, so it links no broker client but lapin here.
+lapin = { workspace = true }
+testcontainers = { workspace = true }
+# `mysql` backs the datastore driver-dispatch lib test (assembly.rs); `postgres` + `kafka`
+# come from the workspace default. Dev-only — the binary is unaffected.
+testcontainers-modules = { workspace = true, features = ["mysql"] }
+# Raw ZIP entry access for the archive-tampering conformance fixtures.
+zip = { workspace = true }
+# In-process OTLP gRPC receiver for the telemetry integration test.
+opentelemetry-proto = { workspace = true }
+tonic = { workspace = true }
+tokio-stream = { workspace = true }

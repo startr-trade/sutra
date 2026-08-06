@@ -1,0 +1,107 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--AUTHORED FIXTURE — not a published schema. Standards-Editor idiom; see provenance.md.-->
+<xs:schema xmlns="urn:iso:std:iso:20022:tech:xsd:test.002.001.03" xmlns:xs="http://www.w3.org/2001/XMLSchema" elementFormDefault="qualified" targetNamespace="urn:iso:std:iso:20022:tech:xsd:test.002.001.03">
+    <xs:element name="Document" type="Document"/>
+    <xs:complexType name="Document">
+        <xs:sequence>
+            <xs:element name="OrdrCnfrmtn" type="OrderConfirmationV03"/>
+        </xs:sequence>
+    </xs:complexType>
+    <xs:complexType name="OrderConfirmationV03">
+        <xs:sequence>
+            <xs:element name="MsgId" type="Max35Text"/>
+            <xs:element name="CreDtTm" type="ISODateTime"/>
+            <xs:element maxOccurs="1" minOccurs="0" name="SssnIdr" type="Exact4AlphaNumericText"/>
+            <xs:element name="Sts" type="ConfirmationStatus1Code"/>
+            <xs:element name="TtlAmt" type="ActiveCurrencyAndAmount"/>
+            <xs:element name="OrdrRef" type="OrderReference1Choice"/>
+            <xs:element maxOccurs="unbounded" minOccurs="0" name="Line" type="OrderLine1"/>
+            <xs:element maxOccurs="unbounded" minOccurs="0" name="SplmtryData" type="SupplementaryData1"/>
+        </xs:sequence>
+    </xs:complexType>
+    <xs:complexType name="OrderReference1Choice">
+        <xs:choice>
+            <xs:element name="OrdrId" type="Max35Text"/>
+            <xs:element name="ExtrnlRef" type="Max35Text"/>
+        </xs:choice>
+    </xs:complexType>
+    <xs:complexType name="OrderLine1">
+        <xs:sequence>
+            <xs:element name="ItmCd" type="Exact4AlphaNumericText"/>
+            <xs:element name="Qty" type="DecimalNumber"/>
+            <xs:element name="UnitPric" type="ActiveCurrencyAndAmount"/>
+            <xs:element maxOccurs="1" minOccurs="0" name="Dsclmr" type="Max350Text"/>
+            <xs:element maxOccurs="1" minOccurs="0" name="DlvryDt" type="ISODate"/>
+            <xs:element maxOccurs="1" minOccurs="0" name="BckOrdrd" type="YesNoIndicator"/>
+        </xs:sequence>
+    </xs:complexType>
+    <xs:complexType name="ActiveCurrencyAndAmount">
+        <xs:simpleContent>
+            <xs:extension base="ActiveCurrencyAndAmount_SimpleType">
+                <xs:attribute name="Ccy" type="ActiveCurrencyCode" use="required"/>
+            </xs:extension>
+        </xs:simpleContent>
+    </xs:complexType>
+    <xs:complexType name="SupplementaryData1">
+        <xs:sequence>
+            <xs:element maxOccurs="1" minOccurs="0" name="PlcAndNm" type="Max350Text"/>
+            <xs:element name="Envlp" type="SupplementaryDataEnvelope1"/>
+        </xs:sequence>
+    </xs:complexType>
+    <xs:complexType name="SupplementaryDataEnvelope1">
+        <xs:sequence>
+            <xs:any namespace="##any" processContents="lax"/>
+        </xs:sequence>
+    </xs:complexType>
+    <xs:simpleType name="ActiveCurrencyAndAmount_SimpleType">
+        <xs:restriction base="xs:decimal">
+            <xs:fractionDigits value="5"/>
+            <xs:minInclusive value="0"/>
+            <xs:totalDigits value="18"/>
+        </xs:restriction>
+    </xs:simpleType>
+    <xs:simpleType name="ActiveCurrencyCode">
+        <xs:restriction base="xs:string">
+            <xs:pattern value="[A-Z]{3,3}"/>
+        </xs:restriction>
+    </xs:simpleType>
+    <xs:simpleType name="ConfirmationStatus1Code">
+        <xs:restriction base="xs:string">
+            <xs:enumeration value="ACPT"/>
+            <xs:enumeration value="PART"/>
+            <xs:enumeration value="RJCT"/>
+        </xs:restriction>
+    </xs:simpleType>
+    <xs:simpleType name="DecimalNumber">
+        <xs:restriction base="xs:decimal">
+            <xs:fractionDigits value="17"/>
+            <xs:totalDigits value="18"/>
+        </xs:restriction>
+    </xs:simpleType>
+    <xs:simpleType name="Exact4AlphaNumericText">
+        <xs:restriction base="xs:string">
+            <xs:pattern value="[a-zA-Z0-9]{4}"/>
+        </xs:restriction>
+    </xs:simpleType>
+    <xs:simpleType name="ISODate">
+        <xs:restriction base="xs:date"/>
+    </xs:simpleType>
+    <xs:simpleType name="ISODateTime">
+        <xs:restriction base="xs:dateTime"/>
+    </xs:simpleType>
+    <xs:simpleType name="Max350Text">
+        <xs:restriction base="xs:string">
+            <xs:minLength value="1"/>
+            <xs:maxLength value="350"/>
+        </xs:restriction>
+    </xs:simpleType>
+    <xs:simpleType name="Max35Text">
+        <xs:restriction base="xs:string">
+            <xs:minLength value="1"/>
+            <xs:maxLength value="35"/>
+        </xs:restriction>
+    </xs:simpleType>
+    <xs:simpleType name="YesNoIndicator">
+        <xs:restriction base="xs:boolean"/>
+    </xs:simpleType>
+</xs:schema>

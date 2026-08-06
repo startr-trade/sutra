@@ -1,0 +1,25 @@
+[package]
+name = "sutra-catalog-gen"
+description = "R15 Rust catalog generator LIBRARY — emits the artifact-documentation page system for rust/crates/** (syn-parsed source-file pages, crate-index pages, bidirectional Relationships tables, deterministic --check); shipped through the CLI as `sutra catalog`"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+# syn on the STABLE toolchain — rustdoc-JSON is nightly-only and deliberately NOT used (R15).
+# `full` unlocks every `syn::Item` variant + statements; `printing` (default) gives ToTokens for
+# signature rendering.
+syn = { version = "2", features = ["full"] }
+proc-macro2 = "1"
+quote = "1"
+# Cargo.toml manifest parsing (crate name / description / path dependencies). Parse-only:
+# `default-features = false, features = ["parse"]` drops the `display`/`toml_writer` half we
+# never use and keeps the build fully offline against the workspace's existing crate cache.
+toml_edit = { version = "0.25", default-features = false, features = ["parse"] }
+anyhow = "1"
+# --check regenerates into a temp dir and diffs against the committed tree.
+tempfile = "3"
+
+[dev-dependencies]
+tempfile = "3"

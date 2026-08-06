@@ -1,0 +1,88 @@
+# OTel Collector config for the local docker-compose reference stack.
+#
+# This mirrors deploy/modules/local-k8s-infra/observability.tf's
+# `local.otel_collector_config` (the current, actively-maintained k8s bring-up)
+# almost verbatim — same receiver, same processors (NaN-datapoint drop, the
+# dotted-vs-scalar `pool` attribute fix), same exporter shape, same index names
+# (sutra-traces / sutra-metrics / sutra-app-logs). Two deliberate local-only
+# differences, both called out in ../README.md "Differences from prod":
+#   1. The `elasticsearch` exporter endpoint is plain http:// (no TLS) — the
+#      compose Elasticsearch runs with xpack.security enabled but
+#      xpack.security.http.ssl.enabled: false, so there is no cert to trust.
+#   2. An `extensions.health_check` block is added (port 13133) purely so
+#      something on the host can poll collector liveness — the k8s Deployment
+#      the config is otherwise copied from has no readiness/liveness probe at
+#      all.
+#
+# ES_PASSWORD is read from the collector container's own environment
+# (docker-compose.yml sets it from the same ${ES_PASSWORD} used to seed the
+# Elasticsearch container's ELASTIC_PASSWORD) via the collector's native
+# `${env:NAME}` expansion — the identical syntax the k8s config uses.
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch: {}
+
+  filter/drop_nan:
+    error_mode: ignore
+    metrics:
+      datapoint:
+        - value_double != value_double
+
+  # Resolve a dotted-vs-scalar attribute collision: a metric carrying DOTTED
+  # `pool.name`/`pool.type` attributes collides with any metric carrying a SCALAR
+  # `pool`. Under ECS mapping ES turns the dotted keys into an OBJECT field `pool`,
+  # then rejects the scalar-`pool` docs ("object mapping for [pool] ... found a
+  # concrete value"), silently dropping them. Rename the dotted side to flat keys
+  # so `pool` stays a scalar keyword and nothing collides.
+  transform/pool_attr:
+    error_mode: ignore
+    metric_statements:
+      - context: datapoint
+        statements:
+          - set(attributes["pool_name"], attributes["pool.name"]) where attributes["pool.name"] != nil
+          - delete_key(attributes, "pool.name")
+          - set(attributes["pool_type"], attributes["pool.type"]) where attributes["pool.type"] != nil
+          - delete_key(attributes, "pool.type")
+
+extensions:
+  # Local-compose-only addition (see header) — probe with:
+  #   curl http://127.0.0.1:13133/
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+exporters:
+  debug:
+    verbosity: normal
+  elasticsearch:
+    endpoints: ["http://elasticsearch:9200"]
+    user: elastic
+    password: "${env:ES_PASSWORD}"
+    mapping:
+      mode: ecs
+    traces_index: sutra-traces
+    metrics_index: sutra-metrics
+    logs_index: sutra-app-logs
+
+service:
+  extensions: [health_check]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [debug, elasticsearch]
+    metrics:
+      receivers: [otlp]
+      processors: [transform/pool_attr, filter/drop_nan, batch]
+      exporters: [debug, elasticsearch]
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [debug, elasticsearch]

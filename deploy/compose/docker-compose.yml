@@ -1,0 +1,231 @@
+# Local backing-services stack for dev/prod parity (15-factor Factor 10).
+#
+# Mirrors the production service SET that the OpenTofu modules under deploy/modules/
+# provision (local-k8s-infra + local-k8s-cluster, and the deploy/k8s-it/shared-scenario
+# harness that runs against them): Postgres (engine persistence), RabbitMQ (broker),
+# Elasticsearch + Kibana + Fluent Bit (EFK), and an OTel Collector shipping OTLP
+# straight into Elasticsearch. Same image families, same canonical SUTRA_*/RABBITMQ_*
+# env-var names, same index names — just `docker compose up` instead of `tofu apply`
+# against a kind/real cluster. See README.md, including "Differences from prod".
+#
+# The Sutra engine itself is NOT started by default — this file's job is the backing
+# stack a locally-run engine (`cargo run -p sutra-engine`, or its own image) points at.
+# See the commented `engine` service at the bottom and README.md "Pointing a
+# locally-run engine at this stack".
+#
+# Usage:
+#   docker compose -f deploy/compose/docker-compose.yml up -d
+#   docker compose -f deploy/compose/docker-compose.yml down       # keep volumes
+#   docker compose -f deploy/compose/docker-compose.yml down -v    # wipe data too
+#
+# Every port below is published to 127.0.0.1 ONLY (loopback) — this stack ships fixed
+# dev-only credentials and must never be reachable beyond localhost.
+
+name: sutra-backing
+
+services:
+  # ===== Postgres — the ENGINE-INTERNAL datasource (instance/outbox/lease/audit
+  # tables). Never a deployment package's own business store — those declare their
+  # own connections in datastores.yaml. Same postgres:16-alpine pin every Rust
+  # testcontainers IT suite and deploy/k8s-it/shared-scenario/main.tf use.
+  postgres:
+    image: postgres:16-alpine
+    container_name: sutra-postgres
+    environment:
+      POSTGRES_DB: sutra
+      POSTGRES_USER: sutra
+      # Same variable name the CLI's `sutra migrate` reads as SUTRA_DB_PASSWORD
+      # (rust/crates/sutra-cli/src/commands/migrate.rs) — export it once and both
+      # this container's password and a host-run `sutra migrate` agree.
+      POSTGRES_PASSWORD: ${SUTRA_DB_PASSWORD:-sutra-dev-only}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - sutra-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sutra -d sutra"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    logging:
+      driver: fluentd
+      options:
+        fluentd-address: "127.0.0.1:24224"
+        tag: "docker.postgres"
+        fluentd-async: "true"
+
+  # ===== RabbitMQ — ONE broker, a real service account (no guest, no loopback
+  # backdoor) — matches deploy/k8s-it/shared-scenario/main.tf. The example channel
+  # YAMLs (examples/**/channels.yaml) already name their broker host `rabbitmq` and
+  # read `${RABBITMQ_USERNAME}` / `${RABBITMQ_PASSWORD}`, so nothing needs editing to
+  # point them at this stack.
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    container_name: sutra-rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USERNAME:-sutra}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-sutra-dev-only}
+    ports:
+      - "127.0.0.1:5672:5672"   # AMQP
+      - "127.0.0.1:15672:15672" # management UI (same creds)
+    volumes:
+      - sutra-rabbitmq-data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 10s
+      retries: 12
+      start_period: 10s
+    logging:
+      driver: fluentd
+      options:
+        fluentd-address: "127.0.0.1:24224"
+        tag: "docker.rabbitmq"
+        fluentd-async: "true"
+
+  # ===== Elasticsearch — single node, basic auth enabled (same `elastic` superuser
+  # prod's ECK-managed cluster uses via the `sutra-es-es-elastic-user` Secret), TLS
+  # OFF for local simplicity. See README "Differences from prod".
+  #
+  # Linux hosts: Elasticsearch refuses to start below the default kernel
+  # max-map-count (262144) — if it exits immediately, run:
+  #   sudo sysctl -w vm.max_map_count=262144
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.15.0
+    container_name: sutra-elasticsearch
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "true"
+      xpack.security.http.ssl.enabled: "false"
+      xpack.security.transport.ssl.enabled: "false"
+      ELASTIC_PASSWORD: ${ES_PASSWORD:-sutra-dev-only}
+      ES_JAVA_OPTS: "-Xms1g -Xmx1g"
+    ports:
+      - "127.0.0.1:9200:9200"
+    volumes:
+      - sutra-es-data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf -u elastic:${ES_PASSWORD:-sutra-dev-only} http://localhost:9200/_cluster/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    logging:
+      driver: fluentd
+      options:
+        fluentd-address: "127.0.0.1:24224"
+        tag: "docker.elasticsearch"
+        fluentd-async: "true"
+
+  # ===== Kibana — same version as Elasticsearch (ECK pins both together in
+  # deploy/modules/local-k8s-infra/variables.tf's var.elasticsearch_version).
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.15.0
+    container_name: sutra-kibana
+    environment:
+      ELASTICSEARCH_HOSTS: http://elasticsearch:9200
+      ELASTICSEARCH_USERNAME: elastic
+      ELASTICSEARCH_PASSWORD: ${ES_PASSWORD:-sutra-dev-only}
+    ports:
+      - "127.0.0.1:5601:5601"
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:5601/api/status | grep -q '\"level\":\"available\"' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    logging:
+      driver: fluentd
+      options:
+        fluentd-address: "127.0.0.1:24224"
+        tag: "docker.kibana"
+        fluentd-async: "true"
+
+  # ===== OTel Collector — one OTLP receiver for all three signals, ECS-mapped
+  # straight into Elasticsearch. Config is otel-collector-config.yaml, copied from
+  # deploy/modules/local-k8s-infra/observability.tf's local.otel_collector_config
+  # (see that file's header comment for the deliberate local-only deltas). Point a
+  # locally-run engine's SUTRA_TELEMETRY_OTLP_ENDPOINT at 127.0.0.1:4317.
+  #
+  # No container healthcheck: the otel/opentelemetry-collector-contrib image ships
+  # no shell/curl/wget to run a CMD-SHELL check with. The config's
+  # extensions.health_check (port 13133) is exposed for external polling instead —
+  # see otel-collector-config.yaml.
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.114.0
+    container_name: sutra-otel-collector
+    command: ["--config=/etc/otel/config.yaml"]
+    environment:
+      ES_PASSWORD: ${ES_PASSWORD:-sutra-dev-only}
+    volumes:
+      - ./otel-collector-config.yaml:/etc/otel/config.yaml:ro
+    ports:
+      - "127.0.0.1:4317:4317" # OTLP gRPC
+      - "127.0.0.1:4318:4318" # OTLP HTTP
+      - "127.0.0.1:13133:13133" # health_check extension
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+
+  # ===== Fluent Bit — ships the OTHER backing services' own container logs (see
+  # each service's `logging: driver: fluentd` above) into the sutra-logs index over
+  # the Fluent Forward protocol. Config is fluent-bit.conf — see its header comment
+  # for why this is a forward listener rather than a filesystem tail, and why the
+  # engine's application logs are never expected to arrive here (OTLP is their only
+  # path, straight to otel-collector above).
+  #
+  # No container healthcheck, same reason as otel-collector: the fluent/fluent-bit
+  # image ships no general-purpose shell utilities to probe its own :2020 endpoint
+  # with. Poll it from the host instead: curl http://127.0.0.1:2020/api/v1/health
+  fluent-bit:
+    image: fluent/fluent-bit:3.1.9
+    container_name: sutra-fluent-bit
+    environment:
+      ES_PASSWORD: ${ES_PASSWORD:-sutra-dev-only}
+    volumes:
+      - ./fluent-bit.conf:/fluent-bit/etc/fluent-bit.conf:ro
+    ports:
+      - "127.0.0.1:24224:24224" # Fluent Forward input (the other services log here)
+      - "127.0.0.1:2020:2020"   # Fluent Bit's own HTTP monitoring endpoint
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+
+  # ===== Optional: run the Sutra engine itself in this Compose project. Uncomment,
+  # point SUTRA_ENGINE_IMAGE at a locally built tag, and drop packaged .sutra
+  # archives into ./deployments/ (create the directory first). Or run the engine
+  # OUTSIDE Compose (`cargo run -p sutra-engine`, or its own binary) and export the
+  # same SUTRA_*/RABBITMQ_* vars pointing at 127.0.0.1's published ports instead —
+  # see README.md "Pointing a locally-run engine at this stack".
+  # engine:
+  #   image: ${SUTRA_ENGINE_IMAGE:-sutra-engine:latest}
+  #   environment:
+  #     SUTRA_HTTP_PORT: "8080"
+  #     SUTRA_DEPLOYMENTS_DIR: /deployments
+  #     SUTRA_DATASOURCE_URL: postgresql://postgres:5432/sutra
+  #     SUTRA_DATASOURCE_USERNAME: sutra
+  #     SUTRA_DATASOURCE_PASSWORD: ${SUTRA_DB_PASSWORD:-sutra-dev-only}
+  #     RABBITMQ_USERNAME: ${RABBITMQ_USERNAME:-sutra}
+  #     RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:-sutra-dev-only}
+  #     SUTRA_TELEMETRY_OTLP_ENDPOINT: http://otel-collector:4317
+  #     SUTRA_TELEMETRY_SERVICE_NAME: sutra-engine
+  #     OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE: delta
+  #   volumes:
+  #     - ./deployments:/deployments:ro
+  #   ports:
+  #     - "127.0.0.1::8080" # dynamic host port — discover with `compose port engine 8080`
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+  #     rabbitmq:
+  #       condition: service_healthy
+  #     otel-collector:
+  #       condition: service_started
+
+volumes:
+  sutra-postgres-data:
+  sutra-rabbitmq-data:
+  sutra-es-data:

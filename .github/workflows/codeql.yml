@@ -1,0 +1,48 @@
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "27 3 * * 1" # weekly, Monday 03:27 UTC
+
+jobs:
+  analyze:
+    name: Analyze (Rust)
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      contents: read
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: rust
+            build-mode: none
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:${{ matrix.language }}"
+
+# NOTES
+# - CodeQL code scanning is FREE on public repositories (GitHub Advanced Security
+#   is included); on a private repo it needs a GHAS licence, so this effectively
+#   activates once the repo is public.
+# - CodeQL's Rust support is recent. `build-mode: none` extracts from source, which
+#   suits the workspace living under rust/. If it ever misses code, switch to
+#   build-mode `manual` with an explicit `cargo build` step (working-directory: rust).
+# - Alternatively, enable CodeQL "default setup" from the repo Security tab and delete
+#   this file.

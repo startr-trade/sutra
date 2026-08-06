@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Conformance (c)/(e) — a channel-call task parks keyed by its declared alias
+     (payload.key of the REQUEST); the correlated response on `call-response` resumes it,
+     the declared OUTPUT MAPPING binds payload.status of the RESPONSE to responseBody
+     (only mapped variables land), and the done-marker send carries it.
+     The long PT30S timeout never fires in the happy path; the terminal step must resolve
+     (cancel) its TIMER row. -->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0"
+                  id="Definitions_call_response"
+                  targetNamespace="urn:sutra:module:conf:1.0.0">
+  <bpmn:process id="call-response" name="Channel call with correlated response" isExecutable="true">
+    <bpmn:startEvent id="Start">
+      <bpmn:extensionElements>
+        <q:source channel="call-resp-start"/>
+      </bpmn:extensionElements>
+      <bpmn:outgoing>f1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="Start" targetRef="CallOut"/>
+    <bpmn:serviceTask id="CallOut" name="Call the partner" implementation="channel:callout2">
+      <bpmn:extensionElements>
+        <!-- The response arrives on this channel (relay path). -->
+        <q:source channel="call-response"/>
+        <!-- Park key: the request's business key; the response carries the same key. -->
+        <q:alias name="ccKey" expression="payload.key" unique="true"/>
+        <q:timeout duration="PT30S"/>
+      </bpmn:extensionElements>
+      <!-- Output mapping — the response payload lands ONLY per this mapping. -->
+      <bpmn:dataOutputAssociation>
+        <bpmn:assignment>
+          <bpmn:from>payload.status</bpmn:from>
+          <bpmn:to>responseBody</bpmn:to>
+        </bpmn:assignment>
+      </bpmn:dataOutputAssociation>
+      <bpmn:incoming>f1</bpmn:incoming>
+      <bpmn:outgoing>f2</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="f2" sourceRef="CallOut" targetRef="DoneNotify"/>
+    <bpmn:sendTask id="DoneNotify" name="Emit done marker (carries the mapped status)">
+      <bpmn:extensionElements>
+        <q:send destination="http://done.example/notify"/>
+      </bpmn:extensionElements>
+      <bpmn:incoming>f2</bpmn:incoming>
+      <bpmn:outgoing>f3</bpmn:outgoing>
+    </bpmn:sendTask>
+    <bpmn:sequenceFlow id="f3" sourceRef="DoneNotify" targetRef="End"/>
+    <bpmn:endEvent id="End">
+      <bpmn:incoming>f3</bpmn:incoming>
+    </bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>

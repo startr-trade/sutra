@@ -1,0 +1,10 @@
+# Deployment package — one standalone authoring unit. `sutra package <this dir>`
+# seals it into one content-addressed .sutra archive. Labels are opaque selectors: tenant
+# is a label, not a resource scope. Generated once from the retired overlay tree by
+# `sutra package --from-legacy-tree`; edit freely — this directory is the source now.
+labels:
+  "module": "money-transfer"
+  "tenant": "default"
+  "version": "1.0.0"
+engine:
+  minContract: 1

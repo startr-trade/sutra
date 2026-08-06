@@ -1,0 +1,10 @@
+[package]
+name = "sutra-envref-spi"
+description = "The secret-reference (envref) SPI + neutral builtins — extracted from the neutral engine core (domain-neutrality refactor). Holds the SchemeResolver contract, the env:/secret: neutral resolvers, the ResolverRegistry + public resolution fns, and the inventory-collected EnvRefResolverEntry seam per-vendor sutra-envref-<vendor> crates (vault, aws) self-register through — so sutra-engine resolves config secret-refs GENERICALLY and names no vendor."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+inventory = "0.3.24"

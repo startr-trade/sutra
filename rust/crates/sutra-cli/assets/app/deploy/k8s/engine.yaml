@@ -1,0 +1,88 @@
+# generated-by: sutra create app (edit freely — this file is yours)
+#
+# Kubernetes variant of the compose deploy: the same generic engine image, the same
+# environment keys, the deployments mount as a PersistentVolumeClaim. The engine database is
+# environment-provided (point the Secret at your PostgreSQL); packaged business stores bring
+# their OWN connections via each package's datastores.yaml.
+#
+# Deploy an archive:   kubectl cp <pkg>.sutra <engine-pod>:/deployments/
+# Reach the engine:    kubectl port-forward svc/%%APP%%-engine 0:80   (dynamic local port)
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: %%APP%%-engine-db
+type: Opaque
+stringData:
+  url: postgres://postgres.example.internal:5432/sutra   # your engine-internal database
+  username: sutra
+  password: change-me                                     # dev placeholder — use your secret manager
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: %%APP%%-deployments
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: %%APP%%-engine
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: %%APP%%-engine
+  template:
+    metadata:
+      labels:
+        app: %%APP%%-engine
+    spec:
+      containers:
+        - name: engine
+          image: sutra-engine:latest        # the generic engine image (same as compose)
+          env:
+            - name: SUTRA_DEPLOYMENTS_DIR     # deployment source root (packaged .sutra archives)
+              value: /deployments
+            - name: SUTRA_HTTP_PORT         # container-internal listen port
+              value: "8080"
+            - name: SUTRA_DATASOURCE_URL    # engine-internal datasource (never a business store)
+              valueFrom:
+                secretKeyRef: { name: %%APP%%-engine-db, key: url }
+            - name: SUTRA_DATASOURCE_USERNAME
+              valueFrom:
+                secretKeyRef: { name: %%APP%%-engine-db, key: username }
+            - name: SUTRA_DATASOURCE_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: %%APP%%-engine-db, key: password }
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            httpGet: { path: /sutra/health/ready, port: 8080 }
+            periodSeconds: 2
+          livenessProbe:
+            httpGet: { path: /sutra/health/live, port: 8080 }
+            periodSeconds: 10
+          volumeMounts:
+            - name: deployments
+              mountPath: /deployments
+              readOnly: true
+      volumes:
+        - name: deployments
+          persistentVolumeClaim:
+            claimName: %%APP%%-deployments
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: %%APP%%-engine
+spec:
+  selector:
+    app: %%APP%%-engine
+  ports:
+    - port: 80
+      targetPort: 8080

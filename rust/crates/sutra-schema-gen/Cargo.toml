@@ -1,0 +1,17 @@
+[package]
+name = "sutra-schema-gen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Tools LIBRARY: parses a directory of Standards-Editor-idiom message-definition XSDs and emits the Rust binding sources for them — model, lenient decoder, canonical map projection, shape metadata, cross-schema registry. Domain-neutral (arbitrary corpus + output paths, names no message standard). Byte-identical regeneration with a drift gate; shipped through the CLI as `sutra schemagen generate|check`."
+
+[dependencies]
+quick-xml = { workspace = true }
+
+# No dev-dependencies. The generator is a neutral TOOL and its suite is self-contained: the
+# golden gate compares against a vendored emission under tests/data/ rather than against the
+# generated crate, so nothing here depends on which corpus a given distribution generates from.
+# The two checks that genuinely need the generated crate — the canonical decimal-projection
+# parity and the scan of the committed generated corpus — live with that crate, in the
+# repository that owns it.

@@ -1,0 +1,8 @@
+channels:
+  - name: balance
+    transport: http
+    codec: urn:sutra:codec:json
+  - name: balance-response
+    direction: outbound
+    transport: http
+    bind: "http://localhost:8080/callback"

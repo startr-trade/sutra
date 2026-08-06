@@ -1,0 +1,23 @@
+# Local OpenTofu state + provider plugins for the operator-owned k8s-IT stages
+# (cluster/, infra/, shared-scenario/) — never commit.
+#
+# `make destroy` tears infra + the cluster down; `make clean` wipes the local files
+# entirely. Both are operator-initiated: the ITs never call them.
+.terraform/
+.terraform.lock.hcl
+terraform.tfstate
+terraform.tfstate.backup
+*.tfvars.local
+crash.log
+crash.*.log
+
+# kind-written kubeconfig (cluster/sutra-fednow-it-config) — contains the cluster CA
+# + client cert/key. The tehcyx/kind provider writes it as <cluster_name>-config in
+# cluster/. Never commit credentials. (The bare name is kept alongside the glob: it is
+# the harness's hardcoded default path.)
+*-config
+sutra-fednow-it-config
+
+# Observability access dump written by the infra stage's null_resource — contains the
+# live LB IPs AND the elastic superuser password. Never commit credentials.
+observability-access.txt

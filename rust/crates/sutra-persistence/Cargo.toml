@@ -1,0 +1,80 @@
+[package]
+name = "sutra-persistence"
+description = "Sutra engine persistence layer: deployment-scoped Postgres stores, snapshot v2 codec, strict transactional step, ordered migration runner"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+# All four SQL dialects are supported. PostgreSQL is the reference
+# dialect and always compiles; the other three are feature-gated but ON by default so a
+# plain `cargo build` carries the full matrix. Turn features off for a lean
+# PG-only build (`--no-default-features`).
+default = ["mysql", "mssql"]
+# MySQL + MariaDB (one dialect module: MariaDB 10.6+/11 speaks the same SQL surface).
+mysql = ["sqlx/mysql"]
+# Microsoft SQL Server 2022 via the TDS client stack (sqlx has no MSSQL driver).
+mssql = ["dep:tiberius", "dep:tokio", "dep:tokio-util"]
+
+[dependencies]
+sha2 = { workspace = true }
+serde_json = { workspace = true }
+# Snapshot v4 typed values: FEEL numbers are arbitrary-precision decimals, and the persisted
+# form has to be scale-faithful (`100.00` must not come back as `100`).
+bigdecimal = { workspace = true }
+time = { workspace = true }
+# At-rest encryption: the neutral AES-256-GCM seam + base64 for the
+# `sutra.enc.<name>` ciphertext values in the snapshot v3 text container.
+sutra-crypto = { path = "../sutra-crypto" }
+base64 = { workspace = true }
+uuid = { version = "1", features = ["v4"] }
+thiserror = "2"
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio",
+    "postgres",
+    "uuid",
+    "time",
+] }
+# MSSQL dialect (feature `mssql`): TDS 7.3+ protocol client, TLS via rustls, `time` type
+# mappings for DATETIME2. tokio supplies the TCP socket, tokio-util the AsyncRead/Write
+# compatibility wrapper tiberius expects.
+tiberius = { version = "0.12", default-features = false, features = [
+    "tds73",
+    "rustls",
+    "time",
+], optional = true }
+tokio = { version = "1", features = ["net"], optional = true }
+tokio-util = { version = "0.7", features = ["compat"], optional = true }
+
+[dev-dependencies]
+sutra-testkit = { path = "../sutra-testkit" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+testcontainers = { version = "0.25", features = ["blocking"] }
+testcontainers-modules = { version = "0.13", features = [
+    "postgres",
+    "mysql",
+    "mariadb",
+    "mssql_server",
+] }
+
+[[test]]
+name = "pg"
+path = "tests/pg/main.rs"
+
+[[test]]
+name = "mysql"
+path = "tests/mysql/main.rs"
+required-features = ["mysql"]
+
+# MariaDB rides the MySQL dialect module; its suite re-runs the identical test
+# sources against a mariadb:11 container to prove the shared dialect genuinely holds.
+[[test]]
+name = "mariadb"
+path = "tests/mariadb/main.rs"
+required-features = ["mysql"]
+
+[[test]]
+name = "mssql"
+path = "tests/mssql/main.rs"
+required-features = ["mssql"]

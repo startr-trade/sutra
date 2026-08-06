@@ -1,0 +1,9 @@
+{{!-- generated-by: sutra coverage init (regenerated on re-init; remove this header to take
+   ownership; user-edited files are never touched unless forced) --}}
+{{!-- Renders the path-coverage report. `coverageReport` is the map the coverage:report engine op
+   built: {process, percentage, covered, total, coveredPaths[], uncoveredPaths[]}. The template only renders — the
+   percentage/counts were computed engine-side against the declared <q:coverage> paths and the covered-set. --}}
+<CoverageReport process="{{coverageReport.process}}" percentage="{{coverageReport.percentage}}" covered="{{coverageReport.covered}}" total="{{coverageReport.total}}">
+{{#each coverageReport.coveredPaths as |p|}}<covered>{{p}}</covered>{{/each}}
+{{#each coverageReport.uncoveredPaths as |p|}}<uncovered>{{p}}</uncovered>{{/each}}
+</CoverageReport>

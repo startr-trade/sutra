@@ -1,0 +1,106 @@
+# Channels for the `default` tenant's approval module, 1.0.0. Path-derived identity
+# (tenant=default, module=approval, version=1.0.0). Every channel uses the package's user
+# structural codec compiled from schemas/approval/ — a user codec is referenced by its
+# path-derived URN `urn:<path from schemas/>`, so schemas/approval/ → codec: urn:approval.
+#
+# Routing is <q:source>-driven (no `process:` pin): the engine matches the decoded message type to a
+# subscribing start event (approval-request -> ApprovalRequest -> StartEvent_Request) or, when no
+# start event subscribes (approval-decision -> ApprovalDecision), treats the inbound as a
+# channel-delivered RELAY to the wait node subscribing to that channel.
+
+channels:
+  # Activation channel — an ApprovalRequest mints + parks an approval-hold instance.
+  - name: approval-request
+    transport: http
+    bind: "POST /channels/approval-request"
+    codec: urn:approval
+    cloudevents-mode: none
+    auth:
+      scheme: apikey
+      apikey:
+        value: approval-demo-key
+        header: X-Api-Key
+
+  # Relay channel — an ApprovalDecision resumes the waiting instance (correlated by E2EId). No start
+  # event subscribes, so the dispatcher's resolveRelay path handles it.
+  - name: approval-decision
+    transport: http
+    bind: "POST /channels/approval-decision"
+    codec: urn:approval
+    cloudevents-mode: none
+    auth:
+      scheme: apikey
+      apikey:
+        value: approval-demo-key
+        header: X-Api-Key
+
+  # Template-showcase channel — an XML ApprovalRequest drives the stateless template-showcase flow
+  # (Prep data task -> engine-choice gateway -> XSLT or Handlebars template task, each replying
+  # natively). XML inbound so the XSLT engine has source XML.
+  - name: showcase-request
+    transport: http
+    bind: "POST /channels/showcase-request"
+    codec: urn:approval
+    cloudevents-mode: none
+    auth:
+      scheme: apikey
+      apikey:
+        value: approval-demo-key
+        header: X-Api-Key
+
+  # Script-showcase channel — an XML ApprovalRequest drives the stateless script-showcase flow
+  # (ScriptMeta -> ScriptDecision, both Handlebars) -> Reply. Each scriptTask renders a scripts/ file,
+  # merging its JSON output into the instance variables; the reply echoes them.
+  - name: script-showcase-request
+    transport: http
+    bind: "POST /channels/script-showcase-request"
+    codec: urn:approval
+    cloudevents-mode: none
+    auth:
+      scheme: apikey
+      apikey:
+        value: approval-demo-key
+        header: X-Api-Key
+
+  # Throw-showcase channel — an XML ApprovalRequest drives the stateless throw-showcase flow
+  # (Prep -> link goto -> Guarded (+escalation boundary) -> escalation throw -> signal throw -> Reply).
+  # Each intermediate throw is emit-and-continue; the reply echoes the variables each construct produced.
+  - name: throw-showcase-request
+    transport: http
+    bind: "POST /channels/throw-showcase-request"
+    codec: urn:approval
+    cloudevents-mode: none
+    auth:
+      scheme: apikey
+      apikey:
+        value: approval-demo-key
+        header: X-Api-Key
+
+  # Sub-process-showcase channel — an XML ApprovalRequest drives the stateless subprocess-showcase
+  # flow (Review embedded subProcess: Assess FEEL assignment -> Decide DMN businessRuleTask, then a
+  # template Reply). The embedded sub-process expands inline and shares the parent's variable scope; the
+  # reply echoes the variables its inner tasks set.
+  - name: subprocess-showcase-request
+    transport: http
+    bind: "POST /channels/subprocess-showcase-request"
+    codec: urn:approval
+    cloudevents-mode: none
+    auth:
+      scheme: apikey
+      apikey:
+        value: approval-demo-key
+        header: X-Api-Key
+
+  # Data-flow-showcase channel (the declarative data-mapping layer) — an XML ApprovalRequest drives the stateless
+  # datamapping-showcase flow (Seed -> Derive -> Reply): FEEL data-assignment nodes compute amount /
+  # riskBand in the diagram, and the reply template reads a scoped <q:param> derived per invocation.
+  - name: datamapping-showcase-request
+    transport: http
+    bind: "POST /channels/datamapping-showcase-request"
+    codec: urn:approval
+    cloudevents-mode: none
+    auth:
+      scheme: apikey
+      apikey:
+        value: approval-demo-key
+        header: X-Api-Key

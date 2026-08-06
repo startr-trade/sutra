@@ -1,0 +1,14 @@
+[package]
+name = "sutra-formats"
+description = "Built-in schema-less formats (json, xml, yaml, raw-text, raw-bytes, csv) — pure parsers over the sutra-codec-spi contract; each self-registers via inventory."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+sutra-codec-spi = { path = "../sutra-codec-spi" }
+inventory = "0.3.24"
+quick-xml = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml_ng = "0.10"

@@ -1,0 +1,16 @@
+[package]
+name = "sutra-envref-gcp"
+description = "GCP Secret Manager envref resolver — the `gcp-secret:<project>/<secret>[#<version>]` SchemeResolver, self-registering as an EnvRefResolverEntry via inventory so sutra-dist bundles it without the neutral sutra-engine naming any GCP SDK. Talks the Secret Manager REST API directly over reqwest/rustls with a hand-signed service-account RS256 JWT (jsonwebtoken/ring) — no vendor SDK (the GCP SDK risks native-tls; the tree is rustls/ring ONLY)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+sutra-envref-spi = { path = "../sutra-envref-spi" }
+inventory = "0.3.24"
+reqwest = { workspace = true }
+serde_json = { workspace = true }
+base64 = { workspace = true }
+jsonwebtoken = { workspace = true }
+tokio = { version = "1", features = ["rt", "net", "time"] }

@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Conformance (b) — a channel-call task parks (its REQUEST enqueue commits atomically
+     with the park step); no response ever arrives, the INTERRUPTING timer
+     boundary fires, the timeout path emits its marker and the instance
+     completes. -->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0"
+                  id="Definitions_call_timeout"
+                  targetNamespace="urn:sutra:module:conf:1.0.0">
+  <bpmn:process id="call-timeout" name="Channel call with timeout" isExecutable="true">
+    <bpmn:startEvent id="Start">
+      <bpmn:extensionElements>
+        <q:source channel="call-timeout-start"/>
+      </bpmn:extensionElements>
+      <bpmn:outgoing>f1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="Start" targetRef="CallOut"/>
+    <bpmn:serviceTask id="CallOut" name="Call the partner" implementation="channel:callout">
+      <bpmn:extensionElements>
+        <!-- Park key — the transport-resolved idempotency key is
+             always present. -->
+        <q:alias name="callKey" expression="event.idempotencyKey" unique="true"/>
+      </bpmn:extensionElements>
+      <bpmn:incoming>f1</bpmn:incoming>
+      <bpmn:outgoing>f2</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:boundaryEvent id="CallTimeout" attachedToRef="CallOut">
+      <bpmn:timerEventDefinition>
+        <!-- PT3S: wide enough that the immediate post-park assertions observe WAITING
+             before the poller fires, even with a slow first dispatch under
+             parallel-suite load (cold pool + admission queries ~0.3-1s). -->
+        <bpmn:timeDuration>PT3S</bpmn:timeDuration>
+      </bpmn:timerEventDefinition>
+      <bpmn:outgoing>f3</bpmn:outgoing>
+    </bpmn:boundaryEvent>
+    <bpmn:sequenceFlow id="f2" sourceRef="CallOut" targetRef="End"/>
+    <bpmn:sequenceFlow id="f3" sourceRef="CallTimeout" targetRef="TimeoutNotify"/>
+    <bpmn:sendTask id="TimeoutNotify" name="Emit timeout marker">
+      <bpmn:extensionElements>
+        <q:send destination="http://timeout.example/notify"/>
+      </bpmn:extensionElements>
+      <bpmn:incoming>f3</bpmn:incoming>
+      <bpmn:outgoing>f4</bpmn:outgoing>
+    </bpmn:sendTask>
+    <bpmn:sequenceFlow id="f4" sourceRef="TimeoutNotify" targetRef="EndTimeout"/>
+    <bpmn:endEvent id="End">
+      <bpmn:incoming>f2</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:endEvent id="EndTimeout">
+      <bpmn:incoming>f4</bpmn:incoming>
+    </bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>

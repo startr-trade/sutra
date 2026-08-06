@@ -1,0 +1,8 @@
+[package]
+name = "demo-app"
+description = "Fixture app crate — depends on demo-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+demo-core = { path = "../demo-core" }

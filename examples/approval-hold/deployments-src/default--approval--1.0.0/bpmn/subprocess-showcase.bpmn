@@ -1,0 +1,78 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Embedded sub-process showcase — fully declarative, no application code. One synchronous flow whose
+  <bpmn:subProcess> is expanded inline. The nested graph runs to completion (its own start → … → end)
+  sharing the parent's variable scope, then the outer flow continues.
+
+    startEvent (XML ApprovalRequest on subprocess-showcase-request)
+    then Review (embedded subProcess):
+        SubStart → Assess (data task: FEEL assignment riskScore := 27)
+                 → Decide (businessRuleTask: rules/approval-decide.dmn maps riskScore → decision)
+                 → SubEnd
+    then Reply  : Handlebars template serviceTask (subprocess-reply.hbs) echoing the variables the
+                  SUB-PROCESS's inner tasks set — proving the embedded flow shares the parent scope —
+                  and replying (native)
+    then End
+
+  The Decide step is this suite's <bpmn:businessRuleTask> exercise: the implementation attribute names a
+  .dmn file under the module's rules/ folder; the DMN engine (sutra-validator-dmn) evaluates its
+  decision table against the process variables and merges the named outputs back (rules are DMN/FEEL
+  only — there is no other rule language).
+-->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0"
+                  id="Definitions_subprocess_showcase"
+                  targetNamespace="urn:sutra:module:approval:1.0.0">
+
+  <bpmn:process id="subprocess-showcase" name="Embedded sub-process showcase" isExecutable="true">
+
+    <!-- Typed variables — set inside the embedded sub-process, read by the outer reply template. -->
+    <bpmn:extensionElements>
+      <q:variables>
+        <q:variable name="riskScore" type="number"/>   <!-- Assess (FEEL assignment) -->
+        <q:variable name="decision" type="string"/>    <!-- Decide (DMN decision table output) -->
+      </q:variables>
+    </bpmn:extensionElements>
+
+    <bpmn:startEvent id="Start" name="ApprovalRequest received">
+      <bpmn:extensionElements>
+        <q:source channel="subprocess-showcase-request" messageTypeValue="ApprovalRequest"/>
+      </bpmn:extensionElements>
+      <bpmn:outgoing>F1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="F1" sourceRef="Start" targetRef="Review"/>
+
+    <!-- Embedded sub-process: its child flow expands inline and shares the parent's variable scope. -->
+    <bpmn:subProcess id="Review" name="Review">
+      <bpmn:incoming>F1</bpmn:incoming><bpmn:outgoing>F2</bpmn:outgoing>
+      <bpmn:startEvent id="SubStart"><bpmn:outgoing>SF1</bpmn:outgoing></bpmn:startEvent>
+      <bpmn:sequenceFlow id="SF1" sourceRef="SubStart" targetRef="Assess"/>
+      <!-- Data task: a FEEL assignment writes riskScore into the SHARED scope (no implementation). -->
+      <bpmn:serviceTask id="Assess" name="Assess (FEEL data assignment)">
+        <bpmn:incoming>SF1</bpmn:incoming><bpmn:outgoing>SF2</bpmn:outgoing>
+        <bpmn:dataInputAssociation>
+          <bpmn:assignment><bpmn:from>27</bpmn:from><bpmn:to>riskScore</bpmn:to></bpmn:assignment>
+        </bpmn:dataInputAssociation>
+      </bpmn:serviceTask>
+      <bpmn:sequenceFlow id="SF2" sourceRef="Assess" targetRef="Decide"/>
+      <!-- Business rule task: the DMN table derives `decision` from the shared riskScore. -->
+      <bpmn:businessRuleTask id="Decide" name="Decide (DMN decision table)"
+                             implementation="approval-decide.dmn">
+        <bpmn:incoming>SF2</bpmn:incoming><bpmn:outgoing>SF3</bpmn:outgoing>
+      </bpmn:businessRuleTask>
+      <bpmn:sequenceFlow id="SF3" sourceRef="Decide" targetRef="SubEnd"/>
+      <bpmn:endEvent id="SubEnd"><bpmn:incoming>SF3</bpmn:incoming></bpmn:endEvent>
+    </bpmn:subProcess>
+    <bpmn:sequenceFlow id="F2" sourceRef="Review" targetRef="Reply"/>
+
+    <bpmn:serviceTask id="Reply" name="Reply (Handlebars template)" implementation="subprocess-reply.hbs">
+      <bpmn:extensionElements>
+        <q:reply mode="native" contentType="application/xml"/>
+      </bpmn:extensionElements>
+      <bpmn:incoming>F2</bpmn:incoming><bpmn:outgoing>F3</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F3" sourceRef="Reply" targetRef="End"/>
+
+    <bpmn:endEvent id="End" name="Done"><bpmn:incoming>F3</bpmn:incoming></bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>

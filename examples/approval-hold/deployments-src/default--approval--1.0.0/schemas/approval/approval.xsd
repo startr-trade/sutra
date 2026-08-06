@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Custom module schema for the approval-hold sample. One XSD, TWO root elements = two message
+  types the StructuralCodec covers:
+
+    ApprovalRequest  — starts an approval-hold instance (carries the correlation key E2EId + Amount)
+    ApprovalDecision — the human decision that resumes the parked instance (same E2EId + Decision)
+
+  The engine registers this file as the version-scoped codec
+  urn:sutra:module:approval:1.0.0:approval (moduleNamespace + file base name), referenced from
+  channels.yaml. json/yaml inbound is transcoded into this XSD's targetNamespace and validated
+  against it (Tier-1 structural) — the same XSD-validation mechanism a message-standard codec
+  would use against its own schema corpus.
+-->
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           targetNamespace="urn:sutra:approval"
+           xmlns="urn:sutra:approval"
+           elementFormDefault="qualified">
+
+  <xs:element name="ApprovalRequest">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element name="E2EId"  type="xs:string"/>
+        <xs:element name="Amount" type="xs:string"/>
+      </xs:sequence>
+    </xs:complexType>
+  </xs:element>
+
+  <xs:element name="ApprovalDecision">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element name="E2EId"    type="xs:string"/>
+        <xs:element name="Decision" type="xs:string"/>
+      </xs:sequence>
+    </xs:complexType>
+  </xs:element>
+
+</xs:schema>

@@ -1,0 +1,77 @@
+openapi: 3.1.0
+info:
+  title: Sutra deployment — acme/mini-package/1.0.0
+  version: 1.0.0
+  description: 'Generated API surface for deployment `dep-000000000000000000000001` (acme/mini-package/1.0.0). Derived from the archive manifest: HTTP channels are path items; broker/outbound channels are described under `x-sutra-*` vendor extensions; `x-sutra-datastores` inventories the deployment''s data-stores. This document is generated live from the same parsed plan that drives routing — it never drifts.'
+  x-sutra-deployment-id: dep-000000000000000000000001
+  x-sutra-tenant: acme
+  x-sutra-module: mini-package
+servers:
+- url: http://{host}:{port}
+  description: The engine's HTTP port (channel endpoints share the engine port; dynamic, 8080 in the k8s image).
+  variables:
+    host:
+      default: localhost
+    port:
+      default: '8080'
+paths:
+  /channels/balance:
+    post:
+      operationId: channel_balance
+      summary: Inbound channel 'balance' → 1 process(es)
+      description: 'Nature: sync-request-reply. Reachable process start-events: balance-query#Start.'
+      x-sutra-channel: balance
+      x-sutra-transport: http
+      x-sutra-nature: sync-request-reply
+      x-sutra-ack-mode: on-complete
+      x-sutra-broadcast: false
+      x-sutra-singleton: false
+      x-sutra-codec: urn:sutra:codec:json
+      x-sutra-reachable-processes:
+      - processId: balance-query
+        startEventId: Start
+        payloadVar: payload
+        messageTypeValue: BalanceQuery
+        emits:
+        - via: reply
+          mode: native
+          contentType: application/xml
+      x-sutra-inbound-message-types:
+      - BalanceQuery
+      requestBody:
+        required: true
+        description: Decoded by the channel codec. For a data-format codec (json/xml/yaml) the body honors Content-Type negotiation; a schema-backed codec takes full control.
+        content:
+          application/json:
+            schema:
+              type: object
+              x-sutra-codec: urn:sutra:codec:json
+      responses:
+        '200':
+          description: The synchronous process reply (the caller waits for completion).
+          content:
+            application/json:
+              schema:
+                type: object
+        default:
+          description: A decode / validation / dispatch failure (RFC 7807 problem detail).
+          content:
+            application/problem+json:
+              schema:
+                type: object
+x-sutra-outbound:
+- channel: balance-response
+  transport: http
+  direction: outbound
+  destination: http://localhost:8080/callback
+x-sutra-datastores:
+- name: accounts
+  declared: false
+  access:
+  - read
+  readOps: 1
+  writeOps: 0
+  keyExpressions:
+  - payload.accountId
+  accessedBy:
+  - balance-query

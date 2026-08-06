@@ -1,0 +1,25 @@
+# generated-by: sutra create (edit freely — this file is yours)
+#
+# Authoring metadata for this STANDALONE deployment package. The directory around this file is
+# fully self-contained — it mirrors the sealed archive layout 1:1 (bpmn/, rules/, templates/,
+# scripts/, schemas/, channels.yaml, datastores.yaml, migrations/<store>/). `sutra package`
+# seals it into a .sutra archive and DERIVES the archive manifest (per-file digests, the
+# content-addressed deployment id) — never author manifest.yaml by hand.
+#
+# There is no inheritance and no shared library tree: a tenant variant of this package is an
+# explicit COPY (`sutra create deployment <name> --from <this dir>`), edited independently.
+
+name: %%PACKAGE%%
+
+# Labels are OPAQUE to the engine — selectors for operators, the CLI and telemetry only.
+# `tenant` is just a label here, not a runtime concept.
+labels:
+  tenant: default
+  module: %%PACKAGE%%
+  version: 1.0.0
+
+engine:
+  minContract: 1
+
+# Informational index of the externally-reachable processes (bpmn/ process ids).
+entryProcesses:%%ENTRY_PROCESSES%%

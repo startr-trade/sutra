@@ -1,0 +1,25 @@
+[package]
+name = "sutra-dmn"
+description = "DMN 1.5 decision engine with DRG evaluation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["dmn", "decision", "feel", "bpmn", "rules"]
+categories = ["parser-implementations", "compilers"]
+# Publishable to crates.io — the workspace default (publish = false) does not apply here.
+publish = true
+
+[dependencies]
+# path+version dual form: crates.io strips the `path` key on publish and resolves the
+# dependency by `version` alone, so this must match sutra-feel's published version. Bump both
+# together on every release that changes this pairing.
+sutra-feel = { path = "../sutra-feel", version = "0.2.0-rc.1" }
+quick-xml = { workspace = true }
+# DRG COLLECT-with-aggregation (SUM/COUNT/MIN/MAX) builds numeric decision results.
+bigdecimal = { workspace = true }
+time = { workspace = true }
+
+[dev-dependencies]
+bigdecimal = { workspace = true }

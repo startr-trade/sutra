@@ -1,0 +1,1209 @@
+openapi: 3.1.0
+info:
+  title: Sutra engine — platform / system API
+  version: 0.2.0-rc.1
+  description: |
+    The **platform (system) API** the Sutra engine serves on its own HTTP port — distinct from the
+    per-deployment channel endpoints (those are generated per archive). This surface is the
+    operate/management plane: health, deployment status, and instance lifecycle.
+
+    Each deployment's own API surface (its channels → reachable BPMNs, inbound/outbound message
+    types, endpoint nature, and data-stores) is itself an OpenAPI 3.1 document, but it is
+    *generated* per `deploymentId` — it cannot be a committed file — and served live at
+    `GET /sutra/deployments/{id}/openapi` (below). The generator is the `sutra-openapi` crate; the
+    same document is emitted offline by `sutra openapi <archive>`.
+
+    **Committed + drift-gated (Factor 13):** the path set here is verified against the engine's
+    canonical `PLATFORM_ROUTES` table (`sutra-engine/src/server.rs`) by the
+    `openapi_platform_spec_matches_the_route_table` test — adding or removing a platform route
+    without updating this file fails the build.
+
+    **Auth posture:** the `/sutra/*` operate routes run with the unauthenticated internal-ops
+    posture (cluster-internal). The `/admin/*` surface is their OIDC-gated twin — every
+    admin request requires a bearer JWT validated against a configured issuer + audience + JWKS,
+    carrying the required admin scope (`sutra.admin.oidc.*`). Fail-closed: no/invalid token → `401`,
+    a valid token without the admin scope → `403`, and an unconfigured admin surface → `503`
+    (never open by default; disabled only behind the explicit `sutra.admin.oidc.dev-disabled` flag).
+
+    **Instance migration (shipped):** an instance is pinned to its deployment by content-hash
+    `deploymentId`, and every resume path resolves that pin fail-closed — a hot-deploy leaves the
+    previous graph DRAINING precisely so pinned instances keep resuming on the definition they
+    started under. `POST /admin/instances/{id}/migrate` is the sanctioned way off that pin: an
+    explicit, validated, audited admin operation that re-pins ONE live instance onto another ACTIVE
+    deployment and rewrites every node id its durable state names (wait frontier, parked message and
+    timer waits, `<q:retry>` backoff parks and their attempt budgets, `<q:reply continue>` parks, the
+    routed start event). Validation is structural and fail-closed: every live locus must map to a
+    target node that EXISTS and is TYPE-COMPATIBLE with what resume does there, and the response
+    lists EVERY violation rather than the first. `dryRun: true` returns the same report without
+    touching anything. Distinct from DB *schema* migration (`SUTRA_DB_MIGRATIONS`), which is
+    unrelated. `POST /admin/instances/migrate` is the BATCH form over a filtered population: every
+    instance validates, claims and commits INDEPENDENTLY (one transaction each) and gets its own
+    outcome in the report, so a refusal or a claim bounce moves nothing and stops nothing. Two
+    further opt-ins: `targetProcessId` re-homes an instance into a DIFFERENT process (only under an
+    explicit `nodeMapping` naming every live locus — identity is never implicit across a process
+    boundary), and `resume: true` clears a FAILED instance's failure state and re-arms its parks in
+    the migration's own transaction, bringing it back through the ordinary claim-guarded resume
+    paths.
+
+    **Known gaps (NOT yet implemented — intentionally absent below so the drift gate stays
+    honest):**
+      * **Deployment retire/undeploy** — the Rust engine's deployment lifecycle is filesystem-driven
+        (the sealed-`.sutra` directory, watched with two-phase activation), so "undeploy" is removing
+        the archive from that directory, not an in-memory admin control. `/admin/*` therefore exposes
+        deployment *read* status + instance read/control, not archive lifecycle.
+servers:
+  - url: http://{host}:{port}
+    description: The engine's HTTP port (dynamic; 8080 in the k8s image).
+    variables:
+      host: { default: localhost }
+      port: { default: "8080" }
+tags:
+  - name: health
+    description: Liveness / readiness probes (`/sutra/health/*`).
+  - name: deployments
+    description: Deployment activation status.
+  - name: instances
+    description: >
+      Instance lifecycle — list / inspect / cancel. A finished instance is RETAINED rather than
+      deleted (`sutra.instance.retention`, default `P7D`; `PT0S` restores delete-at-terminal), so
+      inspect keeps answering after the process ends instead of 404-ing the moment it succeeds.
+  - name: external-tasks
+    description: >
+      The worker-facing PULL surface — long-poll fetch-and-lock, then complete or fail. A channel
+      declaring `transport: pull` parks its deliveries here instead of dialing an endpoint, which
+      is how polyglot workers consume work over plain HTTP with no broker in the path.
+  - name: admin
+    description: OIDC-gated administrative surface — the authenticated twin of the operate routes.
+paths:
+  /sutra/health/live:
+    get:
+      tags: [health]
+      summary: Liveness probe — the process is up (always UP once serving).
+      operationId: healthLive
+      responses:
+        "200":
+          description: Live.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Health" }
+  /sutra/health/ready:
+    get:
+      tags: [health]
+      summary: Readiness probe — the loader + deployment source are ready to serve.
+      operationId: healthReady
+      responses:
+        "200": { description: Ready., content: { application/json: { schema: { $ref: "#/components/schemas/Health" } } } }
+        "503": { description: Not ready (a dependency reports DOWN)., content: { application/json: { schema: { $ref: "#/components/schemas/Health" } } } }
+  /sutra/deployments:
+    get:
+      tags: [deployments]
+      summary: The full deployment-status snapshot (active-with-slot / draining / failed).
+      operationId: deploymentsList
+      responses:
+        "200":
+          description: The deployment-status snapshot.
+          content: { application/json: { schema: { $ref: "#/components/schemas/DeploymentSnapshot" } } }
+  /sutra/deployments/{id}:
+    get:
+      tags: [deployments]
+      summary: One deployment's status by its content-hash deploymentId.
+      operationId: deploymentById
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: The content-hash deployment id (`dep-<hex>`).
+          schema: { type: string }
+      responses:
+        "200": { description: The deployment's status., content: { application/json: { schema: { $ref: "#/components/schemas/DeploymentStatus" } } } }
+        "404":
+          description: Not activated (yet) — the caller keeps polling. Phase is `Unknown`.
+          content: { application/json: { schema: { $ref: "#/components/schemas/DeploymentStatus" } } }
+  /sutra/deployments/{id}/openapi:
+    get:
+      tags: [deployments]
+      summary: The deployment's generated OpenAPI 3.1 surface (channels → BPMNs, message types, nature, data-stores).
+      description: |
+        The **per-deployment** API surface, generated from that archive's manifest and served live —
+        YAML by default, `Accept: application/json` or `?format=json` for JSON. Unlike this platform
+        spec it cannot be a committed file (one surface per `deploymentId`); it is projected from the
+        SAME parsed plan that drives routing, so it never drifts. HTTP channels appear as `paths`;
+        broker/outbound channels and the data-store inventory are `x-sutra-*` vendor extensions.
+      operationId: deploymentOpenapi
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: The content-hash deployment id (`dep-<hex>`).
+          schema: { type: string }
+      responses:
+        "200":
+          description: The generated per-deployment OpenAPI document.
+          content:
+            application/yaml: { schema: { type: string } }
+            application/json: { schema: { type: object } }
+        "404":
+          description: Not a live (active or draining) deployment.
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+  /sutra/instances:
+    get:
+      tags: [instances]
+      summary: List parked/running instances as lightweight summaries.
+      description: >
+        Optional filters. Without `deployment`, every live deployment is scanned. A
+        persistence-less engine returns an empty set. FINISHED instances (the rows kept by
+        `sutra.instance.retention`) are EXCLUDED by default — this list is unpaged, and a busy
+        deployment holds a whole retention window of them. Set `includeTerminal=true`, or ask for a
+        terminal `status`, to see them.
+      operationId: instancesList
+      parameters:
+        - name: deployment
+          in: query
+          required: false
+          description: One deployment id (`dep-<hex>`) to scan. Wins over the live-set scan.
+          schema: { type: string }
+        - name: status
+          in: query
+          required: false
+          description: Narrow by instance status (e.g. `SUSPENDED`). A terminal value (`COMPLETED`/`TERMINATED`) implies `includeTerminal=true`.
+          schema: { type: string }
+        - name: includeTerminal
+          in: query
+          required: false
+          description: Include finished instances retained as execution history (`sutra.instance.retention`). Default false.
+          schema: { type: boolean, default: false }
+      responses:
+        "200": { description: The instance summaries., content: { application/json: { schema: { $ref: "#/components/schemas/InstanceList" } } } }
+        "400": { description: Malformed `deployment` id., content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+  /sutra/instances/{id}:
+    get:
+      tags: [instances]
+      summary: Inspect one instance — its status, node progress, and variables (`@sensitive` redacted).
+      description: >
+        Answers for FINISHED instances too, for as long as `sutra.instance.retention` (default
+        `P7D`) keeps their row: a `COMPLETED`/`TERMINATED` instance reports its terminal status and
+        the variables of the last state the engine durably persisted. That last durable state is
+        the instance's last PARK, not the terminal step's final variable values — per-step fidelity
+        lives in the admin instance-history route. `404` once the retention window has elapsed (or
+        immediately, when retention is `PT0S`).
+      operationId: instanceById
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: The instance UUID.
+          schema: { type: string, format: uuid }
+      responses:
+        "200": { description: The instance projection., content: { application/json: { schema: { $ref: "#/components/schemas/InstanceDetail" } } } }
+        "400": { description: The id is not a UUID., content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "404": { description: No such instance., content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+  /sutra/instances/{id}/cancel:
+    post:
+      tags: [instances]
+      summary: Cancel a parked/running instance.
+      description: >
+        Resolves the instance's wait points, retires its live aliases, and records it `TERMINATED`.
+        The row is RETAINED as execution history for `sutra.instance.retention` (deleted outright
+        when that is `PT0S`). A FAILED instance is cancellable — that is its release valve — but an
+        instance that has already finished is a `409`: re-stamping it would overwrite the verdict it
+        already carries.
+      operationId: instanceCancel
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: The instance UUID.
+          schema: { type: string, format: uuid }
+      responses:
+        "200": { description: Cancelled., content: { application/json: { schema: { $ref: "#/components/schemas/InstanceCancel" } } } }
+        "400": { description: The id is not a UUID., content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "404": { description: No such instance., content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "409": { description: The instance already reached COMPLETED/TERMINATED — retained as history, nothing to cancel., content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+  # ---- The worker-facing external-task (PULL) surface. Operate-posture, NOT admin: these are the
+  #      routes polyglot workers drive, and a completion re-enters the engine through the ordinary
+  #      inbound path (correlation, validation and dedup all unchanged), so it is an ordinary
+  #      delivery rather than a privileged control operation.
+  /sutra/external-tasks/fetch-and-lock:
+    post:
+      tags: [external-tasks]
+      summary: Fetch and lock parked external tasks (long-poll).
+      description: >
+        Claims up to `maxTasks` fetchable tasks on the named channels and locks them to `workerId`
+        for `lockDuration`. A locked task is invisible to every other worker until its lock
+        EXPIRES, at which point it becomes fetchable again with no sweeper involved — so a worker
+        that dies mid-task costs one lock duration, never the work.
+
+
+        When nothing is available the request is held open for up to `asyncResponseTimeout`,
+        waking the moment a task is parked on one of the requested channels, and answers with an
+        empty list on timeout. The wait is always BOUNDED by the operator's
+        `sutra.external-task.max-async-response-timeout` ceiling.
+
+
+        Every bound (`lockDuration`, `asyncResponseTimeout`, `maxTasks`) is a ceiling a worker may
+        ask under, never over: an out-of-bounds request is a `400`, not a silent clamp, because a
+        worker that believes it holds a longer lock than it does is a duplicate-execution bug.
+      operationId: externalTaskFetchAndLock
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ExternalTaskFetchRequest" }
+      responses:
+        "200": { description: The locked tasks (possibly an empty list on long-poll timeout)., content: { application/json: { schema: { $ref: "#/components/schemas/ExternalTaskList" } } } }
+        "400": { description: The request is malformed or outside the configured bounds (`SUTRA.EXTERNAL_TASK.REQUEST_INVALID`)., content: { application/problem+json: { schema: { $ref: "#/components/schemas/Problem" } } } }
+        "503": { description: The engine runs without a datasource — pull needs one (a parked task is a database row)., content: { application/problem+json: { schema: { $ref: "#/components/schemas/Problem" } } } }
+  /sutra/external-tasks/{id}/complete:
+    post:
+      tags: [external-tasks]
+      summary: Complete a locked external task.
+      description: >
+        Feeds the worker's result back through the engine's ORDINARY inbound path — the same seam
+        every transport delivers through — so correlation (`<q:alias>`), validation and inbox
+        dedup behave exactly as they do for a pushed reply. There is no second resume entry point.
+
+
+        The result becomes the delivered payload on the task's channel; omitting it re-delivers
+        the original request payload, which is the fire-and-forget shape where the flow waits only
+        on the fact of the work. Delivery is at-least-once: the task row is deleted only after the
+        engine accepts the completion, and the task's idempotency key absorbs a duplicate.
+
+
+        Fails CLOSED on a stale `workerId`: a lapsed or foreign lock is a `409`, never a `200`
+        the worker could mistake for success.
+      operationId: externalTaskComplete
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: The external task id.
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ExternalTaskCompleteRequest" }
+      responses:
+        "200": { description: Completed — the result was accepted by the inbound path and the task removed., content: { application/json: { schema: { $ref: "#/components/schemas/ExternalTaskCompleted" } } } }
+        "400": { description: The request is malformed (`SUTRA.EXTERNAL_TASK.REQUEST_INVALID`)., content: { application/problem+json: { schema: { $ref: "#/components/schemas/Problem" } } } }
+        "404": { description: No such task on any live deployment (`SUTRA.EXTERNAL_TASK.NOT_FOUND`)., content: { application/problem+json: { schema: { $ref: "#/components/schemas/Problem" } } } }
+        "409": { description: "The lock is not this worker's: expired/released (`SUTRA.EXTERNAL_TASK.LOCK_LOST`), held by another worker (`SUTRA.EXTERNAL_TASK.LOCK_HELD`), or the task is terminal (`SUTRA.EXTERNAL_TASK.TERMINAL`)." , content: { application/problem+json: { schema: { $ref: "#/components/schemas/Problem" } } } }
+        "422": { description: "The engine refused the completion on the inbound path (`SUTRA.EXTERNAL_TASK.COMPLETION_REJECTED`) — the task is retained and becomes fetchable again. The `attributes.causeCode` carries the engine's own code, which is what says whether re-fetching later can help.", content: { application/problem+json: { schema: { $ref: "#/components/schemas/Problem" } } } }
+        "503": { description: The engine runs without a datasource — pull needs one., content: { application/problem+json: { schema: { $ref: "#/components/schemas/Problem" } } } }
+  /sutra/external-tasks/{id}/failure:
+    post:
+      tags: [external-tasks]
+      summary: Report a failed external task.
+      description: >
+        Releases the lock and spends one of the task's retries (or sets the remaining budget
+        explicitly via `retries`), deferring the next fetch by `retryTimeout`. A budget of zero
+        makes the task TERMINAL: never fetched again, retained with its last error — the pull-side
+        twin of the outbox's poison horizon, so "we gave up" can never degrade into "it silently
+        vanished".
+
+
+        Fails CLOSED on a stale `workerId`, exactly as completion does.
+      operationId: externalTaskFailure
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: The external task id.
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ExternalTaskFailureRequest" }
+      responses:
+        "200": { description: The failure was recorded., content: { application/json: { schema: { $ref: "#/components/schemas/ExternalTaskFailed" } } } }
+        "400": { description: The request is malformed (`SUTRA.EXTERNAL_TASK.REQUEST_INVALID`)., content: { application/problem+json: { schema: { $ref: "#/components/schemas/Problem" } } } }
+        "404": { description: No such task on any live deployment (`SUTRA.EXTERNAL_TASK.NOT_FOUND`)., content: { application/problem+json: { schema: { $ref: "#/components/schemas/Problem" } } } }
+        "409": { description: "The lock is not this worker's, or the task is already terminal." , content: { application/problem+json: { schema: { $ref: "#/components/schemas/Problem" } } } }
+        "503": { description: The engine runs without a datasource — pull needs one., content: { application/problem+json: { schema: { $ref: "#/components/schemas/Problem" } } } }
+  # ---- The OIDC-gated administrative surface — the authenticated twin of the operate routes.
+  #      Every operation requires the bearerAuth scheme + the required admin scope. 401/403/503 are
+  #      the fail-closed responses (missing/invalid token / missing scope / unconfigured surface).
+  /admin/deployments:
+    get:
+      tags: [admin]
+      summary: (admin) The full deployment activation-status snapshot.
+      operationId: adminDeploymentsList
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200": { description: The deployment-status snapshot., content: { application/json: { schema: { $ref: "#/components/schemas/DeploymentSnapshot" } } } }
+        "401": { $ref: "#/components/responses/AdminUnauthorized" }
+        "403": { $ref: "#/components/responses/AdminForbidden" }
+        "503": { $ref: "#/components/responses/AdminUnconfigured" }
+    post:
+      tags: [admin]
+      summary: (admin) Deploy a sealed .sutra archive — validate, store, activate (sync or async LRO).
+      description: >
+        The db deployment source's control path. The request body is the raw sealed `.sutra`
+        archive; the engine validates it fail-closed, stores it ACTIVE for its slot
+        (replace-in-place for a hot-deploy), and activates the flip in-process.
+        **`mode=sync` (default)** returns only once ACTIVE — the response IS the finite signal, ideal
+        for small/local/fast deploys. **`mode=async`** models deploy as a long-running operation:
+        the archive is validated + stored synchronously and the (possibly long) activation flip is
+        deferred, returning `202 Accepted {deploymentId, Pending}` immediately — immune to a k8s
+        ingress read-timeout on a big project. Observe completion by polling
+        `GET /sutra/deployments/{id}` until `Active`/`Failed`, and/or by the completion CloudEvent
+        (`com.sutra.deployment.activated` / `com.sutra.deployment.failed`) emitted to the opt-in
+        `callback` (webhook) and/or `notify` (broker topic) sinks. `503` when the engine is not on
+        the `db` source.
+      operationId: adminDeploy
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: mode, in: query, required: false, description: "`sync` (default — block until Active) or `async` (202 + background flip).", schema: { type: string, enum: [sync, async], default: sync } }
+        - { name: callback, in: query, required: false, description: "(async) An `http(s)://` webhook URL to receive the completion CloudEvent.", schema: { type: string, format: uri } }
+        - { name: notify, in: query, required: false, description: "(async) A broker-scheme destination URI (e.g. `kafka://…/topic`) to receive the completion CloudEvent.", schema: { type: string, format: uri } }
+      requestBody:
+        required: true
+        content:
+          application/octet-stream: { schema: { type: string, format: binary } }
+      responses:
+        "200": { description: (sync) The deployment is ACTIVE., content: { application/json: { schema: { type: object } } } }
+        "202": { description: (async) Accepted — stored and Pending; the activation flip runs in the background., content: { application/json: { schema: { type: object } } } }
+        "400": { description: The archive was rejected (validation failed)., content: { application/json: { schema: { type: object } } } }
+        "401": { $ref: "#/components/responses/AdminUnauthorized" }
+        "403": { $ref: "#/components/responses/AdminForbidden" }
+        "503": { $ref: "#/components/responses/AdminUnconfigured" }
+  /admin/deployments/{id}:
+    get:
+      tags: [admin]
+      summary: (admin) One deployment's activation status by content-hash id.
+      operationId: adminDeploymentById
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: The content-hash deployment id (`dep-<hex>`).
+          schema: { type: string }
+      responses:
+        "200": { description: The deployment's status., content: { application/json: { schema: { $ref: "#/components/schemas/DeploymentStatus" } } } }
+        "401": { $ref: "#/components/responses/AdminUnauthorized" }
+        "403": { $ref: "#/components/responses/AdminForbidden" }
+        "404": { description: Not activated (yet); phase `Unknown`., content: { application/json: { schema: { $ref: "#/components/schemas/DeploymentStatus" } } } }
+        "503": { $ref: "#/components/responses/AdminUnconfigured" }
+    delete:
+      tags: [admin]
+      summary: (admin) Undeploy — retire the slot's active archive + re-activate the remaining set.
+      description: The db deployment source's undeploy. The path parameter is the slot (`tenant--module--version`); its active archive moves to Draining and the fleet re-flips.
+      operationId: adminUndeploy
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: The slot (`tenant--module--version`) to retire.
+          schema: { type: string }
+      responses:
+        "200": { description: The slot's active archive is now Draining., content: { application/json: { schema: { type: object } } } }
+        "401": { $ref: "#/components/responses/AdminUnauthorized" }
+        "403": { $ref: "#/components/responses/AdminForbidden" }
+        "404": { description: No active deployment for the slot., content: { application/json: { schema: { type: object } } } }
+        "503": { $ref: "#/components/responses/AdminUnconfigured" }
+  /admin/instances:
+    get:
+      tags: [admin]
+      summary: (admin) List parked/running instances (same filters as `/sutra/instances`).
+      operationId: adminInstancesList
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: deployment, in: query, required: false, description: One deployment id (`dep-<hex>`) to scan., schema: { type: string } }
+        - { name: status, in: query, required: false, description: "Narrow by instance status (e.g. `SUSPENDED`). A terminal value implies `includeTerminal=true`.", schema: { type: string } }
+        - { name: includeTerminal, in: query, required: false, description: Include finished instances retained as execution history. Default false., schema: { type: boolean, default: false } }
+      responses:
+        "200": { description: The instance summaries., content: { application/json: { schema: { $ref: "#/components/schemas/InstanceList" } } } }
+        "400": { description: Malformed `deployment` id., content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "401": { $ref: "#/components/responses/AdminUnauthorized" }
+        "403": { $ref: "#/components/responses/AdminForbidden" }
+        "503": { $ref: "#/components/responses/AdminUnconfigured" }
+  /admin/instances/{id}:
+    get:
+      tags: [admin]
+      summary: (admin) Inspect one instance — status, node progress, variables (`@sensitive` redacted).
+      description: The gated twin of the operate inspect route — finished instances included, for as long as `sutra.instance.retention` keeps their row.
+      operationId: adminInstanceById
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: The instance UUID.
+          schema: { type: string, format: uuid }
+      responses:
+        "200": { description: The instance projection., content: { application/json: { schema: { $ref: "#/components/schemas/InstanceDetail" } } } }
+        "400": { description: The id is not a UUID., content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "401": { $ref: "#/components/responses/AdminUnauthorized" }
+        "403": { $ref: "#/components/responses/AdminForbidden" }
+        "404": { description: No such instance., content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "503": { $ref: "#/components/responses/AdminUnconfigured" }
+  /admin/instances/by-alias/{key}/{value}:
+    get:
+      tags: [admin]
+      summary: (admin) Resolve a live instance by an alias / business key.
+      description: Scans the live deployment set for the live owner of `(key, value)` and returns the same inspect projection as `/admin/instances/{id}`.
+      operationId: adminInstanceByAlias
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: key, in: path, required: true, description: The alias name (the `<q:alias>` binding)., schema: { type: string } }
+        - { name: value, in: path, required: true, description: The alias / business-key value., schema: { type: string } }
+      responses:
+        "200": { description: The instance projection., content: { application/json: { schema: { $ref: "#/components/schemas/InstanceDetail" } } } }
+        "401": { $ref: "#/components/responses/AdminUnauthorized" }
+        "403": { $ref: "#/components/responses/AdminForbidden" }
+        "404": { description: No live instance carries the alias., content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "503": { $ref: "#/components/responses/AdminUnconfigured" }
+  /admin/instances/{id}/history:
+    get:
+      tags: [admin]
+      summary: (admin) The instance's execution history — its audit journal, seq-ordered and paged.
+      description: >
+        Reads the `audit_event` journal the engine writes per token move. The retained terminal
+        snapshot (the admin inspect route) says where an instance ended; this says how it got
+        there, event by event, with whatever payload the process captured.
+
+
+        **Admin-only** — an audit row can carry captured business data, the same posture a dead
+        letter's bytes get; there is deliberately no `/sutra/*` twin.
+
+
+        **The journal is OPT-IN and this route only reads it**: it is enabled engine-wide by
+        `sutra.audit.sql` and per-process by `<q:audit>`. With either switch off there are no rows,
+        so the response always carries `auditEnabled`, and an empty page carries a `note` naming
+        the reason — an empty journal is never reported as a lost one.
+
+
+        The journal is NOT purged by `sutra.instance.retention`, so an instance whose snapshot has
+        already been purged still has a readable history. `404` is reserved for an id that neither
+        owns an instance row nor appears in any journal.
+
+
+        Paging is by CURSOR (`afterSeq`), not offset, so a page stays stable while a running
+        instance keeps appending. A full page returns `nextAfterSeq`; a short page is the end.
+      operationId: adminInstanceHistory
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: The instance UUID.
+          schema: { type: string, format: uuid }
+        - { name: afterSeq, in: query, required: false, description: Exclusive cursor — return events with `seq` greater than this. Default 0 (seqs start at 1)., schema: { type: integer, default: 0 } }
+        - { name: limit, in: query, required: false, description: Page size, clamped to 1..1000., schema: { type: integer, default: 100, minimum: 1, maximum: 1000 } }
+      responses:
+        "200": { description: One page of the instance's journal (possibly empty — see `auditEnabled` / `note`)., content: { application/json: { schema: { $ref: "#/components/schemas/InstanceHistory" } } } }
+        "400": { description: The id is not a UUID., content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "401": { $ref: "#/components/responses/AdminUnauthorized" }
+        "403": { $ref: "#/components/responses/AdminForbidden" }
+        "404": { description: No such instance — the id owns no row and appears in no journal., content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "503": { $ref: "#/components/responses/AdminUnconfigured" }
+  /admin/instances/{id}/cancel:
+    post:
+      tags: [admin]
+      summary: (admin) Cancel/terminate a parked/running instance.
+      description: The gated twin of the operate cancel route — records the instance `TERMINATED` and retains it as history for `sutra.instance.retention`.
+      operationId: adminInstanceCancel
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: The instance UUID.
+          schema: { type: string, format: uuid }
+      responses:
+        "200": { description: Cancelled., content: { application/json: { schema: { $ref: "#/components/schemas/InstanceCancel" } } } }
+        "400": { description: The id is not a UUID., content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "401": { $ref: "#/components/responses/AdminUnauthorized" }
+        "403": { $ref: "#/components/responses/AdminForbidden" }
+        "404": { description: No such instance., content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "409": { description: The instance already reached COMPLETED/TERMINATED — retained as history, nothing to cancel., content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "503": { $ref: "#/components/responses/AdminUnconfigured" }
+  /admin/instances/{id}/migrate:
+    post:
+      tags: [admin]
+      summary: (admin) Migrate one live instance onto another ACTIVE deployment.
+      description: >
+        Re-pins ONE live instance from the deployment it is pinned to onto another ACTIVE
+        deployment, rewriting every node id its durable state names. This is the sanctioned way off
+        a content-hash pin: without it, an instance parked on a broken model stays parked on the
+        broken model until it is cancelled.
+
+
+        **Validation is the substance, and it is fail-closed.** The engine loads BOTH graphs (the
+        source from the deployment the instance is pinned to, the target from the ACTIVE set) and
+        derives every LIVE LOCUS from durable state — the snapshot's wait frontier, its routed start
+        event and its `<q:retry>` attempt counters, plus the instance's `waiting_event` rows. Each
+        locus is mapped through `nodeMapping` (identity where the map is silent) and the target node
+        must EXIST and be TYPE-COMPATIBLE with what resume actually does there:
+
+
+        | locus | the target node must be |
+        | --- | --- |
+        | `MESSAGE_WAIT` | a relay-resumable wait — `userTask`, intermediate message catch, or a channel-call `serviceTask` |
+        | `TIMER_WAIT` | timer-capable — timer catch event, timer boundary, or a `<q:timeout>`-synthesized `#timeout` boundary |
+        | `RETRY_PARK` | a `serviceTask` carrying `<q:retry>` (the park re-drives the task, so a merely timer-capable node is NOT enough) |
+        | `CONTINUE_REPLY_PARK` | a node carrying `<q:reply continue="true">` (the park self-resumes its tail) |
+        | `ROUTED_START` | a start event |
+        | `RETRY_BUDGET` | a node carrying `<q:retry>` (it owns a burned attempt budget) |
+
+
+        EVERY violation is reported, not just the first, so fixing a mapping takes one round trip.
+
+
+        **`dryRun: true` mutates nothing** — no claim is taken, no row is written — and returns the
+        same report. Because nothing is locked, a dry-run report is advisory: a concurrent resume can
+        move the frontier out from under it.
+
+
+        **Concurrency.** A real run CLAIMS the instance first, under an ownership identity distinct
+        from the resume paths', so a migration can never slip past a resume in flight on the same
+        replica. Contention is a retry-safe `409` (`SUTRA.ADMIN.MIGRATE.CLAIM_HELD`) with nothing
+        read, rewritten or committed. The move itself is ONE transaction spanning two deployment
+        scopes: snapshot, wait rows, aliases, GDPR blind-index rows and the audit journal all land
+        under the new pin together, or none do.
+
+
+        **Terminal vs FAILED.** COMPLETED / TERMINATED instances are a validation error — they are
+        retained history, and re-pinning history would rewrite the record of where it ran. A FAILED
+        instance IS migratable, and that is the prime use case (fix the model, migrate, then decide
+        what to resume). Migration on its own NEVER auto-resumes: it re-pins and rewrites, full stop.
+
+
+        **`resume: true`** is the explicit opt-in that finishes the repair loop. On a FAILED
+        instance that migrated successfully it clears the failure keys, re-stamps the snapshot
+        SUSPENDED and re-arms the parks the failure commit tore down — all inside the migration's
+        OWN transaction, so a crash can never leave a half-revived instance. The instance then comes
+        back through the ORDINARY claim-guarded paths (the timer poller for a timer park, the next
+        correlated inbound for a message park); there is no new resume entry point. On any instance
+        that is not FAILED it is a validation error (`…RESUME_NOT_FAILED`) — a suspended instance is
+        not stuck, it is parked, and it resumes by correlation or by its timers with no operator
+        action at all.
+
+
+        **`targetProcessId`** re-homes the instance into a DIFFERENT process of the target
+        deployment. It requires an explicit `nodeMapping` entry for EVERY live locus
+        (`…CROSS_PROCESS_UNMAPPED`): two processes that both declare `Approve` are not thereby the
+        same `Approve`, so an accidental id collision must never read as a deliberate mapping. The
+        same compatibility matrix then applies, evaluated against the target process's graph; a
+        target deployment that does not declare the named process is `…PROCESS_ABSENT`. The
+        snapshot's `sutra.processId` and the wait rows' process id are rewritten together.
+
+
+        **Not moved:** pending outbox rows stay under the source pin (they were minted by its channel
+        bindings and are dispatched against them; the dispatcher covers draining deployments). They
+        are reported as a warning so the operator knows why.
+      operationId: adminInstanceMigrate
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: The instance UUID.
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [targetDeploymentId]
+              properties:
+                targetDeploymentId:
+                  type: string
+                  description: The ACTIVE deployment to re-pin onto (`dep-<hex>`). DRAINING and unknown ids are refused.
+                nodeMapping:
+                  type: object
+                  additionalProperties: { type: string }
+                  description: >
+                    Source node id → target node id. Omitted entries map to themselves (identity).
+                    An entry naming a node the instance neither parks at nor has completed is
+                    REFUSED rather than silently ignored — a typo must not read as an identity
+                    mapping.
+                targetProcessId:
+                  type: string
+                  description: >
+                    Re-home the instance into THIS process of the target deployment (cross-process
+                    migration). Omitted — and naming the instance's own process — is an ordinary
+                    same-process migration. Requires an explicit `nodeMapping` entry for every live
+                    locus.
+                dryRun:
+                  type: boolean
+                  default: false
+                  description: Validate only — take no claim, write nothing, return the full report.
+                resume:
+                  type: boolean
+                  default: false
+                  description: >
+                    After a successful move of a FAILED instance, clear its failure state and re-arm
+                    its parks in the same transaction so it comes back through the ordinary
+                    claim-guarded resume paths. A validation error on any instance that is not
+                    FAILED.
+      responses:
+        "200": { description: Migrated (or, with `dryRun`, validated). The body is the full report., content: { application/json: { schema: { $ref: "#/components/schemas/InstanceMigration" } } } }
+        "400": { description: The id is not a UUID, or the body is malformed / missing `targetDeploymentId`., content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "401": { $ref: "#/components/responses/AdminUnauthorized" }
+        "403": { $ref: "#/components/responses/AdminForbidden" }
+        "404": { description: No such instance., content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "409": { description: "Retry-safe refusal — the ownership claim is held (`SUTRA.ADMIN.MIGRATE.CLAIM_HELD`), a unique-live alias collides under the target (`…ALIAS_CONFLICT`), or the validated move did not commit (`…COMMIT_FAILED`). Nothing moved.", content: { application/json: { schema: { $ref: "#/components/schemas/InstanceMigration" } } } }
+        "422": { description: "Validation failed — the report lists EVERY violation (`…TARGET_NOT_ACTIVE`, `…TARGET_SAME_AS_SOURCE`, `…SOURCE_UNRESOLVABLE`, `…PROCESS_ABSENT`, `…NODE_UNMAPPED`, `…NODE_INCOMPATIBLE`, `…MAPPING_INVALID`, `…INSTANCE_TERMINAL`, `…CROSS_PROCESS_UNMAPPED`, `…RESUME_NOT_FAILED`).", content: { application/json: { schema: { $ref: "#/components/schemas/InstanceMigration" } } } }
+        "503": { $ref: "#/components/responses/AdminUnconfigured" }
+  /admin/instances/migrate:
+    post:
+      tags: [admin]
+      summary: (admin) Migrate a FILTERED POPULATION off one deployment pin (batch).
+      description: >
+        The batch form of `POST /admin/instances/{id}/migrate`: the same validation, the same
+        compatibility matrix and the same node mapping, applied to every instance the `filter`
+        selects.
+
+
+        **The partial-failure contract is the point.** Every selected instance is validated,
+        claimed, moved and reported ON ITS OWN — its own ownership claim, its own transaction, its
+        own entry in `instances[]`. There is deliberately NO batch-wide transaction, so nothing
+        about one instance can decide another's fate and a mid-batch crash leaves every instance
+        either FULLY migrated or completely untouched.
+
+
+        **The HTTP status describes the BATCH, not its instances.** A run in which every instance
+        refused still answers `200`: the call was accepted, executed to completion and reported in
+        full. Scripts key on `totals` and on each entry's `outcome`
+        (`MIGRATED` / `VALID` / `REFUSED` / `BOUNCED` / `NOT_FOUND` / `ERROR`), never on the status
+        line.
+
+
+        **Contention is reported, never retried.** An instance whose claim is held bounces
+        (`outcome: BOUNCED`, `retrySafe: true`) and the batch moves on. Retrying inside the call
+        would make the runtime unbounded and turn the report into a claim about a moment that has
+        already passed; the caller re-runs the same request instead. The selector is deterministic
+        (ordered by instance id) and whatever moved is no longer under the source pin, so a re-run
+        converges.
+
+
+        **Selection.** `filter.sourceDeploymentId` is required — one migration names one source
+        graph and one target graph, and a node mapping that is right for one source is meaningless
+        for another. Retained TERMINAL rows are excluded unless `includeTerminal` asks for them, in
+        which case they are reported as explicit `…INSTANCE_TERMINAL` refusals rather than silently
+        omitted. `limit` is clamped to 1000 (default 100): the batch takes one claim and one
+        transaction per instance and retries nothing, so a bounded selection is what keeps its
+        runtime a promise a caller can rely on.
+      operationId: adminInstancesMigrate
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [targetDeploymentId, filter]
+              properties:
+                targetDeploymentId:
+                  type: string
+                  description: The ACTIVE deployment to re-pin onto (`dep-<hex>`). DRAINING and unknown ids are refused.
+                filter:
+                  type: object
+                  required: [sourceDeploymentId]
+                  properties:
+                    sourceDeploymentId: { type: string, description: "The pin to migrate OFF (`dep-<hex>`). Required — there is no all-deployments mode." }
+                    processId: { type: string, description: Narrow to one archive-local process id. Required when `targetProcessId` is given. }
+                    status:
+                      type: string
+                      enum: [SUSPENDED, FAILED]
+                      description: Narrow to one snapshot status — the only two an instance can be migrated in.
+                    includeTerminal:
+                      type: boolean
+                      default: false
+                      description: >
+                        Consider retained TERMINAL rows too. They can never migrate; the flag exists
+                        so a caller gets an explicit per-instance refusal instead of a silent
+                        omission.
+                    limit: { type: integer, minimum: 1, maximum: 1000, default: 100 }
+                nodeMapping:
+                  type: object
+                  additionalProperties: { type: string }
+                  description: Source node id → target node id, applied to EVERY selected instance.
+                targetProcessId: { type: string, description: "Cross-process re-home (requires `filter.processId` and an explicit mapping for every live locus)." }
+                dryRun: { type: boolean, default: false, description: Validate every selected instance — take no claim, write nothing. }
+                resume: { type: boolean, default: false, description: "Migrate-then-resume each FAILED instance. A validation error per instance for anything else; rejected outright with `filter.status: SUSPENDED`." }
+      responses:
+        "200": { description: "The batch ran. Per-instance outcomes are in `instances[]`; `totals` counts them.", content: { application/json: { schema: { $ref: "#/components/schemas/InstanceMigrationBatch" } } } }
+        "400": { description: "Malformed body — missing `targetDeploymentId`/`filter.sourceDeploymentId`, a `filter.status` outside {SUSPENDED, FAILED}, `resume` with `filter.status: SUSPENDED`, or `targetProcessId` without `filter.processId`.", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "401": { $ref: "#/components/responses/AdminUnauthorized" }
+        "403": { $ref: "#/components/responses/AdminForbidden" }
+        "422": { description: "The batch itself is refused — the target is not ACTIVE, or source and target are the same pin.", content: { application/json: { schema: { $ref: "#/components/schemas/InstanceMigrationBatch" } } } }
+        "503": { $ref: "#/components/responses/AdminUnconfigured" }
+  /admin/subjects/erase:
+    post:
+      tags: [admin]
+      summary: (admin) GDPR erase/disclose a data subject's instances via the blind index.
+      description: >
+        Resolves the instances recorded for a @subjectKey value (via the HMAC blind index) and
+        hard-deletes their state + nulls captured audit payloads (audit metadata is retained),
+        emitting a metadata-only SUTRA.SUBJECT_ERASED audit event. Set dryRun=true to DISCLOSE
+        (list) the matching instances without deleting anything. Omit deploymentId to fan the
+        operation out across ALL of the tenant's active deployments (the blind index is
+        migration-stable, so one keyId matches the subject across versions).
+      operationId: adminSubjectErase
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [keyId, subjectName, value]
+              properties:
+                keyId: { type: string, description: The migration-stable crypto anchor (tenant) the subject was indexed under. }
+                deploymentId: { type: string, description: Optional — scope to one deployment (dep-<hex>); omitted ⇒ all the tenant's active deployments. }
+                subjectName: { type: string, description: The @subjectKey variable name (e.g. customerId). }
+                value: { type: string, description: The subject value to erase/disclose. }
+                dryRun: { type: boolean, default: false, description: Disclose only — no deletion. }
+      responses:
+        "200": { description: Erased or disclosed., content: { application/json: { schema: { type: object } } } }
+        "400": { description: Bad request (invalid deploymentId)., content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "401": { $ref: "#/components/responses/AdminUnauthorized" }
+        "403": { $ref: "#/components/responses/AdminForbidden" }
+        "412": { description: Blind-indexing disabled (no master key)., content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "503": { $ref: "#/components/responses/AdminUnconfigured" }
+  /admin/dead-letters:
+    get:
+      tags: [admin]
+      summary: (admin) List dead letters — consumed-and-dropped deliveries, newest first.
+      description: >
+        One page of the deployment's dead-letter records: inbound arrivals on a NON-idempotent
+        process that failed during execution (consumed at-most-once), plus poisoned `required`
+        outbound deliveries. Metadata only — `payloadBytes` reports the captured payload's SIZE and
+        the bytes themselves are never rendered; they leave the engine only by being re-dispatched
+        through the replay endpoint. Admin-only for exactly that reason (a dead letter holds the raw
+        business payload). Supply `deploymentId` to scope + page precisely; omitted, the engine fans
+        out across the live deployment set and `offset` applies per deployment before merging.
+      operationId: adminDeadLetters
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - name: deploymentId
+          in: query
+          required: false
+          description: Scope to one deployment (dep-<hex>). Required for meaningful paging.
+          schema: { type: string }
+        - name: limit
+          in: query
+          required: false
+          description: Page size (default 50, clamped to 200).
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+        - name: offset
+          in: query
+          required: false
+          schema: { type: integer, minimum: 0, default: 0 }
+      responses:
+        "200": { description: One page of dead letters., content: { application/json: { schema: { $ref: "#/components/schemas/DeadLetterList" } } } }
+        "400": { description: Invalid deploymentId., content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "401": { $ref: "#/components/responses/AdminUnauthorized" }
+        "403": { $ref: "#/components/responses/AdminForbidden" }
+        "503": { $ref: "#/components/responses/AdminUnconfigured" }
+  /admin/dead-letters/{id}:
+    get:
+      tags: [admin]
+      summary: (admin) Inspect one dead letter (metadata only).
+      operationId: adminDeadLetterById
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: The dead-letter row id.
+          schema: { type: integer, format: int64 }
+        - name: deploymentId
+          in: query
+          required: false
+          description: Scope the lookup; omitted, the live deployment set is walked.
+          schema: { type: string }
+      responses:
+        "200": { description: The dead letter., content: { application/json: { schema: { $ref: "#/components/schemas/DeadLetter" } } } }
+        "400": { description: The id is not a positive integer., content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "401": { $ref: "#/components/responses/AdminUnauthorized" }
+        "403": { $ref: "#/components/responses/AdminForbidden" }
+        "404": { description: No such dead letter., content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "503": { $ref: "#/components/responses/AdminUnconfigured" }
+  /admin/dead-letters/{id}/replay:
+    post:
+      tags: [admin]
+      summary: (admin) Redrive one dead letter through the normal intake path.
+      description: >
+        Re-dispatches the captured payload + headers as a FRESH delivery on the original channel,
+        with a newly minted event id so inbox dedup does not swallow it as a duplicate of the
+        arrival that died. The full intake pipeline runs again (quotas, feature gate, payload cap,
+        codec decode, handler resolution) — nothing is skipped. Fails closed rather than fabricating
+        a delivery: 422 when the row captured no payload or no routing keys (rows written before
+        payload capture, and outbound required-delivery incidents, which are redriven from the
+        outbox instead).
+      operationId: adminDeadLetterReplay
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: The dead-letter row id.
+          schema: { type: integer, format: int64 }
+        - name: deploymentId
+          in: query
+          required: false
+          description: Scope the lookup; omitted, the live deployment set is walked.
+          schema: { type: string }
+      responses:
+        "200": { description: Replayed — the dispatch outcome is reported., content: { application/json: { schema: { $ref: "#/components/schemas/DeadLetterReplay" } } } }
+        "400": { description: The id is not a positive integer., content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "401": { $ref: "#/components/responses/AdminUnauthorized" }
+        "403": { $ref: "#/components/responses/AdminForbidden" }
+        "404": { description: No such dead letter., content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "422": { description: Not replayable — no payload/routing keys were captured., content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "500": { description: The engine rejected the redrive (its diagnostic is returned)., content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "503": { $ref: "#/components/responses/AdminUnconfigured" }
+components:
+  securitySchemes:
+    # OIDC bearer JWT. The engine validates the token against `sutra.admin.oidc.*`
+    # (issuer + audience + JWKS signature) and the required admin scope/claim.
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: OIDC-issued JWT with the required admin scope (`sutra.admin.oidc.required-role`).
+  responses:
+    AdminUnauthorized:
+      description: Missing / malformed / invalid bearer token (bad signature, issuer, audience, or expiry).
+      headers:
+        WWW-Authenticate: { schema: { type: string }, description: "`Bearer`." }
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    AdminForbidden:
+      description: Authenticated, but the token lacks the required admin scope/claim.
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    AdminUnconfigured:
+      description: Admin OIDC gating is required but not configured — the surface is closed (fail-closed).
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+  schemas:
+    Health:
+      type: object
+      properties:
+        status: { type: string, enum: [UP, DOWN], description: Aggregate health. }
+        checks:
+          type: array
+          items:
+            type: object
+            properties:
+              name: { type: string }
+              status: { type: string, enum: [UP, DOWN] }
+    DeploymentStatus:
+      type: object
+      description: One deployment's activation state. `phase` is `Unknown` on a 404 (not yet activated).
+      properties:
+        deploymentId: { type: string }
+        phase: { type: string, description: "e.g. Active, Draining, Failed, Unknown" }
+        ready: { type: boolean }
+      additionalProperties: true
+    DeploymentSnapshot:
+      type: object
+      description: The engine's full deployment-status snapshot (shape owned by DeployStatus::to_json).
+      additionalProperties: true
+    InstanceSummary:
+      type: object
+      properties:
+        instanceId: { type: string, format: uuid }
+        deploymentId: { type: string }
+        status: { type: string }
+    InstanceList:
+      type: object
+      properties:
+        instances:
+          type: array
+          items: { $ref: "#/components/schemas/InstanceSummary" }
+    DeadLetter:
+      type: object
+      description: >
+        One consumed-and-dropped delivery. The captured payload is represented by its SIZE only —
+        the bytes are never rendered on any read surface.
+      properties:
+        id: { type: integer, format: int64 }
+        deploymentId: { type: string }
+        channel: { type: string, description: The inbound channel, or the destination URI for an outbound required-delivery incident. }
+        processId: { type: string }
+        dedupKey: { type: string }
+        failureCode: { type: string, description: "The causing SUTRA.* diagnostic code." }
+        detail: { type: string }
+        receivedAt: { type: string, format: date-time }
+        recordedAt: { type: string, format: date-time }
+        payloadBytes: { type: [integer, "null"], description: Size of the captured payload; null when none was captured. }
+        contentType: { type: [string, "null"] }
+        tenant: { type: string }
+        moduleKey: { type: string, description: '"<tenant>/<module>/<version>" — with channel, the binding a replay resolves.' }
+        replayable: { type: boolean, description: True when a payload AND routing keys were captured. }
+    DeadLetterList:
+      type: object
+      properties:
+        deadLetters:
+          type: array
+          items: { $ref: "#/components/schemas/DeadLetter" }
+        limit: { type: integer }
+        offset: { type: integer }
+    DeadLetterReplay:
+      type: object
+      properties:
+        deadLetterId: { type: integer, format: int64 }
+        deploymentId: { type: string }
+        channel: { type: string }
+        eventId: { type: string, description: The freshly minted event id the redrive was dispatched under. }
+        replayed: { type: boolean }
+        outcome:
+          type: object
+          description: The dispatch outcome (kind = Completed / Duplicate / DeadLettered).
+          additionalProperties: true
+    InstanceDetail:
+      type: object
+      properties:
+        instanceId: { type: string, format: uuid }
+        deploymentId: { type: string }
+        status: { type: string, description: "RUNNING / SUSPENDED / COMPLETED (ran to an end event) / TERMINATED (operator-cancelled) / FAILED (a fatal step killed it — not resumable). The terminal values are answerable for as long as `sutra.instance.retention` keeps the row." }
+        failureCode: { type: string, description: "Present only for a FAILED instance: the stable SUTRA.* code of the fatal step. The failure DETAIL is deliberately not exposed on this unauthenticated surface." }
+        completedNodes: { type: array, items: { type: string } }
+        waitingNodes: { type: array, items: { type: string }, description: "The frontier the instance is parked at — for a FAILED instance the frontier it died at, and for a retained terminal instance the frontier it was last parked at (all of whose wait rows are resolved)." }
+        sensitive: { type: array, items: { type: string }, description: Names of `@sensitive` variables. }
+        variables:
+          type: object
+          additionalProperties: { type: string }
+          description: Variable values; every `@sensitive` value is `***REDACTED***`.
+    InstanceCancel:
+      type: object
+      properties:
+        instanceId: { type: string, format: uuid }
+        deploymentId: { type: string }
+        status: { type: string, description: "Always `CANCELLED` — the OUTCOME of the call." }
+        persistedStatus: { type: [string, "null"], description: "The status the retained row now carries (`TERMINATED`); null when retention is `PT0S` and the row was deleted." }
+        retained: { type: boolean, description: Whether the instance was kept as queryable execution history. }
+      additionalProperties: true
+    AuditEvent:
+      type: object
+      description: >
+        One row of an instance's audit journal. `payload` is rendered as parsed JSON when the row
+        holds valid JSON and as a plain string otherwise, so a malformed row degrades readably
+        instead of failing the page. It is `{}` for an instance whose process captured nothing, and
+        also after a GDPR erasure redacted it (the trail row itself is retained on purpose).
+      properties:
+        seq: { type: integer, description: Monotonic per-instance sequence — the ordering and the paging cursor. }
+        at: { type: string, format: date-time }
+        eventType: { type: string, description: "e.g. INSTANCE_STARTED / NODE_ENTERED / NODE_LEFT / INSTANCE_COMPLETED / INSTANCE_FAILED." }
+        nodeId: { type: [string, "null"] }
+        diagnosticCode: { type: [string, "null"], description: "The stable SUTRA.* code, for events that carry a diagnostic." }
+        diagnostic: { description: "The diagnostic body, when one was captured." }
+        payload: { description: The captured payload. }
+    InstanceHistory:
+      type: object
+      description: One seq-ordered page of an instance's audit journal.
+      properties:
+        instanceId: { type: string, format: uuid }
+        deploymentId: { type: [string, "null"], description: The deployment whose journal answered; null when the instance is known but has no journal rows. }
+        events:
+          type: array
+          items: { $ref: "#/components/schemas/AuditEvent" }
+        afterSeq: { type: integer, description: The cursor this page was read from. }
+        limit: { type: integer }
+        nextAfterSeq: { type: [integer, "null"], description: Cursor for the next page; null when this page was the last one. }
+        auditEnabled: { type: boolean, description: Whether the durable journal is switched on engine-wide (`sutra.audit.sql`). }
+        note: { type: string, description: "Present only on an EMPTY page: why it is empty (journal disabled, no `<q:audit>`, or a cursor past the end) — so an empty journal is never mistaken for a lost one." }
+    MigrationFinding:
+      type: object
+      description: One machine-readable violation or warning from a migration validation.
+      properties:
+        code: { type: string, description: "The stable `SUTRA.ADMIN.MIGRATE.*` code." }
+        sourceNodeId: { type: [string, "null"], description: The node id as the SOURCE graph names it, for node-scoped findings. }
+        targetNodeId: { type: [string, "null"], description: The id it maps to in the target. }
+        detail: { type: string, description: What is wrong, and what the target node would have to be. }
+    MigrationLocus:
+      type: object
+      description: >
+        One live locus of the instance and how it resolved against the target graph. A locus is any
+        node id the durable state pins; the KIND determines which target construct is acceptable.
+      properties:
+        kind:
+          type: string
+          enum: [MESSAGE_WAIT, TIMER_WAIT, RETRY_PARK, CONTINUE_REPLY_PARK, ROUTED_START, RETRY_BUDGET]
+        sourceNodeId: { type: string }
+        targetNodeId: { type: string }
+        targetConstruct: { type: [string, "null"], description: "The BPMN construct found at the target node (`userTask`, `timerCatchEvent`, …); null when the locus is a violation." }
+        status: { type: string, enum: [OK, VIOLATION] }
+    InstanceMigration:
+      type: object
+      description: >
+        The full migration report — returned identically for a dry run, a refusal and a success, so
+        the document an operator inspects before migrating is the one they get back afterwards.
+      properties:
+        instanceId: { type: string, format: uuid }
+        fromDeploymentId: { type: string, description: The pin the instance had (or still has, if the migration was refused). }
+        toDeploymentId: { type: string }
+        processId: { type: string, description: The instance's own archive-local process id (`fromProcessId`, under its historical name). }
+        fromProcessId: { type: string }
+        toProcessId: { type: string, description: The process the instance is validated against and re-homed into — equal to `fromProcessId` for an ordinary same-process migration. }
+        crossProcess: { type: boolean, description: Whether this is a genuine re-home into a different process (which requires an explicit mapping for every live locus). }
+        status: { type: string, description: "The instance's snapshot status when it was validated (`SUSPENDED` / `FAILED` / …)." }
+        dryRun: { type: boolean }
+        valid: { type: boolean, description: Whether validation passed — `true` with `migrated:false` is a successful dry run. }
+        migrated: { type: boolean, description: Whether the durable move committed. Always false on a dry run or a refusal. }
+        resumeRequested: { type: boolean, description: Whether the caller asked for migrate-then-resume. }
+        resumed: { type: boolean, description: "Whether the instance was brought back live: `resume: true` on a FAILED instance that moved. `false` on every ordinary migration — re-pinning never advances an instance by itself." }
+        outcome: { type: string, enum: [MIGRATED, VALID, REFUSED, BOUNCED, NOT_FOUND, ERROR], description: "Present on BATCH entries: this instance's verdict." }
+        mappingSource: { type: string, enum: [identity, explicit] }
+        mapping:
+          type: object
+          additionalProperties: { type: string }
+          description: The EFFECTIVE mapping actually applied — explicit entries plus identity for every other locus and completed node, materialised in full.
+        loci:
+          type: array
+          items: { $ref: "#/components/schemas/MigrationLocus" }
+        violations:
+          type: array
+          description: EVERY reason the migration cannot proceed, not just the first. Empty when `valid`.
+          items: { $ref: "#/components/schemas/MigrationFinding" }
+        warnings:
+          type: array
+          description: >
+            Non-fatal findings — a completed node absent from the target (replay-as-done matches by
+            id, so it would be executed again), a wait frontier entry with no `waiting_event` row
+            behind it, or pending outbox rows staying on the source pin.
+          items: { $ref: "#/components/schemas/MigrationFinding" }
+        rewrites:
+          type: object
+          description: What the commit actually moved. Present only when `migrated`.
+          properties:
+            waitRows: { type: integer }
+            aliasRows: { type: integer }
+            subjectRows: { type: integer }
+            auditRows: { type: integer }
+            rearmedParks: { type: integer, description: "Parks re-armed by `resume` — the rows the failure commit had resolved. 0 on every ordinary migration." }
+            outboxRows: { type: integer, description: "Always 0 — outbox rows stay under the source pin by design." }
+        auditSeq: { type: integer, description: "The per-instance journal seq the `SUTRA.INSTANCE_MIGRATED` event took; the snapshot's counter is bumped past it." }
+        retrySafe: { type: boolean, description: "A claim/commit bounce: nothing was read, rewritten or committed, so the call is safe to retry." }
+        note: { type: string, description: "Present on a dry run: the report is advisory (nothing was locked while it was produced)." }
+      additionalProperties: true
+    InstanceMigrationBatch:
+      type: object
+      description: >
+        One batch migration's report. `totals` counts the per-instance outcomes; `instances[]`
+        carries the same document the single-instance endpoint returns, plus that instance's
+        `outcome` and `retrySafe`.
+      properties:
+        fromDeploymentId: { type: string, description: The filter's source pin. }
+        toDeploymentId: { type: string }
+        toProcessId: { type: string, nullable: true, description: Present only for a cross-process re-home. }
+        dryRun: { type: boolean }
+        resume: { type: boolean }
+        mappingSource: { type: string, enum: [identity, explicit] }
+        filter:
+          type: object
+          description: The selector echoed back, so a saved report says exactly what it acted on.
+          properties:
+            sourceDeploymentId: { type: string }
+            processId: { type: string, nullable: true }
+            status: { type: string, nullable: true }
+            includeTerminal: { type: boolean }
+            limit: { type: integer }
+        selected: { type: integer, description: How many instances the filter selected (and therefore how many entries follow). }
+        totals:
+          type: object
+          properties:
+            migrated: { type: integer }
+            valid: { type: integer, description: Dry-run validations that passed. }
+            refused: { type: integer }
+            bounced: { type: integer, description: Retry-safe — a live ownership claim, or a commit that lost a race. }
+            notFound: { type: integer }
+            errors: { type: integer }
+            resumed: { type: integer }
+        instances:
+          type: array
+          items: { $ref: "#/components/schemas/InstanceMigration" }
+        note: { type: string, description: The one-line reading of the totals, including what to do about bounced instances. }
+      additionalProperties: true
+    Error:
+      type: object
+      properties:
+        error: { type: string }
+      additionalProperties: true
+    Problem:
+      type: object
+      description: >
+        RFC 7807 problem document carrying the stable `SUTRA.*` diagnostic code — the same error
+        shape the per-deployment channel endpoints answer rejects with, so a worker parses one
+        format across both surfaces.
+      properties:
+        type: { type: string }
+        title: { type: string, description: The stable `SUTRA.*` code. }
+        status: { type: integer }
+        detail: { type: string }
+        code: { type: string, description: The stable `SUTRA.*` code. }
+        attributes: { type: object, additionalProperties: { type: string } }
+    ExternalTaskFetchRequest:
+      type: object
+      required: [workerId, channels]
+      properties:
+        workerId: { type: string, description: The worker's identity — the lock owner. Completion and failure must present the same value. }
+        channels:
+          type: array
+          description: The channel names (topics) to claim from. A `pull://<channel>` bind names its channel; that name is the topic.
+          items: { type: string }
+          minItems: 1
+        lockDuration: { type: string, description: "ISO-8601 duration the claimed tasks stay locked (e.g. `PT30S`). Defaults to `sutra.external-task.default-lock-duration`; capped by `…max-lock-duration`." }
+        maxTasks: { type: integer, minimum: 1, description: "How many tasks to claim at most. Defaults to (and is capped by) `sutra.external-task.max-tasks`." }
+        asyncResponseTimeout: { type: string, description: "ISO-8601 duration to hold the request open when nothing is available. Defaults to (and is capped by) `sutra.external-task.max-async-response-timeout`." }
+    ExternalTask:
+      type: object
+      description: One locked task. `payload` carries a UTF-8 body inline; a binary body arrives as `payloadBase64` instead, so a worker never has to guess which it got.
+      properties:
+        id: { type: string, format: uuid, description: "The task id — the `{id}` of complete/failure." }
+        channel: { type: string, description: "The channel this task was parked on, and the channel the completion is delivered to." }
+        tenant: { type: string }
+        moduleKey: { type: string, description: The version-bearing `<tenant>/<module>/<version>` triple. }
+        deploymentId: { type: string }
+        instanceId: { type: string, format: uuid, description: The process instance whose send produced this task. }
+        idempotencyKey: { type: string, description: "The delivery's idempotency key — carried onto the completion, which is what makes at-least-once safe." }
+        headers: { type: object, additionalProperties: { type: string }, description: "The parked transport headers, including whatever the author's `<q:alias>` correlates on." }
+        contentType: { type: [string, "null"] }
+        payload: { type: string, description: "The request payload, when it is valid UTF-8." }
+        payloadBase64: { type: string, description: "The request payload, base64-encoded, when it is not valid UTF-8." }
+        lockExpiresAt: { type: string, format: date-time, description: When this worker's lock lapses and the task becomes fetchable again. }
+        retries: { type: integer, description: Remaining failure budget. }
+        attempts: { type: integer, description: How many times this task has been handed out. }
+    ExternalTaskList:
+      type: object
+      properties:
+        tasks:
+          type: array
+          items: { $ref: "#/components/schemas/ExternalTask" }
+    ExternalTaskCompleteRequest:
+      type: object
+      required: [workerId]
+      properties:
+        workerId: { type: string, description: Must match the lock owner; a stale value fails closed with a `409`. }
+        result: { type: string, description: The result payload as text. Mutually exclusive with `resultBase64`; omitting both re-delivers the original request payload. }
+        resultBase64: { type: string, description: The result payload as base64 bytes. Mutually exclusive with `result`. }
+        contentType: { type: string, description: Content type of the result; defaults to the parked task's own. }
+    ExternalTaskCompleted:
+      type: object
+      properties:
+        taskId: { type: string, format: uuid }
+        channel: { type: string }
+        instanceId: { type: string, format: uuid }
+        status: { type: string, enum: [COMPLETED] }
+    ExternalTaskFailureRequest:
+      type: object
+      required: [workerId]
+      properties:
+        workerId: { type: string, description: Must match the lock owner; a stale value fails closed with a `409`. }
+        errorMessage: { type: string, description: "What went wrong — retained on the row and, at exhaustion, in the terminal record." }
+        retries: { type: integer, minimum: 0, description: "The budget to leave behind. Omitted spends one; `0` makes the task TERMINAL." }
+        retryTimeout: { type: string, description: "ISO-8601 duration before the task is fetchable again. Defaults to `sutra.external-task.retry-timeout`." }
+    ExternalTaskFailed:
+      type: object
+      properties:
+        taskId: { type: string, format: uuid }
+        channel: { type: string }
+        instanceId: { type: string, format: uuid }
+        retries: { type: integer, description: The remaining failure budget after this report. }
+        status: { type: string, enum: [PENDING, TERMINAL], description: "`TERMINAL` means the budget is spent — the task is retained but never fetched again." }

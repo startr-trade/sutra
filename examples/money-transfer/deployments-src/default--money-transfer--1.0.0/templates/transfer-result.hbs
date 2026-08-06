@@ -1,0 +1,4 @@
+{{!-- Renders the accepted-transfer reply. The template does NO arithmetic — it only renders values FEEL already
+   computed: fromId/toId/amount come from the TransferRequest payload; newFrom/newTo were computed by
+   the Compute task's FEEL assignments inside the transaction and persisted before commit. --}}
+<TransferAccepted from="{{payload.fromId}}" to="{{payload.toId}}" amount="{{payload.amount}}" newFromBalance="{{newFrom}}" newToBalance="{{newTo}}"/>

@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Review decision for the subprocess-showcase flow (a businessRuleTask; rules are DMN/FEEL only).
+  Evaluated by the DMN decision engine (sutra-validator-dmn) against the process variables; the named
+  output column `decision` merges back into the instance variables. FIRST hit policy: the first matching
+  rule wins ("-" is the catch-all).
+-->
+<definitions xmlns="https://www.omg.org/spec/DMN/20230324/MODEL/"
+             namespace="urn:sutra:module:approval:decide">
+  <decision id="approvalDecide" name="Review decision from risk score">
+    <decisionTable hitPolicy="FIRST">
+      <input id="i_risk"><inputExpression typeRef="number"><text>riskScore</text></inputExpression></input>
+      <output id="o_decision" name="decision" typeRef="string"/>
+      <rule id="r_approve">
+        <inputEntry><text>&lt; 50</text></inputEntry>
+        <outputEntry><text>"approve"</text></outputEntry>
+      </rule>
+      <rule id="r_review">
+        <inputEntry><text>-</text></inputEntry>
+        <outputEntry><text>"review"</text></outputEntry>
+      </rule>
+    </decisionTable>
+  </decision>
+</definitions>

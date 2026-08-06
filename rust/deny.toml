@@ -1,0 +1,100 @@
+# cargo-deny configuration for the Sutra Rust workspace.
+#
+# Runs as `make audit` (alongside `cargo audit`). The gate has three jobs:
+#   1. licenses  — every dependency must carry an OSI-permissive / weak-copyleft licence
+#                  from the allowlist below; anything else fails the build.
+#   2. advisories — deny YANKED crates and RUSTSEC vulnerabilities; unmaintained advisories
+#                  surface as WARNINGS (informational, non-fatal) so an unmaintained
+#                  transitive dep is visible without blocking a release candidate.
+#   3. bans/sources — flag duplicate versions (warn) and refuse crates from unknown
+#                  registries / git sources.
+#
+# Every deviation is documented inline (exceptions / clarifications / ignores) — the
+# supply-chain triage lives in this file, not in a side channel.
+
+[graph]
+# Audit the host target the engine image is built for (glibc/Debian x86_64). Keeping the
+# target set explicit avoids pulling Windows/macOS-only advisories into the report.
+targets = [
+    "x86_64-unknown-linux-gnu",
+]
+all-features = false
+
+# ---------------------------------------------------------------------------
+[advisories]
+# The RustSec advisory DB is fetched to the default location on first run.
+yanked = "deny"
+# Unmaintained advisories are scoped to WORKSPACE-DIRECT dependencies only: a transitive
+# unmaintained crate (e.g. testcontainers pulling rustls-pemfile) does not fail the gate,
+# but `cargo audit` still surfaces it as a WARNING (the "unmaintained = WARN" posture). A
+# NEW unmaintained *direct* dependency would fail here — that is the signal we want to block.
+unmaintained = "workspace"
+# Accepted / tracked vulnerabilities — every entry carries its full triage inline below
+# (chain, severity, why accepted or when it upgrades). Nothing here is a silent accept: each
+# ID is either dev/test-only (not in the shipped engine binary), has no fix available, or is
+# a tracked upgrade blocked upstream.
+ignore = [
+    # (quick-xml RUSTSEC-2026-0194/-0195 removed — upgraded to 0.41.0, which fixes both.)
+    # rsa 0.9.10 — SHIPPED via sqlx-mysql. Marvin timing side-channel (5.9 med). NO FIX
+    # published upstream. Reachable only on the MySQL auth handshake over the (trusted) DB
+    # link; not used for message signing. Accepted until sqlx-mysql ships a patched rsa.
+    "RUSTSEC-2023-0071",
+    # rustls-webpki 0.101.7 — SHIPPED via tiberius 0.12 -> tokio-rustls 0.24 -> rustls 0.21
+    # (the MSSQL dialect's TLS stack only). Name-constraint bypass + CRL-parse panic. Reaches
+    # only the MSSQL server-cert path over a trusted DB link. UPGRADE blocked upstream: tiberius
+    # pins rustls 0.21; unblocks when tiberius moves to rustls 0.23+.
+    "RUSTSEC-2026-0099",
+    "RUSTSEC-2026-0098",
+    "RUSTSEC-2026-0104",
+    # astral-tokio-tar 0.5.6 — DEV/TEST ONLY (testcontainers image unpacking). NOT in the
+    # shipped engine binary; the test harness pulls only trusted images. PAX-header desync +
+    # symlink chmod on extraction. Accepted (no shipped exposure); revisit if testcontainers
+    # bumps it.
+    "RUSTSEC-2026-0145",
+    "RUSTSEC-2026-0112",
+    "RUSTSEC-2026-0066",
+    "RUSTSEC-2026-0113",
+]
+
+# ---------------------------------------------------------------------------
+[licenses]
+# Allowlist — OSI-permissive plus the weak-copyleft MPL-2.0 (file-level copyleft; does not
+# reach across a crate boundary). Anything outside this set fails the licenses check.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "MPL-2.0",
+    # Unicode data tables (unicode-ident and friends) ship under the Unicode licence; it is
+    # a permissive data licence, kept explicit because it is not in the "BSD/MIT" shorthand.
+    "Unicode-3.0",
+]
+# Confidence below this treats a licence expression as undetermined (forces a clarification).
+confidence-threshold = 0.85
+# Our own workspace crates are `publish = false` / license = "UNLICENSED"; skip them.
+private = { ignore = true }
+# Per-crate exceptions — a licence accepted ONLY for the named crate, keeping the global
+# allow list matching the specified policy. webpki-roots is the Mozilla CA-certificate bundle
+# (pulled by sqlx-core for DB TLS); it ships the cert DATA under CDLA-Permissive-2.0, a
+# permissive data-sharing licence. Scoped here rather than widening `allow`.
+exceptions = [
+    { allow = ["CDLA-Permissive-2.0"], crate = "webpki-roots" },
+]
+
+# ---------------------------------------------------------------------------
+[bans]
+# Duplicate versions of the same crate are common in a large graph (transitive skew); warn
+# so they are visible for periodic cleanup without blocking a release.
+multiple-versions = "warn"
+wildcards = "warn"
+
+# ---------------------------------------------------------------------------
+[sources]
+# Every dependency must resolve from crates.io; unknown registries / git sources fail.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

@@ -1,0 +1,4 @@
+{{!-- Renders the coverage-reset acknowledgement. `coverageReset` is the map the coverage:reset:transfer
+   engine op built: {process, cleared, total} — how many of the target's declared paths had a mark that
+   was deleted (the covered-set is now empty -> a subsequent report reads 0%). --}}
+<CoverageReset process="{{coverageReset.process}}" cleared="{{coverageReset.cleared}}" total="{{coverageReset.total}}"/>

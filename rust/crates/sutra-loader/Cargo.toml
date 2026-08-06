@@ -1,0 +1,37 @@
+[package]
+name = "sutra-loader"
+description = "The `.sutra` format owner: authoring-tree resolver, package/lint library, and deployment-archive writer/reader shared by CLI and engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+sutra-bpmn = { path = "../sutra-bpmn" }
+# The lint/loader uses only the pure MODEL of channels + datastore (config parse, codes, registry,
+# `scheme_of` / `parse_datastores`) — NOT the async transport spine or the sqlx providers. Depending
+# with `default-features = false` keeps them off a `sutra-loader`-only build (and the wasm lint core);
+# the engine turns them back on via its OWN direct deps (feature unification).
+sutra-channels = { path = "../sutra-channels", default-features = false }
+sutra-codec-spi = { path = "../sutra-codec-spi" }
+sutra-codec-schema = { path = "../sutra-codec-schema" }
+sutra-datastore = { path = "../sutra-datastore", default-features = false }
+sutra-dmn = { path = "../sutra-dmn" }
+sutra-srl = { path = "../sutra-srl" }
+sutra-executor = { path = "../sutra-executor" }
+sutra-feel = { path = "../sutra-feel" }
+sutra-templates = { path = "../sutra-templates" }
+sutra-xsd = { path = "../sutra-xsd" }
+regex = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+sha2 = { workspace = true }
+zip = { workspace = true }
+
+[dev-dependencies]
+# Force-linked in the test binary (tests/all.rs) so `sutra_codec_spi::builtin_formats()` is
+# populated and the example-package lint resolves what the public examples bind (the CLI/engine
+# binaries force-link the same way; a test binary links only the lib, so it must do so itself).
+sutra-formats = { path = "../sutra-formats" }
+tempfile = "3"
+

@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           targetNamespace="urn:iso:std:iso:20022:tech:xsd:test.001.001.01"
+           xmlns="urn:iso:std:iso:20022:tech:xsd:test.001.001.01"
+           elementFormDefault="qualified">
+  <xs:element name="Document" type="Document"/>
+  <xs:complexType name="Document">
+    <xs:sequence>
+      <xs:element name="Body" type="Body"/>
+    </xs:sequence>
+  </xs:complexType>
+  <xs:complexType name="Body">
+    <xs:sequence>
+      <xs:element name="MsgId" type="Max35Text"/>
+      <xs:element name="Amt" type="Amount" minOccurs="0"/>
+      <xs:element name="Cd" type="CodeType" minOccurs="0"/>
+      <xs:element name="Pick" type="PartyChoice" minOccurs="0" maxOccurs="unbounded"/>
+    </xs:sequence>
+  </xs:complexType>
+  <xs:complexType name="PartyChoice">
+    <xs:choice>
+      <xs:element name="OrgId" type="Max35Text"/>
+      <xs:element name="PrvtId" type="Max35Text"/>
+    </xs:choice>
+  </xs:complexType>
+  <xs:complexType name="Amount">
+    <xs:simpleContent>
+      <xs:extension base="Amount_SimpleType">
+        <xs:attribute name="Ccy" type="CurrencyCode" use="required"/>
+      </xs:extension>
+    </xs:simpleContent>
+  </xs:complexType>
+  <xs:simpleType name="Amount_SimpleType">
+    <xs:restriction base="xs:decimal">
+      <xs:fractionDigits value="5"/>
+      <xs:totalDigits value="18"/>
+      <xs:minInclusive value="0"/>
+    </xs:restriction>
+  </xs:simpleType>
+  <xs:simpleType name="CurrencyCode">
+    <xs:restriction base="xs:string">
+      <xs:pattern value="[A-Z]{3,3}"/>
+    </xs:restriction>
+  </xs:simpleType>
+  <xs:simpleType name="Max35Text">
+    <xs:restriction base="xs:string">
+      <xs:minLength value="1"/>
+      <xs:maxLength value="35"/>
+    </xs:restriction>
+  </xs:simpleType>
+  <xs:simpleType name="CodeType">
+    <xs:restriction base="xs:string">
+      <xs:enumeration value="DEBT"/>
+      <xs:enumeration value="CRED"/>
+    </xs:restriction>
+  </xs:simpleType>
+</xs:schema>

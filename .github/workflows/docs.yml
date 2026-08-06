@@ -1,0 +1,99 @@
+name: Docs
+
+# Builds the mdBook under docs/ and publishes it to GitHub Pages.
+#
+# TOLERATES AN ABSENT BOOK: the book is curated by a separate workstream. Until
+# docs/book.toml exists, the build job no-ops with a notice and the deploy job is skipped —
+# this workflow never fails a push just because the book has not landed yet.
+#
+# One-time repo setup before the first successful deploy:
+#   Settings → Pages → Build and deployment → Source = "GitHub Actions".
+# Without that, actions/deploy-pages fails with "Pages site not found".
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/**"
+      - ".github/workflows/docs.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "docs/**"
+      - ".github/workflows/docs.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Only one Pages deployment at a time; do not cancel an in-flight deploy.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  # Pinned so a book that builds locally builds identically here.
+  MDBOOK_VERSION: "0.4.40"
+
+jobs:
+  build:
+    name: mdBook build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      has_book: ${{ steps.detect.outputs.has_book }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Detect the book
+        id: detect
+        run: |
+          if [ -f docs/book.toml ]; then
+            echo "has_book=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_book=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::docs/book.toml not found — skipping the mdBook build (the book is curated separately)."
+          fi
+
+      - name: Install mdBook
+        if: steps.detect.outputs.has_book == 'true'
+        run: |
+          set -eu
+          url="https://github.com/rust-lang/mdBook/releases/download/v${MDBOOK_VERSION}/mdbook-v${MDBOOK_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+          mkdir -p "$HOME/.local/bin"
+          curl -fsSL "$url" | tar -xz -C "$HOME/.local/bin"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Build
+        if: steps.detect.outputs.has_book == 'true'
+        run: mdbook build docs
+
+      - name: Configure Pages
+        if: steps.detect.outputs.has_book == 'true' && github.event_name != 'pull_request'
+        uses: actions/configure-pages@v5
+
+      # `build-dir` defaults to `book` relative to book.toml → docs/book.
+      - name: Upload Pages artifact
+        if: steps.detect.outputs.has_book == 'true' && github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs/book
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: build
+    # PRs build the book (a broken book fails the PR) but never deploy.
+    if: ${{ needs.build.outputs.has_book == 'true' && github.event_name != 'pull_request' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4

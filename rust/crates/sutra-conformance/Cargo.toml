@@ -1,0 +1,45 @@
+[package]
+name = "sutra-conformance"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# Tests-only crate: the primary conformance gate. The library is empty — every gate lives
+# under `tests/all/` (the consolidation pattern: one linked test binary). The tier-2 docker
+# suites boot the shipped `sutra-rust-engine:dev` image via testcontainers and drive each
+# example end to end; the tier-3 k8s suites hot-deploy onto the shared cluster instance.
+#
+# The HARNESS is not here: it lives in `sutra_testkit::conformance` (feature `conformance`),
+# so a suite crate in another workspace drives the same fixtures. This crate carries only the
+# suites, their payload builders and their expectations.
+[lib]
+path = "src/lib.rs"
+
+[dev-dependencies]
+sutra-formats = { path = "../sutra-formats" }
+# The atexit container reaper (testcontainers-rs 0.25 has no ryuk) AND — via the `conformance`
+# feature — the promoted harness: `sutra_testkit::conformance::{util, engine, broker, callback,
+# compose, k8s}`, re-exported by `tests/all/support.rs`.
+sutra-testkit = { path = "../sutra-testkit", features = ["conformance"] }
+# `assemble_dir` — one deployment-package directory sealed into one `.sutra` archive on the host.
+sutra-loader = { path = "../sutra-loader" }
+
+# Fixtures the SUITES construct directly (the harness owns its own copies of these):
+# testcontainers for the per-suite ad-hoc containers, lapin for the broker round trips.
+testcontainers = { workspace = true }
+testcontainers-modules = { workspace = true, features = ["rabbitmq"] }
+lapin = { workspace = true }
+# rdkafka is carried for the kafka-transport channels the examples declare (no suite asserts a
+# kafka round trip yet).
+rdkafka = { workspace = true }
+# Raw archive inspection for the deployment-source assembly.
+zip = { workspace = true }
+serde_json = { workspace = true }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "sync"] }
+# HTTP client for the engine intake + Elasticsearch queries (rustls, no OpenSSL).
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+
+[[test]]
+name = "all"
+path = "tests/all.rs"

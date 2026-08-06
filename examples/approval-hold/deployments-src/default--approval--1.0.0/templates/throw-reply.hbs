@@ -1,0 +1,6 @@
+{{!-- Reply template for the throw-showcase flow. Echoes the evidence each throw construct
+   produced: guarded="ok" proves the link goto landed (the guarded task is reachable only via the link
+   jump), escalationHandled=true proves the escalation throw routed to its boundary handler (which runs
+   BEFORE this render — strict mode would fail the render if it had not), and rendering at all proves the
+   signal throw (a no-subscriber broadcast) did not block the flow. --}}
+<ThrowShowcase stage="{{stage}}" linkJump="{{guarded}}" escalated="{{escalationHandled}}"/>

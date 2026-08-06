@@ -1,0 +1,17 @@
+[package]
+name = "sutra-openapi"
+description = "Per-deployment OpenAPI 3.1 surface generator: projects a deployment's parsed manifest (channels, reachable BPMNs, inbound/outbound message types, endpoint nature, data-stores) into an OpenAPI 3.1 document. Served live at GET /sutra/deployments/{id}/openapi and emitted offline by `sutra openapi <archive>` — the spec and the live routing derive from the same parsed plan, so drift is structural-impossible."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde_json = { workspace = true }
+# Runtime YAML rendering of the generated spec. Deserialize the spec's own JSON string into a
+# serde_yaml value before re-serializing, so `serde_json`'s `arbitrary_precision` Number encoding
+# never leaks into the YAML output.
+serde_yaml_ng = "0.10"
+sutra-bpmn = { path = "../sutra-bpmn" }
+sutra-channels = { path = "../sutra-channels" }
+sutra-datastore = { path = "../sutra-datastore" }

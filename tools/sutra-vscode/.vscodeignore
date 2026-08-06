@@ -1,0 +1,24 @@
+# Files excluded from the packaged .vsix. Everything NOT matched here is included
+# (vsce also prunes devDependencies from node_modules automatically). The compiled
+# output under server/out/** and client/out/** IS shipped — including the generated
+# WASM glue at server/out/generated/** (sutra_lint_core.js + sutra_lint_core_bg.wasm),
+# which the LSP server loads at runtime. Do NOT exclude *.wasm.
+
+# ── sources & build inputs (the compiled out/** is what ships) ──
+server/src/**
+client/src/**
+scripts/**
+**/*.ts
+**/*.map
+**/tsconfig*.json
+**/*.tsbuildinfo
+
+# ── test / tooling / repo cruft ──
+server/src/__tests__/**
+vitest.config.ts
+.vscode/**
+.vscode-test/**
+.gitignore
+.eslintrc*
+**/.eslintrc*
+*.vsix

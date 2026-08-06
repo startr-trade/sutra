@@ -1,0 +1,22 @@
+[package]
+name = "sutra-transport-file"
+description = "File-spool vendor transport for AIR-GAPPED environments — the FileTriggerSource/FileMessageSink pair + the consumer-lifecycle manager, self-registering as a TransportFactory via inventory so sutra-engine bundles it without any network dependency (only std/tokio fs)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+sutra-channels = { path = "../sutra-channels" }
+sutra-transport-spi = { path = "../sutra-transport-spi" }
+sutra-persistence = { path = "../sutra-persistence" }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "uuid"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "sync", "time"] }
+tracing = { workspace = true }
+inventory = "0.3.24"
+async-trait = { workspace = true }
+time = { workspace = true }
+# NO rdkafka / aws-sdk / google-cloud / lapin / fe2o3-amqp — the point of this transport is a
+# spool that dials NOTHING. The only broker-facing dep is `sqlx`, and only for the shared
+# singleton-lease substrate (PgLeaseStore/PgPool) every transport's manager gates through; the
+# file source/sink themselves touch nothing but `tokio::fs`.

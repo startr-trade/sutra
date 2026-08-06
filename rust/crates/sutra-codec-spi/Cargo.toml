@@ -1,0 +1,11 @@
+[package]
+name = "sutra-codec-spi"
+description = "Payload codec / format / schema SPI — the neutral PayloadCodec / MessageFormat / MessageSchema contracts + shape/result/issue/codes/mapped/projection types + the BuiltinCodec self-registration registry. No concrete parser."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+inventory = "0.3.24"
+serde_json = { workspace = true }

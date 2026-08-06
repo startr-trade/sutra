@@ -1,0 +1,41 @@
+# Data stores for the `default` tenant's money-transfer module, 1.0.0. Path-derived, version-scoped,
+# and inside the deployment's frozen checksum. A BPMN <bpmn:dataStore>/<bpmn:dataStoreReference>
+# references a store BY NAME. See the book's *Data stores* chapter.
+#
+# The module OWNS its store: the connection is declared here and the schema + seed live in this module's
+# resources, so a generic engine image + this mounted resources folder is self-sufficient — no baked
+# default datasource, no baked migrations. The sql provider builds a per-store DataSource from this
+# connection and runs the store's own migrations against it on first use. Each store keeps its migrations
+# in its OWN subfolder (convention: migrations/<store>/), so a multi-store module stays cleanly separated.
+
+datastores:
+  # The durable, cross-instance account ledger. Per-account item = a map {balance, frozen}, keyed by
+  # account id, stored as JSONB. The transfer + balance-query processes get/put items by key via <q:store>.
+  - name: accounts
+    type: sql
+    sql:
+      # The store's OWN connection (env-indirected — 15-factor: no literal secrets). Points at whatever DB
+      # the deployment provides; here the money-transfer IT/Docker set ACCOUNTS_DB_* to its PostgreSQL.
+      url-ref: env:ACCOUNTS_DB_URL
+      username-ref: env:ACCOUNTS_DB_USER
+      password-ref: env:ACCOUNTS_DB_PASSWORD
+      # Module-resident migrations in the store's OWN subfolder (migrations/<store>/, relative to this
+      # version dir): the store's table DDL + seed. Idempotent (CREATE TABLE IF NOT EXISTS + INSERT ...
+      # ON CONFLICT DO NOTHING), run once on first store use, against the store's own DataSource.
+      migrations: migrations/accounts
+    dataClass: financial   # sensitivity tag (reserved; not yet enforced by the sql provider).
+
+  # Where path-coverage marks are persisted (compliance metric). This declaration chooses the DATABASE;
+  # the engine owns the SCHEMA. One row per declared <q:coverage> path — seeded uncovered at deploy and
+  # flipped the first time a run walks it — plus the cross-process reconstruction fragments, in the
+  # engine's own coverage_metric / coverage_fragment tables, created here on first use. Hence no
+  # `migrations:` key and no coverage SQL in this package: there is none for an author to write.
+  # It points at the SAME connection as `accounts` purely for convenience; the tables are its own, and
+  # the accounts fault-injection trigger keys on store_name='accounts', so coverage writes never trip it.
+  - name: coverage
+    type: sql
+    sql:
+      url-ref: env:ACCOUNTS_DB_URL
+      username-ref: env:ACCOUNTS_DB_USER
+      password-ref: env:ACCOUNTS_DB_PASSWORD
+    dataClass: operational   # a metric, not customer/financial data.

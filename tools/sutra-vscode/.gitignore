@@ -1,0 +1,6 @@
+node_modules/
+server/out/
+client/out/
+*.tsbuildinfo
+.vscode-test/
+*.vsix

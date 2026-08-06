@@ -1,0 +1,19 @@
+  # Coverage ADMIN channels (compliance metric read/reset — generated-by: sutra coverage init).
+  # Plain read/reset ops against the deployment's `coverage` data-store: NOT singletons, they
+  # scale across all replicas (the covered-set is a shared durable store, not per-replica state).
+  # NOTE: the bound codec's schema must declare the CoverageQuery / CoverageReset message roots.
+  #
+  # coverage-query -> CoverageQuery -> coverage-report/Start -> coverage:report:%%PROCESS%%
+  - name: coverage-query
+    transport: http
+    bind: "POST /channels/coverage-query"
+    codec: "%%CODEC%%"
+    cloudevents-mode: none
+%%AUTH%%
+  # coverage-reset -> CoverageReset -> coverage-reset/Start -> coverage:reset:%%PROCESS%%
+  - name: coverage-reset
+    transport: http
+    bind: "POST /channels/coverage-reset"
+    codec: "%%CODEC%%"
+    cloudevents-mode: none
+%%AUTH%%

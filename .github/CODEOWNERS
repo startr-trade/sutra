@@ -1,0 +1,26 @@
+# CODEOWNERS — automatic reviewer assignment.
+#
+# PLACEHOLDER: `@startr-trade/maintainers` must exist as a team in the startr-trade org,
+# with write access to this repository, or GitHub silently ignores every rule below (it
+# shows as an "unknown owner" warning on the file, not as a failed check). Replace it with
+# real teams / usernames as the maintainer set grows.
+#
+# Last match wins, so the catch-all comes first.
+
+*                       @startr-trade/maintainers
+
+# --- Release, supply chain and CI ------------------------------------------------------
+# Changes here can publish artifacts or weaken a gate; they always want a second pair of eyes.
+/.github/                @startr-trade/maintainers
+/rust/deny.toml          @startr-trade/maintainers
+/rust/.cargo/audit.toml  @startr-trade/maintainers
+/rust/Dockerfile         @startr-trade/maintainers
+/scripts/install.sh      @startr-trade/maintainers
+/scripts/install.ps1     @startr-trade/maintainers
+/Makefile                @startr-trade/maintainers
+
+# --- Licensing and policy --------------------------------------------------------------
+/LICENSE-MIT             @startr-trade/maintainers
+/LICENSE-APACHE          @startr-trade/maintainers
+/SECURITY.md             @startr-trade/maintainers
+/CODE_OF_CONDUCT.md      @startr-trade/maintainers
