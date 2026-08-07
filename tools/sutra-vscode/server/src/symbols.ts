@@ -19,7 +19,6 @@
 
 import {
   ParseResult,
-  ParserEvent,
   Range,
   AttributeNode,
   ElementOpen,

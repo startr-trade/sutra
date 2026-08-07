@@ -2,21 +2,6 @@ import { describe, it, expect } from 'vitest';
 import { computeCompletions } from '../completion.js';
 import { defaultRegistry } from '../registry.js';
 
-function positionFor(source: string, marker: string, offsetInMarker?: number): { line: number; character: number } {
-  // Convert a flat offset into {line, character}
-  const idx = source.indexOf(marker);
-  const offset = idx + (offsetInMarker ?? marker.length);
-  let line = 0;
-  let lineStart = 0;
-  for (let i = 0; i < offset; i++) {
-    if (source[i] === '\n') {
-      line++;
-      lineStart = i + 1;
-    }
-  }
-  return { line, character: offset - lineStart };
-}
-
 describe('completion', () => {
   it('suggests known channel ids when cursor is inside <q:source channel="">', () => {
     const source = `<q:source channel=""/>`;

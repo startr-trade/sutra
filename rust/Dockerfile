@@ -85,7 +85,12 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # (TLS to postgres/brokers), so no apt-get. The `[profile.release] strip` (rust/Cargo.toml)
 # already stripped the binary. Together with the strip this closes the footprint regression
 # (debian-slim runtime + unstripped binary → distroless + stripped binary).
-FROM gcr.io/distroless/cc-debian12
+#
+# PINNED BY DIGEST, not by a moving tag: the runtime base is part of the shipped
+# artifact's supply chain, so the image a release builds must be reproducible and
+# scannable at a known version. Refresh deliberately (`docker pull ...:latest` then
+# `docker inspect --format '{{index .RepoDigests 0}}'`), never implicitly.
+FROM gcr.io/distroless/cc-debian12@sha256:e8e7ee4b8b106d4c5fde9e422a321b2b8a2d5cca546c97adcce927f3e1d36e36
 COPY --from=builder /build/sutra-engine /usr/local/bin/sutra-engine
 
 # The engine-internal migration SQL — now Rust-owned under

@@ -64,7 +64,6 @@ export function buildAliasIndex(source: string, parsed?: ParseResult): ProcessAl
   let currentProcess: ProcessAliases | null = null;
   let currentStart: StartEventAliases | null = null;
   // Stack tracks "are we inside <bpmn:extensionElements> of the current start event?"
-  let inExtensionElements = false;
 
   for (const ev of events) {
     if (ev.kind === 'open' || ev.kind === 'self-closing') {
@@ -87,7 +86,7 @@ export function buildAliasIndex(source: string, parsed?: ParseResult): ProcessAl
       }
 
       if (isLocalName(ev.name, 'extensionElements')) {
-        if (currentStart) inExtensionElements = true;
+        // (extension-element depth is not consulted here)
         continue;
       }
 
@@ -115,12 +114,8 @@ export function buildAliasIndex(source: string, parsed?: ParseResult): ProcessAl
       if (isLocalName(ev.name, 'process')) {
         currentProcess = null;
         currentStart = null;
-        inExtensionElements = false;
       } else if (isLocalName(ev.name, 'startEvent')) {
         currentStart = null;
-        inExtensionElements = false;
-      } else if (isLocalName(ev.name, 'extensionElements')) {
-        inExtensionElements = false;
       }
     }
   }

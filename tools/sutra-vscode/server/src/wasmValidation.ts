@@ -70,7 +70,7 @@ function loadWasm(): LintModule | null {
     // The built server runs as CommonJS (see tsconfig `module: NodeNext`, no
     // `"type": "module"` in package.json), so `require` is the native loader and
     // the glue's `__dirname`-relative `.wasm` read resolves correctly.
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
     wasmModule = require('./generated/sutra_lint_core.js') as LintModule;
   } catch {
     wasmModule = null;

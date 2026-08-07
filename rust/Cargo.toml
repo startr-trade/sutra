@@ -165,9 +165,11 @@ vaultrs = { version = "0.7", default-features = false, features = ["rustls"] }
 # (rustls 0.23 → ring; no native-tls / openssl-sys / aws-lc-sys). The `json` feature is for the
 # small token/secret response bodies.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
-# RS256 JWT signing for the GCP service-account OAuth2 jwt-bearer flow. The
-# crypto backend is `ring` (already in the tree via rustls) — rustls-clean, no aws-lc / openssl.
-jsonwebtoken = "9"
+# RS256 JWT signing for the GCP service-account OAuth2 jwt-bearer flow, and admin-JWT
+# verification. v10 requires the crypto provider to be chosen EXPLICITLY (v9 linked `ring`
+# implicitly): `rust_crypto` keeps the tree pure-Rust — no aws-lc-rs C toolchain, no openssl.
+# The 9 → 10 bump closes CVE-2026-25537 (type confusion → authorization bypass).
+jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto", "use_pem"] }
 # Broker/database containers for the Rust integration suites (dev-dependency only).
 testcontainers = { version = "0.25", features = ["blocking"] }
 testcontainers-modules = { version = "0.13", features = ["postgres", "kafka"] }
@@ -190,3 +192,9 @@ tokio-stream = { version = "0.1", features = ["net"] }
 # LocalSet). async-recursion boxes the mutually-recursive async dispatch (run_node ↔ sub-runners).
 async-trait = "0.1"
 async-recursion = "1"
+
+# The admin OIDC tests generate their RSA test keypair at run time (no committed key
+# material); num-bigint-dig's debug-build multiplication would make that keygen take tens
+# of seconds, so it alone is optimized even in dev builds.
+[profile.dev.package.num-bigint-dig]
+opt-level = 3

@@ -10,7 +10,7 @@
  * lives in `qSchema.ts` (MISSING_REQUIRED_CODES, INVALID_ENUM_CODES).
  */
 
-import { ParseResult, Range, parseBpmn } from './parser.js';
+import { ParseResult, Range } from './parser.js';
 import { SymbolTable } from './symbols.js';
 import { WorkspaceRegistry, knownIdsFor } from './registry.js';
 import {

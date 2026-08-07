@@ -690,51 +690,50 @@ mod tests {
 
     use super::*;
 
-    // A throwaway RSA-2048 keypair generated offline for these tests ONLY (never a real key). The
-    // JWKS below carries the matching public modulus/exponent under `kid = tp33-test-key-1`.
-    const TEST_RSA_PEM: &str = "-----BEGIN PRIVATE KEY-----\n\
-MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQCphe40JQyEqzSi\n\
-cJ+oWzc5X2DxmwsSS9waLe7mjakpEobvEyoUeJNR4vogQFHUM5dUW6VAkcwPo+Ci\n\
-3OtlClPyiNiNDEHq/DpEmK2uVRDJ0ThjtzUOXA5SqqNVCyXqATXAX+cxQZR+jQQS\n\
-wxRgwpsXbb/5NEqKB+Kfc/raehQT5XuvnBdEfh77xTOkd92xwJcmzRjj1CjSdIbX\n\
-+743I13UhGLmUtjG6Xo/RVGFTRrcqLvQcdJXJRAyMFD2nsSBI37zAao9agQawW7u\n\
-7zFEar+EuQKAiITNmptuQQRElKOZ5SXcTh5gmFIlP5HKCIM7gt6OrbXeMMDFZHPj\n\
-4nlvTsYVAgMBAAECggEADFRFtuGol3/gerL1uFfKpv/OlsEnt5DbBRq+SLguAM3M\n\
-kK05uYDrzVVpyyLaa17wMeNeHAQujZxQgrp4sqHNvrKLYLYZl4v4zJM3yIQpIysg\n\
-roc9KC+eSWQIhS95IQaDALGI6JPEMhsH8Y8MwkfNDKcVAqcgsl7F8Ze3ZiCMVBuq\n\
-oeTU24MQjMnE4kfVv2sY+MNdJz7EtDHvk/L+eoPo3GoAUzukMDrRIV5rHUywak6W\n\
-fU0YGS2LPdgXRWCT9LCsYwCywKCUATs3WkuigUhQw9tOOxNJPHlJAsVPITPKjMJD\n\
-yhKgNx5IIKR/8UJ0VTIGL/gggTiTD0GTOkTiyME+KQKBgQDsicWARRamIF0ML2Ex\n\
-S91L4MJftsVI0gj1vuZu82JjqnunUgOCO8kpzLOzqB6AYSm8P+0Mg7KRZBxkKu2t\n\
-MFXny8kO9jce5KNBdg97V1PWWH1nt/KRjUTloms8swWWcRklPHVBgPH9Rxca06O+\n\
-O+0+zX6SzJGL3EcUjalE91sACQKBgQC3eJ1oT3vzKR2h6DF+wQgWEZu2CqXwaEJd\n\
-vqxra9Ffw7LkibDUK+icqy8+rgN8YhUimQgR8IXpOODhuEnbkn3IlT6AN9VrxZuY\n\
-6YHMLNMy8SPbJHRLLVRfamFwA19l23YUJb53mddq2jHVFlH+REE41JZqoYbX7muU\n\
-Bl2HAMHArQKBgQCDEMwJCT9FigVE7TPzts/GbaIGmyWx9f/U+5R/wgiwpRSjYARl\n\
-s28B5FVmpS9Rf4U6tElLd+YIPeqlbkwIfRH8wKSFz9Q3IAV+DkcB1x+zU5EZWYnl\n\
-MNwOSfMVzTS5aa2/PkLSqvprl2qsCL1geaA5/m+2M/gqAUK5ls1GU7Fu0QKBgBgd\n\
-bGMXf204jEKJqGfGq29rJRJKWAE/UunLdBIye7SgnlTXnDxnAQ4GmhEdAixJIAoK\n\
-HztsZ819wmEovdx0ZsAEjdCAhjbCJG920a6qfaAGffYB1p9C+AIKk4ALkXBr5htD\n\
-0sMZn2zV/RLK+j/3bLMxjgu562VaWx17sLNb8BuJAoGBAMXYZpPwivQLYF9LYyJn\n\
-F2fSLdYALPI60DrHRql1Qv/qh7rVWJD1EjI7ZXzPb0VznIs0zj+t9JxHLxVluYQr\n\
-CEyjosPiYwUr7prPEBDcUbv0LAqZgjzAtCZKId1aW9zaO/2L4DUDnMxt3dRo1Ndg\n\
-xz/WHnZFm/3hMkIwyER9k5QF\n\
------END PRIVATE KEY-----\n";
+    // A throwaway RSA-2048 keypair GENERATED at first use, once per test binary — never
+    // committed: a public repository must carry no private-key material, not even a test
+    // key (every downstream secret scanner flags it, and "it's only a test key" is a
+    // conversation better never had). Returns (PKCS#8 PEM, JWKS `n`, JWKS `e`) with the
+    // JWKS halves base64url-unpadded per RFC 7518. Keygen cost is one-time and kept sane
+    // in debug builds by the workspace's `num-bigint-dig` opt-level override.
+    fn test_key() -> &'static (String, String, String) {
+        use base64::Engine as _;
+        use rsa::pkcs8::EncodePrivateKey as _;
+        use rsa::traits::PublicKeyParts as _;
+        static KEY: std::sync::OnceLock<(String, String, String)> = std::sync::OnceLock::new();
+        KEY.get_or_init(|| {
+            let key =
+                rsa::RsaPrivateKey::new(&mut rand::rngs::OsRng, 2048).expect("test RSA keygen");
+            let pem = key
+                .to_pkcs8_pem(rsa::pkcs8::LineEnding::LF)
+                .expect("PKCS#8 PEM")
+                .to_string();
+            let b64url =
+                |bytes: Vec<u8>| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+            (
+                pem,
+                b64url(key.n().to_bytes_be()),
+                b64url(key.e().to_bytes_be()),
+            )
+        })
+    }
+
 
     const TEST_KID: &str = "tp33-test-key-1";
     const TEST_ISSUER: &str = "https://idp.test.local/";
     const TEST_AUDIENCE: &str = "sutra-admin";
 
-    /// The public JWKS matching [`TEST_RSA_PEM`] — a genuine test JWKS, no IdP call.
+    /// The public JWKS matching [`test_key`] — a genuine test JWKS, no IdP call.
     fn test_jwks_json() -> String {
+        let (_, n, e) = test_key();
         serde_json::json!({
             "keys": [{
                 "kty": "RSA",
                 "use": "sig",
                 "alg": "RS256",
                 "kid": TEST_KID,
-                "n": "qYXuNCUMhKs0onCfqFs3OV9g8ZsLEkvcGi3u5o2pKRKG7xMqFHiTUeL6IEBR1DOXVFulQJHMD6PgotzrZQpT8ojYjQxB6vw6RJitrlUQydE4Y7c1DlwOUqqjVQsl6gE1wF_nMUGUfo0EEsMUYMKbF22_-TRKigfin3P62noUE-V7r5wXRH4e-8UzpHfdscCXJs0Y49Qo0nSG1_u-NyNd1IRi5lLYxul6P0VRhU0a3Ki70HHSVyUQMjBQ9p7EgSN-8wGqPWoEGsFu7u8xRGq_hLkCgIiEzZqbbkEERJSjmeUl3E4eYJhSJT-RygiDO4Lejq213jDAxWRz4-J5b07GFQ",
-                "e": "AQAB"
+                "n": n,
+                "e": e
             }]
         })
         .to_string()
@@ -770,7 +769,7 @@ xz/WHnZFm/3hMkIwyER9k5QF\n\
         });
         let mut header = jsonwebtoken::Header::new(Algorithm::RS256);
         header.kid = Some(TEST_KID.to_string());
-        let key = jsonwebtoken::EncodingKey::from_rsa_pem(TEST_RSA_PEM.as_bytes())
+        let key = jsonwebtoken::EncodingKey::from_rsa_pem(test_key().0.as_bytes())
             .expect("test RSA PEM parses");
         jsonwebtoken::encode(&header, &claims, &key).expect("token signs")
     }
@@ -848,7 +847,7 @@ xz/WHnZFm/3hMkIwyER9k5QF\n\
         });
         let mut header = jsonwebtoken::Header::new(Algorithm::RS256);
         header.kid = Some(TEST_KID.to_string());
-        let key = jsonwebtoken::EncodingKey::from_rsa_pem(TEST_RSA_PEM.as_bytes()).unwrap();
+        let key = jsonwebtoken::EncodingKey::from_rsa_pem(test_key().0.as_bytes()).unwrap();
         let token = jsonwebtoken::encode(&header, &claims, &key).unwrap();
         let gate = AdminGate::from_config(&oidc_config()).unwrap();
         assert_eq!(

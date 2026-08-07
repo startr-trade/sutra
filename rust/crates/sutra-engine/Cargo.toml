@@ -71,6 +71,12 @@ opentelemetry-appender-tracing = { workspace = true }
 
 [dev-dependencies]
 serde_yaml_ng = "0.10"
+# The admin OIDC tests GENERATE their throwaway RSA keypair at run time (OnceLock-cached
+# per binary) — a public repository carries no private-key material, not even test keys.
+# `rsa` is already in the dependency tree via sqlx-mysql; this only adds it as a dev-dep.
+base64 = { workspace = true }
+rsa = "0.9"
+rand = "0.8"
 # Drive the `/admin/*` router in-process (`ServiceExt::oneshot`) for the gate tests
 # (401/403/200) without binding a socket. Matches the axum 0.8 tower line used across the tree.
 tower = { version = "0.5", features = ["util"] }
