@@ -70,12 +70,12 @@ jobs:
 
       - name: Configure Pages
         if: steps.detect.outputs.has_book == 'true' && github.event_name != 'pull_request'
-        uses: actions/configure-pages@v5
+        uses: actions/configure-pages@v6
 
       # `build-dir` defaults to `book` relative to book.toml → docs/book.
       - name: Upload Pages artifact
         if: steps.detect.outputs.has_book == 'true' && github.event_name != 'pull_request'
-        uses: actions/upload-pages-artifact@v3
+        uses: actions/upload-pages-artifact@v5
         with:
           path: docs/book
 
@@ -96,4 +96,4 @@ jobs:
     steps:
       - name: Deploy
         id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5

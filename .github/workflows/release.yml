@@ -160,7 +160,7 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Install cosign
-        uses: sigstore/cosign-installer@v3
+        uses: sigstore/cosign-installer@v4
 
       # Keyless (Sigstore / Fulcio): the signing identity IS this workflow's OIDC identity —
       # no long-lived key material anywhere. Signs the manifest-list digest, which is what
@@ -191,7 +191,7 @@ jobs:
       # Handed to the `release` job, which attaches it to the GitHub Release alongside the
       # CLI archives (so consumers get the SBOM without needing cosign).
       - name: Upload SBOM for the Release job
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: sbom
           path: sbom.spdx.json
@@ -339,7 +339,7 @@ jobs:
           Remove-Item -Recurse -Force "dist/$stage"
           Get-ChildItem dist
 
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v7
         with:
           name: cli-${{ matrix.target }}
           path: dist/*
@@ -361,14 +361,14 @@ jobs:
           ref: ${{ github.event.inputs.tag || github.ref }}
 
       - name: Download CLI archives
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v8
         with:
           pattern: cli-*
           merge-multiple: true
           path: dist
 
       - name: Download SBOM
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v8
         with:
           name: sbom
           path: dist
