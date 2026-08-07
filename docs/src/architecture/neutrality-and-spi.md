@@ -60,6 +60,29 @@ this repository's composition root changes, and there is no central list anywher
 to. The gate has nothing to exclude for those crates because they are not here; the neutral core
 cannot leak a term that never enters its dependency graph.
 
+```mermaid
+flowchart TD
+    subgraph here["This repository"]
+        CORE["the neutral core<br/>executor · model · channels · engine<br/>gated: no domain literal"]
+        FMT["sutra-formats<br/>the six schema-less formats"]
+        DIST["sutra-dist"]
+    end
+    subgraph out["Outside this repository"]
+        STD["a message-standard codec crate<br/>written against the public codec SPI"]
+        OWN["that distribution's own<br/>composition root"]
+    end
+    CORE --> DIST
+    FMT --> DIST
+    DIST --> B1["the stock engine binary"]
+    CORE --> OWN
+    STD -->|"one Cargo dependency<br/>and one use-as-underscore line"| OWN
+    OWN --> B2["that distribution's binary"]
+```
+
+A distribution adds a wire standard by force-linking one more crate into its *own* composition
+root — there is no central list in this repository to append a name to, which is what makes the
+neutrality gate cheap to keep passing.
+
 `make lint` runs this gate alongside clippy on every change (see
 [Contributing](../contributing.md)) — a business term landing in a gated crate fails CI, not a
 code review comment.
@@ -72,6 +95,16 @@ that registry via [`inventory`](https://docs.rs/inventory) at link time. The neu
 *collects* what got linked in — it never imports or names a specific implementation. Implementing
 an extension *is* registering it; there is no separate central list to forget to update (a gap
 that bit an earlier iteration of the codec set, closed by moving to this pattern).
+
+```mermaid
+flowchart LR
+    CR["a composition root"] -->|"force-links the crate"| IMPL["a concrete crate<br/>a transport, a codec, a resolver, a redactor"]
+    IMPL -->|"inventory::submit! at link time"| REG[("the SPI crate's<br/>process-wide registry")]
+    REG -->|"collected, sorted by name"| NEU["the neutral engine<br/>drives every entry through the same trait"]
+```
+
+The neutral side only ever iterates what got linked in, so adding an implementation is a link-time
+fact rather than an edit to anything the engine owns.
 
 ### Transports — `sutra-transport-spi`
 

@@ -33,7 +33,12 @@ concurrency:
 
 env:
   # Pinned so a book that builds locally builds identically here.
-  MDBOOK_VERSION: "0.4.40"
+  # Pinned to the 0.5 line: mdbook-mermaid 0.17 is built against mdbook 0.5.x, and the
+  # preprocessor protocol differs across that boundary — the two must move together.
+  MDBOOK_VERSION: "0.5.4"
+  # The mermaid preprocessor — the book's diagrams are ```mermaid blocks, so a build
+  # WITHOUT this renders them as unreadable code listings rather than failing loudly.
+  MDBOOK_MERMAID_VERSION: "0.17.0"
 
 jobs:
   build:
@@ -55,13 +60,15 @@ jobs:
             echo "::notice::docs/book.toml not found — skipping the mdBook build (the book is curated separately)."
           fi
 
-      - name: Install mdBook
+      - name: Install mdBook + mermaid preprocessor
         if: steps.detect.outputs.has_book == 'true'
         run: |
           set -eu
           url="https://github.com/rust-lang/mdBook/releases/download/v${MDBOOK_VERSION}/mdbook-v${MDBOOK_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
           mkdir -p "$HOME/.local/bin"
           curl -fsSL "$url" | tar -xz -C "$HOME/.local/bin"
+          mermaid_url="https://github.com/badboy/mdbook-mermaid/releases/download/v${MDBOOK_MERMAID_VERSION}/mdbook-mermaid-v${MDBOOK_MERMAID_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+          curl -fsSL "$mermaid_url" | tar -xz -C "$HOME/.local/bin"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Build

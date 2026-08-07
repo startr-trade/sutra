@@ -24,6 +24,20 @@ shrinks to a single step: from this state, given this input, do the next thing. 
 the current snapshot is ever re-executed, so an upgrade cannot retroactively change what already
 happened.
 
+```mermaid
+flowchart LR
+    subgraph ev["Event replay: state is re-derived"]
+        E1["event"] --> E2["event"] --> E3["event"] --> E4["event"] --> EN["state now"]
+    end
+    subgraph sn["Snapshot: state is stored"]
+        SNAP["snapshot at the last<br/>quiescent point"] -->|"+ this input"| NEXT["do the next thing"]
+    end
+```
+
+In the replay shape every arrow is a permanent contract — the code must keep being able to reproduce
+all of them, for every instance still alive. In the snapshot shape there is exactly one arrow, and
+it only ever points forward.
+
 The audit trail an event-sourced engine gets for free is then an explicit, separately-configured
 concern here — the audit journal — and that turns out to be the honest arrangement anyway: an
 audit record has different retention, different access control, and different redaction
@@ -42,6 +56,18 @@ The properties that fall out of the choice:
   completed, and the start node it was routed through. Resume is "replay the completed set as
   done, satisfy this wait, continue" — a bounded operation over the recorded frontier, not a
   re-execution of the past.
+
+```mermaid
+flowchart LR
+    S["the routed start node"] -.->|"replayed as done"| A["completed node"]
+    A -.->|"replayed as done"| B["completed node"]
+    B --> W["the wait it parked at"]
+    W -->|"satisfied"| N["next node, executed for real"]
+    N --> R["…continue"]
+```
+
+Resume re-walks the graph without re-running it: the dashed edges are bookkeeping over the recorded
+frontier, and the first genuine execution after a wait is the node *after* it.
 
 ## The typed value encoding {#the-typed-value-encoding}
 

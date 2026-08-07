@@ -38,6 +38,21 @@ UPDATE` row locks in the flow itself. The read-only `balance` channel and the `c
 channels are **not** singletons — they scale across every replica, since they only read or reset
 shared state rather than serialize writes to it.
 
+```mermaid
+flowchart LR
+    H["transfer-request — HTTP"] -->|"singleton"| T
+    Q["transfer-queue — RabbitMQ"] -->|"singleton, leader-gated<br/>across replicas"| T
+    K["transfer-topic — Kafka"] -->|"singleton, leader-gated<br/>across replicas"| T
+    T["transfer.bpmn<br/>the ACID transfer"] --> ACC[("accounts — the ledger")]
+    B["balance"] -->|"not a singleton —<br/>every replica serves it"| BQ["balance-query.bpmn<br/>read only"]
+    BQ --> ACC
+    CV["coverage-report, coverage-reset"] -->|"not singletons"| AD["the two admin flows"]
+```
+
+All six channels bind the same `urn:transfer` codec, and the three write intakes converge on one
+process rather than three — so the write path is serialized once, by the channel on a broker and by
+the transaction plus `FOR UPDATE` locks on HTTP, while the read-only paths stay free to scale.
+
 **A custom module schema.** `schemas/transfer/transfer.xsd` declares `TransferRequest` and
 `BalanceQuery` as sibling root elements; the codec registers as `urn:transfer` (see
 [Deployment packages](deployment-packages.md) for the path-derived URN rule), and every channel in
@@ -75,6 +90,32 @@ Full ACID, mapped onto real BPMN + `q:` elements:
 `Compute` and `DecideReason` are pure FEEL data-assignment nodes (`<bpmn:assignment>` pairs of a
 `<from>` FEEL expression and a `<to>` target variable) — no service-task implementation code
 anywhere in this flow.
+
+```mermaid
+sequenceDiagram
+    participant IN as Intake channel
+    participant TX as Transfer, a transaction sub-process
+    participant DB as accounts store
+
+    IN->>TX: TransferRequest, decoded by urn:transfer
+    TX->>DB: LoadFrom — q:store forUpdate, a pessimistic row lock
+    TX->>DB: LoadTo — q:store forUpdate, a pessimistic row lock
+    TX->>TX: Valid? — frozen flags and sufficient balance, in FEEL, before any write
+    alt valid
+        TX->>TX: Compute — pure FEEL assignment
+        TX->>DB: Persist — both new balances
+        Note over TX,DB: normal end of the sub-process — COMMIT, both writes together
+        TX-->>IN: OkReply renders TransferAccepted
+    else invalid
+        TX->>TX: DecideReason, then a cancel end event
+        Note over TX,DB: ROLLBACK — no partial transfer ever lands
+        TX-->>IN: RejectReply, via the boundary cancel event on Transfer
+    end
+```
+
+The gateway sits between the locks and the writes, so consistency is checked while the rows are
+already held — and the only two ways out of the sub-process are the two ends that commit or roll
+back, which is what makes the reply and the durable outcome agree.
 
 ## Compliance path coverage
 

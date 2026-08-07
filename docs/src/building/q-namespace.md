@@ -33,6 +33,26 @@ and the same XSD drives the `sutra-modeler-plugin` property panels.
 | `q:audit` | `bpmn:process` | Audit capture level and data-class tagging. |
 | `q:coverage` | `bpmn:process` | An opt-in tracked compliance path. |
 
+```mermaid
+flowchart LR
+    subgraph P["on bpmn:process itself<br/>q:variables · q:onValidation · q:process<br/>q:audit · q:coverage · q:dispatch / q:case"]
+        direction LR
+        S(["start event"]) --> T["serviceTask"]
+        T --> W["wait node<br/>userTask · message catch"]
+        W --> X(["throw event · send task"])
+        DS[("dataStoreReference")]
+    end
+    S -.- A["q:source<br/>+ q:validators · q:redactors"]
+    T -.- B["q:param · q:retry<br/>q:timeout · q:reply"]
+    W -.- C["q:source · q:alias"]
+    X -.- D["q:send · q:header"]
+    DS -.- F["q:store"]
+```
+
+Nothing in the vocabulary is a new node type: every element hangs off a standard BPMN element's
+extension elements, which is why a process carrying all of it is still a valid, portable BPMN 2.0
+diagram.
+
 ## `q:source` — the inbound trigger
 
 Every message-consuming node — a start event or a wait-state catch — declares exactly one
@@ -106,6 +126,20 @@ headers/application-properties.
 `q:reply`'s `continue="true"` is respond-and-continue: flush the reply the moment the task
 completes, then park the instance and self-resume the remaining nodes asynchronously — the caller
 gets its answer without waiting on the tail of the flow.
+
+```mermaid
+sequenceDiagram
+    participant C as Caller
+    participant E as Engine
+
+    C->>E: inbound message
+    E->>E: run as far as the reply task
+    E-->>C: reply flushed the moment that task completes
+    E->>E: park, then self-resume the remaining nodes
+```
+
+The caller's answer is bounded by the task that produces it rather than by the tail of the process
+— the remaining nodes run on a resume nobody is waiting on.
 
 ## `q:alias` — correlation by your business key
 

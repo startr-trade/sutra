@@ -7,6 +7,18 @@ What you will have at the end: a BPMN process, bound to an HTTP channel, that de
 schema-validates an XML message, branches on the result, and replies — running on the real
 engine against a real PostgreSQL, not a simulator.
 
+```mermaid
+flowchart LR
+    A["sutra create app<br/>scaffold"] --> B["sutra package<br/>seal + lint"]
+    B -->|".sutra archive"| C["deploy/deployments/<br/>watched directory"]
+    C --> D["docker compose up<br/>engine + PostgreSQL"]
+    D --> E["curl a message<br/>→ reply"]
+    E -.->|"edit, re-package"| B
+```
+
+Five steps, and the last arrow is the loop you stay in: change something, re-package, and the
+running engine flips to it.
+
 ## 1. Scaffold an app
 
 ```bash

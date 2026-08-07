@@ -14,6 +14,20 @@ in-process concern and change nothing on this page. Three pieces of work don't t
 concurrency and are held by exactly one replica at a time instead: **timer firing**,
 **stuck-instance scanning**, and **terminal-history purging**.
 
+```mermaid
+flowchart TD
+    R1["Replica 1"] --> DB
+    R2["Replica 2"] --> DB
+    R3["Replica 3"] --> DB
+    DB[("The engine's own PostgreSQL")] --- LEASE["a lease row per role<br/>gates timer firing, the stuck-instance sweep,<br/>terminal-history purging, singleton channels"]
+    DB --- CLAIM["the instance row's own owner<br/>gates advancing one instance"]
+    DB --- OUT["outbox rows<br/>FOR UPDATE SKIP LOCKED"]
+    DB --- IBX["the inbox unique index<br/>ON CONFLICT DO NOTHING"]
+```
+
+Every replica is identical and interchangeable; each of the four things that must not happen twice
+is a different row-level primitive in the one shared database, not a coordination service.
+
 ## Leader election: a PostgreSQL-backed lease
 
 There is no Kubernetes-native `Lease` object and no separate coordination service — leader
@@ -48,6 +62,23 @@ The claim is released inside the same transaction that commits the step's own wr
 "committed" and "unowned again" are one atomic fact. Every exit that does *not* commit — an early
 refusal, an error, a panic — releases the claim explicitly on its way out, so a claim never
 outlives the work it was protecting.
+
+```mermaid
+sequenceDiagram
+    participant A as Replica A
+    participant I as The instance's own row
+    participant B as Replica B
+    A->>I: compare-and-set — take ownership if free or stale
+    I-->>A: claimed
+    B->>I: compare-and-set for the same instance
+    I-->>B: no match — SUTRA.RUNTIME.RESUME.CLAIM_HELD
+    Note over B: relay requeued, timer fire deferred, admin 409
+    A->>I: commit the step's writes and release the claim
+    Note over A,I: one transaction — committed and unowned are the same fact
+```
+
+The whole mechanism is two round trips against one row: the loser of the race has read and written
+nothing, and the winner never holds the claim past the commit it was protecting.
 
 **The claim is re-entrant for the same owner**, and the invariant that makes that safe is worth
 stating exactly: an owner id names one *execution lane* in one process, and a lane advances
@@ -118,6 +149,15 @@ it is genuinely quiescent — and "quiescent" is three independent facts, all of
    with no in-flight anything to observe; retiring underneath it would strand the worker's
    completion. Tasks that turned terminal after exhausting their worker budget stop counting, for
    the same reason poisoned deliveries do.
+
+```mermaid
+flowchart LR
+    I["active instances pinned to it<br/>FAILED counts, terminal history does not"] --> G{"quiescent?"}
+    O["pending outbox rows it minted<br/>terminally poisoned ones stop counting"] --> G
+    T["parked external tasks<br/>budget-exhausted ones stop counting"] --> G
+    G -->|"all three read zero"| R["retired"]
+    G -.->|"any is non-zero"| D["stays draining"]
+```
 
 All three legs are database-scoped counts, so the gate reads the same from every replica and is
 unaffected by which replica happens to run the sweep.

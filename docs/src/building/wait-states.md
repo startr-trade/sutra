@@ -49,6 +49,33 @@ The relayed message doesn't carry an engine-internal instance id — it carries 
 correlation survives a restart and works identically across every replica. See
 [The q: namespace](q-namespace.md) for the full `q:alias` shape.
 
+```mermaid
+sequenceDiagram
+    participant A as Requester
+    participant E as Engine
+    participant DB as PostgreSQL
+    participant R as Relayer
+
+    A->>E: ApprovalRequest on approval-request
+    E->>DB: park — snapshot plus alias e2eId from payload.E2EId
+    Note over E,DB: durable commit — parked, correlatable, thread freed
+    E-->>A: accepted, no business reply yet
+    R->>E: ApprovalDecision on approval-decision
+    E->>E: structural codec, then business validators
+    alt structurally invalid
+        E-->>R: relay rejected — the instance stays parked, unchanged
+    else valid, or soft errors only
+        E->>DB: correlate by e2eId, rehydrate typed variables
+        E->>E: the gateway after the wait routes on the soft errors
+        E->>DB: run to the end — alias retired
+    end
+```
+
+The park is a commit, not a pause: the correlation key is written in the same durable step that
+suspends the instance, so a relay arriving later — on a different channel, against a different
+replica — finds it by the key you named. And because a hard-invalid relay is refused *before*
+anything is rehydrated, the parked instance is never the thing that pays for a bad message.
+
 ## Variables survive the wait **typed**
 
 The instance variables held across a wait keep their real types. A number comes back a number, a

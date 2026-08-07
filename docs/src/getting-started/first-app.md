@@ -36,6 +36,22 @@ a re-deploy of identical bytes is a no-op and a changed package replaces its slo
 
 Follow one message:
 
+```mermaid
+flowchart LR
+    REQ["POST /channels/sample-in<br/>&lt;SampleRequest&gt;…"] --> CH
+
+    subgraph pkg["packages/my-first-app-main"]
+        CH["channels.yaml<br/>sample-in → codec"] --> XSD["schemas/sample.xsd<br/>decode + validate"]
+        XSD -->|"valid, typed"| BPMN["bpmn/sample.bpmn<br/>start → gateway"]
+        XSD -.->|"invalid"| BPMN
+        BPMN -->|"accepted"| TA["templates/<br/>sample-accepted.hbs"]
+        BPMN -.->|"rejected"| TR["templates/<br/>sample-rejected.hbs"]
+    end
+
+    TA --> RES["HTTP reply"]
+    TR -.-> RES
+```
+
 1. **`channels.yaml`** declares `sample-in` as an HTTP channel bound to `POST /channels/sample-in`,
    with a codec. The channel is the *doorway*: it decides how bytes become a message.
 2. The **codec** (`schemas/sample/`) decodes the XML and validates it against `sample.xsd`
@@ -99,10 +115,10 @@ in-flight instances left to finish on the old one.
 | Want to… | Go to |
 |---|---|
 | Understand the model behind all of this | [Concepts](../building/concepts.md) |
-| Bind a broker instead of HTTP | [Channels](../building/channels.md) |
-| Decode a different format, or your own | [Codecs](../building/codecs.md) |
+| Bind a broker instead of HTTP | [Channels and transports](../building/channels.md) |
+| Decode a different format, or your own | [Deployment packages](../building/deployment-packages.md) |
 | Wait for a human decision or a reply | [Wait states](../building/wait-states.md) |
-| Write decisions as tables or rules | [Decisions](../building/decisions.md) |
+| Write decisions as tables or rules | [Rules: DMN, FEEL, and .srl](../building/rules.md) |
 | Retry, schedule, or time-box work | [Retries, history, schedules](../building/retries-history-schedules.md) |
 | Test a 30-day timer in milliseconds | [Testing time](../building/testing-time.md) |
 

@@ -4,7 +4,22 @@ A Sutra **project is a single deployment package**. `sutra create app` produces 
 `sutra package <dir>` seals it into one immutable, content-addressed `.sutra` archive; `sutra
 deploy` activates that archive on a running engine. There is no build step in between — you
 author declarative resources, seal them, and hand the sealed archive to a generic engine binary
-that never needs your source.
+that never needs your source. Secrets are the one thing that never travels inside it: a resource
+names them by scheme (`env:NAME`, `secret:KEY`, `vault:…`), resolved at runtime, and package-time
+validation rejects a literal outright (see [Channels and transports](channels.md)).
+
+```mermaid
+flowchart LR
+    DIR["the package directory<br/>bpmn, rules, scripts, templates, schemas,<br/>migrations, channels.yaml, datastores.yaml"]
+    DIR -->|"sutra package —<br/>full validation suite first, fail-closed"| AR["one immutable .sutra archive<br/>manifest of per-file digests, derived, never authored"]
+    AR -->|"deploymentId = sha256(manifest)"| DEP["sutra deploy"]
+    DEP --> SLOT["the slot — tenant--module--version,<br/>from the package.yaml labels"]
+    AR -.->|"a resource carries env:NAME or secret:KEY,<br/>never the value"| SEC["resolved at runtime,<br/>outside the archive"]
+```
+
+Everything the engine needs to run the module is sealed and hashed, so identical bytes re-deploy as
+a no-op and the same archive promotes across environments unchanged — while the values that must
+differ per environment stay references it resolves on the way up.
 
 ## Package interior
 
@@ -145,6 +160,19 @@ A few things fall out of that shape:
   wrong direction, a missing or uncompilable schema file, or a schema whose namespace doesn't match
   the expected one all reject the archive rather than deploy something that silently validates less
   than the manifest claims.
+
+```mermaid
+flowchart LR
+    W["a wrapper element name on the wire<br/>OrderConfirmation"] --> M["the bundle manifest<br/>incoming / outgoing maps"]
+    CM["codec-manifest.yaml<br/>schemaKind names the bundle kind<br/>a codec crate registered"] --> M
+    M -->|"listed"| E["that edition folder's schema<br/>edition-2026/OrderConfirmation_v3.xsd"]
+    M -.->|"unlisted"| B["the codec crate's own base schema,<br/>at its pinned default version"]
+    NEW["a new edition of the profile"] -.->|"archive its folder alongside,<br/>repoint the manifest,<br/>ship a new archive version"| M
+```
+
+The manifest is the only truth about which schema backs which message — the folder names carry no
+meaning — so adopting a new edition is a package change and a new `deploymentId`, never an engine
+or codec-crate change.
 
 ## Store migrations, and evolving a projected structure {#store-migrations-and-schema-evolution}
 

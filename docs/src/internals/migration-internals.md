@@ -53,6 +53,26 @@ scopes to the other. There is no window in which a statement could see both.
 The re-assertion in phase 1 is deliberate. The claim was taken before validation; re-verifying it
 **under the row lock**, inside the commit, closes the gap between "claimed" and "moved".
 
+```mermaid
+flowchart TD
+    CLM["claim the instance"] --> VAL["validate every locus against the target's<br/>capability index — all violations, not the first"]
+    subgraph TX["one transaction, one commit envelope"]
+        direction TB
+        LK["scoped to the SOURCE — lock the instance row"] --> RA["re-assert the ownership claim and the<br/>non-terminal status, under that lock"]
+        RA --> RD["read every row belonging to the instance,<br/>then delete them"]
+        RD --> INS["re-scoped to the TARGET — insert the rewritten rows<br/>(the pin, the frontier, completed set and routed start<br/>through the node mapping, the renamed retry counters,<br/>the bumped audit floor)"]
+    end
+    VAL --> LK
+    INS --> OK["commit"]
+    RA -.->|"the claim is gone,<br/>or the status is terminal"| NO["refused — nothing moved"]
+    INS -.->|"phase 2 fails"| RB["phase 1 rolls back — no session ever<br/>sees the instance under both pins, or neither"]
+```
+
+The scope is re-set between statements rather than held for the transaction, which is what lets one
+commit read under the source pin and write under the target one — and the re-assertion sits inside
+that envelope precisely so a claim that died between validation and commit stops the move instead of
+racing it.
+
 ## The snapshot moves as a byte-level patch
 
 The snapshot rewrite is a key patch over the raw map — the same shape marking an instance failed or
@@ -157,6 +177,19 @@ with the source row), the snapshot is suspended, and the parks are armed. A re-a
 instant has passed is claimed by the ordinary poller on its next tick; a message park waits for its
 next correlated inbound. There is **no new resume entry point and no privileged re-drive**, which is
 precisely why the claim-guarded concurrency story still holds afterwards.
+
+```mermaid
+flowchart LR
+    F["the wait frontier's own rows"] --> SET
+    L["every row sharing the instance's<br/>latest resolution timestamp"] --> SET
+    T["a synthesized q:timeout boundary,<br/>a timer boundary event"] -.->|"neither appears<br/>in the frontier"| L
+    SET["the re-arm set —<br/>gated on a non-empty frontier"] --> ARM["re-armed in the migration's own transaction,<br/>status back to suspended, failure keys dropped"]
+    ARM --> ORD["ordinary paths — the poller claims a due timer,<br/>a message park waits for its next correlated inbound"]
+```
+
+The frontier alone would silently drop the deadline the park was armed with; the second input
+recovers it exactly, because the failure commit resolved every waiting row in **one** statement and
+nothing touches a `FAILED` instance's rows afterwards.
 
 ### A defect this closed
 

@@ -3,6 +3,20 @@
 Sutra is organized around a few load-bearing ideas. This page is the map; deeper chapters will
 expand each one.
 
+```mermaid
+flowchart TD
+    MSG["A message arrives<br/>on a channel"] --> CODEC["Codec<br/>format × schema"]
+    CODEC -->|"typed payload"| INST["Process instance"]
+    CODEC -.->|"soft error"| INST
+    INST --> WAIT{"needs to wait?"}
+    WAIT -->|"no"| DONE["Reply / emit / complete"]
+    WAIT -->|"yes"| PARK["Suspend + persist<br/>keyed by YOUR business key"]
+    PARK -->|"correlated message<br/>or timer fires"| INST
+    INST <-->|"q:store"| STORE[("Data store<br/>state beyond one instance")]
+```
+
+Everything below is one of these boxes examined closely.
+
 ## The message is the contract
 
 A start event binds to a **channel** and a **message type**. The engine decodes the real wire

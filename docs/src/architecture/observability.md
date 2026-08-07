@@ -25,6 +25,22 @@ boundary except whatever you separately configured elsewhere (a channel, a datas
 sink) — this is a property you can verify by reading the source or watching an unconfigured
 engine's own boot log, not a policy statement to take on faith.
 
+```mermaid
+flowchart LR
+    subgraph eng["The engine process"]
+        SP["traces<br/>sutra.dispatch · decode · validate · execute"]
+        ME["metrics<br/>sutra.instance.* · token.* · task.* · shard.*"]
+        LO["logs<br/>structured JSON"]
+    end
+    LO ==> OUT["stdout — always, no configuration"]
+    SP -.-> COL["a collector you run"]
+    ME -.-> COL
+    LO -.->|"only once an OTLP endpoint is configured"| COL
+```
+
+Three signals, one destination, and it is one you configured: with no OTLP endpoint set there are
+no exporters at all and stdout is the only thing that crosses the process boundary.
+
 ## Traces
 
 The engine's existing `tracing` spans (`sutra.dispatch`, `sutra.resolve`, `sutra.decode`,
@@ -42,6 +58,17 @@ stateful flow's lifecycle (the initial run, then each resume) gets its own trace
 ties the segments together for a human reading a Gantt view is the **instance id**, stamped as a
 plain span attribute (`bpm.instance.id`) on every span belonging to that instance — filter on it
 and the segments line up on one timeline, with the waits showing as the gaps between them.
+
+```mermaid
+flowchart LR
+    S1["the initial run<br/>its own traceId"] -->|"suspend force-ends<br/>every span still open"| W(["the wait — nothing open"])
+    W -->|"resume"| S2["the next segment<br/>a new traceId"]
+    S1 -.->|"bpm.instance.id"| K["the attribute that lines<br/>the segments up in a Gantt view"]
+    S2 -.->|"bpm.instance.id"| K
+```
+
+A month-long park costs no open span; the instance id, not a parent trace, is what stitches the
+segments back together.
 
 ## Metrics
 

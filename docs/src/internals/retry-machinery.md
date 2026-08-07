@@ -175,6 +175,27 @@ because the durable record of the failure survives elsewhere: in the marker, in 
 counter, and in the incident the poison already recorded. Nothing is forgotten; only the *pending
 delivery* is withdrawn.
 
+```mermaid
+sequenceDiagram
+    participant I as Instance
+    participant D as Durable state
+    participant C as Counterpart
+
+    I->>C: request, attempt n, idempotency key A
+    I->>I: the timeout boundary fires, or the delivery is terminally poisoned
+    I->>D: arm the backoff timer, set the marker, delete attempt n's outbox rows
+    Note over I,D: one transaction — nothing of the dead attempt stays pending
+    C->>I: a late response to attempt n
+    I-->>C: refused, SUTRA.DISPATCH.CHANNEL_CALL.RETRY_PENDING — the correlation row stays live
+    D->>I: a due timer on the marked node — the re-drive
+    I->>C: fresh request, attempt n+1, fresh idempotency key B
+    C-->>I: response, served by the same correlation, no re-registration
+```
+
+Withdrawing the dead attempt's deliveries is what makes the fresh idempotency key safe: only one
+request for this call is ever live, so a counterpart doing its own deduplication sees a genuinely
+new one rather than a replay it can answer "already handled".
+
 The general shape is worth naming: an exception to a safety rule is defensible when you can point
 at the specific corruption the rule would cause, and show the information the rule was protecting
 is preserved by another mechanism.
@@ -219,6 +240,26 @@ exactly one answer.
 From there the instance is retained, inspectable, blocks its deployment's retirement, and is
 repairable by [migration](migration-internals.md) — which is the loop the whole design is pointed
 at: fail loudly, keep everything, let an operator fix the model and bring it back.
+
+```mermaid
+stateDiagram-v2
+    Attempt: Attempt — the task runs, or the request is emitted
+    Backoff: Backoff park — timer armed, marker set, the dead attempt's outbox rows deleted
+    Failed: FAILED — a durable snapshot carrying the structured code
+    [*] --> Attempt
+    Attempt --> [*]: success, or a correlated business response
+    Attempt --> [*]: a BPMN error, routed to its boundary
+    Attempt --> Backoff: a failed attempt, budget remaining
+    Backoff --> Attempt: a due timer on the marked node, the re-drive
+    Attempt --> Failed: a nonRetryableCodes hit
+    Attempt --> Failed: the budget is spent
+    Failed --> [*]: retained, inspectable, blocking retirement, repairable by migration
+```
+
+Only two things are a failed attempt of a channel call — a route-less `<q:timeout>` firing and a
+terminally-poisoned delivery. An answer and a BPMN error both leave without touching the budget,
+because each is an outcome the author already routed; retrying an unwelcome answer would
+double-submit.
 
 ## Next
 

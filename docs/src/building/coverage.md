@@ -33,6 +33,20 @@ you pick the database, the engine owns the schema.
 | Intra-process | `<q:coverage path="…" flows="…"/>` inline on a `<bpmn:process>` | one process |
 | Cross-process | a `coverage/<name>.yaml` file, URN-identified `urn:sutra:coverage:<name>` | several correlated processes of one deployment |
 
+```mermaid
+flowchart LR
+    D1["q:coverage on a process<br/>an ordered list of flow ids"] --> SEED
+    D2["a coverage/name.yaml route<br/>a segment per participant process"] --> SEED
+    SEED["on activation — seed one coverage_metric row<br/>per declared route, covered = false"] --> ST[("the coverage store<br/>the deployment declares")]
+    RUN["a real instance's fired-flow trace"] -->|"contains the route's flows<br/>in order, as a subsequence"| UP["guarded UPDATE … AND NOT covered —<br/>the affected-row count is the answer to<br/>did this run newly cover it"]
+    UP --> ST
+    ST --> REP["total, covered, uncovered —<br/>one aggregate and one ordered query,<br/>in a single REPEATABLE READ snapshot"]
+```
+
+Declaration is what creates the measurable surface: `total` is exactly the seeded set, so a route
+nobody declared can never appear as covered *or* uncovered, and the percentage is derived on read
+rather than kept as a counter that could drift.
+
 ## Intra-process: `<q:coverage>` inline
 
 The simplest case declares a route directly on the process it belongs to, as an ordered list of
@@ -141,6 +155,23 @@ segment writes a correlation-tagged record, and a route flips covered once every
 segments has landed in the same correlated group. Reading `total`/`covered`/percentage for a
 cross-process route is the same store query as an intra-process one — the mechanism composes
 rather than duplicating.
+
+```mermaid
+flowchart LR
+    subgraph SEG["one route's per-process segments, injected as ordinary intra-process paths"]
+        A["intake-svc<br/>Flow_p1_start …"]
+        B["hub-svc<br/>Flow_p2_start …"]
+        C["fulfillment-svc<br/>Flow_p3_start …"]
+    end
+    A -->|"on completion, a<br/>correlation-tagged record"| G
+    B --> G
+    C --> G
+    G["one correlated group —<br/>the caseId every hop carries"] -->|"every segment has landed"| F["the route flips covered —<br/>one flag, counted once in total"]
+```
+
+Three separately dispatched instances share no instance id, so the correlation key is the whole
+reconstruction; the segments are marking cursors, which is why many of them collapse onto the one
+route flag a report reads.
 
 ## Composing several definitions in one package
 

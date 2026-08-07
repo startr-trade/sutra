@@ -64,6 +64,19 @@ task is fetchable when it is not terminal, its backoff has elapsed, and it is ei
 holding an *expired* lock. An expired lock is therefore not a state anyone has to clean up. It is
 simply not an obstacle to the next fetch.
 
+```mermaid
+stateDiagram-v2
+    [*] --> Fetchable: the sink parks the delivery as a task row
+    Fetchable --> Locked: a fetch claims it
+    Locked --> Fetchable: the lock expires, and the predicate stops excluding it
+    Locked --> Fetchable: worker failure with budget left, once the backoff elapses
+    Locked --> Terminal: worker failure with the budget spent
+    Locked --> [*]: completion dispatched, then the row deleted
+```
+
+No edge out of `Locked` is driven by a background job: each one is either a worker's own call or the
+claim predicate declining to exclude the row. That is what "no sweeper" actually buys.
+
 The consequences are worth naming, because "no component" is easy to undervalue:
 
 - **No lag.** A task is available the instant its lock expires, not on the next sweep tick.
@@ -87,6 +100,24 @@ The completion order is: verify and hold the lock, dispatch the result through t
 That makes the surface **at-least-once**. A crash between the dispatch and the delete re-offers the
 task, and a duplicate completion is absorbed by inbox deduplication under the delivery's idempotency
 key.
+
+```mermaid
+sequenceDiagram
+    participant W as Worker
+    participant T as Task row
+    participant E as Engine intake
+    W->>T: complete, guarded by the lock it holds
+    T->>T: re-take the lock across the dispatch
+    T->>E: dispatch the result through the ordinary inbound path
+    Note over E: correlation, validation and inbox dedup,<br/>under the delivery's own idempotency key
+    E-->>T: accepted
+    Note over W,T: a crash before the delete re-offers the task —<br/>a duplicate, never a loss
+    T->>T: delete the task row
+```
+
+The delete is last on purpose. The crash window between the dispatch and the delete costs a
+duplicate that already has a dedup key waiting for it; inverting the two would make that same window
+cost the work itself.
 
 The inverse order — delete, then dispatch — would make it **at-most-once**, and the same crash would
 lose the work outright: the task is gone, the instance is still parked, and nothing anywhere records

@@ -22,6 +22,18 @@ when the package deploys — or from an extension crate implementing the codec S
 a message standard (an industry wire format with its own envelope grammar and schema editions)
 is served.
 
+```mermaid
+flowchart LR
+    W["Wire bytes<br/>HTTP · Kafka · SQS · …"] --> C["Channel<br/>transport + auth"]
+    C --> D["Codec<br/>decode + schema-validate"]
+    D -->|"typed payload"| P["Process<br/>BPMN 2.0 + DMN"]
+    D -.->|"violation"| R["Reject path<br/>a branch you modelled"]
+    P --> O["Reply · emit · park for a human"]
+```
+
+Validation sits *in the doorway*, not inside your process — which is why a schema violation is
+a branch you drew rather than an exception you catch.
+
 The engine core is **domain-neutral**: no business vertical lives in the engine itself — it
 lives entirely in codecs, channels, and modules. It also collects **no telemetry of its own** —
 no usage statistics, no crash reports, nothing phones home, ever; the only data a running engine

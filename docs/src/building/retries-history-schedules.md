@@ -45,6 +45,25 @@ Nothing sleeps, and nothing is held in memory. The consequences are the ones you
   nothing;
 - a `PT5M` backoff is a `PT5M` backoff whether or not the replica that started it is still alive.
 
+```mermaid
+sequenceDiagram
+    participant L as Execution lane
+    participant DB as PostgreSQL
+    participant T as Timer poller
+
+    loop while the budget holds
+        L->>L: attempt fails
+        L->>DB: re-park — task still pending, timer armed at the backoff instant
+        Note over L,DB: a durable park, not a sleep — the lane is free for other instances
+        T->>DB: backoff instant due
+        T->>L: re-drive the task
+    end
+    L->>DB: budget spent — durable FAILED, retained and inspectable
+```
+
+A backoff is a row in a database, not a held thread — which is why it survives a restart and a
+hot-deploy, and why a task waiting five minutes costs every other instance nothing.
+
 Declaring `<q:retry>` on a task makes its process **stateful** — the park needs persistence, so a
 process that was otherwise run-to-completion now requires a configured datasource.
 
@@ -99,6 +118,24 @@ A response that arrives for the dead attempt is refused with
 miss, because the correlation is deliberately kept alive. Once the re-issued request goes out, the
 same correlation serves its response normally.
 
+```mermaid
+sequenceDiagram
+    participant E as Engine
+    participant C as Counterpart
+
+    E->>C: attempt n, idempotency key K1
+    Note over E: route-less q:timeout fires — a retryable task failure
+    E->>E: park the backoff, withdraw attempt n's pending delivery
+    C-->>E: late answer to attempt n
+    E-->>C: refused — SUTRA.DISPATCH.CHANNEL_CALL.RETRY_PENDING
+    E->>C: attempt n+1, fresh key K2, fresh timeout window
+    C-->>E: answer — a completion, never a retry trigger
+```
+
+A re-drive is a new request rather than a second wait for the old one, so the counterpart's own
+deduplication sees it as new; and the superseded attempt is refused by name instead of being
+silently absorbed or lost.
+
 ### Exhaustion
 
 A spent budget — or a `nonRetryableCodes` hit — fails the instance durably with
@@ -147,6 +184,23 @@ for a deployment that wants no history at all.
 itself stays opt-in (`sutra.audit.sql`): with it off, the history endpoint answers an explanatory
 empty shape rather than a misleading 404, and the retained terminal snapshot still answers the
 inspect route.
+
+```mermaid
+stateDiagram-v2
+    [*] --> RUNNING
+    RUNNING --> COMPLETED: terminal step re-stamps the snapshot
+    RUNNING --> TERMINATED: terminal step re-stamps the snapshot
+    RUNNING --> FAILED: budget spent or non-retryable code
+    COMPLETED --> [*]: swept past sutra.instance.retention
+    TERMINATED --> [*]: swept past sutra.instance.retention
+    note right of FAILED
+      Retained regardless of the window.
+      Blocks its deployment's retirement; repairable by migration.
+    end note
+```
+
+Finishing is a status change, not a disappearance — and `FAILED` is the one status the retention
+sweeper never reaches.
 
 ## Timer completeness: durations, dates, cycles, and timer starts
 

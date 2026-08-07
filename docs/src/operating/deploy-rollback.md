@@ -31,6 +31,19 @@ drain the old revision, activate the new one — with no restart. In-flight inst
 revision keep running to completion in the background; new inbound picks up the new revision
 immediately.
 
+```mermaid
+flowchart LR
+    PKG["re-packaged archive<br/>new deploymentId, same slot"] --> FLIP["two-phase activation flip<br/>one transaction, no restart"]
+    FLIP -->|"activate"| NEW["new revision<br/>active"]
+    FLIP -->|"drain"| OLD["previous revision<br/>draining"]
+    IN["new inbound"] --> NEW
+    OLD -.->|"in-flight instances<br/>run to completion"| RET["retires once quiescent"]
+```
+
+Nothing in flight is moved by a hot-deploy: new traffic follows the active set from the moment the
+flip commits, while instances that started on the previous revision finish on the graph they started
+under.
+
 ```bash
 # edit the package source, then:
 sutra package packages/my-app --out /tmp/pkgs
@@ -66,6 +79,22 @@ sutra undeploy my-app.sutra --api --engine-url http://localhost:<port>
 The engine drains it — refuses new intake, lets in-flight instances finish, retires the slot once
 it reaches zero instances and zero pending outbox entries. On the ConfigMap path, pair this with
 `sutra deployments list <dir>` to find the right archive/deploymentId first.
+
+Deploy, hot-deploy, rollback and undeploy are all edges of one revision lifecycle:
+
+```mermaid
+stateDiagram-v2
+    [*] --> Active: deploy --api, synchronous
+    [*] --> Pending: deploy --async, 202 accepted
+    Pending --> Active: activation flip completes
+    Pending --> Failed: SUTRA.DEPLOY.* reject
+    Active --> Draining: a newer revision takes the slot, or undeploy
+    Draining --> Active: re-deploy that same archive
+    Draining --> [*]: retired, at zero instances and zero pending outbox entries
+```
+
+Rollback is not a separate operation, it is the `Draining --> Active` edge — which is why the
+previous archive's still-draining `deploymentId` resurrects rather than being rebuilt.
 
 Two drain behaviors worth knowing before you need them:
 

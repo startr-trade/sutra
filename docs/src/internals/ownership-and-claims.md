@@ -26,6 +26,19 @@ redelivered; a timer fire is deferred to a later tick with backoff; an administr
 (`SUTRA.RUNTIME.RESUME.CLAIM_HELD`, or the admin surface's `SUTRA.ADMIN.MIGRATE.CLAIM_HELD`) so a
 caller can tell "you lost a race, try again" apart from "this will never work".
 
+```mermaid
+flowchart LR
+    C{"claim: free or stale?"} -->|"yes"| RUN["rehydrate, run the step"]
+    C -->|"no"| REF["refuse, before anything is rehydrated"]
+    REF --> RQ["broker relay — requeued, redelivered"]
+    REF --> TM["timer fire — deferred to a later tick, with backoff"]
+    REF --> AD["admin call — 409, having read and written nothing"]
+```
+
+The claim comes before any rehydration, so a contended path ends at the diamond rather than partway
+through a step — and every branch out of it is a mechanism that already existed, which is why
+contention needed no new recovery machinery of its own.
+
 ## Release is part of the commit, and part of every other exit
 
 The claim is released **inside the same transaction** that commits the step's writes. "Committed"
@@ -125,6 +138,20 @@ surface](pull-surface-design.md).
 
 No release protocol survives a process that stops existing. The stuck-instance sweep is the answer:
 a lease-gated role that clears any claim whose owner has been silent longer than the claim timeout.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Unowned
+    Unowned --> Held: compare-and-set, free or stale
+    Held --> Held: same owner, so same lane — re-claim granted
+    Held --> Unowned: released inside the committing transaction
+    Held --> Unowned: released on every non-committing exit
+    Held --> Unowned: swept, owner silent past the claim timeout
+```
+
+Three ways out of `Held`, in decreasing order of how much the design leans on them: the commit
+itself, the enumerated non-committing exits, and the sweep — which exists only for the process that
+is no longer around to run any exit at all.
 
 It sweeps **by age and is owner-blind** — it does not parse owner ids, does not know how many lanes
 a replica has, and does not care. That is what let the lane-index suffix land with no change to the

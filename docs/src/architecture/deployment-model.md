@@ -38,8 +38,39 @@ Because the HTTP response *is* the activation signal, there is no propagation wi
 about, no separate "did it actually take?" step — this is the property that makes deploys
 deterministic rather than eventually-consistent from the caller's point of view.
 
+```mermaid
+sequenceDiagram
+    participant C as sutra deploy
+    participant R1 as The replica that took the call
+    participant DB as The engine's database
+    participant R2 as Every other replica
+    C->>R1: POST /admin/deployments — the sealed archive
+    R1->>R1: re-verify the archive, fail-closed
+    R1->>DB: store as the slot's active row
+    Note over DB: one transaction — exactly one active row per slot
+    R1->>R1: two-phase flip — drain the old revision, activate the new
+    R1-->>C: 200 {deploymentId, phase "Active"}
+    DB--)R2: LISTEN/NOTIFY after commit, version-poll as the fallback
+    R2->>R2: converge on the committed active set
+```
+
+The caller's answer arrives only after the flip, so it is definitive; the rest of the fleet
+converges off the committed row rather than off anything the deploying replica tells it.
+
 `DELETE /admin/deployments/{slot|id}` marks a row `draining`; the engine's activation flip drains
 it (no new intake, retire once quiescent).
+
+```mermaid
+stateDiagram-v2
+    [*] --> Active: POST /admin/deployments
+    Active --> Draining: a new revision takes the slot
+    Active --> Draining: DELETE by slot or id
+    Draining --> Retired: no new intake, quiescent
+    Retired --> [*]
+```
+
+The slot outlives its revisions: taking a slot moves the old row sideways into `draining` rather
+than deleting it, which is what makes a hot-deploy a replace rather than a restart.
 
 ## Sync vs. async — the same call, two response shapes
 
@@ -61,6 +92,15 @@ endpoint accepts an async mode:
     spine — one more durable outbox entry, delivered by the same dispatcher that sends every other
     outbound message — so a deploy-complete notification is not a separate mechanism, just another
     emission.
+
+```mermaid
+flowchart LR
+    P["POST /admin/deployments"] ==>|"sync — the default"| A["blocks through the flip<br/>200 Active, or a SUTRA.DEPLOY.* reject"]
+    P -->|"async — opt-in"| B["202 Pending, activation runs behind it"]
+    B -->|"poll"| C["GET /sutra/deployments/{id}<br/>until Active or Failed"]
+    B -->|"push"| D["a CloudEvent to callback= and/or notify="]
+    D -->|"one more outbox row"| E["the same dispatcher that sends<br/>every other outbound message"]
+```
 
 This is a long-running-operation (LRO) shape, not a bespoke deploy protocol: accept fast, do the
 work in the background, let the caller choose polling or a push notification.

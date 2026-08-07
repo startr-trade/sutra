@@ -3,6 +3,20 @@
 Sutra runs many tenants behind one engine and one database, with isolation enforced at the
 storage layer rather than by giving each tenant its own infrastructure.
 
+```mermaid
+flowchart LR
+    M["inbound message"] --> CH["channel dispatcher<br/>tenant = the package's own label"]
+    CH --> Q{"per-tenant ceilings<br/>concurrent instances · inbound rate"}
+    Q -.->|"over the cap"| REJ["HTTP 429 · broker nack"]
+    Q -->|"admitted"| EX["the executor"]
+    EX --> P["the persistence layer<br/>injects the tenant WHERE clause"]
+    P --> DB[("PostgreSQL row-level security<br/>SET LOCAL app.current_tenant")]
+```
+
+Two different gates: the ceilings are an admission concern, enforced before an inbound ever
+reaches the executor, while the tenant partition itself is enforced twice on the way to disk — the
+second time by the database, which no query can talk its way around.
+
 ## Tenant identity is a package label
 
 A deployment package's `tenant` is an opaque label in `package.yaml` (alongside `module` and
@@ -68,6 +82,19 @@ executor:
 Both rejections surface as the same class of diagnostic the payload-size cap uses (see
 [Limits and quotas](../operating/limits.md)), translated to the right per-transport signal (HTTP
 429, a broker nack, …).
+
+```mermaid
+flowchart LR
+    IA["inbound → Replica A"] --> DA{"admit?"}
+    IB["inbound → Replica B"] --> DB2{"admit?"}
+    WA["A's own 60s window<br/>in memory"] --> DA
+    WB["B's own 60s window<br/>in memory"] --> DB2
+    C[("live count in instance_state<br/>one shared table")] --> DA
+    C --> DB2
+```
+
+The concurrency cap is one shared count, so it holds fleet-wide; the rate window is per-replica
+memory, so a fleet of N replicas admits up to N windows' worth before anything says no.
 
 ## Audit isolation
 

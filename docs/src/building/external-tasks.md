@@ -79,6 +79,19 @@ becomes fetchable again. There is no sweeper, no reaper, and no timeout job: exp
 predicate that decides what a fetch may claim, so a worker that dies mid-task costs exactly one
 lock duration and never costs the work.
 
+```mermaid
+stateDiagram-v2
+    [*] --> fetchable: the pull sink parks the delivery as a task row
+    fetchable --> locked: fetch-and-lock, workerId + lockDuration
+    locked --> fetchable: lock expires — no sweeper, it is the claim predicate
+    locked --> fetchable: failure with budget left, after retryTimeout
+    locked --> [*]: complete — dispatched inbound, then the row is deleted
+    locked --> terminal: budget spent — retained with its last error
+```
+
+There is no reaper because an expired lock is not a state anyone has to clean up: it is simply no
+longer an obstacle to the next fetch, so availability is instant rather than one sweep tick late.
+
 A completion or failure from a worker that no longer owns the lock **fails closed**, and the
 refusal names which of the three situations it is:
 
@@ -97,6 +110,24 @@ The task row is deleted **only after** the engine has accepted the completion. A
 window between the two re-offers the task, so the work is never lost — the surface is
 at-least-once, deliberately, because the inverse ordering (delete, then dispatch) would be
 at-most-once and would drop work outright on the same crash.
+
+```mermaid
+sequenceDiagram
+    participant W as Worker
+    participant E as Engine
+    participant TR as Task row
+
+    W->>E: complete — workerId + result
+    E->>TR: ownership-guarded — is this lock still yours?
+    E->>E: dispatch the result through the ordinary inbound path
+    Note over E,TR: crash here and the task is re-offered — inbox dedup absorbs the duplicate
+    E->>TR: delete the row
+    E-->>W: 200
+```
+
+The ordering is the whole guarantee: the crash window can only produce a duplicate the idempotency
+key already absorbs, where the inverse order would lose the work with nothing recording that it
+ever happened.
 
 What makes the duplicate harmless is that each task carries the originating outbound delivery's
 key as an **explicit idempotency key**, and the completion re-enters under it. Inbox dedup absorbs

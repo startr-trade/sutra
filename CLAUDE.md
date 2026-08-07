@@ -126,7 +126,8 @@ answered, that's a gap worth flagging rather than guessing at.
 ## Docs
 
 This book (`docs/`) is built with [mdBook](https://rust-lang.github.io/mdBook/):
-`mdbook build docs` or `mdbook serve docs`. Every relative link in `docs/src/**/*.md` must resolve
+`mdbook build docs` or `mdbook serve docs` (the book's diagrams are ```mermaid blocks, so
+`mdbook-mermaid` must be on PATH or they render as code listings). Every relative link in `docs/src/**/*.md` must resolve
 — check with `mdbook build` before treating a docs change as complete if mdBook is installed
 locally; if it isn't, at minimum grep for the link targets you added/changed and confirm the
 files exist at those relative paths.

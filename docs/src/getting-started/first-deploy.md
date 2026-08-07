@@ -27,6 +27,19 @@ Two consequences worth internalizing:
 | **Synchronous API** | CI/CD, any engine you can reach | `sutra deploy … --api --engine-url …` |
 | **ConfigMap patch** | Kubernetes | `sutra deploy …` (the default when a cluster context is set) |
 
+```mermaid
+flowchart LR
+    PKG[".sutra archive"] --> W["watched directory"]
+    PKG --> A["POST /admin/deployments"]
+    PKG --> K["ConfigMap patch"]
+    W --> V["re-verify fail-closed<br/>store as the slot's new revision"]
+    A --> V
+    K --> V
+    V --> F["two-phase activation flip"]
+    F --> ACT["Active"]
+    V -.->|"invalid archive"| REJ["SUTRA.DEPLOY.* refusal<br/>nothing stored"]
+```
+
 All three end at the same place: the archive is stored, validated, and activated by the same
 two-phase flip. They differ only in how the bytes arrive.
 

@@ -37,6 +37,20 @@ along the way. Anything durable — the instance snapshot, the outbox, the inbox
 store write — goes through `sutra-persistence` (or a module's own store, for data stores; see
 [Data stores](../building/data-stores.md)).
 
+```mermaid
+flowchart LR
+    IN["inbound message"] --> CH["sutra-channels<br/>decode · two-tier validate · route"]
+    CO["sutra-codec-spi<br/>+ the concrete codecs"] -.->|"codec SPI"| CH
+    CH -->|"typed payload"| EX["sutra-executor<br/>token execution"]
+    EX --> BP["sutra-bpmn<br/>model + q: extensions"]
+    EX --> LG["sutra-feel · sutra-dmn<br/>sutra-srl · sutra-templates"]
+    EX -->|"durable state"| PE["sutra-persistence"]
+    EX -.->|"a q:store binding"| DS["a module's own data store"]
+```
+
+Decode-and-validate happens once, at the doorway; everything below the channel layer only ever
+sees a typed payload, and every durable write leaves through one crate.
+
 ## The composition root
 
 `sutra-engine` — the library — never names a concrete codec, transport, or secret-resolver
@@ -49,6 +63,19 @@ registering through the same SPIs and force-linked by its own composition root, 
 precisely what this split is for. This split is what lets a hardened build drop everything it
 doesn't need — `cargo build -p sutra-engine --no-default-features --features file` links no broker
 client at all — without touching a line of the neutral engine or channel code.
+
+```mermaid
+flowchart LR
+    F["sutra-formats<br/>json · xml · yaml<br/>csv · raw-text · raw-bytes"] --> D
+    R["the redactors"] --> D
+    S["vendor secret-resolvers"] --> D
+    T["transports"] -->|"feature-selected"| D
+    E["sutra-engine (the library)<br/>names no concrete"] --> D
+    D["sutra-dist<br/>composition root — force-links"] --> B["the sutra-engine binary<br/>the container image ships"]
+```
+
+Every concrete implementation enters the binary at exactly one crate — which is what lets a
+hardened build link no broker client at all while the neutral crates it depends on stay untouched.
 
 See [Domain neutrality and the SPI model](neutrality-and-spi.md) for exactly how that boundary is
 drawn and mechanically enforced, and what a third party has to write to add a new transport or

@@ -4,6 +4,18 @@ A `businessRuleTask` binds one decision, authored either as a `.dmn` decision ta
 `.srl` ruleset. Both compile onto the **same** FEEL evaluator (`sutra-feel`) — no JVM, no Rete
 runtime, and no second expression language to learn.
 
+```mermaid
+flowchart LR
+    BRT["bpmn:businessRuleTask"] --> R{"routed by<br/>file extension"}
+    R -->|".dmn"| D["DMN 1.5 decision table<br/>all seven hit policies"]
+    R -->|".srl"| S["ruleset — rule / when / then / end<br/>one deterministic forward pass"]
+    D --> F["sutra-feel<br/>one evaluator · DECIMAL64 · determinism denylist"]
+    S --> F
+```
+
+Choosing a table or a ruleset is a choice of framing, not of runtime — an expression means the same
+thing in a gateway condition, a `q:alias`, a DMN cell, and an `.srl` `when`.
+
 ## FEEL — the shared expression language
 
 FEEL (Friendly Enough Expression Language) is what every condition, gateway expression, `q:alias`
@@ -141,6 +153,19 @@ decision table. Both files reason over the identical payload projection the code
 through the same `SUTRA.VALIDATE.*` code family, and their issues land in one accumulated
 `validation.issues` list — the split between engines is invisible to the BPMN gateway that routes
 on the outcome.
+
+```mermaid
+flowchart LR
+    P["the payload projection<br/>the codec decoded"] --> V1["1 · intake-timing.dmn"]
+    P --> V2["2 · intake-fields.srl"]
+    V1 -->|"issues append"| ACC["one accumulated result<br/>validation.issues · outcome · tier"]
+    V2 -->|"issues append"| ACC
+    ACC --> G{"the BPMN gateway<br/>routes on the outcome"}
+```
+
+Both entries read the identical projection and append into one result, so the gateway cannot tell
+which file — or which rule engine — produced a given code; only `firstReasonCode` carries the
+declared order.
 
 ## Which to reach for
 

@@ -56,6 +56,20 @@ locus will get:
 **Every violation is reported, not just the first.** Fixing a mapping should take one round trip,
 not one per node.
 
+```mermaid
+flowchart TD
+    DUR["Durable state<br/>wait frontier · routed start<br/>retry counters · waiting rows"] --> LOCI["Live loci"]
+    SRC["Source graph<br/>the deployment the instance is pinned to"] --> LOCI
+    LOCI --> MAP["nodeMapping<br/>identity where the map is silent"]
+    TGT["Target graph<br/>from the active set"] --> CHK
+    MAP --> CHK{"target node exists,<br/>and matches what resume<br/>actually does there?"}
+    CHK -->|"no"| REF["Refused — every violation listed"]
+    CHK -->|"yes"| GO["Migrate"]
+```
+
+Both graphs are loaded, so the check runs against the target's real nodes rather than against the
+mapping's good intentions — and a refusal comes back complete, not one node at a time.
+
 Some findings are warnings rather than refusals:
 
 - **A completed node the target does not declare** — not a live locus, so not fatal. But
@@ -147,6 +161,27 @@ or committed**. A resume that starts after the migration claims bounces off it i
 The move itself is **one transaction**: snapshot, waiting rows, aliases, subject index and audit
 scope all land under the new pin together, or none do. No session ever observes the instance under
 both pins or under neither.
+
+```mermaid
+sequenceDiagram
+    participant M as Migrate call
+    participant C as The instance row
+    participant R as A resume path
+    alt the claim is free
+        M->>C: claim, under a distinct owner identity
+        C-->>M: taken
+        R->>C: claim, to resume
+        C-->>R: CLAIM_HELD — requeue or defer
+        M->>C: commit, claim re-verified under the row lock
+        Note over M,C: snapshot, waiting rows, aliases, subject index,<br/>audit scope: all together, or none
+    else a resume already holds it
+        M->>C: claim, under a distinct owner identity
+        C-->>M: 409 CLAIM_HELD, nothing read, rewritten or committed
+    end
+```
+
+Whichever side gets there first, the other one bounces retry-safely — the distinct owner identity is
+what stops a migration re-entering past a resume already in flight on the same replica.
 
 ## Batch migration
 

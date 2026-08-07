@@ -18,6 +18,37 @@ native ack/nack, HTTP gets a status code — but the two values mean the same th
   the connection open until completion and return the reply body — the classic synchronous
   request/reply.
 
+```mermaid
+sequenceDiagram
+    participant S as Broker / HTTP caller
+    participant E as Engine intake
+    participant P as Process instance
+    S->>E: deliver
+    E->>E: durably capture the inbound
+    Note over E: on-persist acknowledges here
+    E-->>S: broker ack, or HTTP 202 Accepted with no business body
+    E->>P: start
+    P-->>S: eventual reply, if any, on an outbound channel
+```
+
+```mermaid
+sequenceDiagram
+    participant S as Broker / HTTP caller
+    participant E as Engine intake
+    participant P as Process instance
+    S->>E: deliver
+    E->>E: durably capture the inbound
+    E->>P: start
+    Note over S,E: broker — ack deferred in the registry<br/>HTTP — connection held open
+    P-->>E: INSTANCE_COMPLETED or INSTANCE_FAILED
+    Note over E: on-complete acknowledges here
+    E-->>S: broker ack or nack, or the HTTP reply body
+```
+
+The two are identical up to the durable capture; the mode moves only where the ack arrow sits. That
+one move is the whole trade — release the delivery slot early and let inbox dedup absorb a
+redelivery, or hold it so the broker's own redelivery is your crash-recovery path.
+
 **The default differs by transport, because the natural mode differs**: broker channels default
 to `on-persist` (release the delivery slot early); HTTP channels default to `on-complete`
 (synchronous request/reply). An HTTP channel opts into asynchronous intake by declaring
@@ -81,6 +112,20 @@ that aren't reaching a terminal state. Diagnostic codes at each stage:
 `SUTRA.ACK.DEFERRED_REGISTERED` (debug), `SUTRA.ACK.DEFERRED_ACKED` (debug),
 `SUTRA.ACK.DEFERRED_NACKED` (info — a permanent reject), `SUTRA.ACK.DEFERRED_OVERFLOW` (warn),
 `SUTRA.ACK.DEFERRED_TIMEOUT` (warn), `SUTRA.ACK.ON_COMPLETE_UNSUPPORTED` (warn, at startup).
+
+```mermaid
+stateDiagram-v2
+    [*] --> Registered: on-complete inbound, ack withheld
+    Registered --> Acked: instance completed
+    Registered --> Nacked: instance failed
+    Registered --> Nacked: sweep, entry older than the timeout
+    Registered --> Nacked: at capacity, oldest entry evicted
+```
+
+The completion and failure edges are the mode working as intended. The sweep and capacity edges are
+the ones an operator watches: a timeout nack frees the broker slot while the instance keeps running,
+and repeated overflow means either the capacity is too low or something is never reaching a terminal
+state.
 
 ## Migration note
 

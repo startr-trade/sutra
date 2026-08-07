@@ -57,6 +57,26 @@ types. That is one more way to ease integration, not a better kind of store.
 If nothing outside the process ever reads the store, that affordance buys nothing, and key/value is
 the right answer.
 
+```mermaid
+flowchart LR
+    W["one write through q:store"]
+    subgraph KV["no structure: block — key/value, the default"]
+        KROW["the generic table, shared by every key/value<br/>store on that connection<br/>store name, key, value, rev, updated_at"]
+    end
+    subgraph PJ["a structure: block — projected"]
+        PROW["this store's own table<br/>store_key, one column per declared field,<br/>rev, updated_at"]
+    end
+    W --> KROW
+    W --> PROW
+    KROW -.->|"an opaque document to parse"| BI["a dashboard, a nightly query, an analyst —<br/>anything that speaks SQL and has<br/>never heard of Sutra"]
+    PROW -->|"balance and opened_at,<br/>as columns, with types"| BI
+```
+
+Both shapes hold the same record and answer the same `<q:store>` access with the same locking and
+`rev` semantics; the only thing projection moves is the arrow on the right — an opaque document
+versus columns a reader can use directly, bought with the flat-only constraint and ownership of the
+DDL.
+
 **The shape is a property of the store, not of the flow — within limits worth knowing.** A store's
 shape is declared in `datastores.yaml` and nowhere else. The BPMN is unchanged either way: the same
 `<bpmn:dataStoreReference>`, the same `<q:store>` with the same `key` / `field` / `forUpdate` /
@@ -366,6 +386,24 @@ isn't satisfiable, naming every offending column at once. That is the defence ag
 drifted from the package's own migrations — a hand-applied `ALTER` — and it fails loudly because a
 silent partial write is far worse than a refusal. It costs one catalog round-trip the first time
 the store is used, and nothing on any operation after that.
+
+```mermaid
+flowchart TD
+    L["sutra lint — package time<br/>replays migrations/store/V*.sql in version order,<br/>no database connection and no credentials"]
+    L -.->|"COLUMN_MISSING, KEY_MISMATCH,<br/>COLUMN_NAME_INVALID, STRUCTURE_NOT_FLAT"| LE["package rejected"]
+    L -.->|"DDL outside the parsed subset,<br/>or a JSON Schema structure"| LW["warning only —<br/>no column diagnostic raised"]
+    L --> D["deploy — the engine resolves the store"]
+    LW --> D
+    D -.->|"a base64Binary field, or a structure<br/>no XSD codec of this package declares"| DE["deployment refused"]
+    D --> F["first use — the once-per-store gate that runs<br/>the migrations reads the live table's columns"]
+    F -.->|"the table does not satisfy<br/>the declaration"| FE["PROJECTION_UNSATISFIABLE —<br/>the store fails closed, naming every column"]
+    F --> R["every operation after it —<br/>no further catalog round-trip"]
+    R -.->|"a field the structure does not declare,<br/>or a value that is not a record"| RE["UNDECLARED_FIELD,<br/>VALUE_NOT_A_RECORD"]
+```
+
+Each gate sees something the one before it could not — lint has the migrations but no database,
+deploy has the resolved store but no table, first use has the live catalog — which is why a package
+can pass lint (or draw only a warning from it) and still refuse to deploy.
 
 ### A worked example
 

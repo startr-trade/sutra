@@ -26,6 +26,20 @@ protocol and no listener of their own. `local` delivers in-process to another ch
 the delivery as a task a worker fetches instead of dialing anything, which is the
 [external-task surface](external-tasks.md).
 
+```mermaid
+flowchart LR
+    H["http"] --> SPI
+    B["kafka · rabbitmq · aws-sqs<br/>gcp-pubsub · amqp"] --> SPI
+    F["file<br/>air-gapped spool"] --> SPI
+    LP["local · pull<br/>engine-internal, no wire protocol"] -.-> SPI
+    SPI["One transport SPI<br/>bind · activate · drain, generically"] --> CD["The channel's codec<br/>decode + schema-validate"]
+    CD --> SUB["The processes that subscribed<br/>q:source channel + messageType"]
+```
+
+Which transport a channel rides changes only how the bytes arrive: bind, activate and drain are one
+generic path, and everything past the doorway — decode, validation, subscription — is identical for
+all of them.
+
 Dapr and Knative Eventing ride the HTTP transport as integration patterns rather than dedicated
 crates — the engine speaks plain HTTP (+ CloudEvents) to a Dapr sidecar or a Knative broker, so no
 broker vendor client ever links into the engine for either.
@@ -65,6 +79,19 @@ separate `<q:source>` on the same underlying `<bpmn:transaction>`.
 **Fan-out.** By default a channel is point-to-point: for a given `(channel, messageType)`, exactly
 one subscribing process is allowed (enforced at deploy time). Setting `broadcast: true` fans a
 decoded message out to *every* subscribing process, one instance each — genuine pub/sub.
+
+```mermaid
+flowchart LR
+    H["intake channel<br/>http"] --> P["one process<br/>one q:source per channel"]
+    R["intake channel<br/>rabbitmq"] --> P
+    K["intake channel<br/>kafka"] --> P
+    N["one channel<br/>+ messageType"] --> S1["exactly one subscribing process<br/>enforced at deploy time"]
+    N -.->|"broadcast: true"| S2["every subscribing process<br/>one instance each"]
+```
+
+The channel never names a process; the process names the channel. That is what lets one flow be fed
+by three transports at once, and why a second subscriber to the same `(channel, messageType)` is a
+deploy-time error unless the channel opts into broadcast.
 
 **Concurrency admission.** A channel may optionally declare `maxConcurrentInstances` — an
 admission cap on simultaneously active instances from that channel (a suspended instance still

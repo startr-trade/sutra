@@ -38,6 +38,17 @@ Work arrives in three shapes, and the router handles each differently:
 | **The id does not exist yet** — a spawn from an inbound message, or a due timer start event | Any lane may mint it; arrivals are spread round-robin. No hop, ever. |
 | **The id is learned mid-pipeline** — a relay | Resolved on the arrival lane, then handed off if the owner lane is a different one. |
 
+```mermaid
+flowchart LR
+    T["timer fire<br/>carries its instance id"] -->|"hash(instanceId)"| OWN["the instance's owner lane"]
+    S["spawn<br/>no instance id yet"] -->|"round-robin"| ANY["any lane mints it — no hop, ever"]
+    R["relay<br/>names a business key only"] --> ARR["the arrival lane<br/>decode · validate · correlate"]
+    ARR -->|"resolved id, at most one hop"| OWN
+```
+
+Only a relay can hop, and only once — because the id it routes on does not exist until the arrival
+lane has decoded and correlated the delivery.
+
 ### The cross-lane handoff
 
 A relay does not name an instance id on the wire. It names a business key, and the engine only
@@ -58,6 +69,23 @@ waits for that lane's answer. Two rules make this safe by construction:
   re-runs only the race-sensitive part — claim, load, terminal/failed/suspended guards, deployment
   pin resolution, resume — never the decode, validation, or correlation, which are deterministic
   over the delivery and already done.
+
+```mermaid
+sequenceDiagram
+    participant K as Caller task — HTTP handler, consumer, outbox worker
+    participant A as Lane A, where the delivery arrived
+    participant B as Lane B, the instance's owner
+    K->>A: the delivery
+    A->>A: decode, intake validation, q:alias correlation
+    A-->>K: handoff — the already-decoded resume request
+    K->>B: enqueue the resolved request
+    B->>B: claim, load, guards, pin resolution, resume
+    B-->>K: the answer
+    Note over A,B: a lane loop never sends into another lane's queue
+```
+
+The hop travels back out through the caller rather than lane-to-lane, which is what makes the
+mutual-block deadlock impossible and turns a full queue into backpressure on the transport.
 
 Only relays ever hop. Spawns and timer fires never do.
 
@@ -81,6 +109,22 @@ That is also why the claim-bounce meter below doubles as the mis-route alarm.
 A deploy activation rebuilds the engine's live view of processes, codecs, validators, and
 channels. Under lanes, the controller sends that rebuild to **every** lane and **waits for all of
 them** before it replaces the live deployment set and rewires transports.
+
+```mermaid
+sequenceDiagram
+    participant C as The activation controller
+    participant L0 as Lane 0
+    participant LN as Lane N-1
+    C->>L0: rebuild processes, codecs, validators, channels
+    C->>LN: rebuild
+    L0-->>C: applied between two requests
+    LN-->>C: applied between two requests
+    Note over C,LN: the controller waits for every lane
+    C->>C: replace the live deployment set, rewire transports
+```
+
+The await-all barrier is the only thing lanes add to the flip: the later stages cannot begin until
+every lane has applied its rebuild.
 
 Per-lane atomicity is what matters, and it is preserved: a lane applies its flip between two
 requests, never inside one, so nothing is ever observed half-flipped. Because every step of an

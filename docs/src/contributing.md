@@ -111,6 +111,25 @@ The zero-warning clippy bar and the domain-neutrality gate are both hard require
 preferences — see [Domain neutrality and the SPI model](architecture/neutrality-and-spi.md) for
 why the latter exists.
 
+### Diagrams in this book
+
+Diagrams are [mermaid](https://mermaid.js.org) in fenced ```` ```mermaid ```` blocks, rendered by
+the `mdbook-mermaid` preprocessor (put it on your PATH, or your local build shows the source
+instead of the picture). Four rules keep them consistent:
+
+1. **No hardcoded colors** — no `style … fill:#…`, no `classDef`. The book has a light and a dark
+   theme and mermaid picks its own palette for each; a hardcoded fill is unreadable in one of
+   them. Shape, label and subgraph carry the meaning.
+2. **A diagram earns its place** by compressing something the reader would otherwise hold in
+   their head — an ordering, a state machine, a fan-in, a comparison. A bullet list drawn as
+   boxes is not a diagram.
+3. **Keep it small** (roughly a dozen nodes). If it needs more, it is two diagrams.
+4. **Label the edges** where the label is the information (`park`, `after PT30S`,
+   `hash(instanceId)`), and put one or two sentences under the diagram naming the takeaway.
+
+The diagram must say what the prose says: no fact appears only in a picture, and nothing in a
+picture contradicts the text.
+
 ## Where designs live
 
 Deeper design rationale than this book covers — why a mechanism was built the way it was, staged

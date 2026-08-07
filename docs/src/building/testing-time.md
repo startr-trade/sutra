@@ -6,6 +6,23 @@ the kind of thing that is hard to test and therefore usually untested. Sutra's a
 day-long timer settles in wall-clock seconds against a real database, with real durable rows and
 the real timer poller.
 
+```mermaid
+sequenceDiagram
+    participant T as Test
+    participant E as Engine
+    participant DB as PostgreSQL
+
+    T->>E: send the message that starts the flow
+    E->>DB: park: durable timer row, due in PT24H
+    Note over E,DB: real row, real poller — only "now" is virtual
+    T->>E: fast-forward the clock past the due time
+    E->>DB: timer is due: claim + fire
+    E-->>T: the reminder path ran
+```
+
+A day-long timer settles in milliseconds because the *clock* moved, not because the timer was
+shortened — the durable rows and the code path are the production ones.
+
 Two ways in: a CLI command for BPMN authors, and an embedded seam for anyone writing tests in
 Rust.
 

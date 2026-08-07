@@ -64,7 +64,7 @@ The engine, tooling, and libraries are a single Cargo workspace under `rust/`.
 | Path | What it is |
 |---|---|
 | **`rust/`** | The Cargo workspace — the engine, CLI, libraries and tools. Start at [`rust/README.md`](rust/README.md); build & test tiers in [`rust/TESTING.md`](rust/TESTING.md). |
-| **`docs/`** | The documentation site ([mdBook](https://rust-lang.github.io/mdBook/)) — build with `mdbook serve docs`. |
+| **`docs/`** | The documentation site ([mdBook](https://rust-lang.github.io/mdBook/)) — build with `mdbook serve docs` (diagrams need [`mdbook-mermaid`](https://github.com/badboy/mdbook-mermaid) on PATH). |
 | **`catalog/`** | Generated impact-analysis catalog — one page per source file, with dependency relationships (git-ignored; run `make catalog` to populate). |
 | **`examples/`** | End-to-end example apps (money-transfer, approval-hold). |
 | **`deploy/`** | Reusable OpenTofu deployment modules. |
