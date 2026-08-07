@@ -31,7 +31,7 @@ jobs:
           output: trivy-fs.sarif
           severity: CRITICAL,HIGH
       - name: Upload SARIF to code scanning
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4
         if: always()
         with:
           sarif_file: trivy-fs.sarif
@@ -51,13 +51,13 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - name: Set up Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
       # GHA-backed layer cache, same pattern as release.yml/nightly.yml: the chef-cook
       # dependency layer dominates this build and only changes with the lockfile. Its own
       # `scope=` because tag-ref caches (release's) are not readable from main/scheduled
       # runs — this cache is saved on main pushes and read back by the weekly schedule.
       - name: Build engine image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: ./rust
           file: ./rust/Dockerfile
@@ -75,7 +75,7 @@ jobs:
           output: trivy-image.sarif
           severity: CRITICAL,HIGH
       - name: Upload SARIF to code scanning
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4
         if: always()
         with:
           sarif_file: trivy-image.sarif
