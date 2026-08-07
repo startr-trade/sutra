@@ -6,7 +6,7 @@ the engine end to end.
 
 ```bash
 # Scaffold a new app
-cd rust && cargo run -p sutra-cli -- create app my-first-app
+sutra create app my-first-app
 ```
 
 This produces an app with:
@@ -23,6 +23,10 @@ sutra deploy  ./my-first-app.sutra
 ```
 
 Then send a message on the bound channel and watch it decode, validate, route, and reply.
+
+> Already ran the **[quickstart](quickstart.md)**? That covers this scaffold end to end —
+> package, start an engine, send a message, watch a hot-deploy flip. This page is the
+> reference for what the scaffold contains.
 
 > The runnable, end-to-end walkthroughs live under [`examples/`](https://github.com/startr-trade/sutra/tree/main/examples)
 > — each has its own README with the exact `package` / `deploy` / `curl` lines. Start with

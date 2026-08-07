@@ -5,6 +5,7 @@
 # Getting Started
 
 - [Installation](getting-started/installation.md)
+- [Quickstart](getting-started/quickstart.md)
 - [Your first app](getting-started/first-app.md)
 - [Your first deployment](getting-started/first-deploy.md)
 

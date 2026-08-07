@@ -718,7 +718,6 @@ mod tests {
         })
     }
 
-
     const TEST_KID: &str = "tp33-test-key-1";
     const TEST_ISSUER: &str = "https://idp.test.local/";
     const TEST_AUDIENCE: &str = "sutra-admin";

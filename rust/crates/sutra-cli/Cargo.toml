@@ -76,6 +76,11 @@ async-trait = { workspace = true }
 # `sutra deploy --wait` polls the engine's /sutra/deployments/{id} readiness endpoint.
 # Same feature set as the conformance harness (rustls, shared with the kube HTTP stack).
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+# `self-update` verifies a release archive against the release's own SHA256SUMS before
+# installing it, and unpacks the Windows asset. Both are already workspace-pinned and in
+# the tree (loader hashes archives; the archive container is zip).
+sha2 = { workspace = true }
+zip = { workspace = true }
 include_dir = "0.7"
 
 # `sutra deploy` / `sutra undeploy` — the native Kubernetes client: kube-rs with kubeconfig

@@ -13,8 +13,9 @@
 services:
   engine:
     # The sutra engine image — one generic image; behaviour comes entirely from the mounted
-    # deployments. Override with SUTRA_ENGINE_IMAGE (e.g. a locally built tag).
-    image: ${SUTRA_ENGINE_IMAGE:-sutra-engine:latest}
+    # deployments. Defaults to the PUBLISHED release image so a fresh scaffold runs without
+    # building anything. Override with SUTRA_ENGINE_IMAGE (e.g. a locally built tag).
+    image: ${SUTRA_ENGINE_IMAGE:-ghcr.io/startr-trade/sutra:latest}
     environment:
       # Deployment source root: the engine loads its work from this mount. It consumes
       # packaged .sutra archives dropped into the directory; add/remove = deploy/undeploy.

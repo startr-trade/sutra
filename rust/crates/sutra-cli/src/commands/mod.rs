@@ -26,6 +26,7 @@ pub mod migrate;
 pub mod openapi;
 pub mod package;
 pub mod schemagen;
+pub mod self_update;
 pub mod simulate;
 pub mod test;
 pub mod version;
@@ -35,6 +36,8 @@ pub mod version;
 pub enum Command {
     /// Print the tool version.
     Version(version::VersionArgs),
+    /// Replace this binary with a published release build (explicit, verified, atomic).
+    SelfUpdate(self_update::SelfUpdateArgs),
     /// Apply engine schema migrations (or inspect them: status, verify, --dry-run).
     Migrate(migrate::MigrateArgs),
     /// Print a structural summary of a BPMN file (processes, events, tasks, gateways, channels).
@@ -88,6 +91,7 @@ impl Command {
     pub fn execute(self, global: &GlobalArgs, io: &mut Io<'_>) -> i32 {
         match self {
             Command::Version(args) => version::execute(args, global, io),
+            Command::SelfUpdate(args) => self_update::execute(args, global, io),
             Command::Migrate(args) => migrate::execute(args, global, io),
             Command::Describe(args) => describe::execute(args, global, io),
             Command::Openapi(args) => openapi::execute(args, global, io),

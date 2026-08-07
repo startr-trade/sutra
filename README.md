@@ -72,25 +72,36 @@ The engine, tooling, and libraries are a single Cargo workspace under `rust/`.
 | **`openapi/`** | API specifications. |
 | **`scripts/`** | Repository-level dev / ops scripts. |
 
-## Quickstart
-
-Prerequisites: a Rust toolchain, Docker (for the tier-2 / conformance suites), and `tofu` + a
-kind cluster (for the tier-3 k8s suites only).
+## Install
 
 ```bash
-# Build + test the workspace (tier-1: no Docker)
-make test
-make lint
+# The CLI — downloads the release build for your platform and verifies its checksum
+curl -fsSL https://raw.githubusercontent.com/startr-trade/sutra/main/scripts/install.sh | sh
 
-# Build the engine container image
-docker build -t sutra-engine:dev -f rust/Dockerfile rust/
-
-# The CLI packages, deploys, and inspects deployments
-cd rust && cargo run -p sutra-cli -- --help
+# The engine — one generic image; behaviour comes from the packages you deploy into it
+docker pull ghcr.io/startr-trade/sutra:latest
 ```
 
-A one-line installer for the released `sutra` CLI and a published container image will
-accompany the first tagged release. See the [documentation](docs/) to get started.
+Windows: `irm https://raw.githubusercontent.com/startr-trade/sutra/main/scripts/install.ps1 | iex`.
+Neither needs a Rust toolchain. Then `sutra self-update --check` tells you when a newer
+release exists, and `sutra self-update --runtime` moves the CLI and the engine image
+together.
+
+From there, the [quickstart](https://sutra.startr.trade/getting-started/quickstart.html)
+scaffolds an app, packages it, starts an engine with Docker Compose, and sends a message
+through it in about five minutes.
+
+## Build from source
+
+Needed only to develop the engine itself. Prerequisites: a Rust toolchain, Docker (for the
+tier-2 / conformance suites), and `tofu` + a kind cluster (for the tier-3 k8s suites only).
+
+```bash
+make test        # tier-1: the no-docker suite
+make lint
+docker build -t sutra-engine:dev -f rust/Dockerfile rust/
+cargo install --path rust/crates/sutra-cli
+```
 
 ## Documentation
 
