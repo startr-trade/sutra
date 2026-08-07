@@ -1,5 +1,10 @@
 # Introduction
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="images/brand/sutra-lockup-dark.svg">
+  <img src="images/brand/sutra-lockup-light.svg" alt="Sutra" width="480">
+</picture>
+
 **Sutra is a Rust-native, message-native workflow engine built on BPMN 2.0.** It turns a
 standard BPMN process into a declarative way to **consume typed, schema-validated messages off
 any channel**, route and correlate them, **pause for human decisions**, and reply — as a single

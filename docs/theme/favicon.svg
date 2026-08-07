@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="Sutra">
+  <!-- Favicon cut of the S-thread mark: heavier stroke, two beads only, so the
+       S + saffron end-dot still read at 16 px. Theme-aware via prefers-color-scheme. -->
+  <style>
+    .thread { stroke: #26317E; }
+    .ring   { stroke: #26317E; fill: #FFFFFF; }
+    @media (prefers-color-scheme: dark) {
+      .thread { stroke: #AEB6E8; }
+      .ring   { stroke: #AEB6E8; fill: #0F1117; }
+    }
+  </style>
+  <path class="thread" d="M92 26 C 46 26 42 60 64 66 C 86 72 82 102 40 102"
+        fill="none" stroke-width="12" stroke-linecap="round"/>
+  <circle class="ring" cx="92" cy="26" r="13" stroke-width="6"/>
+  <circle cx="40" cy="102" r="11" fill="#E8871E"/>
+</svg>

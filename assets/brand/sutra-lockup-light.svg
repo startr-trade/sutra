@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 200" role="img" aria-label="Sutra logo">
+  <!-- The thread: runs through the BPMN beads, then rises to become the shirorekha
+       (the Devanagari headline bar) that the wordmark hangs from. One continuous line. -->
+  <path d="M20 120 H392 C424 120 416 48 448 48 H686"
+        fill="none" stroke="#26317E" stroke-width="5" stroke-linecap="round"/>
+
+  <!-- BPMN arrowhead: the thread is also a sequence flow -->
+  <path d="M686 40 L704 48 L686 56 Z" fill="#E8871E"/>
+
+  <!-- start event: thin circle, threaded -->
+  <circle cx="64" cy="120" r="20" fill="#FFFFFF" stroke="#26317E" stroke-width="4"/>
+
+  <!-- task: rounded rectangle -->
+  <rect x="122" y="96" width="72" height="48" rx="10" fill="#FFFFFF" stroke="#26317E" stroke-width="4"/>
+
+  <!-- gateway: diamond -->
+  <path d="M258 92 L286 120 L258 148 L230 120 Z" fill="#FFFFFF" stroke="#26317E" stroke-width="4"/>
+
+  <!-- end event: thick circle, saffron — the completed step -->
+  <circle cx="348" cy="120" r="20" fill="#FFFFFF" stroke="#E8871E" stroke-width="8"/>
+
+  <!-- wordmark hangs from the bar, Devanagari-style -->
+  <text x="456" y="118" font-family="'Noto Sans','Segoe UI',ui-sans-serif,sans-serif"
+        font-size="74" font-weight="700" letter-spacing="1" fill="#26317E">sutra</text>
+
+  <!-- the Sanskrit word itself, quiet -->
+  <text x="458" y="162" font-family="'Noto Sans Devanagari','Noto Sans',sans-serif"
+        font-size="26" fill="#8A8FA8">सूत्रा</text>
+</svg>

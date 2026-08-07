@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 240" role="img" aria-label="Sutra S-thread mark">
+  <!-- Alternative mark: the thread itself draws an S (sutra), threading a start
+       event at its head, a gateway at its heart, and ending as a sequence-flow
+       arrow — the whole letter is one process. -->
+  <path d="M148 42 C 70 42 62 104 100 120 C 138 136 130 198 62 198"
+        fill="none" stroke="#26317E" stroke-width="7" stroke-linecap="round"/>
+
+  <!-- start event threaded at the head of the S -->
+  <circle cx="148" cy="42" r="15" fill="#FFFFFF" stroke="#26317E" stroke-width="4"/>
+
+  <!-- gateway at the waist -->
+  <path d="M100 98 L122 120 L100 142 L78 120 Z" fill="#FFFFFF" stroke="#E8871E" stroke-width="5"/>
+
+  <!-- sequence-flow arrowhead at the tail -->
+  <path d="M66 188 L44 198 L66 208 Z" fill="#26317E"/>
+</svg>

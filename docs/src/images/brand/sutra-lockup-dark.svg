@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 200" role="img" aria-label="Sutra logo">
+  <path d="M20 120 H392 C424 120 416 48 448 48 H686"
+        fill="none" stroke="#AEB6E8" stroke-width="5" stroke-linecap="round"/>
+
+  <path d="M686 40 L704 48 L686 56 Z" fill="#F49D1A"/>
+
+  <circle cx="64" cy="120" r="20" fill="#0F1117" stroke="#AEB6E8" stroke-width="4"/>
+
+  <rect x="122" y="96" width="72" height="48" rx="10" fill="#0F1117" stroke="#AEB6E8" stroke-width="4"/>
+
+  <path d="M258 92 L286 120 L258 148 L230 120 Z" fill="#0F1117" stroke="#AEB6E8" stroke-width="4"/>
+
+  <circle cx="348" cy="120" r="20" fill="#0F1117" stroke="#F49D1A" stroke-width="8"/>
+
+  <text x="456" y="118" font-family="'Noto Sans','Segoe UI',ui-sans-serif,sans-serif"
+        font-size="74" font-weight="700" letter-spacing="1" fill="#EDEFF9">sutra</text>
+
+  <text x="458" y="162" font-family="'Noto Sans Devanagari','Noto Sans',sans-serif"
+        font-size="26" fill="#7C82A0">सूत्रा</text>
+</svg>

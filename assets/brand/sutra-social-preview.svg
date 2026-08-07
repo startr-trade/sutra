@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 640" role="img" aria-label="Sutra — a Rust-native workflow engine built on BPMN 2.0">
+  <!-- GitHub social-preview card (render to PNG at 1280×640 before uploading). -->
+  <rect width="1280" height="640" fill="#0F1117"/>
+
+  <!-- the S-thread mark, dark-scheme colors -->
+  <g transform="translate(120,110) scale(1.75)">
+    <path d="M148 42 C 70 42 62 104 100 120 C 138 136 130 198 62 198"
+          fill="none" stroke="#AEB6E8" stroke-width="7" stroke-linecap="round"/>
+    <circle cx="148" cy="42" r="15" fill="#0F1117" stroke="#AEB6E8" stroke-width="4"/>
+    <path d="M100 98 L122 120 L100 142 L78 120 Z" fill="#0F1117" stroke="#F49D1A" stroke-width="5"/>
+    <path d="M66 188 L44 198 L66 208 Z" fill="#AEB6E8"/>
+  </g>
+
+  <!-- headline thread + wordmark -->
+  <path d="M566 190 H1120" fill="none" stroke="#AEB6E8" stroke-width="6" stroke-linecap="round"/>
+  <path d="M1120 180 L1144 190 L1120 200 Z" fill="#F49D1A"/>
+  <text x="570" y="330" font-family="'Noto Sans','Segoe UI',ui-sans-serif,sans-serif"
+        font-size="140" font-weight="700" letter-spacing="2" fill="#EDEFF9">sutra</text>
+  <text x="576" y="392" font-family="'Noto Sans Devanagari','Noto Sans',sans-serif"
+        font-size="34" fill="#7C82A0">सूत्रा</text>
+
+  <text x="570" y="470" font-family="'Noto Sans','Segoe UI',ui-sans-serif,sans-serif"
+        font-size="32" fill="#C9CDE4">A Rust-native, message-native workflow engine</text>
+  <text x="570" y="514" font-family="'Noto Sans','Segoe UI',ui-sans-serif,sans-serif"
+        font-size="32" fill="#C9CDE4">built on BPMN 2.0</text>
+
+  <text x="570" y="586" font-family="'Noto Sans','Segoe UI',ui-sans-serif,sans-serif"
+        font-size="30" letter-spacing="1" fill="#E8871E">sutra.startr.trade</text>
+</svg>
