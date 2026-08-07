@@ -85,15 +85,15 @@ Sutra is four things, and this book covers all of them:
   a [data store](building/data-stores.md), which is key/value by default — one row per key, holding
   a value of any shape — and which can additionally project a *flat* record onto real typed
   columns, so the SQL tooling you already point at that database reads it directly.
-- **What's still thin.** A one-line CLI installer and a published container registry image
-  ship with the first tagged release (see [Installation](getting-started/installation.md));
-  until then the CLI and the engine image are built from source. Where a chapter below is a
-  stub, it says so explicitly rather than padding.
+- **What's still thin.** There is no operations console — the admin HTTP API is complete, but
+  a UI over it is roadmap, not shipped. Worker helper libraries beyond the HTTP pull API are
+  ecosystem work that hasn't happened yet, and macOS has no published CLI binary (it builds
+  from source). Where a chapter below is a stub, it says so explicitly rather than padding.
 
 ## Where to go next
 
-- **[Installation](getting-started/installation.md)** — get a toolchain and build the engine.
-- **[Your first app](getting-started/first-app.md)** — scaffold an app and watch a typed
+- **[Installation](getting-started/installation.md)** — one line for the CLI, one pull for the engine.
+- **[Quickstart](getting-started/quickstart.md)** — scaffold an app and watch a typed
   message flow through: decode → validate → route → reply.
 - **[Concepts](building/concepts.md)** — the ideas that make Sutra different: typed message
   contracts, channels, wait-states, the `q:` vocabulary, and content-addressed deployment.

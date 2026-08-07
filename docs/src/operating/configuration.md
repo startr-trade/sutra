@@ -27,7 +27,7 @@ engine ever disagree.
 | `sutra.deployment.source` | `SUTRA_DEPLOYMENT_SOURCE` | `dir` (default) — watch a folder of sealed archives — or `db` — the database-backed store, activated only via `POST /admin/deployments`. See [Deployment model](../architecture/deployment-model.md). |
 | `sutra.deployments.dir` | `SUTRA_DEPLOYMENTS_DIR` | Required for the `dir` source: the directory of `.sutra` archives the engine watches. |
 | `sutra.deployments.poll-interval` | `SUTRA_DEPLOYMENTS_POLL_INTERVAL` | How often the `dir` source rescans (default a few seconds). |
-| `sutra.http.port` | `SUTRA_HTTP_PORT` | Listen port; `0` binds an OS-assigned port (always use `0` locally — see [Your first app](../getting-started/first-app.md)). |
+| `sutra.http.port` | `SUTRA_HTTP_PORT` | Listen port; `0` binds an OS-assigned port (always use `0` locally — see [Quickstart](../getting-started/quickstart.md)). |
 
 ## The engine's own datasource
 

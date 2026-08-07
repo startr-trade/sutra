@@ -203,7 +203,7 @@ one carrying only the type change fails the gate rather than the deployment.
 
 ## Building one by hand vs. scaffolding
 
-`sutra create app <name>` (see [Your first app](../getting-started/first-app.md)) generates a
+`sutra create app <name>` (see [Anatomy of an app](../getting-started/first-app.md)) generates a
 package in this exact shape, verified through the engine's own loaders before anything is
 written. Growing it from there:
 

@@ -40,7 +40,7 @@ sutra create app <NAME> [--dir <DIR>]
 Scaffolds an application workspace: a sample standalone deployment package under
 `packages/<name>-main/` plus deploy assets (a compose file, a deployments drop-directory, a k8s
 manifest, a health-gated smoke script). Idempotent-safe — existing files are never overwritten.
-See [Your first app](../getting-started/first-app.md).
+See [Quickstart](../getting-started/quickstart.md) and [Anatomy of an app](../getting-started/first-app.md).
 
 ### `sutra create deployment`
 
