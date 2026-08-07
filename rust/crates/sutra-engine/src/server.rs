@@ -130,14 +130,28 @@ impl RunningEngine {
     /// (observed as a stale-rules window in a rolling-update conformance run).
     /// On SIGTERM / SIGINT this drains via [`Self::drain`]: consumers stopped and
     /// leases released BEFORE the process exits, so the successor takes over
-    /// immediately.
+    /// immediately. (Windows has no SIGTERM — there the console interrupt, Ctrl-C,
+    /// is the only termination signal and takes the same drain path.)
     pub async fn join_graceful(mut self) -> std::io::Result<()> {
-        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-        let mut int = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+        #[cfg(unix)]
+        let served = {
+            let mut term =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+            let mut int =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+            tokio::select! {
+                result = &mut self.task => Some(result),
+                _ = term.recv() => None,
+                _ = int.recv() => None,
+            }
+        };
+        #[cfg(not(unix))]
         let served = tokio::select! {
             result = &mut self.task => Some(result),
-            _ = term.recv() => None,
-            _ = int.recv() => None,
+            interrupt = tokio::signal::ctrl_c() => {
+                interrupt?;
+                None
+            }
         };
         match served {
             Some(result) => result.map_err(std::io::Error::other)?,
