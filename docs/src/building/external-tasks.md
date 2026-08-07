@@ -81,12 +81,12 @@ lock duration and never costs the work.
 
 ```mermaid
 stateDiagram-v2
-    [*] --> fetchable: the pull sink parks the delivery as a task row
-    fetchable --> locked: fetch-and-lock, workerId + lockDuration
-    locked --> fetchable: lock expires — no sweeper, it is the claim predicate
-    locked --> fetchable: failure with budget left, after retryTimeout
-    locked --> [*]: complete — dispatched inbound, then the row is deleted
-    locked --> terminal: budget spent — retained with its last error
+    [*] --> fetchable: the pull sink parks<br/>the delivery as a task row
+    fetchable --> locked: fetch-and-lock<br/>workerId + lockDuration
+    locked --> fetchable: lock expires — no sweeper,<br/>it is the claim predicate
+    locked --> fetchable: failure with budget left,<br/>after retryTimeout
+    locked --> [*]: complete — dispatched,<br/>then the row is deleted
+    locked --> terminal: budget spent —<br/>retained with its last error
 ```
 
 There is no reaper because an expired lock is not a state anyone has to clean up: it is simply no

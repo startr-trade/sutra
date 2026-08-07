@@ -1,6 +1,13 @@
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// Mermaid bootstrap for the Sutra book.
+//
+// Two things beyond the stock mdbook-mermaid init:
+//
+//  1. `useMaxWidth: false` on every diagram type. The default scales each SVG DOWN to the
+//     content column, which is what made wide diagrams render at unreadable point sizes. At
+//     natural size a wide diagram overflows instead — and `mermaid-fix.css` gives the block
+//     its own horizontal scrollbar, so the page never scrolls sideways.
+//  2. A larger base font, and `wrap: true` for sequence diagrams so long messages and notes
+//     wrap inside their boxes instead of overflowing them.
 
 (() => {
     const darkThemes = ['ayu', 'navy', 'coal'];
@@ -17,10 +24,34 @@
     }
 
     const theme = lastThemeWasLight ? 'default' : 'dark';
-    mermaid.initialize({ startOnLoad: true, theme });
 
-    // Simplest way to make mermaid re-render the diagrams in the new theme is via refreshing the page
+    mermaid.initialize({
+        startOnLoad: true,
+        theme,
+        themeVariables: {
+            fontSize: '15px',
+            fontFamily: '"Open Sans", "Segoe UI", system-ui, sans-serif',
+        },
+        flowchart: {
+            useMaxWidth: false,
+            htmlLabels: true,
+            padding: 10,
+            nodeSpacing: 45,
+            rankSpacing: 55,
+        },
+        sequence: {
+            useMaxWidth: false,
+            wrap: true,
+            width: 170,
+            noteMargin: 12,
+            boxMargin: 12,
+        },
+        state: { useMaxWidth: false },
+        er: { useMaxWidth: false },
+    });
 
+    // Re-rendering in the new theme is a page refresh — mermaid bakes theme colours into the
+    // emitted SVG, so there is nothing to restyle in place.
     for (const darkTheme of darkThemes) {
         document.getElementById(darkTheme).addEventListener('click', () => {
             if (lastThemeWasLight) {

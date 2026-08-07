@@ -10,7 +10,8 @@ default-theme = "rust"
 preferred-dark-theme = "ayu"
 git-repository-url = "https://github.com/startr-trade/sutra"
 edit-url-template = "https://github.com/startr-trade/sutra/edit/main/docs/{path}"
-additional-js = ["mermaid.min.js", "mermaid-init.js"]
+additional-css = ["mermaid-fix.css"]
+additional-js = ["mermaid.min.js", "mermaid-init.js", "diagram-open.js"]
 
 [output.html.fold]
 enable = true

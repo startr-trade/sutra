@@ -66,12 +66,12 @@ simply not an obstacle to the next fetch.
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Fetchable: the sink parks the delivery as a task row
+    [*] --> Fetchable: the sink parks<br/>the delivery
     Fetchable --> Locked: a fetch claims it
-    Locked --> Fetchable: the lock expires, and the predicate stops excluding it
-    Locked --> Fetchable: worker failure with budget left, once the backoff elapses
-    Locked --> Terminal: worker failure with the budget spent
-    Locked --> [*]: completion dispatched, then the row deleted
+    Locked --> Fetchable: the lock expires —<br/>the predicate stops excluding it
+    Locked --> Fetchable: failure, budget left,<br/>after the backoff
+    Locked --> Terminal: failure,<br/>budget spent
+    Locked --> [*]: completion dispatched,<br/>then the row deleted
 ```
 
 No edge out of `Locked` is driven by a background job: each one is either a worker's own call or the

@@ -8,8 +8,8 @@ runtime, and no second expression language to learn.
 flowchart LR
     BRT["bpmn:businessRuleTask"] --> R{"routed by<br/>file extension"}
     R -->|".dmn"| D["DMN 1.5 decision table<br/>all seven hit policies"]
-    R -->|".srl"| S["ruleset — rule / when / then / end<br/>one deterministic forward pass"]
-    D --> F["sutra-feel<br/>one evaluator · DECIMAL64 · determinism denylist"]
+    R -->|".srl"| S["ruleset: rule / when / then<br/>one deterministic pass"]
+    D --> F["sutra-feel — one evaluator<br/>DECIMAL64 · determinism denylist"]
     S --> F
 ```
 

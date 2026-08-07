@@ -19,8 +19,8 @@ flowchart TD
     R1["Replica 1"] --> DB
     R2["Replica 2"] --> DB
     R3["Replica 3"] --> DB
-    DB[("The engine's own PostgreSQL")] --- LEASE["a lease row per role<br/>gates timer firing, the stuck-instance sweep,<br/>terminal-history purging, singleton channels"]
-    DB --- CLAIM["the instance row's own owner<br/>gates advancing one instance"]
+    DB[("The engine's own PostgreSQL")] --- LEASE["a lease row per role<br/>timers · sweeps · purges<br/>singleton channels"]
+    DB --- CLAIM["the instance row's owner<br/>gates advancing one instance"]
     DB --- OUT["outbox rows<br/>FOR UPDATE SKIP LOCKED"]
     DB --- IBX["the inbox unique index<br/>ON CONFLICT DO NOTHING"]
 ```

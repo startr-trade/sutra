@@ -10,11 +10,11 @@ validation rejects a literal outright (see [Channels and transports](channels.md
 
 ```mermaid
 flowchart LR
-    DIR["the package directory<br/>bpmn, rules, scripts, templates, schemas,<br/>migrations, channels.yaml, datastores.yaml"]
-    DIR -->|"sutra package —<br/>full validation suite first, fail-closed"| AR["one immutable .sutra archive<br/>manifest of per-file digests, derived, never authored"]
-    AR -->|"deploymentId = sha256(manifest)"| DEP["sutra deploy"]
-    DEP --> SLOT["the slot — tenant--module--version,<br/>from the package.yaml labels"]
-    AR -.->|"a resource carries env:NAME or secret:KEY,<br/>never the value"| SEC["resolved at runtime,<br/>outside the archive"]
+    DIR["the package directory<br/>bpmn · schemas · templates<br/>channels.yaml · datastores.yaml"]
+    DIR -->|"sutra package<br/>validates first, fail-closed"| AR["one immutable .sutra<br/>manifest of per-file digests"]
+    AR -->|"deploymentId =<br/>sha256(manifest)"| DEP["sutra deploy"]
+    DEP --> SLOT["the slot:<br/>tenant--module--version"]
+    AR -.->|"carries env:NAME or<br/>secret:KEY, never a value"| SEC["resolved at runtime,<br/>outside the archive"]
 ```
 
 Everything the engine needs to run the module is sealed and hashed, so identical bytes re-deploy as

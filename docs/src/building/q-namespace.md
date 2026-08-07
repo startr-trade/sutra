@@ -34,15 +34,17 @@ and the same XSD drives the `sutra-modeler-plugin` property panels.
 | `q:coverage` | `bpmn:process` | An opt-in tracked compliance path. |
 
 ```mermaid
-flowchart LR
-    subgraph P["on bpmn:process itself<br/>q:variables · q:onValidation · q:process<br/>q:audit · q:coverage · q:dispatch / q:case"]
-        direction LR
+flowchart TD
+    PROC["on the process itself:<br/>q:variables · q:onValidation · q:process<br/>q:audit · q:coverage · q:dispatch"]
+
+    subgraph flow["…and on the nodes inside it"]
         S(["start event"]) --> T["serviceTask"]
-        T --> W["wait node<br/>userTask · message catch"]
-        W --> X(["throw event · send task"])
+        T --> W["wait node"]
+        W --> X(["throw · send"])
         DS[("dataStoreReference")]
     end
-    S -.- A["q:source<br/>+ q:validators · q:redactors"]
+
+    S -.- A["q:source<br/>q:validators"]
     T -.- B["q:param · q:retry<br/>q:timeout · q:reply"]
     W -.- C["q:source · q:alias"]
     X -.- D["q:send · q:header"]

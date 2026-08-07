@@ -55,17 +55,19 @@ The re-assertion in phase 1 is deliberate. The claim was taken before validation
 
 ```mermaid
 flowchart TD
-    CLM["claim the instance"] --> VAL["validate every locus against the target's<br/>capability index — all violations, not the first"]
-    subgraph TX["one transaction, one commit envelope"]
+    CLM["claim the instance"] --> VAL["validate every locus<br/>all violations, not the first"]
+
+    subgraph TX["one transaction"]
         direction TB
-        LK["scoped to the SOURCE — lock the instance row"] --> RA["re-assert the ownership claim and the<br/>non-terminal status, under that lock"]
-        RA --> RD["read every row belonging to the instance,<br/>then delete them"]
-        RD --> INS["re-scoped to the TARGET — insert the rewritten rows<br/>(the pin, the frontier, completed set and routed start<br/>through the node mapping, the renamed retry counters,<br/>the bumped audit floor)"]
+        LK["scoped to the SOURCE:<br/>lock the instance row"] --> RA["re-assert the claim and<br/>non-terminal status"]
+        RA --> RD["read the instance's rows,<br/>then delete them"]
+        RD --> INS["re-scoped to the TARGET:<br/>insert the rewritten rows"]
     end
+
     VAL --> LK
     INS --> OK["commit"]
-    RA -.->|"the claim is gone,<br/>or the status is terminal"| NO["refused — nothing moved"]
-    INS -.->|"phase 2 fails"| RB["phase 1 rolls back — no session ever<br/>sees the instance under both pins, or neither"]
+    RA -.->|"claim gone,<br/>or terminal"| NO["refused —<br/>nothing moved"]
+    INS -.->|"phase 2 fails"| RB["phase 1 rolls back:<br/>never both pins, never neither"]
 ```
 
 The scope is re-set between statements rather than held for the transaction, which is what lets one

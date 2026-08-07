@@ -130,6 +130,11 @@ instead of the picture). Four rules keep them consistent:
 The diagram must say what the prose says: no fact appears only in a picture, and nothing in a
 picture contradicts the text.
 
+Diagrams render at their natural size rather than being scaled down into the content column
+(that scaling is what makes wide diagrams unreadable), so a wide one scrolls inside its own
+block. **Clicking any diagram opens it full size in a new tab**, where the browser's own zoom,
+save and print apply — which is also the escape hatch when a diagram is genuinely large.
+
 ## Where designs live
 
 Deeper design rationale than this book covers — why a mechanism was built the way it was, staged

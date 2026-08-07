@@ -243,17 +243,17 @@ at: fail loudly, keep everything, let an operator fix the model and bring it bac
 
 ```mermaid
 stateDiagram-v2
-    Attempt: Attempt — the task runs, or the request is emitted
-    Backoff: Backoff park — timer armed, marker set, the dead attempt's outbox rows deleted
-    Failed: FAILED — a durable snapshot carrying the structured code
+    Attempt: Attempt<br/>the task runs, or the request is emitted
+    Backoff: Backoff park<br/>timer armed, marker set,<br/>the dead attempt's outbox rows deleted
+    Failed: FAILED<br/>a durable snapshot with the code
     [*] --> Attempt
-    Attempt --> [*]: success, or a correlated business response
-    Attempt --> [*]: a BPMN error, routed to its boundary
-    Attempt --> Backoff: a failed attempt, budget remaining
-    Backoff --> Attempt: a due timer on the marked node, the re-drive
-    Attempt --> Failed: a nonRetryableCodes hit
-    Attempt --> Failed: the budget is spent
-    Failed --> [*]: retained, inspectable, blocking retirement, repairable by migration
+    Attempt --> [*]: success, or a<br/>business response
+    Attempt --> [*]: a BPMN error,<br/>routed to its boundary
+    Attempt --> Backoff: failed,<br/>budget left
+    Backoff --> Attempt: due timer<br/>on the marked node
+    Attempt --> Failed: nonRetryableCodes
+    Attempt --> Failed: budget spent
+    Failed --> [*]: retained, inspectable,<br/>repairable by migration
 ```
 
 Only two things are a failed attempt of a channel call — a route-less `<q:timeout>` firing and a

@@ -29,10 +29,10 @@ caller can tell "you lost a race, try again" apart from "this will never work".
 ```mermaid
 flowchart LR
     C{"claim: free or stale?"} -->|"yes"| RUN["rehydrate, run the step"]
-    C -->|"no"| REF["refuse, before anything is rehydrated"]
-    REF --> RQ["broker relay — requeued, redelivered"]
-    REF --> TM["timer fire — deferred to a later tick, with backoff"]
-    REF --> AD["admin call — 409, having read and written nothing"]
+    C -->|"no"| REF["refuse — nothing rehydrated"]
+    REF --> RQ["broker relay:<br/>requeued"]
+    REF --> TM["timer fire:<br/>deferred, with backoff"]
+    REF --> AD["admin call: 409,<br/>nothing read or written"]
 ```
 
 The claim comes before any rehydration, so a contended path ends at the diamond rather than partway

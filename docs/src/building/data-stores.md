@@ -58,18 +58,21 @@ If nothing outside the process ever reads the store, that affordance buys nothin
 the right answer.
 
 ```mermaid
-flowchart LR
+flowchart TD
     W["one write through q:store"]
-    subgraph KV["no structure: block — key/value, the default"]
-        KROW["the generic table, shared by every key/value<br/>store on that connection<br/>store name, key, value, rev, updated_at"]
+
+    subgraph KV["Key/value — the default"]
+        KROW[("a shared generic table<br/>name · key · value · rev")]
     end
-    subgraph PJ["a structure: block — projected"]
-        PROW["this store's own table<br/>store_key, one column per declared field,<br/>rev, updated_at"]
+
+    subgraph PJ["Projected — a structure: block"]
+        PROW[("this store's own table<br/>one typed column per field")]
     end
+
     W --> KROW
     W --> PROW
-    KROW -.->|"an opaque document to parse"| BI["a dashboard, a nightly query, an analyst —<br/>anything that speaks SQL and has<br/>never heard of Sutra"]
-    PROW -->|"balance and opened_at,<br/>as columns, with types"| BI
+    KROW -.->|"an opaque document<br/>to parse"| BI["any SQL tool that has<br/>never heard of Sutra"]
+    PROW -->|"balance, opened_at:<br/>columns, with types"| BI
 ```
 
 Both shapes hold the same record and answer the same `<q:store>` access with the same locking and
@@ -389,16 +392,14 @@ the store is used, and nothing on any operation after that.
 
 ```mermaid
 flowchart TD
-    L["sutra lint — package time<br/>replays migrations/store/V*.sql in version order,<br/>no database connection and no credentials"]
-    L -.->|"COLUMN_MISSING, KEY_MISMATCH,<br/>COLUMN_NAME_INVALID, STRUCTURE_NOT_FLAT"| LE["package rejected"]
-    L -.->|"DDL outside the parsed subset,<br/>or a JSON Schema structure"| LW["warning only —<br/>no column diagnostic raised"]
-    L --> D["deploy — the engine resolves the store"]
-    LW --> D
-    D -.->|"a base64Binary field, or a structure<br/>no XSD codec of this package declares"| DE["deployment refused"]
-    D --> F["first use — the once-per-store gate that runs<br/>the migrations reads the live table's columns"]
-    F -.->|"the table does not satisfy<br/>the declaration"| FE["PROJECTION_UNSATISFIABLE —<br/>the store fails closed, naming every column"]
-    F --> R["every operation after it —<br/>no further catalog round-trip"]
-    R -.->|"a field the structure does not declare,<br/>or a value that is not a record"| RE["UNDECLARED_FIELD,<br/>VALUE_NOT_A_RECORD"]
+    L["<b>lint</b> — package time<br/>replays your V*.sql, no database"]
+    L -.->|"COLUMN_MISSING<br/>KEY_MISMATCH"| LE["package rejected"]
+    L --> D["<b>deploy</b> — the store resolves"]
+    D -.->|"a field no codec<br/>of this package declares"| DE["deployment refused"]
+    D --> F["<b>first use</b> — read the<br/>live table's columns, once"]
+    F -.->|"the table does not<br/>satisfy the declaration"| FE["PROJECTION_UNSATISFIABLE<br/>fails closed, names every column"]
+    F --> R["<b>every operation after</b><br/>no further catalog round-trip"]
+    R -.->|"undeclared field,<br/>or not a record"| RE["UNDECLARED_FIELD<br/>VALUE_NOT_A_RECORD"]
 ```
 
 Each gate sees something the one before it could not — lint has the migrations but no database,

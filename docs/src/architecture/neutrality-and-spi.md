@@ -63,19 +63,21 @@ cannot leak a term that never enters its dependency graph.
 ```mermaid
 flowchart TD
     subgraph here["This repository"]
-        CORE["the neutral core<br/>executor · model · channels · engine<br/>gated: no domain literal"]
-        FMT["sutra-formats<br/>the six schema-less formats"]
+        CORE["the neutral core<br/>no domain literal, gated"]
+        FMT["sutra-formats<br/>six schema-less formats"]
         DIST["sutra-dist"]
     end
+
     subgraph out["Outside this repository"]
-        STD["a message-standard codec crate<br/>written against the public codec SPI"]
-        OWN["that distribution's own<br/>composition root"]
+        STD["a codec crate<br/>against the public SPI"]
+        OWN["its composition root"]
     end
+
     CORE --> DIST
     FMT --> DIST
-    DIST --> B1["the stock engine binary"]
+    DIST --> B1["the stock binary"]
     CORE --> OWN
-    STD -->|"one Cargo dependency<br/>and one use-as-underscore line"| OWN
+    STD -->|"one dependency,<br/>one link line"| OWN
     OWN --> B2["that distribution's binary"]
 ```
 

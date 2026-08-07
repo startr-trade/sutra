@@ -25,12 +25,13 @@ the current snapshot is ever re-executed, so an upgrade cannot retroactively cha
 happened.
 
 ```mermaid
-flowchart LR
-    subgraph ev["Event replay: state is re-derived"]
-        E1["event"] --> E2["event"] --> E3["event"] --> E4["event"] --> EN["state now"]
+flowchart TD
+    subgraph ev["Event replay"]
+        E1["event"] --> E2["event"] --> E3["event"] --> EN["state now,<br/>re-derived every time"]
     end
-    subgraph sn["Snapshot: state is stored"]
-        SNAP["snapshot at the last<br/>quiescent point"] -->|"+ this input"| NEXT["do the next thing"]
+
+    subgraph sn["Snapshot"]
+        SNAP["state at the last<br/>quiescent point"] -->|"+ this input"| NEXT["do the next thing"]
     end
 ```
 

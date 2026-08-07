@@ -1,0 +1,73 @@
+/* Diagram presentation.
+ *
+ * In the page a diagram FITS the content column — scaled down proportionally if it is wider,
+ * never clipped and never scrolling. That keeps the reading column clean; the escape hatch for
+ * a diagram worth studying closely is `diagram-open.js`, which opens it full size in its own
+ * tab where the browser's zoom and scroll apply.
+ *
+ * (`mermaid-init.js` still renders at natural size — `useMaxWidth: false` — so the SVG carries
+ * its true intrinsic dimensions. The fitting below is CSS, which keeps the aspect ratio and
+ * hands the untouched geometry to the new tab.)
+ */
+
+pre.mermaid {
+    /* The rendered SVG replaces the block's contents; none of the code-block chrome applies. */
+    background: none;
+    border: none;
+    padding: 0.5rem 0;
+    margin: 1.5rem 0;
+
+    /* Narrow diagrams sit centred in the column rather than hugging the left margin. */
+    text-align: center;
+
+    /* A code block's monospace/pre rules would otherwise leak into HTML labels. */
+    white-space: normal;
+    font-family: inherit;
+    line-height: normal;
+}
+
+pre.mermaid svg {
+    /* Fit the column, keep the aspect ratio. No horizontal scrollbar, nothing cut off. */
+    max-width: 100%;
+    height: auto;
+}
+
+/* ---- click to open the diagram in its own tab (diagram-open.js) ---------------------- */
+
+pre.mermaid {
+    cursor: zoom-in;
+    position: relative;
+}
+
+pre.mermaid:focus-visible {
+    outline: 2px solid var(--links, #4a90d9);
+    outline-offset: 4px;
+    border-radius: 4px;
+}
+
+/* A quiet affordance: the hint appears only on hover/focus, so it never competes with the
+ * diagram itself. Hidden on touch, where there is no hover and the label would be a lie. */
+pre.mermaid::after {
+    content: "open in a new tab \2197";
+    position: absolute;
+    top: 0.25rem;
+    right: 0.5rem;
+    font-size: 0.72rem;
+    opacity: 0;
+    transition: opacity 0.15s ease-in-out;
+    pointer-events: none;
+    color: var(--fg, #333);
+    background: var(--bg, #fff);
+    border: 1px solid var(--table-border-color, rgba(128, 128, 128, 0.35));
+    border-radius: 3px;
+    padding: 0.05rem 0.35rem;
+}
+
+pre.mermaid:hover::after,
+pre.mermaid:focus-visible::after {
+    opacity: 0.8;
+}
+
+@media (hover: none) {
+    pre.mermaid::after { content: none; }
+}

@@ -88,9 +88,9 @@ stateDiagram-v2
     [*] --> Pending: deploy --async, 202 accepted
     Pending --> Active: activation flip completes
     Pending --> Failed: SUTRA.DEPLOY.* reject
-    Active --> Draining: a newer revision takes the slot, or undeploy
-    Draining --> Active: re-deploy that same archive
-    Draining --> [*]: retired, at zero instances and zero pending outbox entries
+    Active --> Draining: a newer revision<br/>takes the slot, or undeploy
+    Draining --> Active: re-deploy<br/>that same archive
+    Draining --> [*]: retired — zero instances,<br/>zero pending outbox
 ```
 
 Rollback is not a separate operation, it is the `Draining --> Active` edge — which is why the

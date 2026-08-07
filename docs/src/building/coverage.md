@@ -158,15 +158,15 @@ rather than duplicating.
 
 ```mermaid
 flowchart LR
-    subgraph SEG["one route's per-process segments, injected as ordinary intra-process paths"]
-        A["intake-svc<br/>Flow_p1_start …"]
-        B["hub-svc<br/>Flow_p2_start …"]
-        C["fulfillment-svc<br/>Flow_p3_start …"]
+    subgraph SEG["one route's per-process segments"]
+        A["intake-svc"]
+        B["hub-svc"]
+        C["fulfillment-svc"]
     end
-    A -->|"on completion, a<br/>correlation-tagged record"| G
+    A -->|"a correlation-<br/>tagged record"| G
     B --> G
     C --> G
-    G["one correlated group —<br/>the caseId every hop carries"] -->|"every segment has landed"| F["the route flips covered —<br/>one flag, counted once in total"]
+    G["one group, keyed by<br/>the caseId every hop carries"] -->|"all segments in"| F["the route flips covered<br/>counted once in total"]
 ```
 
 Three separately dispatched instances share no instance id, so the correlation key is the whole
