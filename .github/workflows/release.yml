@@ -385,10 +385,16 @@ jobs:
           # A tag containing '-' is a pre-release (v1.0.0-rc.1).
           prerelease=""
           case "$TAG" in *-*) prerelease="--prerelease" ;; esac
+          # Authored notes win: .github/releases/<tag>.md, if present, is the release
+          # body; otherwise fall back to GitHub's commit-generated notes.
+          notes="--generate-notes"
+          if [ -f ".github/releases/$TAG.md" ]; then
+            notes="--notes-file .github/releases/$TAG.md"
+          fi
           if ! gh release view "$TAG" >/dev/null 2>&1; then
             gh release create "$TAG" \
               --title "$TAG" \
-              --generate-notes \
+              $notes \
               --verify-tag \
               $prerelease
           fi
