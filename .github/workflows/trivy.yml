@@ -23,7 +23,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - name: Trivy filesystem scan
-        uses: aquasecurity/trivy-action@0.28.0 # pin; bump as needed
+        uses: aquasecurity/trivy-action@v0.36.0 # pin (v-prefixed tags); bump as needed
         with:
           scan-type: fs
           scanners: vuln,secret,misconfig
@@ -67,7 +67,7 @@ jobs:
           cache-from: type=gha,scope=trivy-image
           cache-to: type=gha,mode=max,scope=trivy-image
       - name: Trivy image scan
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: image
           image-ref: sutra-engine:ci
