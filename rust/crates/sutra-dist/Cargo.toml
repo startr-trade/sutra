@@ -8,6 +8,10 @@ publish.workspace = true
 
 [dependencies]
 sutra-engine = { path = "../sutra-engine" }
+# `--health-check`: the distroless runtime has no shell and no curl, so the image's Docker
+# HEALTHCHECK invokes this binary to probe its own readiness endpoint. rustls-only, no
+# system OpenSSL — the same posture as the rest of the tree.
+reqwest = { workspace = true }
 # Force-linked built-in payload codecs — bundled by the BINARY so their `inventory`
 # registrations ship (the neutral engine collects them generically via
 # builtin_codecs()/builtin_formats()). See main.rs. This is the composition boundary: concrete

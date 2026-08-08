@@ -50,8 +50,8 @@ tokio-util = { version = "0.7", features = ["compat"], optional = true }
 [dev-dependencies]
 sutra-testkit = { path = "../sutra-testkit" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
-testcontainers = { version = "0.25", features = ["blocking"] }
-testcontainers-modules = { version = "0.13", features = [
+testcontainers = { version = "0.27", features = ["blocking"] }
+testcontainers-modules = { version = "0.15", features = [
     "postgres",
     "mysql",
     "mariadb",

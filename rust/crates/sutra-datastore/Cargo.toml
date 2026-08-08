@@ -42,8 +42,8 @@ tokio-util = { version = "0.7", features = ["compat"], optional = true }
 sutra-testkit = { path = "../sutra-testkit" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 # Reused container-per-dialect harness for the MySQL/MariaDB/MSSQL suites (dev-only).
-testcontainers = { version = "0.25", features = ["blocking"] }
-testcontainers-modules = { version = "0.13", features = ["mysql", "mariadb", "mssql_server"] }
+testcontainers = { version = "0.27", features = ["blocking"] }
+testcontainers-modules = { version = "0.15", features = ["mysql", "mariadb", "mssql_server"] }
 
 [[test]]
 name = "pg_datastore"

@@ -111,4 +111,13 @@ EXPOSE 8080
 # Non-root (k8s restricted PSS friendly).
 USER 10001
 
+# Docker-level health. The base is distroless — no shell, no curl — so the probe is a mode
+# of the engine binary itself (`--health-check` GETs its own /sutra/health/ready on
+# 127.0.0.1:$SUTRA_HTTP_PORT and exits 0/1). Exec form, because there is no shell to parse
+# a string form. Kubernetes ignores this and uses its own httpGet probes against the same
+# endpoint; this is for `docker run`, Compose, and swarm-style schedulers.
+# start-period covers migration + deployment activation on a cold boot.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \
+    CMD ["/usr/local/bin/sutra-engine", "--health-check"]
+
 ENTRYPOINT ["/usr/local/bin/sutra-engine"]

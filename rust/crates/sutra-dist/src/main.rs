@@ -62,8 +62,55 @@ use sutra_transport_rabbitmq as _;
 #[cfg(feature = "aws-sqs")]
 use sutra_transport_sqs as _;
 
+/// `--health-check` — probe this container's own readiness endpoint and exit 0/1.
+///
+/// The runtime image is distroless: no shell, no curl, no wget. A Docker `HEALTHCHECK`
+/// therefore has exactly one executable available to it — this binary — so the probe ships
+/// as a mode of the engine itself. It talks to `127.0.0.1` on the port the engine was told
+/// to bind, reads nothing but the status code, and never touches the database.
+///
+/// Kubernetes does not use this (its probes hit `/sutra/health/ready` directly over the
+/// network); it exists for `docker run`, Compose, and anything else that gates on Docker's
+/// own health state.
+async fn health_check() -> ! {
+    let port = std::env::var("SUTRA_HTTP_PORT")
+        .ok()
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or(8080);
+    let url = format!("http://127.0.0.1:{port}/sutra/health/ready");
+    let outcome = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build();
+    let code = match outcome {
+        Ok(client) => match client.get(&url).send().await {
+            Ok(response) if response.status().is_success() => 0,
+            // Any answer other than 2xx is unhealthy — including the 503 the readiness
+            // endpoint returns when a lane has died.
+            Ok(response) => {
+                eprintln!("health-check: {url} -> HTTP {}", response.status());
+                1
+            }
+            Err(e) => {
+                eprintln!("health-check: {url} -> {e}");
+                1
+            }
+        },
+        Err(e) => {
+            eprintln!("health-check: client build failed: {e}");
+            1
+        }
+    };
+    std::process::exit(code);
+}
+
 #[tokio::main]
 async fn main() {
+    // The health probe runs BEFORE any telemetry or config work: it is a short-lived
+    // sidecar invocation of the same image, not an engine boot.
+    if std::env::args().any(|a| a == "--health-check") {
+        health_check().await;
+    }
+
     // Telemetry first so even config errors log through the structured stack.
     // RUST_LOG overrides the default `info` level.
     let telemetry_config = sutra_engine::TelemetryConfig::load();

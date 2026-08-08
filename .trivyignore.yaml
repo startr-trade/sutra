@@ -1,0 +1,83 @@
+# Trivy triage record.
+#
+# POLICY
+#   Every severity is reported. A defect has no level: the tree is either clean or it is not.
+#   The one sanctioned suppression is "upstream has no fix we can reach", and it is always
+#   TIME-BOXED. When `expired_at` passes the finding comes back as an alert and must be
+#   re-triaged — either the fix has shipped and we take it, or the entry is renewed with a
+#   fresh justification. Nothing is silenced permanently, because a permanent silence is how
+#   a fix that shipped last quarter goes unnoticed for a year.
+#
+#   `statement` is the reason, in full. If you cannot write one, the entry does not belong here.
+#
+# RENEWAL
+#   These expire together, on purpose: one dated re-triage of the whole file beats fifteen
+#   staggered reminders. On expiry, for each entry: check whether a fixed version is now
+#   reachable (`cargo update`, or a fresh base-image digest), take it if so, and only renew
+#   what genuinely still has no path forward.
+
+vulnerabilities:
+  # ---- rustls-webpki, reached through tiberius (SQL Server) ------------------------------
+  # Fixed upstream in 0.103.13. We cannot reach it: tiberius 0.12.3 is the LATEST release and
+  # hard-requires tokio-rustls ^0.24 -> rustls 0.21 -> rustls-webpki 0.101.x. The only escapes
+  # are dropping SQL Server support or moving tiberius to native-tls, which links system
+  # OpenSSL and trades a Rust CVE for a larger C attack surface.
+  # Also not in the shipped artifact: `mssql` is an opt-in cargo feature and is NOT in the
+  # default set the release image builds.
+  # RENEWAL CHECK: has tiberius released a version on rustls 0.23+?
+  - id: GHSA-82j2-j2ch-gfr8
+    statement: "rustls-webpki via tiberius 0.12.3 (latest), which pins tokio-rustls ^0.24. No upgrade path; mssql is not a default feature so this is absent from the released binary."
+    expired_at: 2026-11-09
+  - id: GHSA-965h-392x-2mh5
+    statement: "Same chain as GHSA-82j2-j2ch-gfr8: rustls-webpki via tiberius, no reachable fix."
+    expired_at: 2026-11-09
+  - id: GHSA-xgp8-3hg3-c2mh
+    statement: "Same chain as GHSA-82j2-j2ch-gfr8: rustls-webpki via tiberius, no reachable fix."
+    expired_at: 2026-11-09
+
+  # ---- Debian packages in the distroless/cc-debian12 base --------------------------------
+  # Every one of these reports an EMPTY fixed-version field: Debian has published no patched
+  # package, so no base-image digest bump on our side can clear them.
+  # RENEWAL CHECK: pull the base fresh and re-scan — a fixed version appearing means take it.
+  - id: CVE-2010-4756
+    statement: "libc6 (glibc) in the distroless base; Debian ships no fixed package."
+    expired_at: 2026-11-09
+  - id: CVE-2018-20796
+    statement: "libc6 (glibc) in the distroless base; Debian ships no fixed package."
+    expired_at: 2026-11-09
+  - id: CVE-2019-1010022
+    statement: "libc6 (glibc) in the distroless base; Debian ships no fixed package."
+    expired_at: 2026-11-09
+  - id: CVE-2019-1010023
+    statement: "libc6 (glibc) in the distroless base; Debian ships no fixed package."
+    expired_at: 2026-11-09
+  - id: CVE-2019-1010024
+    statement: "libc6 (glibc) in the distroless base; Debian ships no fixed package."
+    expired_at: 2026-11-09
+  - id: CVE-2019-1010025
+    statement: "libc6 (glibc) in the distroless base; Debian ships no fixed package."
+    expired_at: 2026-11-09
+  - id: CVE-2019-9192
+    statement: "libc6 (glibc) in the distroless base; Debian ships no fixed package."
+    expired_at: 2026-11-09
+  - id: CVE-2026-5435
+    statement: "libc6 (glibc) in the distroless base; Debian ships no fixed package."
+    expired_at: 2026-11-09
+  - id: CVE-2026-5450
+    statement: "libc6 (glibc) in the distroless base; Debian ships no fixed package."
+    expired_at: 2026-11-09
+  - id: CVE-2026-5928
+    statement: "libc6 (glibc) in the distroless base; Debian ships no fixed package."
+    expired_at: 2026-11-09
+  - id: CVE-2026-6238
+    statement: "libc6 (glibc) in the distroless base; Debian ships no fixed package."
+    expired_at: 2026-11-09
+  - id: CVE-2022-27943
+    statement: "gcc-12-base / libgcc-s1 / libgomp1 / libstdc++6 in the distroless base; Debian ships no fixed package."
+    expired_at: 2026-11-09
+  - id: CVE-2025-27587
+    statement: "libssl3 (OpenSSL 3.0.x as Debian ships it) in the distroless base; no fixed package."
+    expired_at: 2026-11-09
+  - id: CVE-2026-42767
+    statement: "libssl3 (OpenSSL 3.0.x as Debian ships it) in the distroless base; no fixed package."
+    expired_at: 2026-11-09

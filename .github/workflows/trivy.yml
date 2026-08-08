@@ -29,7 +29,14 @@ jobs:
           scanners: vuln,secret,misconfig
           format: sarif
           output: trivy-fs.sarif
-          severity: CRITICAL,HIGH
+          # EVERY severity is reported. A defect has no level: either the tree is clean or
+          # it is not. The only sanctioned suppression is "no fix available", recorded with
+          # its justification (and an expiry date) in .trivyignore.yaml.
+          severity: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
+          # Passed EXPLICITLY: the action only adds --ignorefile when this input is set.
+          # Without it the triage record in .trivyignore.yaml is silently not applied here,
+          # even though a local `trivy fs` picks it up from the working directory.
+          trivyignores: .trivyignore.yaml
       - name: Upload SARIF to code scanning
         uses: github/codeql-action/upload-sarif@v4
         if: always()
@@ -73,7 +80,8 @@ jobs:
           image-ref: sutra-engine:ci
           format: sarif
           output: trivy-image.sarif
-          severity: CRITICAL,HIGH
+          severity: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
+          trivyignores: .trivyignore.yaml
       - name: Upload SARIF to code scanning
         uses: github/codeql-action/upload-sarif@v4
         if: always()
@@ -84,3 +92,18 @@ jobs:
 # NOTE: these jobs report findings to the Security tab (SARIF upload) rather than
 # hard-failing the build. Add `exit-code: 1` to a Trivy step if you want it to gate.
 # SARIF upload to code scanning is free on public repos (see codeql.yml).
+#
+# SEVERITY POLICY. Both scans report EVERY severity — a defect has no level, so the tree is
+# either clean or it is not. The one sanctioned suppression is "upstream has no fix", and
+# every such entry lives in .trivyignore.yaml with the reason written next to it AND an
+# expiry date. When an entry expires the finding returns as an alert and must be re-triaged:
+# a suppression that never comes back is how a fix that shipped last quarter goes unnoticed
+# for a year.
+#
+# `trivyignores` is passed explicitly because the action only adds --ignorefile when that
+# input is set: relying on Trivy's working-directory lookup works locally and silently does
+# not in CI, which is how a triage record can appear to be applied while it is not.
+#
+# Reproduce a run locally with:
+#   trivy fs    --scanners vuln,secret,misconfig .
+#   trivy image ghcr.io/startr-trade/sutra:<tag>

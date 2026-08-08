@@ -171,8 +171,8 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 # The 9 → 10 bump closes CVE-2026-25537 (type confusion → authorization bypass).
 jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto", "use_pem"] }
 # Broker/database containers for the Rust integration suites (dev-dependency only).
-testcontainers = { version = "0.25", features = ["blocking"] }
-testcontainers-modules = { version = "0.13", features = ["postgres", "kafka"] }
+testcontainers = { version = "0.27", features = ["blocking"] }
+testcontainers-modules = { version = "0.15", features = ["postgres", "kafka"] }
 # OTLP telemetry — the current opentelemetry-rust family (0.32-line;
 # tracing-opentelemetry pairs its 0.33 with opentelemetry 0.32). gRPC transport via
 # tonic — the endpoint (`SUTRA_TELEMETRY_OTLP_ENDPOINT`, or the standard
