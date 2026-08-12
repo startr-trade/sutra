@@ -28,6 +28,8 @@ fn main() {
             },
             binary: "sutra".to_string(),
             image: Some("ghcr.io/startr-trade/sutra".to_string()),
+            // Public releases: nothing to sign in to.
+            token_command: None,
         },
     ));
 }

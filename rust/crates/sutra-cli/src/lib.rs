@@ -111,6 +111,8 @@ pub enum UpdateChannel {
     /// A flat HTTPS file store: every asset is `<base>/<filename>`, with the tag carried in
     /// the filename rather than a path. Enough to describe a repository download area, an
     /// object-store prefix, or an internal artifact server.
+    ///
+    /// For a store behind an identity provider, set `token_command` — see [`UpdateSource`].
     FileStore {
         /// Base URL assets hang off, without a trailing slash.
         base: String,
@@ -136,6 +138,19 @@ pub struct UpdateSource {
     /// Not necessarily on the same host as the binaries: a distribution may publish its CLI
     /// to its source host and its runtimes to a cloud registry.
     pub image: Option<String>,
+
+    /// A command whose stdout is a bearer token for the release store — typically the
+    /// `print-a-token` subcommand of whichever cloud or identity CLI the distribution's
+    /// users already sign into.
+    ///
+    /// This is how a private distribution gets browser-based sign-in without this crate
+    /// knowing any identity provider: the distribution names a command that its users are
+    /// already signed into, and the token never touches a config file, an environment
+    /// variable a process listing would show, or this source tree. A non-zero exit means
+    /// "not signed in", and the refusal says which command to run.
+    ///
+    /// `None` = a public store, or credentials supplied through `<PROGRAM>_AUTH`.
+    pub token_command: Option<Vec<String>>,
 }
 
 /// The update source this distribution declared, if any.

@@ -144,6 +144,19 @@ pub fn execute_with(
         }
     };
 
+    // One sign-in per invocation, before anything else touches the network. A distribution
+    // with no token command gets `None` and the public path.
+    let token = match &src.token_command {
+        Some(cmd) => match token_from(cmd) {
+            Ok(t) => Some(t),
+            Err(msg) => {
+                let _ = writeln!(io.err, "self-update: {msg}");
+                return exit::USAGE;
+            }
+        },
+        None => None,
+    };
+
     // The DISTRIBUTION's own version, not the embedded engine's. `version_string()` may be a
     // multi-line block ("<product> 2.0.0\nsutra 0.2.0-rc.1 (engine)"); line one is the
     // product. Comparing the engine's version against a product's release tags would report
@@ -157,7 +170,7 @@ pub fn execute_with(
         .unwrap_or(crate::VERSION);
     let wanted = match args.version.clone() {
         Some(tag) => tag,
-        None => match latest_tag(&src.channel, &src.binary) {
+        None => match latest_tag(&src.channel, &src.binary, token.as_deref()) {
             Ok(tag) => tag,
             Err(msg) => {
                 let _ = writeln!(io.err, "self-update: {msg}");
@@ -227,7 +240,7 @@ pub fn execute_with(
     };
 
     let _ = writeln!(io.out, "updating {current} -> {wanted} ({target})");
-    if let Err(msg) = install(src, &wanted, target, &exe) {
+    if let Err(msg) = install(src, &wanted, target, &exe, token.as_deref()) {
         let _ = writeln!(io.err, "self-update: {msg}");
         return exit::USAGE;
     }
@@ -289,11 +302,35 @@ fn client() -> Result<reqwest::Client, String> {
         .map_err(|e| format!("http client: {e}"))
 }
 
-fn fetch(url: &str) -> Result<Vec<u8>, String> {
+/// Run a distribution's token command and return its stdout as a bearer token. A non-zero
+/// exit is reported with the command line, because "not signed in" is the common case and the
+/// user needs to know what to run.
+fn token_from(command: &[String]) -> Result<String, String> {
+    let (program, args) = command.split_first().ok_or("empty token command")?;
+    let output = std::process::Command::new(program)
+        .args(args)
+        .output()
+        .map_err(|e| format!("running `{}`: {e} (is it installed?)", command.join(" ")))?;
+    if !output.status.success() {
+        return Err(format!(
+            "`{}` failed — you are probably not signed in",
+            command.join(" ")
+        ));
+    }
+    let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if token.is_empty() {
+        return Err(format!("`{}` produced no token", command.join(" ")));
+    }
+    Ok(token)
+}
+
+fn fetch(url: &str, token: Option<&str>) -> Result<Vec<u8>, String> {
     block_on(async {
         let mut request = client()?.get(url);
         // A private channel needs credentials; a public one must not send any.
-        if let Some(auth) = channel_auth() {
+        if let Some(token) = token {
+            request = request.bearer_auth(token);
+        } else if let Some(auth) = channel_auth() {
             let (user, password) = auth.split_once(':').unwrap_or((auth.as_str(), ""));
             request = request.basic_auth(user, Some(password));
         }
@@ -324,14 +361,19 @@ fn channel_auth() -> Option<String> {
 }
 
 /// The newest release tag on this distribution's channel, pre-releases included.
-fn latest_tag(channel: &crate::UpdateChannel, binary: &str) -> Result<String, String> {
+fn latest_tag(
+    channel: &crate::UpdateChannel,
+    binary: &str,
+    token: Option<&str>,
+) -> Result<String, String> {
     match channel {
         // `/releases/latest` is deliberately NOT used: it skips pre-releases, and every 0.x
         // release so far is one.
         crate::UpdateChannel::GithubReleases { repo } => {
-            let body = fetch(&format!(
-                "https://api.github.com/repos/{repo}/releases?per_page=1"
-            ))?;
+            let body = fetch(
+                &format!("https://api.github.com/repos/{repo}/releases?per_page=1"),
+                token,
+            )?;
             let json: serde_json::Value =
                 serde_json::from_slice(&body).map_err(|e| format!("release list: {e}"))?;
             json.get(0)
@@ -358,7 +400,7 @@ fn latest_tag(channel: &crate::UpdateChannel, binary: &str) -> Result<String, St
                         .to_string(),
                 );
             };
-            let body = fetch(index_url)?;
+            let body = fetch(index_url, token)?;
             let json: serde_json::Value =
                 serde_json::from_slice(&body).map_err(|e| format!("release index: {e}"))?;
             let entries = if index_pointer.is_empty() {
@@ -393,6 +435,7 @@ fn install(
     tag: &str,
     target: &str,
     exe: &Path,
+    token: Option<&str>,
 ) -> Result<(), String> {
     let asset = asset_name_of(&src.binary, tag, target);
     let base = match &src.channel {
@@ -403,14 +446,14 @@ fn install(
         crate::UpdateChannel::FileStore { base, .. } => base.clone(),
     };
 
-    let archive = fetch(&format!("{base}/{asset}"))?;
+    let archive = fetch(&format!("{base}/{asset}"), token)?;
     let sums_name = match &src.channel {
         crate::UpdateChannel::GithubReleases { .. } => "SHA256SUMS".to_string(),
         // A flat store holds several artifacts' sums side by side, so the checksum file is
         // named for the artifact it covers rather than being a bare SHA256SUMS.
         crate::UpdateChannel::FileStore { .. } => format!("SHA256SUMS-{}.txt", src.binary),
     };
-    let sums = String::from_utf8(fetch(&format!("{base}/{sums_name}"))?)
+    let sums = String::from_utf8(fetch(&format!("{base}/{sums_name}"), token)?)
         .map_err(|_| format!("{sums_name} is not valid UTF-8"))?;
     verify(&archive, &sums, &asset)?;
 
@@ -516,6 +559,7 @@ mod tests {
             },
             binary: "sutra".to_string(),
             image: Some("ghcr.io/startr-trade/sutra".to_string()),
+            token_command: None,
         }
     }
 
