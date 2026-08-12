@@ -82,6 +82,67 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Unset (direct library use, tests) means the engine's own [`VERSION`].
 static VERSION_STRING: OnceLock<String> = OnceLock::new();
 
+/// Where `self-update` fetches this distribution's releases from — set once by
+/// [`run_with_update_source`].
+///
+/// This is a SEAM, not a constant, for a load-bearing reason: this library is the tooling
+/// composition root for other distributions too (a rails CLI links it with its own codecs and
+/// runs under its own name). A hardcoded repository would make `self-update` download THIS
+/// engine's binary and overwrite whatever product is actually running — replacing a
+/// distribution's CLI with a different one, along with every codec it linked.
+///
+/// Unset therefore means "this distribution publishes elsewhere", and `self-update` REFUSES
+/// rather than guessing. Silence is the safe default here.
+static UPDATE_SOURCE: OnceLock<UpdateSource> = OnceLock::new();
+
+/// How a distribution's releases are discovered and fetched.
+///
+/// Two shapes, and deliberately no vendor list: this crate is the tooling composition root
+/// for distributions that publish to hosts it has never heard of, and enumerating them here
+/// would put one product's infrastructure in another product's source tree. A distribution
+/// that does not publish to GitHub Releases describes its store with [`Self::FileStore`] and
+/// keeps its own URLs in its own repository.
+#[derive(Debug, Clone)]
+pub enum UpdateChannel {
+    /// GitHub Releases on `owner/repo` — this project's own channel. Assets live under
+    /// `/releases/download/<tag>/`, and the newest tag comes from the releases API.
+    GithubReleases { repo: String },
+
+    /// A flat HTTPS file store: every asset is `<base>/<filename>`, with the tag carried in
+    /// the filename rather than a path. Enough to describe a repository download area, an
+    /// object-store prefix, or an internal artifact server.
+    FileStore {
+        /// Base URL assets hang off, without a trailing slash.
+        base: String,
+        /// Optional JSON listing used to discover the newest tag. Without it, callers must
+        /// pass `--version` — which is the honest failure, not a guess.
+        index_url: Option<String>,
+        /// JSON Pointer to the array of entries within that listing (e.g. `/values`); an
+        /// empty pointer means the document is itself the array.
+        index_pointer: String,
+        /// Field on each entry holding the file name (e.g. `name`).
+        index_name_field: String,
+    },
+}
+
+/// Where a distribution's release binaries live, and what they are called.
+#[derive(Debug, Clone)]
+pub struct UpdateSource {
+    /// The publishing channel.
+    pub channel: UpdateChannel,
+    /// Asset stem: assets are `<binary>-<tag>-<target>.tar.gz` (`.zip` on Windows).
+    pub binary: String,
+    /// Container image the same release publishes, for `--runtime`. `None` = no image.
+    /// Not necessarily on the same host as the binaries: a distribution may publish its CLI
+    /// to its source host and its runtimes to a cloud registry.
+    pub image: Option<String>,
+}
+
+/// The update source this distribution declared, if any.
+pub fn update_source() -> Option<&'static UpdateSource> {
+    UPDATE_SOURCE.get()
+}
+
 /// Top-level argument surface of the CLI. The `name` here is only a fallback: [`run`] and
 /// [`run_with_version`] override it with [`program_name`] before parsing.
 #[derive(Debug, Parser)]
@@ -163,6 +224,17 @@ pub fn run() -> i32 {
 ///
 /// The first line is also what `version --format json` reports as `version`; the engine's own
 /// version is always available there as `engine`.
+/// [`run_with_version`], plus where `self-update` should fetch this distribution's releases.
+///
+/// A distribution that publishes to GitHub Releases calls this; one that publishes anywhere
+/// else (a private registry, an internal artifact store) calls [`run_with_version`] and its
+/// `self-update` refuses with a pointer to its own install docs — which is correct, and far
+/// better than updating a user's binary to a different product.
+pub fn run_with_update_source(version: impl Into<String>, source: UpdateSource) -> i32 {
+    let _ = UPDATE_SOURCE.set(source);
+    run_with_version(version)
+}
+
 pub fn run_with_version(version: impl Into<String>) -> i32 {
     let version = version.into();
     let command = SutraCli::command()

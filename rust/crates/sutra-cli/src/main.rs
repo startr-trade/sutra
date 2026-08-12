@@ -16,5 +16,18 @@ use sutra_formats as _;
 use sutra_transport_http as _;
 
 fn main() {
-    std::process::exit(sutra_cli::run());
+    // Sutra is open source and publishes to GitHub Releases, so `self-update` resolves there.
+    // Declaring it here rather than inside the library is deliberate: the library is also the
+    // composition root for OTHER distributions, and a hardcoded repository would let their
+    // `self-update` install THIS binary over theirs.
+    std::process::exit(sutra_cli::run_with_update_source(
+        sutra_cli::VERSION,
+        sutra_cli::UpdateSource {
+            channel: sutra_cli::UpdateChannel::GithubReleases {
+                repo: "startr-trade/sutra".to_string(),
+            },
+            binary: "sutra".to_string(),
+            image: Some("ghcr.io/startr-trade/sutra".to_string()),
+        },
+    ));
 }

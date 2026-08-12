@@ -23,7 +23,13 @@ use crate::exit;
 use crate::output::{report_format, Io, ReportFormat};
 use crate::GlobalArgs;
 
-const REPO: &str = "startr-trade/sutra";
+/// The distribution that is actually running: its repository, its binary name, and the image
+/// its release publishes. `None` means this build never declared one — see
+/// [`crate::run_with_update_source`] — and every path below refuses rather than defaulting to
+/// some other product's releases.
+fn source() -> Option<&'static crate::UpdateSource> {
+    crate::update_source()
+}
 
 #[derive(Debug, Default, clap::Args)]
 pub struct SelfUpdateArgs {
@@ -46,8 +52,8 @@ pub struct SelfUpdateArgs {
 /// The engine image reference for a release tag. The image is tagged with the version
 /// WITHOUT the `v` (see `release.yml`'s metadata step), which is the one place these two
 /// naming schemes have to agree.
-pub fn engine_image(tag: &str) -> String {
-    format!("ghcr.io/{REPO}:{}", normalize(tag))
+pub fn engine_image_of(image: &str, tag: &str) -> String {
+    format!("{image}:{}", normalize(tag))
 }
 
 /// The published-asset target triple for the host, or `None` when this platform has no
@@ -64,13 +70,13 @@ pub fn target_triple() -> Option<&'static str> {
 
 /// The release-asset file name for a tag + target — the exact shape `release.yml` packages
 /// (`sutra-<tag>-<target>.tar.gz`, `.zip` on Windows).
-pub fn asset_name(tag: &str, target: &str) -> String {
+pub fn asset_name_of(binary: &str, tag: &str, target: &str) -> String {
     let ext = if target.contains("windows") {
         "zip"
     } else {
         "tar.gz"
     };
-    format!("sutra-{tag}-{target}.{ext}")
+    format!("{binary}-{tag}-{target}.{ext}")
 }
 
 /// `true` when `candidate` names a different release than `current`. Deliberately a plain
@@ -85,12 +91,38 @@ fn normalize(tag: &str) -> &str {
 }
 
 pub fn execute(args: SelfUpdateArgs, global: &GlobalArgs, io: &mut Io<'_>) -> i32 {
+    execute_with(args, global, io, source())
+}
+
+/// [`execute`] with the update source passed in rather than read from the process-global
+/// declaration — so both the "declared" and "not declared" behaviours are testable, in
+/// parallel, without either test depending on the other's ordering.
+pub fn execute_with(
+    args: SelfUpdateArgs,
+    global: &GlobalArgs,
+    io: &mut Io<'_>,
+    source: Option<&crate::UpdateSource>,
+) -> i32 {
     let format = match report_format(global.format.as_deref()) {
         Ok(f) => f,
         Err(msg) => {
             let _ = writeln!(io.err, "self-update: {msg}");
             return exit::USAGE;
         }
+    };
+
+    // WHICH product is running decides where its releases live. A distribution that never
+    // declared one must not fall through to some other project's binaries.
+    let Some(src) = source else {
+        let _ = writeln!(
+            io.err,
+            "self-update: {} does not publish through this channel.\n\
+             This build embeds the engine CLI library but ships its own releases; updating it \
+             from here would install a DIFFERENT product over it.\n\
+             Use the install method your distribution documents.",
+            crate::program_name()
+        );
+        return exit::USAGE;
     };
 
     // `--runtime-only` never touches this binary, so an unpublished host platform (macOS
@@ -103,18 +135,29 @@ pub fn execute(args: SelfUpdateArgs, global: &GlobalArgs, io: &mut Io<'_>) -> i3
                 io.err,
                 "self-update: no published binary for {}/{} — install from source:\n    \
                  cargo install --path rust/crates/sutra-cli\n\
-                 (or `sutra self-update --runtime-only` to update just the engine image)",
+                 (or `{} self-update --runtime-only` to update just the engine image)",
                 std::env::consts::OS,
-                std::env::consts::ARCH
+                std::env::consts::ARCH,
+                crate::program_name()
             );
             return exit::USAGE;
         }
     };
 
-    let current = crate::VERSION;
+    // The DISTRIBUTION's own version, not the embedded engine's. `version_string()` may be a
+    // multi-line block ("<product> 2.0.0\nsutra 0.2.0-rc.1 (engine)"); line one is the
+    // product. Comparing the engine's version against a product's release tags would report
+    // an update on every run, forever.
+    let current = crate::version_string()
+        .lines()
+        .next()
+        .unwrap_or(crate::VERSION)
+        .rsplit(' ')
+        .next()
+        .unwrap_or(crate::VERSION);
     let wanted = match args.version.clone() {
         Some(tag) => tag,
-        None => match latest_tag() {
+        None => match latest_tag(&src.channel, &src.binary) {
             Ok(tag) => tag,
             Err(msg) => {
                 let _ = writeln!(io.err, "self-update: {msg}");
@@ -134,14 +177,15 @@ pub fn execute(args: SelfUpdateArgs, global: &GlobalArgs, io: &mut Io<'_>) -> i3
                         "current": current,
                         "latest": wanted,
                         "updateAvailable": available,
-                        "engineImage": engine_image(&wanted),
+                        "engineImage": src.image.as_ref().map(|i| engine_image_of(i, &wanted)),
                     })
                 );
             }
             ReportFormat::Text if available => {
                 let _ = writeln!(
                     io.out,
-                    "an update is available: {current} -> {wanted}\nrun `sutra self-update` to install it"
+                    "an update is available: {current} -> {wanted}\nrun `{} self-update` to install it",
+                    crate::program_name()
                 );
             }
             ReportFormat::Text => {
@@ -152,7 +196,7 @@ pub fn execute(args: SelfUpdateArgs, global: &GlobalArgs, io: &mut Io<'_>) -> i3
     }
 
     if args.runtime_only {
-        return match pull_engine(&wanted, io) {
+        return match pull_engine(src, &wanted, io) {
             Ok(()) => exit::OK,
             Err(msg) => {
                 let _ = writeln!(io.err, "self-update: {msg}");
@@ -166,7 +210,7 @@ pub fn execute(args: SelfUpdateArgs, global: &GlobalArgs, io: &mut Io<'_>) -> i3
         // The CLI can be current while the local engine image is not (a fresh machine, or a
         // runtime that was never pulled), so an explicit --runtime still runs.
         if args.runtime {
-            if let Err(msg) = pull_engine(&wanted, io) {
+            if let Err(msg) = pull_engine(src, &wanted, io) {
                 let _ = writeln!(io.err, "self-update: {msg}");
                 return exit::USAGE;
             }
@@ -183,24 +227,25 @@ pub fn execute(args: SelfUpdateArgs, global: &GlobalArgs, io: &mut Io<'_>) -> i3
     };
 
     let _ = writeln!(io.out, "updating {current} -> {wanted} ({target})");
-    if let Err(msg) = install(&wanted, target, &exe) {
+    if let Err(msg) = install(src, &wanted, target, &exe) {
         let _ = writeln!(io.err, "self-update: {msg}");
         return exit::USAGE;
     }
     let _ = writeln!(io.out, "installed {wanted} at {}", exe.display());
 
     if args.runtime {
-        if let Err(msg) = pull_engine(&wanted, io) {
+        if let Err(msg) = pull_engine(src, &wanted, io) {
             // The CLI is already updated and working; a failed image pull is reported but
             // must not present the whole command as a failure that needs re-running.
             let _ = writeln!(io.err, "self-update: engine image not updated: {msg}");
             return exit::FINDINGS;
         }
-    } else {
+    } else if let Some(image) = &src.image {
         let _ = writeln!(
             io.out,
-            "\nthe matching engine image is {}\n  pull it with: sutra self-update --runtime-only",
-            engine_image(&wanted)
+            "\nthe matching engine image is {}\n  pull it with: {} self-update --runtime-only",
+            engine_image_of(image, &wanted),
+            crate::program_name()
         );
     }
     exit::OK
@@ -209,8 +254,11 @@ pub fn execute(args: SelfUpdateArgs, global: &GlobalArgs, io: &mut Io<'_>) -> i3
 /// Pull the engine image of `tag` through the local Docker CLI. Docker is shelled out to
 /// deliberately: it already holds the user's registry credentials, proxy settings and
 /// storage config, none of which an embedded registry client would inherit correctly.
-fn pull_engine(tag: &str, io: &mut Io<'_>) -> Result<(), String> {
-    let image = engine_image(tag);
+fn pull_engine(src: &crate::UpdateSource, tag: &str, io: &mut Io<'_>) -> Result<(), String> {
+    let Some(base) = &src.image else {
+        return Err("this distribution publishes no engine image".to_string());
+    };
+    let image = engine_image_of(base, tag);
     let _ = writeln!(io.out, "pulling {image}…");
     let status = std::process::Command::new("docker")
         .arg("pull")
@@ -243,8 +291,13 @@ fn client() -> Result<reqwest::Client, String> {
 
 fn fetch(url: &str) -> Result<Vec<u8>, String> {
     block_on(async {
-        let response = client()?
-            .get(url)
+        let mut request = client()?.get(url);
+        // A private channel needs credentials; a public one must not send any.
+        if let Some(auth) = channel_auth() {
+            let (user, password) = auth.split_once(':').unwrap_or((auth.as_str(), ""));
+            request = request.basic_auth(user, Some(password));
+        }
+        let response = request
             .send()
             .await
             .map_err(|e| format!("GET {url}: {e}"))?;
@@ -259,34 +312,113 @@ fn fetch(url: &str) -> Result<Vec<u8>, String> {
     })
 }
 
-/// The newest release tag, pre-releases included. `/releases/latest` is deliberately NOT
-/// used: it skips pre-releases, and every 0.x release so far is one.
-fn latest_tag() -> Result<String, String> {
-    let url = format!("https://api.github.com/repos/{REPO}/releases?per_page=1");
-    let body = fetch(&url)?;
-    let json: serde_json::Value =
-        serde_json::from_slice(&body).map_err(|e| format!("release list: {e}"))?;
-    json.get(0)
-        .and_then(|r| r.get("tag_name"))
-        .and_then(|t| t.as_str())
-        .map(|s| s.to_string())
-        .ok_or_else(|| "could not read a release tag (rate-limited? pass --version)".to_string())
+/// Credentials for a private channel, as `user:app-password`. Read from the
+/// program-specific variable first (`FOO_AUTH` for a binary named `foo`), then the generic
+/// one — so a machine with several distributions installed keeps their tokens apart.
+fn channel_auth() -> Option<String> {
+    let specific = format!("{}_AUTH", crate::program_name().to_uppercase().replace('-', "_"));
+    std::env::var(specific)
+        .ok()
+        .or_else(|| std::env::var("SUTRA_UPDATE_AUTH").ok())
+        .filter(|v| !v.trim().is_empty())
 }
 
-fn install(tag: &str, target: &str, exe: &Path) -> Result<(), String> {
-    let asset = asset_name(tag, target);
-    let base = format!("https://github.com/{REPO}/releases/download/{tag}");
+/// The newest release tag on this distribution's channel, pre-releases included.
+fn latest_tag(channel: &crate::UpdateChannel, binary: &str) -> Result<String, String> {
+    match channel {
+        // `/releases/latest` is deliberately NOT used: it skips pre-releases, and every 0.x
+        // release so far is one.
+        crate::UpdateChannel::GithubReleases { repo } => {
+            let body = fetch(&format!(
+                "https://api.github.com/repos/{repo}/releases?per_page=1"
+            ))?;
+            let json: serde_json::Value =
+                serde_json::from_slice(&body).map_err(|e| format!("release list: {e}"))?;
+            json.get(0)
+                .and_then(|r| r.get("tag_name"))
+                .and_then(|t| t.as_str())
+                .map(|s| s.to_string())
+                .ok_or_else(|| {
+                    "could not read a release tag (rate-limited? pass --version)".to_string()
+                })
+        }
+        // Downloads carry no tag of their own, so the tag is recovered from the asset NAME
+        // (`<binary>-<tag>-<target>.tar.gz`) and the newest upload wins.
+        // A flat store carries no tag of its own, so the tag is recovered from the asset
+        // NAME (`<binary>-<tag>-<target>.<ext>`) and the listing's own order decides "newest".
+        crate::UpdateChannel::FileStore {
+            index_url,
+            index_pointer,
+            index_name_field,
+            ..
+        } => {
+            let Some(index_url) = index_url else {
+                return Err(
+                    "this distribution publishes no release index — pass --version <tag>"
+                        .to_string(),
+                );
+            };
+            let body = fetch(index_url)?;
+            let json: serde_json::Value =
+                serde_json::from_slice(&body).map_err(|e| format!("release index: {e}"))?;
+            let entries = if index_pointer.is_empty() {
+                Some(&json)
+            } else {
+                json.pointer(index_pointer)
+            }
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| format!("release index has no array at '{index_pointer}'"))?;
+            entries
+                .iter()
+                .find_map(|entry| {
+                    let name = entry.get(index_name_field)?.as_str()?;
+                    let rest = name.strip_prefix(&format!("{binary}-"))?;
+                    // Every published target begins with an architecture segment, so that is
+                    // where the tag ends.
+                    let cut = rest.find("-x86_64").or_else(|| rest.find("-aarch64"))?;
+                    Some(rest[..cut].to_string())
+                })
+                .ok_or_else(|| {
+                    format!(
+                        "no {binary} release found in the index \
+                         (private store? set the auth variable, or pass --version)"
+                    )
+                })
+        }
+    }
+}
+
+fn install(
+    src: &crate::UpdateSource,
+    tag: &str,
+    target: &str,
+    exe: &Path,
+) -> Result<(), String> {
+    let asset = asset_name_of(&src.binary, tag, target);
+    let base = match &src.channel {
+        crate::UpdateChannel::GithubReleases { repo } => {
+            format!("https://github.com/{repo}/releases/download/{tag}")
+        }
+        // A flat namespace — the tag lives in the file name, not in a path segment.
+        crate::UpdateChannel::FileStore { base, .. } => base.clone(),
+    };
 
     let archive = fetch(&format!("{base}/{asset}"))?;
-    let sums = String::from_utf8(fetch(&format!("{base}/SHA256SUMS"))?)
-        .map_err(|_| "SHA256SUMS is not valid UTF-8".to_string())?;
+    let sums_name = match &src.channel {
+        crate::UpdateChannel::GithubReleases { .. } => "SHA256SUMS".to_string(),
+        // A flat store holds several artifacts' sums side by side, so the checksum file is
+        // named for the artifact it covers rather than being a bare SHA256SUMS.
+        crate::UpdateChannel::FileStore { .. } => format!("SHA256SUMS-{}.txt", src.binary),
+    };
+    let sums = String::from_utf8(fetch(&format!("{base}/{sums_name}"))?)
+        .map_err(|_| format!("{sums_name} is not valid UTF-8"))?;
     verify(&archive, &sums, &asset)?;
 
     // Stage in the TARGET directory, never $TMPDIR: the final step must be a rename, and a
     // rename across filesystems fails (a /tmp tmpfs vs /usr/local/bin is the common case).
     let dir = exe.parent().ok_or("the running binary has no parent dir")?;
-    let staged = dir.join(format!(".sutra-update-{tag}"));
-    unpack(&archive, target, &staged)
+    let staged = dir.join(format!(".{}-update-{tag}", src.binary));
+    unpack(&archive, &src.binary, target, &staged)
         .map_err(|e| format!("{e}\n(no changes made — {} is untouched)", exe.display()))?;
 
     #[cfg(unix)]
@@ -331,20 +463,20 @@ fn verify(archive: &[u8], sums: &str, asset: &str) -> Result<(), String> {
 }
 
 /// Extract the `sutra` binary out of the release archive into `dest`.
-fn unpack(archive: &[u8], target: &str, dest: &PathBuf) -> Result<(), String> {
+fn unpack(archive: &[u8], binary: &str, target: &str, dest: &PathBuf) -> Result<(), String> {
     if target.contains("windows") {
         let mut zip = zip::ZipArchive::new(std::io::Cursor::new(archive))
             .map_err(|e| format!("opening the release zip: {e}"))?;
         for i in 0..zip.len() {
             let mut entry = zip.by_index(i).map_err(|e| format!("zip entry {i}: {e}"))?;
-            if entry.name().ends_with("sutra.exe") {
+            if entry.name().ends_with(&format!("{binary}.exe")) {
                 let mut out = std::fs::File::create(dest)
                     .map_err(|e| format!("creating {}: {e}", dest.display()))?;
                 std::io::copy(&mut entry, &mut out).map_err(|e| format!("extracting: {e}"))?;
                 return Ok(());
             }
         }
-        Err("the release zip contained no sutra.exe".to_string())
+        Err(format!("the release zip contained no {binary}.exe"))
     } else {
         // The tarball is small (one stripped binary + licenses) and already in memory; shelling
         // out to `tar` keeps the dependency surface of an updater minimal.
@@ -358,7 +490,7 @@ fn unpack(archive: &[u8], target: &str, dest: &PathBuf) -> Result<(), String> {
             .arg(dir)
             .arg("--strip-components=1")
             .arg("--wildcards")
-            .arg("*/sutra")
+            .arg(format!("*/{binary}"))
             .status();
         let _ = std::fs::remove_file(&tmp);
         match status {
@@ -366,7 +498,7 @@ fn unpack(archive: &[u8], target: &str, dest: &PathBuf) -> Result<(), String> {
             Ok(s) => return Err(format!("tar exited {s}")),
             Err(e) => return Err(format!("running tar: {e} (is tar on PATH?)")),
         }
-        let extracted = dir.join("sutra");
+        let extracted = dir.join(binary);
         std::fs::rename(&extracted, dest).map_err(|e| format!("staging the new binary: {e}"))
     }
 }
@@ -376,14 +508,25 @@ mod tests {
     use super::*;
     use crate::output::run_captured;
 
+    /// A stand-in distribution, so a rendering test never depends on what this build declared.
+    fn test_source() -> crate::UpdateSource {
+        crate::UpdateSource {
+            channel: crate::UpdateChannel::GithubReleases {
+                repo: "startr-trade/sutra".to_string(),
+            },
+            binary: "sutra".to_string(),
+            image: Some("ghcr.io/startr-trade/sutra".to_string()),
+        }
+    }
+
     #[test]
     fn asset_names_match_what_the_release_workflow_packages() {
         assert_eq!(
-            asset_name("v0.2.0-rc.1", "x86_64-unknown-linux-musl"),
+            asset_name_of("sutra", "v0.2.0-rc.1", "x86_64-unknown-linux-musl"),
             "sutra-v0.2.0-rc.1-x86_64-unknown-linux-musl.tar.gz"
         );
         assert_eq!(
-            asset_name("v1.0.0", "x86_64-pc-windows-msvc"),
+            asset_name_of("sutra", "v1.0.0", "x86_64-pc-windows-msvc"),
             "sutra-v1.0.0-x86_64-pc-windows-msvc.zip"
         );
     }
@@ -421,10 +564,13 @@ mod tests {
         // release.yml tags the image with `${tag#v}`; if these two ever disagree, `--runtime`
         // pulls a tag that does not exist.
         assert_eq!(
-            engine_image("v0.2.0-rc.1"),
+            engine_image_of("ghcr.io/startr-trade/sutra", "v0.2.0-rc.1"),
             "ghcr.io/startr-trade/sutra:0.2.0-rc.1"
         );
-        assert_eq!(engine_image("1.0.0"), "ghcr.io/startr-trade/sutra:1.0.0");
+        assert_eq!(
+            engine_image_of("registry.example.com/team/product-engine", "1.0.0"),
+            "registry.example.com/team/product-engine:1.0.0"
+        );
     }
 
     #[test]
@@ -438,9 +584,43 @@ mod tests {
             format: Some("json".to_string()),
             ..GlobalArgs::default()
         };
-        let (_, out, _) = run_captured("", |io| execute(args, &global, io));
+        let src = test_source();
+        let (_, out, _) = run_captured("", |io| execute_with(args, &global, io, Some(&src)));
         let payload: serde_json::Value = serde_json::from_str(out.trim()).expect("json");
         assert_eq!(payload["engineImage"], "ghcr.io/startr-trade/sutra:9.9.9");
+    }
+
+    /// The defect this seam exists to prevent: a distribution that links this library but
+    /// publishes elsewhere must NOT be updated from the engine's own releases.
+    /// The version compared against a release tag must be the PRODUCT's, not the embedded
+    /// engine's — otherwise a distribution at 2.0.0 carrying engine 0.2.0 reports an update
+    /// forever, because it is comparing the wrong number.
+    #[test]
+    fn the_reported_version_is_the_products_first_line_not_the_engines() {
+        let block = "product 2.0.0-rc.1\nsutra   0.2.0-rc.1 (engine)";
+        let product = block
+            .lines()
+            .next()
+            .unwrap()
+            .rsplit(' ')
+            .next()
+            .unwrap();
+        assert_eq!(product, "2.0.0-rc.1");
+        assert!(differs(product, "v2.1.0"));
+        assert!(!differs(product, "v2.0.0-rc.1"));
+    }
+
+    #[test]
+    fn a_distribution_that_declared_no_source_refuses_rather_than_installing_another_product() {
+        let args = SelfUpdateArgs {
+            check: true,
+            version: Some("v9.9.9".to_string()),
+            ..SelfUpdateArgs::default()
+        };
+        let (code, _, err) =
+            run_captured("", |io| execute_with(args, &GlobalArgs::default(), io, None));
+        assert_eq!(code, crate::exit::USAGE);
+        assert!(err.contains("does not publish through this channel"), "{err}");
     }
 
     #[test]
@@ -453,7 +633,10 @@ mod tests {
             version: Some(crate::VERSION.to_string()),
             ..SelfUpdateArgs::default()
         };
-        let (code, out, _) = run_captured("", |io| execute(args, &GlobalArgs::default(), io));
+        let src = test_source();
+        let (code, out, _) = run_captured("", |io| {
+            execute_with(args, &GlobalArgs::default(), io, Some(&src))
+        });
         assert_eq!(code, crate::exit::OK);
         assert!(out.contains("up to date"), "{out}");
     }
@@ -469,7 +652,9 @@ mod tests {
             format: Some("json".to_string()),
             ..GlobalArgs::default()
         };
-        let (code, out, _) = run_captured("", |io| execute(args, &global, io));
+        let src = test_source();
+        let (code, out, _) =
+            run_captured("", |io| execute_with(args, &global, io, Some(&src)));
         assert_eq!(code, crate::exit::OK);
         let payload: serde_json::Value = serde_json::from_str(out.trim()).expect("json");
         assert_eq!(payload["updateAvailable"], true);
