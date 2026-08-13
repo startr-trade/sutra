@@ -752,10 +752,18 @@ async fn a_flip_under_load_at_n4_leaves_no_lane_half_flipped_and_pinned_resumes_
     // flip window. Every dispatch must succeed — a lane observed half-flipped would
     // answer RESOLVE_CHANNEL_UNKNOWN.
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Signalled once the load task has a dispatch BEHIND it. Without this the test is a race
+    // it usually wins rather than an assertion: `tokio::spawn` only queues the task, so on a
+    // busy runtime the flip can complete and set `stop` before the task is ever polled, and
+    // the load loop then exits on its first condition check having exercised nothing. The
+    // window would go untested and the test would still pass — except for the emptiness check
+    // below, which is why CI saw it fail rather than pass vacuously.
+    let (running_tx, running_rx) = tokio::sync::oneshot::channel();
     let load = {
         let handle = handle.clone();
         let stop = Arc::clone(&stop);
         tokio::spawn(async move {
+            let mut running_tx = Some(running_tx);
             let mut results = Vec::new();
             let mut i = 0u32;
             while !stop.load(Ordering::Relaxed) {
@@ -764,11 +772,20 @@ async fn a_flip_under_load_at_n4_leaves_no_lane_half_flipped_and_pinned_resumes_
                         .dispatch(inbound("flow-in", b"x", &format!("f-l{i}")))
                         .await,
                 );
+                // First completed dispatch: the load is genuinely in flight, so the flip that
+                // follows lands ON it. Send failure means the test task is gone — nothing to
+                // report to.
+                if let Some(tx) = running_tx.take() {
+                    let _ = tx.send(());
+                }
                 i += 1;
             }
             results
         })
     };
+    running_rx
+        .await
+        .expect("the load task completed a dispatch before the flip");
 
     // The fan-out flip: one rebuild closure per lane, each preserving the lane identity
     // and its §6.1 counter handle — the deploy.rs shape.
