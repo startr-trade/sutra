@@ -12,8 +12,4 @@ ignore = [
     "RUSTSEC-2026-0099",  # rustls-webpki 0.101.7 name-constraint (MSSQL/tiberius TLS; upstream-blocked)
     "RUSTSEC-2026-0098",  # rustls-webpki 0.101.7 URI name-constraint (MSSQL/tiberius TLS; upstream-blocked)
     "RUSTSEC-2026-0104",  # rustls-webpki 0.101.7 CRL-parse panic (MSSQL/tiberius TLS; upstream-blocked)
-    "RUSTSEC-2026-0145",  # astral-tokio-tar 0.5.6 PAX desync (DEV/TEST only via testcontainers)
-    "RUSTSEC-2026-0112",  # astral-tokio-tar 0.5.6 PAX desync (DEV/TEST only via testcontainers)
-    "RUSTSEC-2026-0066",  # astral-tokio-tar 0.5.6 PAX validation (DEV/TEST only via testcontainers)
-    "RUSTSEC-2026-0113",  # astral-tokio-tar 0.5.6 symlink chmod (DEV/TEST only via testcontainers)
 ]

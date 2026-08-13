@@ -353,7 +353,10 @@ fn fetch(url: &str, token: Option<&str>) -> Result<Vec<u8>, String> {
 /// program-specific variable first (`FOO_AUTH` for a binary named `foo`), then the generic
 /// one — so a machine with several distributions installed keeps their tokens apart.
 fn channel_auth() -> Option<String> {
-    let specific = format!("{}_AUTH", crate::program_name().to_uppercase().replace('-', "_"));
+    let specific = format!(
+        "{}_AUTH",
+        crate::program_name().to_uppercase().replace('-', "_")
+    );
     std::env::var(specific)
         .ok()
         .or_else(|| std::env::var("SUTRA_UPDATE_AUTH").ok())
@@ -642,13 +645,7 @@ mod tests {
     #[test]
     fn the_reported_version_is_the_products_first_line_not_the_engines() {
         let block = "product 2.0.0-rc.1\nsutra   0.2.0-rc.1 (engine)";
-        let product = block
-            .lines()
-            .next()
-            .unwrap()
-            .rsplit(' ')
-            .next()
-            .unwrap();
+        let product = block.lines().next().unwrap().rsplit(' ').next().unwrap();
         assert_eq!(product, "2.0.0-rc.1");
         assert!(differs(product, "v2.1.0"));
         assert!(!differs(product, "v2.0.0-rc.1"));
@@ -661,10 +658,14 @@ mod tests {
             version: Some("v9.9.9".to_string()),
             ..SelfUpdateArgs::default()
         };
-        let (code, _, err) =
-            run_captured("", |io| execute_with(args, &GlobalArgs::default(), io, None));
+        let (code, _, err) = run_captured("", |io| {
+            execute_with(args, &GlobalArgs::default(), io, None)
+        });
         assert_eq!(code, crate::exit::USAGE);
-        assert!(err.contains("does not publish through this channel"), "{err}");
+        assert!(
+            err.contains("does not publish through this channel"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -697,8 +698,7 @@ mod tests {
             ..GlobalArgs::default()
         };
         let src = test_source();
-        let (code, out, _) =
-            run_captured("", |io| execute_with(args, &global, io, Some(&src)));
+        let (code, out, _) = run_captured("", |io| execute_with(args, &global, io, Some(&src)));
         assert_eq!(code, crate::exit::OK);
         let payload: serde_json::Value = serde_json::from_str(out.trim()).expect("json");
         assert_eq!(payload["updateAvailable"], true);
