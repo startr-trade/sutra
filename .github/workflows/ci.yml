@@ -115,10 +115,14 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
+      # `shared-key`, not `key`: a plain `key` is combined with the job identity, so no other
+      # workflow can ever restore it. This cache is deliberately restorable from elsewhere —
+      # release.yml's verify job reads it, which is what keeps a release from recompiling a
+      # workspace main already compiled. Saved on main, so a tag ref can restore it.
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
-          key: test
+          shared-key: verify
       # Hosted runners ship ~25 GB of preinstalled toolchains we never use (dotnet, android
       # SDK, GHC, CodeQL bundles). Reclaiming them up front is what keeps the link step from
       # running the disk to zero on a cold cache; cheap (~20 s) next to a 10-minute build.

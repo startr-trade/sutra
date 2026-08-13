@@ -52,48 +52,151 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+      # Restores ci.yml's main-branch cache (same `shared-key`), so this gate re-verifies the
+      # tagged tree without recompiling the dependency graph from zero. Cargo's own
+      # fingerprinting decides what is still valid — the gate itself is unchanged, it still
+      # runs the whole of `make lint` and `make test`.
+      #
+      # `save-if: false` because this job runs on a TAG ref: a cache saved here is readable
+      # only by that same tag, so writing one would spend upload time on something the next
+      # release can never hit, while evicting main's caches from the 10 GB budget.
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
-          key: release-verify
+          shared-key: verify
+          save-if: false
       - run: make lint
       - run: make test
 
   # ---------------------------------------------------------------------------
   # 1. Engine image — multi-arch, signed, SBOM'd.
   # ---------------------------------------------------------------------------
-  image:
-    name: engine image (linux/amd64 + linux/arm64)
-    runs-on: ubuntu-latest
-    # The arm64 leg is built under QEMU emulation (see the NOTE below): a full Rust
-    # workspace compile plus `cargo install cargo-chef` emulated is slow. Six hours is the
-    # hosted-runner ceiling and this deliberately uses it.
-    timeout-minutes: 360
+  image-build:
+    name: engine image (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+            slug: amd64
+            # Starts WARM. trivy.yml builds this exact Dockerfile, this exact context, at
+            # this exact default profile on every push to main — and a cache written on the
+            # DEFAULT BRANCH is readable from a tag ref (one written on a tag ref is not).
+            # So the chef-cook dependency layer, ~500 crates and the bulk of this build,
+            # is imported rather than recompiled.
+            cache_from: type=gha,scope=trivy-image
+          # GitHub's hosted arm64 Linux runner — free on public repos, and a NATIVE arm
+          # compile rather than an emulated one.
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            slug: arm64
+            # Cold, and deliberately: nothing on main builds arm64, so there is no cache to
+            # import. Warming it would mean a daily arm64 build existing only to serve this
+            # rare job — more compute spent than saved. Native arm is what makes that trade
+            # fine; the cold build costs roughly what the amd64 leg costs.
+            cache_from: ""
+    runs-on: ${{ matrix.runner }}
+    # Native compiles, so the arm64 leg costs roughly what the amd64 leg does. The old
+    # six-hour ceiling existed only to survive emulation.
+    timeout-minutes: 120
     permissions:
       contents: read
       packages: write # push to ghcr.io
       id-token: write # cosign keyless (Sigstore OIDC)
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      # NO QEMU. Each architecture is built on a runner of that architecture (see the
+      # `platform` matrix): arm64 on GitHub's hosted `ubuntu-24.04-arm`, which is free for
+      # public repositories. Emulating an arm64 Rust build under binfmt recompiled the whole
+      # dependency graph plus librdkafka's vendored C at emulated speed — the reason this job
+      # once budgeted six hours. Native runners cut it to the amd64 leg's own time, and the
+      # two legs run in parallel.
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Build ONE platform and push BY DIGEST — no tag. Tagging happens once, in the merge
+      # job below, because a tag can only point at one thing: if each leg pushed the same tag
+      # the second would silently overwrite the first and the "multi-arch" image would be
+      # whichever leg finished last.
+      - name: Build + push by digest
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: ./rust
+          file: ./rust/Dockerfile
+          platforms: ${{ matrix.platform }}
+          provenance: true
+          # SBOM is produced by anchore/sbom-action on the MERGED manifest and cosign-attested
+          # there, so buildkit's own SBOM attestation stays off — two competing SBOM
+          # predicates on one image is worse than one.
+          sbom: false
+          outputs: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          # READ ONLY, and only from a scope some main-branch workflow actually writes (see
+          # the matrix). There is deliberately no `cache-to`: this job runs on a TAG ref, and
+          # a tag-ref cache is readable only by that same ref — the next release, a different
+          # tag, could never hit it. Exporting mode=max here would spend minutes per leg
+          # writing something nothing can ever read, and would push main's CI caches out of
+          # the repository's 10 GB cache budget while doing it.
+          cache-from: ${{ matrix.cache_from }}
+
+      # The digest is how the merge job finds this leg. One file per platform, named by the
+      # digest itself, so the two matrix jobs cannot collide in the shared artifact.
+      - name: Export the digest
+        run: |
+          set -eu
+          digest='${{ steps.build.outputs.digest }}'
+          mkdir -p /tmp/digests
+          # Bare hex, no `sha256:` prefix — a colon is an illegal character in an artifact
+          # path, and the merge step prefixes it back on.
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload the digest
+        uses: actions/upload-artifact@v7
+        with:
+          name: digest-${{ matrix.slug }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  # Fuse the per-architecture images into ONE manifest list, then sign and SBOM
+  # THAT — the digest a user's `docker pull ghcr.io/startr-trade/sutra:<tag>`
+  # actually resolves to.
+  # ---------------------------------------------------------------------------
+  image:
+    name: engine image (manifest list)
+    needs: image-build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+      id-token: write # cosign keyless (Sigstore OIDC)
     outputs:
-      digest: ${{ steps.build.outputs.digest }}
+      digest: ${{ steps.merge.outputs.digest }}
       version: ${{ steps.rel.outputs.version }}
     steps:
       - uses: actions/checkout@v5
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
 
-      # NOTE ON QEMU: binfmt emulation is the simplest correct way to produce a linux/arm64
-      # image from a single hosted runner, and it is what this workflow does. It is also
-      # SLOW for a Rust build — the arm64 leg recompiles the whole dependency graph
-      # (plus librdkafka's vendored C sources) under emulation.
-      # If the arm64 leg starts timing out, the drop-in replacement is a native split
-      # build: one job on `ubuntu-latest` for amd64, one on `ubuntu-24.04-arm` for arm64,
-      # each pushing by digest (`outputs: type=image,push-by-digest=true`), then a final
-      # `docker buildx imagetools create` to fuse the manifest list. That removes QEMU
-      # entirely and cuts the arm64 leg to native speed.
-      - name: Set up QEMU (arm64 emulation)
-        uses: docker/setup-qemu-action@v4
+      - name: Download the digests
+        uses: actions/download-artifact@v8
         with:
-          platforms: arm64
+          path: /tmp/digests
+          pattern: digest-*
+          merge-multiple: true
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v4
@@ -125,55 +228,45 @@ jobs:
             *)   echo "latest=true"  >> "$GITHUB_OUTPUT" ;;
           esac
 
-      - name: Compute image tags
-        id: meta
-        uses: docker/metadata-action@v6
-        with:
-          images: ${{ env.IMAGE_NAME }}
-          tags: |
-            type=raw,value=${{ steps.rel.outputs.version }}
-            type=raw,value=latest,enable=${{ steps.rel.outputs.latest == 'true' }}
-          labels: |
-            org.opencontainers.image.title=sutra-engine
-            org.opencontainers.image.description=Sutra — a Rust-native, message-native BPMN 2.0 workflow engine
-            org.opencontainers.image.licenses=MIT OR Apache-2.0
-
-      # Build context is rust/ — the Dockerfile COPYs Cargo.toml / Cargo.lock / crates from
-      # the context root. `CARGO_PROFILE` is left at the Dockerfile default (`release`:
-      # thin-LTO, one codegen unit, stripped, distroless runtime). The fast `release-it`
-      # profile is an integration-test convenience and is never shipped.
-      - name: Build + push
-        id: build
-        uses: docker/build-push-action@v7
-        with:
-          context: ./rust
-          file: ./rust/Dockerfile
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          provenance: true
-          # SBOM is produced below by anchore/sbom-action (SPDX) and cosign-attested, so
-          # buildkit's own SBOM attestation is off to avoid two competing SBOM predicates.
-          sbom: false
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+      - name: Create the manifest list
+        id: merge
+        env:
+          VERSION: ${{ steps.rel.outputs.version }}
+          LATEST: ${{ steps.rel.outputs.latest }}
+        run: |
+          set -eu
+          tags="--tag ${IMAGE_NAME}:${VERSION}"
+          # An `&&` one-liner here would be a landmine: under `set -e` a false test makes the
+          # whole command return 1 and kills the step. A pre-release would fail the release
+          # precisely BECAUSE it correctly declined to move `latest`.
+          if [ "$LATEST" = "true" ]; then
+            tags="$tags --tag ${IMAGE_NAME}:latest"
+          fi
+          # Each digest file is named for the manifest one architecture leg pushed; together
+          # they are the sources of the list. Word-splitting is the point here.
+          # shellcheck disable=SC2046
+          docker buildx imagetools create $tags \
+            $(printf "${IMAGE_NAME}@sha256:%s " $(ls /tmp/digests))
+          digest="$(docker buildx imagetools inspect "${IMAGE_NAME}:${VERSION}" \
+            --format '{{json .Manifest.Digest}}' | tr -d '"')"
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+          echo "manifest ${IMAGE_NAME}:${VERSION} -> ${digest}"
 
       - name: Install cosign
         uses: sigstore/cosign-installer@v4
 
       # Keyless (Sigstore / Fulcio): the signing identity IS this workflow's OIDC identity —
-      # no long-lived key material anywhere. Signs the manifest-list digest, which is what
+      # no long-lived key material anywhere. Signs the MANIFEST LIST digest, which is what
       # `cosign verify ghcr.io/startr-trade/sutra:<tag>` resolves to.
       - name: Sign the image (cosign keyless)
         env:
-          DIGEST: ${{ steps.build.outputs.digest }}
+          DIGEST: ${{ steps.merge.outputs.digest }}
         run: cosign sign --yes "${IMAGE_NAME}@${DIGEST}"
 
       - name: Generate SPDX SBOM
         uses: anchore/sbom-action@v0
         with:
-          image: ${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+          image: ${{ env.IMAGE_NAME }}@${{ steps.merge.outputs.digest }}
           format: spdx-json
           output-file: sbom.spdx.json
           upload-artifact: false
@@ -181,7 +274,7 @@ jobs:
 
       - name: Attest the SBOM to the image digest
         env:
-          DIGEST: ${{ steps.build.outputs.digest }}
+          DIGEST: ${{ steps.merge.outputs.digest }}
         run: |
           cosign attest --yes \
             --predicate sbom.spdx.json \
@@ -199,28 +292,18 @@ jobs:
 
       - name: Job summary
         env:
-          DIGEST: ${{ steps.build.outputs.digest }}
+          DIGEST: ${{ steps.merge.outputs.digest }}
+          VERSION: ${{ steps.rel.outputs.version }}
         run: |
           {
             echo "### Engine image"
-            echo
-            echo '```'
-            echo "${IMAGE_NAME}@${DIGEST}"
-            echo '```'
-            echo
-            echo "Tags: \`${{ steps.meta.outputs.tags }}\`"
-            echo
-            echo "Verify:"
-            echo '```sh'
-            echo "cosign verify ${IMAGE_NAME}@${DIGEST} \\"
-            echo "  --certificate-identity-regexp '^https://github.com/${{ github.repository }}/' \\"
-            echo "  --certificate-oidc-issuer https://token.actions.githubusercontent.com"
-            echo '```'
+            echo ""
+            echo "- \`${IMAGE_NAME}:${VERSION}\`"
+            echo "- digest \`${DIGEST}\`"
+            echo "- platforms: linux/amd64 + linux/arm64, each built natively (no emulation)"
           } >> "$GITHUB_STEP_SUMMARY"
 
-  # ---------------------------------------------------------------------------
-  # 2. `sutra` CLI binaries.
-  # ---------------------------------------------------------------------------
+
   cli:
     name: sutra CLI (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
@@ -274,10 +357,15 @@ jobs:
         working-directory: rust
         run: rustup target add ${{ matrix.target }}
 
+      # Restore-only, for the reason above. Nothing on main compiles these targets (CI builds
+      # the host gnu target), so there is nothing to hit either — and warming them would mean
+      # compiling three release targets on every main push to save a rare release job, which
+      # is more compiling, not less.
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
           key: cli-${{ matrix.target }}
+          save-if: false
 
       - name: Install musl toolchain
         if: matrix.target == 'x86_64-unknown-linux-musl'
