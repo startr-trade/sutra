@@ -31,8 +31,12 @@ echo "smoke: ready"
 curl -fsS "${base_url}/sutra/health/live" >/dev/null
 echo "smoke: live"
 
+# The channel declares apikey auth, so the request carries the header. Without it the engine
+# answers 401 and this script fails — which is the point of declaring it.
+api_key="${SAMPLE_API_KEY:-%%APIKEY%%}"
 reply="$(curl -fsS -X POST "${base_url}/channels/sample-in" \
   -H 'Content-Type: application/xml' \
+  -H "X-Api-Key: ${api_key}" \
   --data '<SampleRequest><note>smoke</note></SampleRequest>')"
 echo "smoke: reply ${reply}"
 

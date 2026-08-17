@@ -116,6 +116,26 @@ fn lookup_call() -> &'static Regex {
     re(&CELL, r"\blookup\s+([^})]*)")
 }
 
+/// A handlebars comment: `{{!-- … --}}` (matched non-greedily, so a comment CONTAINING `}}` —
+/// the documented-example case — is removed whole rather than up to its first inner brace).
+fn block_comment() -> &'static Regex {
+    static CELL: OnceLock<Regex> = OnceLock::new();
+    re(&CELL, r"(?s)\{\{!--.*?--\}\}")
+}
+
+/// The short comment form: `{{! … }}`.
+fn short_comment() -> &'static Regex {
+    static CELL: OnceLock<Regex> = OnceLock::new();
+    re(&CELL, r"\{\{![^}]*\}\}")
+}
+
+/// Remove comments before the token scans run. Byte offsets do not need preserving — nothing
+/// downstream reports positions from this string.
+fn strip_comments(src: &str) -> String {
+    let once = block_comment().replace_all(src, "");
+    short_comment().replace_all(&once, "").into_owned()
+}
+
 pub(crate) fn analyze(template: &[u8]) -> TemplateAnalysis {
     let src = String::from_utf8_lossy(template).into_owned();
     // Parse error — the render path surfaces it; analysis is empty.
@@ -123,6 +143,12 @@ pub(crate) fn analyze(template: &[u8]) -> TemplateAnalysis {
         return TemplateAnalysis::default();
     }
 
+    // Comments are not references. `{{!-- … --}}` and `{{! … }}` never render, so anything
+    // inside them cannot read data — but the scans below are regex-driven over the raw source
+    // and would have counted it. That made PROSE load-bearing: a template documenting its own
+    // shape ("navigate its fields, e.g. {{payload.someField}}") produced a field reference, and
+    // once the codec exposed a schema the comment became a hard FIELD_UNKNOWN error.
+    let src = strip_comments(&src);
     let locals = block_params(&src);
     let mut refs: Vec<String> = Vec::new();
 

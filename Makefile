@@ -18,7 +18,7 @@
 # under docs/ keeps writing there.
 CATALOG_OUTPUT := $(if $(wildcard docs/design/artifact-documentation),docs/design/artifact-documentation,catalog)
 
-.PHONY: catalog catalog-rust catalog-check catalog-rust-check install-hooks verify-workflows \
+.PHONY: catalog catalog-rust catalog-check catalog-rust-check install-hooks verify-workflows verify-docs \
 	print-catalog-output \
 	help test test-docker test-all test-k8s lint docker-clean audit image image-it
 
@@ -111,6 +111,13 @@ test-all: ## Tier-1 + tier-2 together (k8s tier-3 excluded).
 ## Check that every GitHub Actions workflow parses and that every `uses:` reference exists
 ## upstream. A version nobody published (`cosign-installer@v4` — sigstore ships v4.1.2, not v4)
 ## fails a workflow at its FIRST step, and a release is an expensive place to find that out.
+## Run the `sutra` commands the getting-started chapters tell a reader to run, against a real
+## binary, and report which ones work. Prose that names a command is a promise: `sutra create app`
+## followed by `sutra package` — the two the scaffolder itself prints as "next" — were both broken
+## in 0.2.0-rc.1 while every unit test passed.
+verify-docs: ## Run the commands the getting-started docs document (SUTRA_BIN=<path> to pick a binary).
+	bash scripts/verify-doc-commands.sh
+
 verify-workflows: ## Verify workflow YAML + that every action reference resolves upstream.
 	bash scripts/verify-workflow-actions.sh
 

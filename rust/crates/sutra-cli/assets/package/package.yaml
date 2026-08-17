@@ -9,7 +9,9 @@
 # There is no inheritance and no shared library tree: a tenant variant of this package is an
 # explicit COPY (`sutra create deployment <name> --from <this dir>`), edited independently.
 
-name: %%PACKAGE%%
+# NO `name:` KEY — the schema is CLOSED (labels, engine, entryProcesses, audit) and the package
+# name is its DIRECTORY name, which is also the archive's file name. `sutra package` rejects
+# anything else, so a name here made the scaffold unpackageable.
 
 # Labels are OPAQUE to the engine — selectors for operators, the CLI and telemetry only.
 # `tenant` is just a label here, not a runtime concept.

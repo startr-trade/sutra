@@ -835,9 +835,17 @@ fn declared_types(deployment: &LoadedDeployment, codec_name: &str) -> DeclaredTy
         declared.sort();
         return DeclaredTypes::Closed(declared);
     }
-    // User codecs use `urn:<path-derived>` (or the bare path-derived name) and register under
-    // the path-derived name (the key of `deployment.codecs`).
+    // A module schema codec must be referenced the way the RUNTIME registers it: `urn:<folder>`
+    // (sutra_engine::assembly builds the registry with `format!("urn:{name}")`). Accepting the
+    // bare folder name here was a FALSE GREEN of the worst kind — `sutra package` succeeded and
+    // the deployment then answered every message with a 500
+    // (SUTRA.INBOUND.CODEC_NOT_FOUND: "Known: [\"urn:sample\"]"), which is a package-time
+    // check failing at its one job. So the bare form is now rejected, and the diagnostic names
+    // the form to write.
     let local = user_codec_name(name);
+    if name == local && deployment.codecs.contains_key(local) {
+        return DeclaredTypes::Unknown; // bare name: resolvable here, unresolvable at runtime
+    }
     if let Some(xsds) = deployment.codecs.get(local) {
         let refs: Vec<&[u8]> = xsds.iter().map(|a| a.content.as_bytes()).collect();
         let compiled = sutra_codec_schema::StructuralCodec::compile(name, &refs);
@@ -920,8 +928,19 @@ fn check_channel_declarations(
                     codes::INBOUND_CODEC_NOT_FOUND,
                     format!(
                         "deployment {dep_label}: channel '{name}' binds codec '{}', which is \
-                         neither a bundled codec nor a module schema codec of namespace '{}'",
-                        def.binding.codec, deployment.namespace
+                         neither a bundled codec nor a module schema codec of namespace '{}'{}",
+                        def.binding.codec,
+                        deployment.namespace,
+                        // The near-miss worth naming: a schemas/<folder> codec referenced without
+                        // the `urn:` prefix the runtime registers it under.
+                        if deployment.codecs.contains_key(def.binding.codec.trim()) {
+                            format!(
+                                " — the schema codec exists; reference it as 'urn:{}'",
+                                def.binding.codec.trim()
+                            )
+                        } else {
+                            String::new()
+                        }
                     ),
                 )
                 .at_named("channels.yaml", name),
@@ -2971,7 +2990,13 @@ fn check_feel_pure(
 // ---- template input validation (type safety) ------------------------------------------------
 
 /// The fixed render-context roots the executor always supplies.
-const FIXED_ROOTS: [&str; 4] = ["uuid", "now", "vars", "event"];
+/// The template inputs every intake provides, whatever the channel or codec. `validation`
+/// belongs here because `sutra_channels::intake` inserts it UNCONDITIONALLY on every
+/// message — before the `<q:onValidation>` policy runs, and whether or not the codec has a
+/// structural tier. Omitting it made this check reject a template reading `validation.*`
+/// that the runtime would have rendered perfectly well: the scaffolded validation-gateway
+/// sample could not be packaged at all.
+const FIXED_ROOTS: [&str; 5] = ["uuid", "now", "vars", "event", "validation"];
 
 /// A process's resolved intake for the field checks.
 struct Intake {

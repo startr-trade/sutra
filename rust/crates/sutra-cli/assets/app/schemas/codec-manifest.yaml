@@ -1,6 +1,7 @@
 # generated-by: sutra create app (edit freely — this file is yours)
-# Codec manifest for the `sample` codec. The codec id is this folder's archive-local path
-# (schemas/sample) — the channels bind it. Schema files are discovered by convention: every
+# Codec manifest for the `sample` codec. The codec id is THIS FOLDER'S NAME relative to
+# schemas/ — `sample` — and that is what channels.yaml binds. A nested folder joins with
+# colons (schemas/a/b -> `a:b`); the `schemas/` prefix is never part of the id. Schema files are discovered by convention: every
 # *.xsd under this folder composes the codec (here sample.xsd, declaring the SampleRequest,
 # CoverageQuery and CoverageReset roots).
 schemaKind: xsd

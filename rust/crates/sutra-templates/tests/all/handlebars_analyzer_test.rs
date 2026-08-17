@@ -110,3 +110,27 @@ fn literal_lookup_key_is_resolvable() {
     let a = analyze(r#"{{lookup payload.Items "Fixed"}}{{lookup payload.Rows 0}}"#);
     assert!(a.unresolvable.is_empty(), "got {:?}", a.unresolvable);
 }
+
+/// A reference inside a handlebars COMMENT is not a reference: comments never render, so they
+/// cannot read data. This matters because scaffolded templates document their own shape by
+/// example — `{{!-- e.g. {{payload.someField}} --}}` — and counting that produced a field
+/// reference the schema then rejected, making prose load-bearing.
+#[test]
+fn references_inside_comments_are_not_roots() {
+    let a = analyze(
+        "{{!-- Accepted reply. The message is `payload` (navigate it, e.g. {{payload.nope}}). --}}\n\
+         {{! also inert: {{vars.nope}} }}\n\
+         <Accepted id=\"{{payload.real}}\"/>",
+    );
+    assert!(
+        !a.roots.iter().any(|r| r == "vars"),
+        "a short-form comment leaked a root: {:?}",
+        a.roots
+    );
+    assert_eq!(
+        a.payload_paths,
+        vec!["real".to_string()],
+        "only the rendered path counts: {:?}",
+        a.payload_paths
+    );
+}

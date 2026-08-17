@@ -69,8 +69,8 @@ untouched, because format and transport are channel concerns.
 Inspect any of this without running an engine:
 
 ```bash
-sutra describe packages/my-first-app-main        # what the engine sees: channels, processes, bindings
-sutra dispatch-graph packages/my-first-app-main  # which channel reaches which process
+sutra describe packages/my-first-app-main/bpmn/sample.bpmn        # processes, events, tasks, gateways
+sutra dispatch-graph packages/my-first-app-main/bpmn/sample.bpmn  # which channel reaches which process
 ```
 
 ## Make it yours

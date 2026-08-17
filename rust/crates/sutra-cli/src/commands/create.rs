@@ -151,7 +151,19 @@ fn create_app(args: AppArgs, format: ReportFormat, io: &mut Io<'_>) -> i32 {
     let root = args.dir.join(&args.name);
     let package = format!("{}-main", args.name);
     let pkg_dir = root.join("packages").join(&package);
-    let vars: Vec<(&str, &str)> = vec![("APP", args.name.as_str()), ("PACKAGE", package.as_str())];
+    // ENGINE_IMAGE_TAG is THIS binary's version. A scaffold that defaulted to `:latest` could
+    // not run at all: a pre-release tag deliberately never moves `latest`, so the published
+    // registry has no such manifest and `docker compose up` failed on a fresh workspace. Pinning
+    // the CLI's own version is also the correct pairing — the archive this CLI seals is meant for
+    // the engine of the same release.
+    let vars: Vec<(&str, &str)> = vec![
+        ("APP", args.name.as_str()),
+        ("PACKAGE", package.as_str()),
+        ("ENGINE_IMAGE_TAG", crate::VERSION),
+        // A dev-only value for the channel's apikey reference, spelled once and substituted into
+        // the compose env and the smoke script so the two cannot drift apart.
+        ("APIKEY", "dev-only-sample-key"),
+    ];
 
     let mut report = WriteReport::default();
     let mut failed = false;
@@ -185,6 +197,16 @@ fn create_app(args: AppArgs, format: ReportFormat, io: &mut Io<'_>) -> i32 {
         &mut report,
     );
     mark_executable(&smoke);
+    // The db init script the compose stack mounts into the postgres container: it creates the
+    // NOSUPERUSER/NOBYPASSRLS role the engine connects as. Executable because the postgres
+    // entrypoint runs `/docker-entrypoint-initdb.d/*.sh` directly when it can.
+    let db_init = root.join("deploy/engine-db-init.sh");
+    put(
+        db_init.clone(),
+        render(asset("app/deploy/engine-db-init.sh"), &vars),
+        &mut report,
+    );
+    mark_executable(&db_init);
     put(
         root.join("deploy/k8s/engine.yaml"),
         render(asset("app/deploy/k8s/engine.yaml"), &vars),
@@ -411,7 +433,12 @@ fn copy_tree(src: &Path, dst: &Path, report: &mut WriteReport) -> std::io::Resul
     Ok(())
 }
 
-/// Rewrite the top-level `name:` of a copied package.yaml to the new package name.
+/// Rewrite a copied package.yaml's `module` LABEL to the new package name.
+///
+/// It used to rewrite a top-level `name:` key, which package.yaml's closed schema never
+/// accepted — `sutra package` rejected every scaffold that carried one. The package's name is
+/// its directory name; `module` is the label that names it for operators and telemetry, so a
+/// copy (`create deployment --from`) restamps that instead.
 fn restamp_package_name(package_yaml: &Path, name: &str, report: &mut WriteReport) {
     let Ok(text) = std::fs::read_to_string(package_yaml) else {
         return;
@@ -420,9 +447,11 @@ fn restamp_package_name(package_yaml: &Path, name: &str, report: &mut WriteRepor
     let out: Vec<String> = text
         .lines()
         .map(|line| {
-            if !replaced && line.starts_with("name:") {
+            let trimmed = line.trim_start();
+            if !replaced && trimmed.starts_with("module:") {
                 replaced = true;
-                format!("name: {name}")
+                let indent = &line[..line.len() - trimmed.len()];
+                format!("{indent}module: {name}")
             } else {
                 line.to_string()
             }
@@ -632,6 +661,33 @@ mod tests {
         })
     }
 
+    /// THE test this file was missing: a scaffolded workspace must survive the very next command
+    /// the tool tells the user to run. Every asset assertion elsewhere in this module passed
+    /// while `sutra package` rejected the output outright — a `name:` key package.yaml's closed
+    /// schema forbids, a codec bound as `schemas/sample` when the loader registers it as
+    /// `sample`, an XSD with no targetNamespace so its schema was never exposed. Nothing short
+    /// of running the real validator catches that class.
+    #[test]
+    fn a_scaffolded_app_passes_the_package_validator() {
+        let dir = scratch_dir("create-app-lints");
+        let (code, out, _) = run(app_args("payments", &dir), None);
+        assert_eq!(code, crate::exit::OK, "{out}");
+
+        let pkg = dir.join("payments/packages/payments-main");
+        let report = sutra_loader::package::lint_dir(&pkg);
+        let errors: Vec<String> = report
+            .diagnostics
+            .iter()
+            .filter(|d| d.severity == sutra_loader::lint::LintSeverity::Error)
+            .map(|d| format!("{}: {}", d.code, d.message))
+            .collect();
+        assert!(
+            errors.is_empty(),
+            "the scaffolded package does not lint clean:\n  {}",
+            errors.join("\n  ")
+        );
+    }
+
     #[test]
     fn create_app_scaffolds_the_f3_workspace() {
         let dir = scratch_dir("create-app");
@@ -737,7 +793,10 @@ mod tests {
         .unwrap();
         assert_eq!(defs.len(), 1);
         assert_eq!(defs[0].binding.channel_name, "sample-in");
-        assert_eq!(defs[0].codec.as_deref(), Some("schemas/sample"));
+        // `urn:sample` — the form the ENGINE registry uses (`urn:` + the folder name under
+        // schemas/, colon-joined when nested). The bare name resolved at package time and then
+        // 500'd on every message, so both the scaffold and the lint now insist on this one.
+        assert_eq!(defs[0].codec.as_deref(), Some("urn:sample"));
 
         let datastores = std::fs::read_to_string(pkg.join("datastores.yaml")).unwrap();
         let stores = sutra_datastore::config::parse_datastores(&datastores).unwrap();
@@ -786,7 +845,9 @@ mod tests {
             assert!(root.join(d).is_dir(), "missing {d}");
         }
         let text = std::fs::read_to_string(root.join("package.yaml")).unwrap();
-        assert!(text.contains("name: flows"), "{text}");
+        // No `name:` — package.yaml's schema is closed and the package name IS the directory
+        // name. The module LABEL carries it, which is what `create deployment --from` restamps.
+        assert!(!text.contains("\nname:"), "package.yaml must declare no name key: {text}");
         // Skeleton channels/datastores parse clean (empty declarations).
         let stores = sutra_datastore::config::parse_datastores(
             &std::fs::read_to_string(root.join("datastores.yaml")).unwrap(),
@@ -819,7 +880,8 @@ mod tests {
         let copy = parent.join("flows-eu");
         assert!(copy.join("bpmn/x.bpmn").is_file());
         let stamped = std::fs::read_to_string(copy.join("package.yaml")).unwrap();
-        assert!(stamped.contains("name: flows-eu"), "{stamped}");
+        // The MODULE LABEL is what a copy restamps — package.yaml has no `name` key to rewrite.
+        assert!(stamped.contains("module: flows-eu"), "{stamped}");
     }
 
     #[test]

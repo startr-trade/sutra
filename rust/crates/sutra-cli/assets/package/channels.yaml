@@ -12,7 +12,7 @@ channels: []
 #  - name: my-channel                         # channel id — <q:source channel="my-channel"/>
 #    transport: http                          # http | rabbitmq | kafka
 #    bind: "POST /channels/my-channel"        # http only: "<METHOD> <path>"
-#    codec: "schemas/my-schema"               # archive-local codec id (a schemas/ folder) — decodes inbound bytes
+#    codec: "urn:my-schema"                   # `urn:` + the folder name under schemas/ (the form the runtime registers)
 #    cloudevents-mode: none                   # none | binary | structured
 #    #idempotency-key-header: X-Message-Id    # dedupe key header (at-most-once intake)
 #    #singleton: true                         # one active consumer across N replicas (leader-gated)

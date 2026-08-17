@@ -7,7 +7,14 @@
     CoverageQuery / CoverageReset — the coverage ADMIN messages, ready for
       `sutra coverage init bpmn/sample.bpmn` (see the workspace README).
 -->
-<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema" elementFormDefault="qualified">
+<!-- targetNamespace is REQUIRED, not decoration: without it the compiled codec exposes no
+     schema, so every payload path in a template degrades to "unverifiable" and the
+     structural validation tier has nothing to validate against. It must be the
+     deployment namespace the engine derives for this package. -->
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           targetNamespace="urn:sutra:deployment:%%PACKAGE%%"
+           xmlns="urn:sutra:deployment:%%PACKAGE%%"
+           elementFormDefault="qualified">
 
   <xs:element name="SampleRequest">
     <xs:complexType>

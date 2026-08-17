@@ -78,12 +78,18 @@ curl -s http://$ENGINE/sutra/health/ready
 ```bash
 curl -s -X POST http://$ENGINE/channels/sample-in \
   -H 'Content-Type: application/xml' \
+  -H 'X-Api-Key: dev-only-sample-key' \
   --data '<SampleRequest><note>hello</note></SampleRequest>'
 ```
 
 ```xml
 <Accepted><note>hello</note></Accepted>
 ```
+
+The `X-Api-Key` header is not optional: `channels.yaml` declares `apikey` auth on this
+channel, because the engine refuses to wire an unauthenticated HTTP intake
+(`SUTRA.CHANNEL.AUTH.MISSING_SCHEME`). The scaffold's dev value is supplied by
+`deploy/compose.yaml`; a real deployment resolves `${SAMPLE_API_KEY}` from its secret store.
 
 That reply came out the other end of a real process: the channel decoded the XML, validated it
 against `sample.xsd`, started an instance, ran a gateway on the validation outcome, rendered a
@@ -94,6 +100,7 @@ Now watch it reject something. Send a payload the schema forbids:
 ```bash
 curl -s -X POST http://$ENGINE/channels/sample-in \
   -H 'Content-Type: application/xml' \
+  -H 'X-Api-Key: dev-only-sample-key' \
   --data '<SampleRequest><wrong>hello</wrong></SampleRequest>'
 ```
 
@@ -114,10 +121,10 @@ The bundled check runs both of those for you:
 curl -s http://$ENGINE/sutra/deployments | jq
 
 # What does the engine think this package binds?
-sutra describe packages/my-first-app-main
+sutra describe packages/my-first-app-main/bpmn/sample.bpmn
 
 # Will a message actually reach a process? (no engine needed)
-sutra simulate --channel sample-in --dry-run packages/my-first-app-main
+sutra simulate --channel sample-in --dry-run packages/my-first-app-main/bpmn/sample.bpmn
 ```
 
 ## 6. Change something

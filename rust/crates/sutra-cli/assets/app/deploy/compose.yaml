@@ -13,9 +13,11 @@
 services:
   engine:
     # The sutra engine image — one generic image; behaviour comes entirely from the mounted
-    # deployments. Defaults to the PUBLISHED release image so a fresh scaffold runs without
-    # building anything. Override with SUTRA_ENGINE_IMAGE (e.g. a locally built tag).
-    image: ${SUTRA_ENGINE_IMAGE:-ghcr.io/startr-trade/sutra:latest}
+    # deployments. Defaults to the release that matches the CLI which scaffolded this file, which
+    # is both the correct pairing and the only one guaranteed to exist: a PRE-release tag never
+    # moves `:latest`, so a `:latest` default cannot be pulled at all. Override with
+    # SUTRA_ENGINE_IMAGE (e.g. a locally built tag).
+    image: ${SUTRA_ENGINE_IMAGE:-ghcr.io/startr-trade/sutra:%%ENGINE_IMAGE_TAG%%}
     environment:
       # Deployment source root: the engine loads its work from this mount. It consumes
       # packaged .sutra archives dropped into the directory; add/remove = deploy/undeploy.
@@ -25,8 +27,17 @@ services:
       # ENGINE-INTERNAL datasource (instances / outbox / leases / audit) — never a package's
       # business store: those declare their OWN connections in the package's datastores.yaml.
       SUTRA_DATASOURCE_URL: postgres://engine-db:5432/sutra
-      SUTRA_DATASOURCE_USERNAME: sutra
+      # NOT the postgres superuser. The engine refuses to start against a role that can bypass
+      # row-level security (SUTRA.STARTUP.RLS_BYPASS_RISK) — a superuser bypasses it
+      # unconditionally, which would leave the deployment-isolation policies inert. This stack
+      # therefore hands the engine the same KIND of credential production does: a plain login
+      # role, NOSUPERUSER and NOBYPASSRLS, created by engine-db-init.sh. The startup check stays
+      # ON here, so the guarantee is enforced in development rather than acknowledged away.
+      SUTRA_DATASOURCE_USERNAME: ${ENGINE_DB_USER:-sutra_engine}
       SUTRA_DATASOURCE_PASSWORD: ${ENGINE_DB_PASSWORD:-sutra-dev-only}
+      # Resolves the `${SAMPLE_API_KEY}` reference in packages/*/channels.yaml. A real
+      # deployment sources this from its secret store, never from a compose default.
+      SAMPLE_API_KEY: ${SAMPLE_API_KEY:-%%APIKEY%%}
     volumes:
       - ./deployments:/deployments:ro
     ports:
@@ -39,10 +50,19 @@ services:
     image: postgres:16-alpine
     environment:
       POSTGRES_DB: sutra
-      POSTGRES_USER: sutra
-      POSTGRES_PASSWORD: ${ENGINE_DB_PASSWORD:-sutra-dev-only}
+      # The BOOTSTRAP superuser, used by the image's own entrypoint and by the init script
+      # below — never by the engine. Splitting the two is the point: see engine-db-init.sh.
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_BOOTSTRAP_PASSWORD:-bootstrap-dev-only}
+      # Consumed by engine-db-init.sh to create the engine's own role.
+      ENGINE_DB_USER: ${ENGINE_DB_USER:-sutra_engine}
+      ENGINE_DB_PASSWORD: ${ENGINE_DB_PASSWORD:-sutra-dev-only}
+    volumes:
+      # Runs ONCE, when the data volume is first initialised. `docker compose down -v` (which
+      # drops the volume) is what makes it run again.
+      - ./engine-db-init.sh:/docker-entrypoint-initdb.d/10-engine-role.sh:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U sutra -d sutra"]
+      test: ["CMD-SHELL", "pg_isready -U postgres -d sutra"]
       interval: 2s
       timeout: 3s
       retries: 30

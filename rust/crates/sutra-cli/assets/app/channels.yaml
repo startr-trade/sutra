@@ -10,15 +10,23 @@ channels:
   - name: sample-in                          # <q:source channel="sample-in"/> in bpmn/sample.bpmn
     transport: http                          # http | rabbitmq | kafka
     bind: "POST /channels/sample-in"         # http bind: "<METHOD> <path>"
-    codec: "schemas/sample"                  # archive-local codec id — compiled from schemas/sample/*.xsd
+    # `urn:<folder under schemas/>` — the form the RUNTIME registers. A bare `sample` passes
+    # package-time validation (it strips the urn: prefix before matching) and then fails at
+    # the first message with SUTRA.INBOUND.CODEC_NOT_FOUND, because the engine registry is
+    # keyed on the prefixed name. Write the prefixed form.
+    codec: "urn:sample"                      # compiled from schemas/sample/*.xsd
     cloudevents-mode: none                   # none | binary | structured
     # Optional per-channel wiring (all fields commented with their meaning):
     #idempotency-key-header: X-Message-Id    # dedupe key header (at-most-once intake)
     #singleton: true                         # one active consumer across N replicas (leader-gated)
     #max-concurrent-instances: 100           # concurrency cap
-    #auth:                                   # inbound auth on http binds
-    #  scheme: apikey                        # apikey | bearer | mtls
-    #  apikey:
-    #    value: ${SAMPLE_API_KEY}            # ${ENV} secret reference, resolved at channel startup —
-    #    header: X-Api-Key                   # never a literal secret (package-time validation rejects
-    #                                        # literals; local demos may relax that at lint time)
+    # DECLARED, not optional: the engine refuses to wire an HTTP channel with no auth scheme
+    # (SUTRA.CHANNEL.AUTH.MISSING_SCHEME) — an unauthenticated public intake is not a default it
+    # will give you. `apikey` is the simplest of the three; `bearer` and `mtls` are the others.
+    auth:
+      scheme: apikey                        # apikey | bearer | mtls
+      apikey:
+        value: ${SAMPLE_API_KEY}            # ${ENV} secret reference, resolved at channel startup —
+        header: X-Api-Key                   # never a literal secret (package-time validation
+                                            # rejects literals). deploy/compose.yaml supplies a
+                                            # dev value; deploy/smoke.sh sends it.
