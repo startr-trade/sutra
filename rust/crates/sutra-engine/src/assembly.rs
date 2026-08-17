@@ -1503,7 +1503,18 @@ pub(crate) fn build_shared_registries(
         }
         for (urn, xsds) in &plan.codecs {
             let refs: Vec<&[u8]> = xsds.iter().map(|x| x.as_slice()).collect();
-            codecs.register(StructuralCodec::compile(urn, &refs));
+            // THE VALIDATING BUILD. `compile` alone produces a shape-only codec — it projects and
+            // coerces leaves but runs no XSD validation, so the structural tier emitted no issues
+            // and `validation.outcome` was OK for every payload a module schema codec could
+            // decode. A validation gateway could therefore never reject anything, and a schema in
+            // a package meant nothing at runtime while package-time lint checked against it.
+            //
+            // Falls back to the shape-only build when the XSD set is outside the supported subset:
+            // that is a deployment that used to load and still should, and the reply to it is a
+            // narrower guarantee rather than a refusal to serve.
+            let codec = StructuralCodec::compile_with_formats(urn, &refs, &["xml", "json", "yaml"])
+                .unwrap_or_else(|_| StructuralCodec::compile(urn, &refs));
+            codecs.register(codec);
         }
         // Archive schema bundles under the deployment scope — they win over a built-in of the
         // same logical name for THIS deployment (`CodecRegistry::resolve`'s tier 1), leaving every

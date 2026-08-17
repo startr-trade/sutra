@@ -31,13 +31,16 @@ echo "smoke: ready"
 curl -fsS "${base_url}/sutra/health/live" >/dev/null
 echo "smoke: live"
 
-# The channel declares apikey auth, so the request carries the header. Without it the engine
-# answers 401 and this script fails — which is the point of declaring it.
+# Two things this request has to get right, both of which the engine enforces:
+#   * the apikey header the channel declares (without it: 401);
+#   * the document's NAMESPACE. The codec validates against schemas/sample/*.xsd, whose
+#     targetNamespace is this deployment's, so an unqualified <SampleRequest> is a different
+#     element to the validator and comes back <Rejected … no declaration found>.
 api_key="${SAMPLE_API_KEY:-%%APIKEY%%}"
 reply="$(curl -fsS -X POST "${base_url}/channels/sample-in" \
   -H 'Content-Type: application/xml' \
   -H "X-Api-Key: ${api_key}" \
-  --data '<SampleRequest><note>smoke</note></SampleRequest>')"
+  --data '<SampleRequest xmlns="%%NAMESPACE%%"><note>smoke</note></SampleRequest>')"
 echo "smoke: reply ${reply}"
 
 case "$reply" in

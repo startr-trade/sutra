@@ -150,6 +150,7 @@ fn create_app(args: AppArgs, format: ReportFormat, io: &mut Io<'_>) -> i32 {
     }
     let root = args.dir.join(&args.name);
     let package = format!("{}-main", args.name);
+    let namespace = format!("urn:sutra:deployment:{package}");
     let pkg_dir = root.join("packages").join(&package);
     // ENGINE_IMAGE_TAG is THIS binary's version. A scaffold that defaulted to `:latest` could
     // not run at all: a pre-release tag deliberately never moves `latest`, so the published
@@ -163,6 +164,11 @@ fn create_app(args: AppArgs, format: ReportFormat, io: &mut Io<'_>) -> i32 {
         // A dev-only value for the channel's apikey reference, spelled once and substituted into
         // the compose env and the smoke script so the two cannot drift apart.
         ("APIKEY", "dev-only-sample-key"),
+        // The deployment namespace, which is the XSD's targetNamespace — so the smoke POST sends
+        // a document the schema can actually declare. An unqualified <SampleRequest> is a
+        // DIFFERENT element as far as the validator is concerned, and is rejected with "no
+        // declaration found".
+        ("NAMESPACE", namespace.as_str()),
     ];
 
     let mut report = WriteReport::default();
@@ -257,7 +263,11 @@ fn create_app(args: AppArgs, format: ReportFormat, io: &mut Io<'_>) -> i32 {
         channel: "sample-in",
         message_type: "SampleRequest",
         namespace: &format!("urn:sutra:deployment:{package}"),
-        validation: ValidationMode::Fatal,
+        // SOFT: reject on ANY validation issue, not only FATAL. A malformed document fails
+        // FATAL and would be caught either way, but a content-tier ruleset (<q:validators>) can
+        // report SOFT_ERRORS, and a sample whose gateway ignored those would be teaching the
+        // wrong lesson about what the gateway is for.
+        validation: ValidationMode::Soft,
     };
     let (bpmn, accepted, rejected) = render_bpmn(&spec);
     debug_assert!(verify_bpmn(&bpmn).is_ok(), "sample bpmn must parse");

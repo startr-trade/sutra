@@ -79,11 +79,11 @@ curl -s http://$ENGINE/sutra/health/ready
 curl -s -X POST http://$ENGINE/channels/sample-in \
   -H 'Content-Type: application/xml' \
   -H 'X-Api-Key: dev-only-sample-key' \
-  --data '<SampleRequest><note>hello</note></SampleRequest>'
+  --data '<SampleRequest xmlns="urn:sutra:deployment:my-first-app-main"><note>hello</note></SampleRequest>'
 ```
 
 ```xml
-<Accepted><note>hello</note></Accepted>
+<Accepted process="sample"/>
 ```
 
 The `X-Api-Key` header is not optional: `channels.yaml` declares `apikey` auth on this
@@ -91,9 +91,18 @@ channel, because the engine refuses to wire an unauthenticated HTTP intake
 (`SUTRA.CHANNEL.AUTH.MISSING_SCHEME`). The scaffold's dev value is supplied by
 `deploy/compose.yaml`; a real deployment resolves `${SAMPLE_API_KEY}` from its secret store.
 
+The **namespace is not decoration** either. The codec validates against
+`schemas/sample/sample.xsd`, whose `targetNamespace` is this deployment's
+(`urn:sutra:deployment:my-first-app-main`), so an unqualified `<SampleRequest>` is a different
+element as far as the validator is concerned and comes back rejected with *no declaration
+found*. Payload namespaces are how every message standard this engine speaks — ISO 20022, MT,
+NACHA — identifies its documents.
+
 That reply came out the other end of a real process: the channel decoded the XML, validated it
 against `sample.xsd`, started an instance, ran a gateway on the validation outcome, rendered a
-template, and replied on the inbound connection.
+template, and replied on the inbound connection. The reply is literally
+`templates/sample-accepted.hbs`; edit it to echo a field (`{{payload.note}}`) and the change is
+verified against the schema at package time.
 
 Now watch it reject something. Send a payload the schema forbids:
 
@@ -101,7 +110,12 @@ Now watch it reject something. Send a payload the schema forbids:
 curl -s -X POST http://$ENGINE/channels/sample-in \
   -H 'Content-Type: application/xml' \
   -H 'X-Api-Key: dev-only-sample-key' \
-  --data '<SampleRequest><wrong>hello</wrong></SampleRequest>'
+  --data '<SampleRequest xmlns="urn:sutra:deployment:my-first-app-main"><wrong>hello</wrong></SampleRequest>'
+```
+
+```xml
+<Rejected process="sample" outcome="FATAL"
+          reason="element 'wrong' is not expected at this point of the content model"/>
 ```
 
 You get the rejection branch, not a stack trace and not a 500. **That is the point of the
