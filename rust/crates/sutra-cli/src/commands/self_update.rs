@@ -454,7 +454,7 @@ fn latest_tag(
                         .collect()
                 })
                 .unwrap_or_default();
-            tags.sort_by(|a, b| version_key(b).cmp(&version_key(a)));
+            tags.sort_by_key(|t| std::cmp::Reverse(version_key(t)));
             for tag in tags {
                 if fetch(
                     &format!("https://api.github.com/repos/{repo}/releases/tags/{tag}"),
