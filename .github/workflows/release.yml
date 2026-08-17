@@ -546,12 +546,35 @@ jobs:
 
       # Dependency order matters: sutra-dmn depends on sutra-feel. Modern cargo blocks on
       # index propagation after the first publish, so no manual sleep is needed.
-      - name: Publish sutra-feel
+      #
+      # IDEMPOTENT, and it has to be. A crates.io version is immutable — it can never be
+      # published twice — while this job can absolutely run twice: a re-release of the same
+      # tag through workflow_dispatch, or a release retried after a later job failed. So an
+      # already-published version is a SUCCESS here, not a failure. Only that one error is
+      # tolerated; every other publish failure still fails the job.
+      #
+      # The token goes through CARGO_REGISTRY_TOKEN rather than `--token`, which cargo now
+      # warns is deprecated.
+      - name: Publish sutra-feel, then sutra-dmn
         if: ${{ env.CRATES_IO_TOKEN != '' }}
         working-directory: rust
-        run: cargo publish --locked -p sutra-feel --token "$CRATES_IO_TOKEN"
-
-      - name: Publish sutra-dmn
-        if: ${{ env.CRATES_IO_TOKEN != '' }}
-        working-directory: rust
-        run: cargo publish --locked -p sutra-dmn --token "$CRATES_IO_TOKEN"
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: |
+          set -eu
+          for crate in sutra-feel sutra-dmn; do
+            echo "::group::cargo publish -p ${crate}"
+            if out="$(cargo publish --locked -p "$crate" 2>&1)"; then
+              echo "$out"
+              echo "::notice::${crate} published."
+            else
+              echo "$out"
+              case "$out" in
+                *"already exists on crates.io"*)
+                  echo "::notice::${crate} is already published at this version — nothing to do." ;;
+                *)
+                  echo "::error::${crate} failed to publish."; exit 1 ;;
+              esac
+            fi
+            echo "::endgroup::"
+          done
