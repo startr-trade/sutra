@@ -37,14 +37,42 @@ if ([System.Environment]::Is64BitOperatingSystem -ne $true -or
 }
 $target = 'x86_64-pc-windows-msvc'
 
-# `/releases/latest` skips pre-releases and every 0.x release so far IS one, so read the
-# release list and take the newest entry.
+# THREE sources, tried in order, because each one has a failure mode the next covers:
+#   1. /releases/latest  — right once a STABLE release exists; 404 while every release is a
+#      pre-release, which every 0.x has been;
+#   2. the release LIST  — includes pre-releases, and has been seen answering an EMPTY ARRAY
+#      while the release was perfectly fetchable by tag;
+#   3. git TAGS          — a different endpoint, which answered when the list did not. Newest
+#      v-prefixed tag first, then confirmed to carry a release.
+# GH_TOKEN / GITHUB_TOKEN, when present, lifts api.github.com from 60 requests an hour to 5000.
+$api = "https://api.github.com/repos/$repo"
+$ghHeaders = @{ 'User-Agent' = 'sutra-install' }
+$ghToken = if ($env:GH_TOKEN) { $env:GH_TOKEN } else { $env:GITHUB_TOKEN }
+if ($ghToken) { $ghHeaders['Authorization'] = "Bearer $ghToken" }
+
+function Get-Json($uri) {
+    try { Invoke-RestMethod -Uri $uri -Headers $ghHeaders -TimeoutSec 60 } catch { $null }
+}
+
 if (-not $Version) {
     Write-Host '  resolving the latest release...'
-    $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases?per_page=1" `
-                             -Headers @{ 'User-Agent' = 'sutra-install' }
-    $Version = $rel[0].tag_name
-    if (-not $Version) { throw 'sutra-install: could not resolve the latest release tag (rate-limited? pass -Version)' }
+    $latest = Get-Json "$api/releases/latest"
+    if ($latest -and $latest.tag_name) { $Version = $latest.tag_name }
+    if (-not $Version) {
+        $rel = Get-Json "$api/releases?per_page=1"
+        if ($rel -and $rel.Count -gt 0) { $Version = $rel[0].tag_name }
+    }
+    if (-not $Version) {
+        Write-Host '  release list empty - falling back to tags'
+        $tags = Get-Json "$api/tags?per_page=100"
+        foreach ($t in ($tags | Where-Object { $_.name -like 'v*' } |
+                        Sort-Object -Property @{ Expression = { $_.name } } -Descending)) {
+            if (Get-Json "$api/releases/tags/$($t.name)") { $Version = $t.name; break }
+        }
+    }
+    if (-not $Version) {
+        throw "sutra-install: could not resolve a release tag from $api (rate-limited, or nothing published). Pin one with -Version v0.2.0-rc.1, or set GH_TOKEN."
+    }
 }
 Write-Host "  version: $Version"
 
@@ -58,13 +86,13 @@ New-Item -ItemType Directory -Force -Path $tmp | Out-Null
 try {
     Write-Host "  downloading $asset..."
     $archive = Join-Path $tmp $asset
-    Invoke-WebRequest -Uri "$dl/$Version/$asset" -OutFile $archive -UseBasicParsing
+    Invoke-WebRequest -Uri "$dl/$Version/$asset" -OutFile $archive -UseBasicParsing -TimeoutSec 300
 
     if ($NoVerify) {
         Write-Host '  checksum verification SKIPPED (-NoVerify)'
     } else {
         $sumsPath = Join-Path $tmp 'SHA256SUMS'
-        Invoke-WebRequest -Uri "$dl/$Version/SHA256SUMS" -OutFile $sumsPath -UseBasicParsing
+        Invoke-WebRequest -Uri "$dl/$Version/SHA256SUMS" -OutFile $sumsPath -UseBasicParsing -TimeoutSec 300
         $want = (Select-String -Path $sumsPath -Pattern ([regex]::Escape($asset)) |
                  Select-Object -First 1).Line -split '\s+' | Select-Object -First 1
         if (-not $want) { throw "sutra-install: SHA256SUMS carries no entry for $asset" }

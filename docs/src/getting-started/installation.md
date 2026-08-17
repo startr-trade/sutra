@@ -34,7 +34,38 @@ curl -fsSL …/install.sh | sh -s -- --version v0.2.0-rc.1
 
 # Install somewhere specific
 curl -fsSL …/install.sh | SUTRA_INSTALL_DIR=~/bin sh
+
+# Lift the API rate limit when retrying (60 requests/hour anonymous -> 5000 with a token)
+GH_TOKEN=$(gh auth token) curl -fsSL …/install.sh | sh
 ```
+
+### If the install fails
+
+`raw.githubusercontent.com` **rate-limits** and answers `429 Too Many Requests` under load; so
+does the GitHub API, at 60 requests an hour per IP without a token. Three ways around it, in the
+order worth trying:
+
+```bash
+# 1. the SAME installer, served from the release instead of the raw CDN (different host, and
+#    the script is versioned with the binaries it installs)
+curl -fsSL https://github.com/startr-trade/sutra/releases/download/v0.2.0-rc.1/install.sh \
+  | sh -s -- --version v0.2.0-rc.1
+
+# 2. a token, which moves the API to 5000 requests an hour
+GH_TOKEN=$(gh auth token) curl -fsSL …/install.sh | sh
+
+# 3. no installer at all — the assets are plain files
+gh release download v0.2.0-rc.1 -R startr-trade/sutra \
+  -p 'sutra-*-x86_64-unknown-linux-musl.tar.gz' -p SHA256SUMS
+sha256sum --ignore-missing -c SHA256SUMS
+tar xzf sutra-*-x86_64-unknown-linux-musl.tar.gz --strip-components=1 -C ~/.local/bin
+```
+
+The installer retries transient failures and times out rather than hanging, and it resolves the
+release from three different endpoints (`/releases/latest`, the release list, then git tags),
+because each of them has been observed failing while a release was perfectly installable. When
+all three come up empty it tells you to pin `--version`, which is the one path that needs no
+lookup at all.
 
 Prefer to see what you are running before you run it? Download `install.sh`, read it — it is
 about a hundred lines of POSIX shell — then execute it. Or skip the script entirely and grab

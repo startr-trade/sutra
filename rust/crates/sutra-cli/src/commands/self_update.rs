@@ -298,6 +298,11 @@ fn block_on<F: std::future::Future>(future: F) -> F::Output {
 fn client() -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
         .user_agent(concat!("sutra-cli/", env!("CARGO_PKG_VERSION")))
+        // Bounded, because an unbounded update check hangs a terminal with no output. The
+        // connect timeout is short (a wrong/blocked host should say so quickly); the overall
+        // one is generous enough for a 30 MB binary on a slow link.
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(300))
         .build()
         .map_err(|e| format!("http client: {e}"))
 }
@@ -363,6 +368,36 @@ fn channel_auth() -> Option<String> {
         .filter(|v| !v.trim().is_empty())
 }
 
+/// `tag_name` out of a single-release payload.
+fn tag_name_of(body: &[u8]) -> Option<String> {
+    let json: serde_json::Value = serde_json::from_slice(body).ok()?;
+    json.get("tag_name")
+        .and_then(|t| t.as_str())
+        .map(|s| s.to_string())
+}
+
+/// A sortable key for a `v`-prefixed tag: numeric segments compare as numbers, so v0.10.0 sorts
+/// above v0.9.0 where a string compare would not. A pre-release suffix (`-rc.1`) keeps its text
+/// in the last element, which orders rc.1 < rc.2 and, being longer than the empty string of a
+/// bare release, sorts a pre-release BELOW its own final release.
+fn version_key(tag: &str) -> (Vec<u64>, String) {
+    let body = tag.trim_start_matches('v');
+    let (core, suffix) = body.split_once('-').unwrap_or((body, ""));
+    let nums = core
+        .split('.')
+        .map(|p| p.parse::<u64>().unwrap_or(0))
+        .collect();
+    // An empty suffix must sort ABOVE any pre-release, so invert: bare -> "~" (high), rc -> text.
+    (
+        nums,
+        if suffix.is_empty() {
+            "~".to_string()
+        } else {
+            suffix.to_string()
+        },
+    )
+}
+
 /// The newest release tag on this distribution's channel, pre-releases included.
 fn latest_tag(
     channel: &crate::UpdateChannel,
@@ -370,22 +405,71 @@ fn latest_tag(
     token: Option<&str>,
 ) -> Result<String, String> {
     match channel {
-        // `/releases/latest` is deliberately NOT used: it skips pre-releases, and every 0.x
-        // release so far is one.
+        // THREE sources, because each has a failure mode the next one covers. The release LIST
+        // was the only source here, and it has been seen answering `[]` while the release was
+        // perfectly fetchable BY TAG — which made `self-update` report "could not read a release
+        // tag" for a release that existed. A single source is a single point of failure for the
+        // one command whose whole job is to find the newest release.
         crate::UpdateChannel::GithubReleases { repo } => {
-            let body = fetch(
+            // (a) `/releases/latest`: right once a STABLE release exists, 404 while every
+            //     release is a pre-release — which is why it cannot be the only source either.
+            if let Ok(body) = fetch(
+                &format!("https://api.github.com/repos/{repo}/releases/latest"),
+                token,
+            ) {
+                if let Some(tag) = tag_name_of(&body) {
+                    return Ok(tag);
+                }
+            }
+            // (b) the list, which does include pre-releases.
+            if let Ok(body) = fetch(
                 &format!("https://api.github.com/repos/{repo}/releases?per_page=1"),
+                token,
+            ) {
+                let json: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+                if let Some(tag) = json
+                    .get(0)
+                    .and_then(|r| r.get("tag_name"))
+                    .and_then(|t| t.as_str())
+                {
+                    return Ok(tag.to_string());
+                }
+            }
+            // (c) git TAGS — a different endpoint, which answered when the list did not. Newest
+            //     v-prefixed tag first, then confirmed to actually carry a release: a tag with
+            //     no release has no assets to install.
+            let body = fetch(
+                &format!("https://api.github.com/repos/{repo}/tags?per_page=100"),
                 token,
             )?;
             let json: serde_json::Value =
-                serde_json::from_slice(&body).map_err(|e| format!("release list: {e}"))?;
-            json.get(0)
-                .and_then(|r| r.get("tag_name"))
-                .and_then(|t| t.as_str())
-                .map(|s| s.to_string())
-                .ok_or_else(|| {
-                    "could not read a release tag (rate-limited? pass --version)".to_string()
+                serde_json::from_slice(&body).map_err(|e| format!("tag list: {e}"))?;
+            let mut tags: Vec<String> = json
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
+                        .filter(|n| n.starts_with('v'))
+                        .map(|n| n.to_string())
+                        .collect()
                 })
+                .unwrap_or_default();
+            tags.sort_by(|a, b| version_key(b).cmp(&version_key(a)));
+            for tag in tags {
+                if fetch(
+                    &format!("https://api.github.com/repos/{repo}/releases/tags/{tag}"),
+                    token,
+                )
+                .is_ok()
+                {
+                    return Ok(tag);
+                }
+            }
+            Err(format!(
+                "could not resolve a release tag from github.com/{repo} (rate-limited, or \
+                 nothing published). Pin one with --version <tag>, or set GH_TOKEN to lift the \
+                 API rate limit."
+            ))
         }
         // Downloads carry no tag of their own, so the tag is recovered from the asset NAME
         // (`<binary>-<tag>-<target>.tar.gz`) and the newest upload wins.

@@ -857,7 +857,10 @@ mod tests {
         let text = std::fs::read_to_string(root.join("package.yaml")).unwrap();
         // No `name:` — package.yaml's schema is closed and the package name IS the directory
         // name. The module LABEL carries it, which is what `create deployment --from` restamps.
-        assert!(!text.contains("\nname:"), "package.yaml must declare no name key: {text}");
+        assert!(
+            !text.contains("\nname:"),
+            "package.yaml must declare no name key: {text}"
+        );
         // Skeleton channels/datastores parse clean (empty declarations).
         let stores = sutra_datastore::config::parse_datastores(
             &std::fs::read_to_string(root.join("datastores.yaml")).unwrap(),

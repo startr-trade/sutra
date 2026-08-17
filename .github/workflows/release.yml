@@ -482,6 +482,14 @@ jobs:
       # Bare filenames (no ./ prefix, no directories) so a consumer can
       # `sha256sum --ignore-missing -c SHA256SUMS` from the directory it downloaded into —
       # which is exactly what scripts/install.sh does.
+      # The INSTALLERS ship as release assets, so the documented one-liner can be served from
+      # the release-download host instead of raw.githubusercontent.com — which rate-limits (429)
+      # and, being a CDN of the default branch, hands out an installer that may not match the
+      # release it is installing. From here the script and the binaries it fetches are one
+      # artifact set, versioned together.
+      - name: Stage the installers as release assets
+        run: cp scripts/install.sh scripts/install.ps1 dist/
+
       - name: Compute SHA256SUMS
         working-directory: dist
         run: |
