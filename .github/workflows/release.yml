@@ -136,6 +136,20 @@ jobs:
           context: ./rust
           file: ./rust/Dockerfile
           platforms: ${{ matrix.platform }}
+          # org.opencontainers.image.source is what makes ghcr.io LINK this package to the
+          # repository — which is how the package shows up on the repo page and how a reader
+          # gets from the image back to the code. Without it the package is an orphan in the
+          # org's package list, and its visibility has to be managed entirely by hand.
+          #
+          # It does NOT make the package public: on ghcr.io a package's visibility is its own
+          # setting, independent of the repository's, and a package first pushed by a workflow
+          # starts PRIVATE. That is a one-time flip in the package settings — and until it is
+          # flipped, `docker pull` answers `unauthorized`, never `not found`, because ghcr.io
+          # does not distinguish "private" from "does not exist" to an anonymous caller.
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.licenses=MIT OR Apache-2.0
           provenance: true
           # SBOM is produced by anchore/sbom-action on the MERGED manifest and cosign-attested
           # there, so buildkit's own SBOM attestation stays off — two competing SBOM
