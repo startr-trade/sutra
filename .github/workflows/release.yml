@@ -266,8 +266,12 @@ jobs:
           echo "digest=${digest}" >> "$GITHUB_OUTPUT"
           echo "manifest ${IMAGE_NAME}:${VERSION} -> ${digest}"
 
+      # PINNED TO A FULL VERSION, deliberately. Most actions maintain a floating major tag,
+      # but sigstore stopped at `v3`: v4 exists only as v4.0.0 … v4.1.2, so `@v4` resolves to
+      # nothing and fails the job at its first step. scripts/verify-workflow-actions.sh checks
+      # every reference in this directory for exactly this.
       - name: Install cosign
-        uses: sigstore/cosign-installer@v4
+        uses: sigstore/cosign-installer@v4.1.2
 
       # Keyless (Sigstore / Fulcio): the signing identity IS this workflow's OIDC identity —
       # no long-lived key material anywhere. Signs the MANIFEST LIST digest, which is what

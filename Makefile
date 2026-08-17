@@ -18,7 +18,7 @@
 # under docs/ keeps writing there.
 CATALOG_OUTPUT := $(if $(wildcard docs/design/artifact-documentation),docs/design/artifact-documentation,catalog)
 
-.PHONY: catalog catalog-rust catalog-check catalog-rust-check install-hooks \
+.PHONY: catalog catalog-rust catalog-check catalog-rust-check install-hooks verify-workflows \
 	print-catalog-output \
 	help test test-docker test-all test-k8s lint docker-clean audit image image-it
 
@@ -107,6 +107,12 @@ endif
 ## `--include-ignored` sweep runs tier-2, incl. tc_multi_replica, alongside tier-1).
 test-all: ## Tier-1 + tier-2 together (k8s tier-3 excluded).
 	cd rust && cargo test --workspace --no-fail-fast -- --include-ignored --skip k8s_ --test-threads=4
+
+## Check that every GitHub Actions workflow parses and that every `uses:` reference exists
+## upstream. A version nobody published (`cosign-installer@v4` — sigstore ships v4.1.2, not v4)
+## fails a workflow at its FIRST step, and a release is an expensive place to find that out.
+verify-workflows: ## Verify workflow YAML + that every action reference resolves upstream.
+	bash scripts/verify-workflow-actions.sh
 
 lint: ## Routine clippy -D warnings (workspace) + the domain-neutrality gate.
 	cd rust && cargo clippy --workspace --all-targets -- -D warnings
