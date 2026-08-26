@@ -46,14 +46,10 @@ ignore = [
     "RUSTSEC-2026-0099",
     "RUSTSEC-2026-0098",
     "RUSTSEC-2026-0104",
-    # astral-tokio-tar 0.5.6 — DEV/TEST ONLY (testcontainers image unpacking). NOT in the
-    # shipped engine binary; the test harness pulls only trusted images. PAX-header desync +
-    # symlink chmod on extraction. Accepted (no shipped exposure); revisit if testcontainers
-    # bumps it.
-    "RUSTSEC-2026-0145",
-    "RUSTSEC-2026-0112",
-    "RUSTSEC-2026-0066",
-    "RUSTSEC-2026-0113",
+    # (astral-tokio-tar RUSTSEC-2026-0145/-0112/-0066/-0113 removed — testcontainers now pulls
+    # 0.6.4, which fixes all four. cargo-deny reported them as `advisory-not-detected`, i.e.
+    # exceptions that no longer excepted anything: an ignore matching nothing hides nothing and
+    # makes the live exceptions harder to read.)
 ]
 
 # ---------------------------------------------------------------------------
