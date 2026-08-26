@@ -11,6 +11,7 @@ use crate::GlobalArgs;
 
 pub mod audit_replay;
 pub mod catalog;
+pub mod codecs;
 pub mod compat_baseline;
 pub mod coverage;
 pub mod create;
@@ -36,6 +37,8 @@ pub mod version;
 pub enum Command {
     /// Print the tool version.
     Version(version::VersionArgs),
+    /// List the payload codecs linked into this binary and the message types each declares.
+    Codecs(codecs::CodecsArgs),
     /// Replace this binary with a published release build (explicit, verified, atomic).
     SelfUpdate(self_update::SelfUpdateArgs),
     /// Apply engine schema migrations (or inspect them: status, verify, --dry-run).
@@ -91,6 +94,7 @@ impl Command {
     pub fn execute(self, global: &GlobalArgs, io: &mut Io<'_>) -> i32 {
         match self {
             Command::Version(args) => version::execute(args, global, io),
+            Command::Codecs(args) => codecs::execute(args, global, io),
             Command::SelfUpdate(args) => self_update::execute(args, global, io),
             Command::Migrate(args) => migrate::execute(args, global, io),
             Command::Describe(args) => describe::execute(args, global, io),

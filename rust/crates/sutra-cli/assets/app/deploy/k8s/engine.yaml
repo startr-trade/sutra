@@ -44,7 +44,7 @@ spec:
     spec:
       containers:
         - name: engine
-          image: ghcr.io/startr-trade/sutra:%%ENGINE_IMAGE_TAG%%   # the generic engine image (same as compose)
+          image: %%ENGINE_IMAGE%%   # the generic engine image (same as compose)
           env:
             - name: SUTRA_DEPLOYMENTS_DIR     # deployment source root (packaged .sutra archives)
               value: /deployments

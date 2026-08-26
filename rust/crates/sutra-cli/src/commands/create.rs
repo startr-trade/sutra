@@ -152,15 +152,23 @@ fn create_app(args: AppArgs, format: ReportFormat, io: &mut Io<'_>) -> i32 {
     let package = format!("{}-main", args.name);
     let namespace = format!("urn:sutra:deployment:{package}");
     let pkg_dir = root.join("packages").join(&package);
-    // ENGINE_IMAGE_TAG is THIS binary's version. A scaffold that defaulted to `:latest` could
-    // not run at all: a pre-release tag deliberately never moves `latest`, so the published
-    // registry has no such manifest and `docker compose up` failed on a fresh workspace. Pinning
-    // the CLI's own version is also the correct pairing — the archive this CLI seals is meant for
-    // the engine of the same release.
+    // The engine image the scaffolded stack pulls: THIS distribution's runtime, at THIS
+    // binary's version. Both halves are load-bearing.
+    //
+    // The registry comes from the distribution seam rather than from the asset, because the
+    // codec registry is per-binary: a distribution can link codecs this engine image does not
+    // carry, and a scaffold that hard-coded one registry would package cleanly and then fail
+    // at runtime with SUTRA.INBOUND.CODEC_NOT_FOUND.
+    //
+    // The version comes from this binary rather than `latest`, because a pre-release tag
+    // deliberately never moves `latest` — the published registry has no such manifest, and
+    // `docker compose up` failed outright on a fresh workspace. It is also the correct
+    // pairing: the archive this CLI seals is meant for the engine of the same release.
+    let engine_image = crate::default_runtime_image();
     let vars: Vec<(&str, &str)> = vec![
         ("APP", args.name.as_str()),
         ("PACKAGE", package.as_str()),
-        ("ENGINE_IMAGE_TAG", crate::VERSION),
+        ("ENGINE_IMAGE", engine_image.as_str()),
         // A dev-only value for the channel's apikey reference, spelled once and substituted into
         // the compose env and the smoke script so the two cannot drift apart.
         ("APIKEY", "dev-only-sample-key"),
@@ -277,6 +285,15 @@ fn create_app(args: AppArgs, format: ReportFormat, io: &mut Io<'_>) -> i32 {
         accepted,
         &mut report,
     );
+    // The transform contract for those two templates. It is what makes the reply side
+    // CHECKABLE at deploy time: without it the lint has no declared output to compare against
+    // the codec's type set, and a template that drifts from the schema is discovered by
+    // whoever receives the reply.
+    put(
+        pkg_dir.join("templates/template-manifest.yaml"),
+        render(asset("app/templates/template-manifest.yaml"), &vars),
+        &mut report,
+    );
     put(
         pkg_dir.join("templates/sample-rejected.hbs"),
         rejected,
@@ -304,7 +321,8 @@ fn create_app(args: AppArgs, format: ReportFormat, io: &mut Io<'_>) -> i32 {
         io,
         &format!(
             "next: docker compose -f {}/deploy/compose.yaml up -d && {}/deploy/smoke.sh \
-             (package + drop the sample archive first — see {}/README.md)",
+             (package + drop the sample archive first — see {}/README.md); \
+             engine image: {engine_image}",
             root.display(),
             root.display(),
             root.display()
@@ -598,16 +616,38 @@ fn create_bpmn(args: BpmnArgs, format: ReportFormat, io: &mut Io<'_>) -> i32 {
         .map(|text| text.contains(&format!("name: {channel}")))
         .unwrap_or(false);
 
+    // Second nudge, same spirit: a package that DECLARES transform contracts has just gained
+    // two templates that are not in them, and an undeclared template is simply unchecked at
+    // deploy time. Only ever mentioned — this file is the author's, and merging YAML that
+    // somebody hand-edited is not something a scaffolder should do behind their back.
+    let manifest = args.package.join("templates/template-manifest.yaml");
+    let manifest_gap = std::fs::read_to_string(&manifest)
+        .map(|text| !text.contains(&format!("{}-accepted.hbs", args.process)))
+        .unwrap_or(false);
+
     finish(
         "create bpmn",
         &args.package,
         &report,
         format,
         io,
-        if channel_declared {
-            "the channel binding is already declared in channels.yaml"
-        } else {
-            "note: declare the inbound channel in channels.yaml (see its commented sample)"
+        &match (channel_declared, manifest_gap) {
+            (true, false) => "the channel binding is already declared in channels.yaml".to_string(),
+            (true, true) => format!(
+                "the channel binding is already declared in channels.yaml; add {}-accepted.hbs \
+                 and {}-rejected.hbs to templates/template-manifest.yaml to have their output \
+                 types checked at deploy time",
+                args.process, args.process
+            ),
+            (false, false) => {
+                "note: declare the inbound channel in channels.yaml (see its commented sample)"
+                    .to_string()
+            }
+            (false, true) => format!(
+                "note: declare the inbound channel in channels.yaml (see its commented sample), \
+                 and add {}-accepted.hbs / {}-rejected.hbs to templates/template-manifest.yaml",
+                args.process, args.process
+            ),
         },
     );
 
@@ -717,6 +757,7 @@ mod tests {
             "packages/payments-main/bpmn/sample.bpmn",
             "packages/payments-main/templates/sample-accepted.hbs",
             "packages/payments-main/templates/sample-rejected.hbs",
+            "packages/payments-main/templates/template-manifest.yaml",
             "packages/payments-main/schemas/sample/codec-manifest.yaml",
             "packages/payments-main/schemas/sample/sample.xsd",
         ] {
@@ -754,6 +795,38 @@ mod tests {
                 .permissions()
                 .mode();
             assert_eq!(mode & 0o111, 0o111, "smoke.sh must be executable");
+        }
+    }
+
+    #[test]
+    fn the_scaffolded_stack_pulls_this_distributions_engine() {
+        // Both manifests name the SAME image, and it is the one this binary's distribution
+        // publishes — a scaffold that pulled a different distribution's engine would resolve a
+        // different codec set than the CLI that linted the package.
+        let dir = scratch_dir("create-app-image");
+        let (code, _, _) = run(app_args("acme", &dir), None);
+        assert_eq!(code, crate::exit::OK);
+        let expected = crate::default_runtime_image();
+        let root = dir.join("acme");
+        for manifest in ["deploy/compose.yaml", "deploy/k8s/engine.yaml"] {
+            let text = std::fs::read_to_string(root.join(manifest)).unwrap();
+            assert!(
+                text.contains(&expected),
+                "{manifest} does not pull {expected}"
+            );
+        }
+        // Pinned, never floating: a pre-release tag never moves `latest`, so `latest` names a
+        // manifest the registry does not have. Checked on the `image:` KEYS only — the prose
+        // above them explains exactly this, and matching the whole file would catch the comment.
+        let compose = std::fs::read_to_string(root.join("deploy/compose.yaml")).unwrap();
+        for line in compose
+            .lines()
+            .filter(|l| l.trim_start().starts_with("image:"))
+        {
+            assert!(
+                !line.trim_end().ends_with(":latest"),
+                "unpinned image: {line}"
+            );
         }
     }
 

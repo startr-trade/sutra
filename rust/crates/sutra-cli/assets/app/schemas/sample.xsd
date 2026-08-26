@@ -4,6 +4,7 @@
 
   Message roots of the `sample` codec:
     SampleRequest — the sample process's inbound message (bpmn/sample.bpmn).
+    Accepted / Rejected — the replies the sample process renders (templates/*.hbs).
     CoverageQuery / CoverageReset — the coverage ADMIN messages, ready for
       `sutra coverage init bpmn/sample.bpmn` (see the workspace README).
 -->
@@ -21,6 +22,24 @@
       <xs:sequence>
         <xs:element name="note" type="xs:string"/>
       </xs:sequence>
+    </xs:complexType>
+  </xs:element>
+
+  <!-- The REPLY roots. A sample that insists the inbound namespace is load-bearing and then
+       answers with an undeclared, unqualified element teaches the rule and breaks it in the
+       same breath. Declaring them here is also what a real message standard does: request and
+       response are roots of ONE schema, so both ends of the exchange are checkable. -->
+  <xs:element name="Accepted">
+    <xs:complexType>
+      <xs:attribute name="process" type="xs:string" use="required"/>
+    </xs:complexType>
+  </xs:element>
+
+  <xs:element name="Rejected">
+    <xs:complexType>
+      <xs:attribute name="process" type="xs:string" use="required"/>
+      <xs:attribute name="outcome" type="xs:string" use="required"/>
+      <xs:attribute name="reason" type="xs:string"/>
     </xs:complexType>
   </xs:element>
 

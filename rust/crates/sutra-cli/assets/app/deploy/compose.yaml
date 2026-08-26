@@ -12,12 +12,17 @@
 
 services:
   engine:
-    # The sutra engine image — one generic image; behaviour comes entirely from the mounted
-    # deployments. Defaults to the release that matches the CLI which scaffolded this file, which
-    # is both the correct pairing and the only one guaranteed to exist: a PRE-release tag never
-    # moves `:latest`, so a `:latest` default cannot be pulled at all. Override with
-    # SUTRA_ENGINE_IMAGE (e.g. a locally built tag).
-    image: ${SUTRA_ENGINE_IMAGE:-ghcr.io/startr-trade/sutra:%%ENGINE_IMAGE_TAG%%}
+    # The engine image — one generic image; behaviour comes entirely from the mounted
+    # deployments. The default is the runtime published by the SAME distribution and release as
+    # the CLI that scaffolded this file. That pairing is the whole point: codecs are linked into
+    # a binary, so an engine image from a different distribution resolves a different codec set
+    # and rejects channels this CLI accepted. It is also the only tag guaranteed to exist — a
+    # PRE-release never moves `:latest`, so a `:latest` default cannot be pulled at all.
+    #
+    # Override with SUTRA_ENGINE_IMAGE (a locally built tag, or an air-gapped mirror). If this
+    # image lives in a private registry, log in to it before `up` — the pull is the first thing
+    # that happens and an unauthenticated one fails with `denied`/`unauthorized`.
+    image: ${SUTRA_ENGINE_IMAGE:-%%ENGINE_IMAGE%%}
     environment:
       # Deployment source root: the engine loads its work from this mount. It consumes
       # packaged .sutra archives dropped into the directory; add/remove = deploy/undeploy.

@@ -1,0 +1,28 @@
+# generated-by: sutra create app (edit freely — this file is yours)
+#
+# The transform contract for the templates beside it: for each one, the message type a flow
+# feeding it must carry IN, and the message type it produces OUT.
+#
+# WHY DECLARE IT: the deploy-time lint reads this file and checks the declared output against
+# what the reply codec can actually produce. `Accepted` and `Rejected` are roots of
+# schemas/sample/sample.xsd, so the check has something to check — rename an element in the
+# schema without touching the template and packaging fails with
+# SUTRA.CONFIG.TEMPLATE.OUTPUT_TYPE_UNKNOWN ("a dead output binding") instead of the drift
+# reaching a running engine.
+#
+# It is an AUTHORING-SIDE contract, and it does not travel: the packager leaves this file out
+# of the .sutra archive on purpose, so nothing here is consulted while a message flows and the
+# reply's content type rides on the serviceTask's <q:reply>. What the lint verifies is the
+# NAME — that the declared type is one the reply codec can produce — not the rendered bytes.
+#
+# `file:` is the template id the BPMN serviceTask names in its `implementation` attribute.
+templates:
+  - file: sample-accepted.hbs
+    inputMessageType: SampleRequest
+    outputMessageType: Accepted
+    contentType: application/xml
+
+  - file: sample-rejected.hbs
+    inputMessageType: SampleRequest
+    outputMessageType: Rejected
+    contentType: application/xml

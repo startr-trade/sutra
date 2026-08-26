@@ -158,6 +158,44 @@ pub fn update_source() -> Option<&'static UpdateSource> {
     UPDATE_SOURCE.get()
 }
 
+/// The engine image this distribution publishes alongside the running binary, `repo:tag`.
+///
+/// This is what `create app` writes into the scaffolded compose file and k8s manifest, and it
+/// reads the SAME seam `self-update --runtime` reads ([`UpdateSource::image`]) for one reason:
+/// a distribution's CLI and its engine are a matched pair. A distribution that links codecs
+/// this engine image does not contain would otherwise scaffold a stack that packages cleanly
+/// and then fails at runtime with `SUTRA.INBOUND.CODEC_NOT_FOUND`: the codec registry is
+/// per-binary, and an image from elsewhere is a different binary.
+///
+/// The tag is [`product_version`] — this binary's own release — never `latest`: a pre-release
+/// tag deliberately never moves `latest`, so a `latest` default cannot be pulled at all.
+///
+/// With no update source declared the pairing falls back to the ENGINE's own image at the
+/// ENGINE's own version, which is the only pair this crate can vouch for by itself.
+pub fn default_runtime_image() -> String {
+    runtime_image_of(
+        update_source().and_then(|s| s.image.as_deref()),
+        product_version(),
+    )
+}
+
+/// [`default_runtime_image`] as a pure function of its two inputs, so both branches are
+/// testable: the global seam is a `OnceLock` that a test cannot set without deciding the value
+/// for every other test in the process.
+fn runtime_image_of(declared: Option<&str>, product: &str) -> String {
+    match declared {
+        Some(repo) => format!("{repo}:{product}"),
+        None => format!("ghcr.io/startr-trade/{NAME}:{VERSION}"),
+    }
+}
+
+/// The product version this binary reports: the first line of the version block a distribution
+/// handed [`run_with_version`], which by that function's contract is the product's own version
+/// with the embedded engine described on the lines below it. [`VERSION`] when unset.
+pub fn product_version() -> &'static str {
+    version_string().lines().next().unwrap_or(VERSION)
+}
+
 /// Top-level argument surface of the CLI. The `name` here is only a fallback: [`run`] and
 /// [`run_with_version`] override it with [`program_name`] before parsing.
 #[derive(Debug, Parser)]
@@ -392,6 +430,39 @@ mod tests {
         assert_eq!(args.conn.user.as_deref(), Some("svc"));
         assert_eq!(args.conn.password.as_deref(), Some("secret"));
         assert_eq!(args.conn.schema.as_deref(), Some("engine"));
+    }
+
+    #[test]
+    fn a_distribution_scaffolds_its_own_runtime_at_its_own_version() {
+        // A distribution linking codecs this engine image does not carry would package
+        // cleanly against the public image and fail at runtime, so the DECLARED image wins —
+        // and the tag is the PRODUCT's version, not the engine's. The registry below is a
+        // placeholder: this crate is the composition root for distributions it knows nothing
+        // about, and naming a real one here would put somebody else's infrastructure in it.
+        assert_eq!(
+            runtime_image_of(Some("registry.example.com/acme/acme-engine"), "3.1.0"),
+            "registry.example.com/acme/acme-engine:3.1.0"
+        );
+    }
+
+    #[test]
+    fn with_no_declared_image_the_pairing_is_this_engine_at_this_engines_version() {
+        // Never the product version against the engine's repository: that names a tag which by
+        // construction does not exist.
+        assert_eq!(
+            runtime_image_of(None, "3.1.0"),
+            format!("ghcr.io/startr-trade/{NAME}:{VERSION}")
+        );
+    }
+
+    #[test]
+    fn product_version_is_the_first_line_of_a_multi_line_version_block() {
+        // `run_with_version` documents a version BLOCK: product on line one, what it embeds
+        // below. Everything downstream of that contract reads line one.
+        assert_eq!(
+            "3.1.0\nsutra  0.2.0-rc.1 (engine, f5b2d49)".lines().next(),
+            Some("3.1.0")
+        );
     }
 
     #[test]

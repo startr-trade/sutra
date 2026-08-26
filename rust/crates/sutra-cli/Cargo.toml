@@ -36,6 +36,11 @@ sutra-executor = { path = "../sutra-executor" }
 # Formats only: message-standard codecs are proprietary extension crates, and a deployment that
 # binds one is linted by the CLI of the distribution that bundles it.
 sutra-formats = { path = "../sutra-formats" }
+
+# The codec REGISTRY, for `codecs`: the command's whole point is that the answer is a property
+# of the running binary, so it asks the same inventory the loader resolves bindings through
+# rather than carrying a list of its own.
+sutra-codec-spi = { path = "../sutra-codec-spi" }
 # `sutra test simulate` (F5, the P1-7 time-skipping CLI wrapper): boots a real
 # `sutra_engine::serve` with `EngineConfig::now_override` installed from Rust code, and reuses
 # `fast_forward_until`. This is a Rust-level construction, the SAME sanctioned pattern an app

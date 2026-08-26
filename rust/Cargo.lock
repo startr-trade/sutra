@@ -5749,6 +5749,7 @@ dependencies = [
  "sutra-bpmn",
  "sutra-catalog-gen",
  "sutra-channels",
+ "sutra-codec-spi",
  "sutra-crypto",
  "sutra-datastore",
  "sutra-docgen",
