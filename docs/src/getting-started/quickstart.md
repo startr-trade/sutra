@@ -83,7 +83,7 @@ curl -s -X POST http://$ENGINE/channels/sample-in \
 ```
 
 ```xml
-<Accepted process="sample"/>
+<Accepted xmlns="urn:sutra:deployment:my-first-app-main" process="sample"/>
 ```
 
 The `X-Api-Key` header is not optional: `channels.yaml` declares `apikey` auth on this
@@ -97,6 +97,12 @@ The **namespace is not decoration** either. The codec validates against
 element as far as the validator is concerned and comes back rejected with *no declaration
 found*. Payload namespaces are how every message standard this engine speaks — ISO 20022, MT,
 NACHA — identifies its documents.
+
+The **reply carries it too**, which is the half people miss. `Accepted` and `Rejected` are
+declared in this deployment's own schema alongside the inbound message, so an unqualified
+answer would be a different element from the one the schema declares — the same trap, on the
+way out — and a caller that validates what it receives could not check it at all. The contract
+runs in both directions. See `templates/sample-accepted.hbs`, which says so in a comment.
 
 That reply came out the other end of a real process: the channel decoded the XML, validated it
 against `sample.xsd`, started an instance, ran a gateway on the validation outcome, rendered a
@@ -114,7 +120,7 @@ curl -s -X POST http://$ENGINE/channels/sample-in \
 ```
 
 ```xml
-<Rejected process="sample" outcome="FATAL"
+<Rejected xmlns="urn:sutra:deployment:my-first-app-main" process="sample" outcome="FATAL"
           reason="element 'wrong' is not expected at this point of the content model"/>
 ```
 
