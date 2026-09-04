@@ -13,14 +13,20 @@
 //! - attributes → keys prefixed `@`; a leaf that also has attributes becomes a small map
 //!   of its `@attrs` plus a `#text` entry (omitted when blank);
 //! - element/attribute names use the LOCAL name (namespace prefix dropped); `xmlns`
-//!   declarations are structure, not data — skipped.
+//!   declarations and attributes in the XML Schema-instance namespace (`schemaLocation`,
+//!   `type`, `nil`) are structure, not data — skipped. The schema-instance test matches the
+//!   RESOLVED NAMESPACE, never the `xsi` prefix, which is only a convention: a conformant
+//!   sender may bind that namespace to any prefix, and the XSD validator already ignores it
+//!   by namespace (`sutra_xsd`), so the projection must agree or the two disagree about what
+//!   counts as data.
 //!
 //! The decode payload is the projection of the document element (its children +
 //! attributes — the same shape the XSD validate-and-project step yields), and the
 //! document element's local name is stamped as [`DecodeResult::message_type`].
 
 use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
-use quick_xml::reader::Reader;
+use quick_xml::name::{QName, ResolveResult};
+use quick_xml::reader::NsReader;
 use quick_xml::writer::Writer;
 
 use sutra_codec_spi::codec::{sanitize, PayloadCodec};
@@ -106,6 +112,29 @@ struct Element {
     text: String,
 }
 
+/// The XML Schema-instance namespace. Attributes bound to it (`schemaLocation`, `type`, `nil`)
+/// are schema-instance METADATA: the XSD validator accepts and ignores them, so the projection
+/// must not surface them as data.
+const XSI_NS: &[u8] = b"http://www.w3.org/2001/XMLSchema-instance";
+
+/// Is this attribute STRUCTURE rather than data — a namespace declaration, or an attribute in the
+/// XML Schema-instance namespace?
+///
+/// The schema-instance test is by RESOLVED NAMESPACE, not by prefix: `xsi` is a convention, and
+/// `xmlns:t="http://www.w3.org/2001/XMLSchema-instance" t:schemaLocation="…"` is the very same
+/// attribute. Unprefixed attributes are in no namespace (they never inherit the default `xmlns`),
+/// which `resolve_attribute` already reflects, so ordinary data attributes are untouched.
+fn is_structure(reader: &NsReader<&[u8]>, key: QName<'_>) -> bool {
+    let raw = key.as_ref();
+    if raw == b"xmlns" || raw.starts_with(b"xmlns:") {
+        return true;
+    }
+    matches!(
+        reader.resolver().resolve_attribute(key),
+        (ResolveResult::Bound(ns), _) if ns.as_ref() == XSI_NS
+    )
+}
+
 fn local_of(name: &[u8]) -> String {
     let s = String::from_utf8_lossy(name);
     match s.rsplit_once(':') {
@@ -120,7 +149,7 @@ fn local_of(name: &[u8]) -> String {
 // 0.37 semantics (entity unescaping only), so the deprecation is allowed deliberately.
 #[allow(deprecated)]
 fn parse_element(bytes: &[u8]) -> Result<Element, String> {
-    let mut reader = Reader::from_reader(bytes);
+    let mut reader = NsReader::from_reader(bytes);
     reader.config_mut().expand_empty_elements = true;
 
     let mut stack: Vec<Element> = Vec::new();
@@ -132,13 +161,11 @@ fn parse_element(bytes: &[u8]) -> Result<Element, String> {
                 let mut attrs = Vec::new();
                 for a in e.attributes() {
                     let a = a.map_err(|err| err.to_string())?;
-                    let key = a.key.as_ref();
-                    // Namespace declarations are structure, not data — skip (XmlToMap).
-                    if key == b"xmlns" || key.starts_with(b"xmlns:") {
+                    if is_structure(&reader, a.key) {
                         continue;
                     }
                     attrs.push((
-                        local_of(key),
+                        local_of(a.key.as_ref()),
                         a.unescape_value()
                             .map_err(|err| err.to_string())?
                             .into_owned(),

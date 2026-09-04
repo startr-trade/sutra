@@ -149,6 +149,45 @@ fn xml_namespace_prefixes_drop_to_local_names() {
     assert_eq!(json_payload(&r)["Id"], json!("7"));
 }
 
+#[test]
+fn xml_schema_instance_attributes_are_structure_under_any_prefix() {
+    // `xsi:schemaLocation` and friends are schema-instance METADATA: `sutra_xsd` accepts and
+    // ignores them (schema choice belongs to the codec, never to the packet), so the projection
+    // must not surface them as data either. The test binds the namespace to `t` and `zz` rather
+    // than `xsi`, because a prefix is not a namespace — a prefix-matching filter passes this XML
+    // and leaks `@schemaLocation` into the payload. The decoy `xsi` prefix bound to an unrelated
+    // namespace guards the converse: that attribute IS data.
+    let xml = r#"<Doc xmlns="urn:x"
+                      xmlns:t="http://www.w3.org/2001/XMLSchema-instance"
+                      xmlns:xsi="urn:not-the-schema-instance-namespace"
+                      t:schemaLocation="urn:x doc.xsd"
+                      xsi:keep="yes"
+                      version="2">
+                   <Amt Ccy="USD" xmlns:zz="http://www.w3.org/2001/XMLSchema-instance"
+                        zz:nil="false">10.00</Amt>
+                 </Doc>"#;
+    let r = XmlCodec.decode(xml.as_bytes(), Some("application/xml"));
+    assert_eq!(r.outcome, DecodeOutcome::Ok);
+    let m = json_payload(&r);
+    assert!(
+        m.get("@schemaLocation").is_none(),
+        "t:schemaLocation is the schema-instance namespace, whatever the prefix: {m}"
+    );
+    assert!(
+        m["Amt"].get("@nil").is_none(),
+        "zz:nil likewise, bound deeper in the document: {m}"
+    );
+    assert_eq!(
+        m["@keep"],
+        json!("yes"),
+        "a prefix spelled `xsi` bound elsewhere is ordinary data: {m}"
+    );
+    // Unprefixed attributes are in NO namespace and are never touched by the filter.
+    assert_eq!(m["@version"], json!("2"));
+    assert_eq!(m["Amt"]["@Ccy"], json!("USD"));
+    assert_eq!(m["Amt"]["#text"], json!("10.00"));
+}
+
 // ---- XXE hardening ------------------------------------------------------------------------
 
 #[test]
