@@ -53,9 +53,15 @@ pub fn basename(rel: &str) -> &str {
 
 /// Replace a file's extension with `.md` (`bpmn/foo.bpmn` -> `bpmn/foo.md`).
 pub fn with_md_ext(rel: &str) -> String {
+    with_ext(rel, "md")
+}
+
+/// Swap `rel`'s extension for `ext` (no dot). Used for a page's sidecar assets — the BPMN
+/// diagram's standalone `.svg` sits beside its `.md`, so the page can link it by bare filename.
+pub fn with_ext(rel: &str, ext: &str) -> String {
     match rel.rsplit_once('.') {
-        Some((stem, _ext)) => format!("{stem}.md"),
-        None => format!("{rel}.md"),
+        Some((stem, _old)) => format!("{stem}.{ext}"),
+        None => format!("{rel}.{ext}"),
     }
 }
 

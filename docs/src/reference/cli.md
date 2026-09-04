@@ -68,6 +68,36 @@ into a package, verified through the engine's own BPMN loader before being writt
 | `--message-type <TYPE>` | Inbound message type (default `<Process>Request`) |
 | `--force` | Overwrite an existing user-edited file (never implicit) |
 
+### `sutra create ci`
+
+```
+sutra create ci --provider github|bitbucket [--dir <DIR>]
+```
+
+Writes the pipeline for an existing workspace — `.github/workflows/sutra.yml` or
+`bitbucket-pipelines.yml` — as four steps in the order that fails cheapest first:
+
+1. `sutra package` over every directory under `packages/` — fail-closed validation, so a package
+   the engine would refuse to load never reaches a deployments directory;
+2. `sutra generate docs … --check` — the committed catalog still matches what it documents;
+3. `deploy/smoke.sh` against the real engine and the archive just sealed;
+4. publish — the catalog book to GitHub Pages, or printed to a PDF release artifact on a `v*`
+   tag under Bitbucket.
+
+The provider is explicit rather than detected: a scaffolded pipeline lands in a repository that
+usually already has one, with its own runners and conventions, and guessing would be guessing
+wrong in the file most likely to be deleted on sight.
+
+**The pipeline checks documentation and never writes it.** Regenerating in CI would author bot
+commits and race step 2 against its own output. When step 2 fails the fix is local — run
+`sutra generate docs` and commit the refreshed pages alongside the change that caused them, which
+is what keeps the diff reviewable.
+
+The release it installs is read from the same distribution seam `self-update` uses, pinned to the
+version of the CLI that wrote the file. A distribution's CLI, its engine image and its release
+channel are one matched set: a pipeline that fetched some other distribution's binary would
+resolve a different codec registry than the archive it had just sealed.
+
 ---
 
 ## Validate
@@ -296,10 +326,18 @@ reporting tool's own, `engine` the embedded engine's (equal for this binary):
 
 ## Generate
 
-### `sutra docgen`
+The generators all recompute output that is **derived, not authored**, and all share one
+`--check` drift gate that regenerates without writing — which is the shape a CI or pre-commit
+gate wants. That shared contract is why they sit under one verb. It is also what separates them
+from [`sutra create`](#sutra-create), which scaffolds files that become *yours*: a scaffold is
+headed "edit freely — this file is yours" and needs `--force` to overwrite your edits, while a
+generated page is headed "Do not edit above the MANUAL NOTES sentinel" and `--check` fails the
+build if you edited it. Two verbs, opposite guarantees — never one.
+
+### `sutra generate docs`
 
 ```
-sutra docgen --input <FOLDER> [--output <DIR>] [--check]
+sutra generate docs --input <FOLDER> [--output <DIR>] [--check]
 ```
 
 Recurses a folder of authored deployment artifacts — BPMN processes, DMN/`.srl` rules,
@@ -307,25 +345,29 @@ Handlebars/XSLT templates and their manifests, `channels.yaml`, `package.yaml`, 
 and emits a deterministic markdown catalog, one page per artifact. It parses through the engine's
 *own* loaders, so each page describes exactly what the engine loads rather than a second parser's
 opinion of it. `--check` generates into a temporary directory and reports drift instead of writing
-anything, which is the shape a CI or pre-commit gate wants. `sutra catalog` is its sibling for
-Rust source — same `--output` / `--check` contract, one page per source file, rooted at
-`--repo-root`.
+anything. `sutra generate catalog` is its sibling for Rust source — same `--output` / `--check`
+contract, one page per source file, rooted at `--repo-root`. A deployment package wants `docs`;
+`catalog` documents the engine's own source tree.
 
-### `sutra schemagen`
+Each BPMN page opens with a diagram in BPMN notation, auto-laid-out from the process graph —
+authored BPMN carries no `<bpmndi:BPMNDiagram>`, so no coordinates are needed in the source. The
+SVG is embedded in the page, scaled to the column, and linked to a full-size copy written beside
+it (`<name>.svg`) that opens in a new tab.
+
+### `sutra generate schema-handler`
 
 ```
-sutra schemagen generate <SCHEMAS_DIR> <OUT_DIR> [--full]
-sutra schemagen check    <SCHEMAS_DIR> <TREE_DIR> [--full]
+sutra generate schema-handler <SCHEMAS_DIR> <OUT_DIR> [--full] [--check]
 ```
 
 Compiles a directory of XSD schemas into Rust sources: the decode tables, the canonical map
 projection, and the shape metadata a schema-bound codec is built on. The schema files are the only
-input, and emission is byte-identical run to run after `rustfmt` — which is what makes `check`
-(regenerate in memory, diff against a committed tree, exit `1` on any difference) a usable drift
-gate. The default emission is the slim, data-driven form; `--full` additionally emits the typed
-model. `generate` writes only the files the generator itself produces and never touches
-hand-maintained ones alongside them.
+input, and emission is byte-identical run to run after `rustfmt` — which is what makes `--check`
+(regenerate in memory, diff against the tree at `<OUT_DIR>`, exit `1` on any difference) a usable
+drift gate. The default emission is the slim, data-driven form; `--full` additionally emits the
+typed model. A write run touches only the files the generator itself produces and never the
+hand-maintained ones alongside them — `support.rs` and `Cargo.toml` are yours.
 
-Both paths are arguments, not conventions: `schemagen` is a neutral tool over whatever corpus you
-point it at, and the crate it emits lives wherever the caller wants it — including in a repository
-that composes this one.
+Both paths are arguments, not conventions: it is a neutral tool over whatever corpus you point it
+at, and the crate it emits lives wherever the caller wants it — including in a repository that
+composes this one.

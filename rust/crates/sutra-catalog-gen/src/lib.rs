@@ -3,7 +3,7 @@
 //! The crate is a **library only** — the shipped entry point is the `sutra` CLI:
 //!
 //! ```text
-//! sutra catalog [--repo-root <path>] [--output <path>] [--check]
+//! sutra generate catalog [--repo-root <path>] [--output <path>] [--check]
 //! ```
 //!
 //! Emits the artifact-documentation page system for the Rust workspace under `rust/crates/**`:

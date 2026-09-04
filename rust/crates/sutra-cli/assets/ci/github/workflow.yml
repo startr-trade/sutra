@@ -1,0 +1,100 @@
+# generated-by: sutra create ci --provider github (edit freely — this file is yours)
+#
+# Four steps, in the order that fails cheapest first: validate the package, prove the committed
+# catalog still matches it, prove the flow actually answers, then publish the catalog to Pages.
+#
+# CI never WRITES documentation. The catalog is committed, so regenerating here would author bot
+# commits and race the very gate below. CI checks; a human regenerates and commits, in the same
+# change that moved the BPMN — which is what keeps the diff reviewable.
+name: sutra
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Required by the Pages deploy below. Drop them if you are not publishing the catalog.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One Pages deployment at a time; never cancel one midway.
+concurrency:
+  group: sutra-pages
+  cancel-in-progress: false
+
+env:
+  # Pinned, never `latest`: a pre-release tag deliberately does not move `latest`, and the
+  # archive this CLI seals is meant for the engine of the same release.
+  SUTRA_TAG: "%%CLI_TAG%%"
+  MDBOOK_VERSION: "0.5.4"
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install %%CLI_BINARY%%
+        run: |
+          set -eu
+          mkdir -p "$HOME/.local/bin"
+          curl -fsSL --retry 3 --connect-timeout 10 \
+            "https://github.com/%%CLI_REPO%%/releases/download/${SUTRA_TAG}/%%CLI_BINARY%%-${SUTRA_TAG}-x86_64-unknown-linux-musl.tar.gz" \
+            | tar xz -C "$HOME/.local/bin" %%CLI_BINARY%%
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      # 1. Fail-closed validation. `package` refuses to seal what the engine would refuse to
+      #    load, so a broken package never reaches a deployments directory.
+      - name: package
+        run: |
+          set -eu
+          mkdir -p dist
+          for pkg in packages/*/; do %%CLI_BINARY%% package "$pkg" -o dist; done
+
+      # 2. Drift gate. On failure the fix is local, not here:
+      #      %%CLI_BINARY%% generate docs --input packages --output catalog
+      #    then commit the refreshed pages alongside the change that caused them.
+      - name: catalog is in sync
+        run: %%CLI_BINARY%% generate docs --input packages --output catalog --check
+
+      # 3. The flow actually answers — the real engine, against the sealed archive.
+      - name: smoke
+        run: |
+          set -eu
+          cp dist/*.sutra deploy/deployments/
+          docker compose -f deploy/compose.yaml up -d --wait
+          ./deploy/smoke.sh
+
+      - name: engine logs (on failure)
+        if: failure()
+        run: docker compose -f deploy/compose.yaml logs --no-color engine | tail -200
+
+      # 4. Publish. The catalog IS the book's source tree (`book.toml` sets `src = "."`), so
+      #    nothing is copied or restructured. `mdbook build` is also the only gate on the
+      #    chapter links: it fails on a SUMMARY.md entry with no file behind it.
+      - name: build the catalog book
+        run: |
+          set -eu
+          curl -fsSL --retry 3 --connect-timeout 10 \
+            "https://github.com/rust-lang/mdBook/releases/download/v${MDBOOK_VERSION}/mdbook-v${MDBOOK_VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
+            | tar xz -C "$HOME/.local/bin" mdbook
+          mdbook build catalog -d "${GITHUB_WORKSPACE}/_site"
+
+      - name: upload the site
+        if: github.ref == 'refs/heads/main'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  publish:
+    if: github.ref == 'refs/heads/main'
+    needs: verify
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - id: deploy
+        uses: actions/deploy-pages@v4

@@ -11,6 +11,37 @@ This is the changelog for the **Rust-native** engine (`rust/` workspace). It beg
 
 ## [Unreleased]
 
+### Changed — the generators moved under one `generate` verb (BREAKING)
+
+`sutra docgen`, `sutra catalog` and `sutra schemagen` are replaced by
+
+```
+sutra generate docs           --input <folder>  [--output <dir>] [--check]
+sutra generate catalog        --repo-root <dir> [--output <dir>] [--check]
+sutra generate schema-handler <schemas> <out>   [--full] [--check]
+```
+
+**No aliases are kept** — the old spellings are gone, so any Makefile, pre-commit hook or
+pipeline that invokes them must move. Every invoker in this repository already has.
+
+The three are siblings in the way that matters to a caller: each recomputes output that is
+derived rather than authored, and each offers the same `--check` drift gate. Grouping them also
+draws the line against `sutra create`, which scaffolds files that become *yours* — a scaffold is
+headed "edit freely — this file is yours" and needs `--force` to overwrite your edits, while a
+generated page is headed "Do not edit above the MANUAL NOTES sentinel" and `--check` fails the
+build if you edited it. Opposite guarantees, so they stay under different verbs.
+
+`schema-handler` also drops its `generate` / `check` sub-verbs for the shared `--check` flag —
+under the new parent they would have read `sutra generate schema-handler generate …`. The
+`SUTRA.DOCGEN.*` / `SUTRA.CATALOG.*` / `SUTRA.SCHEMAGEN.*` diagnostic codes are unchanged: they
+are an output contract, not a command name.
+
+### Added — BPMN diagrams in the generated catalog
+
+`sutra generate docs` now opens each BPMN page with a diagram in BPMN notation, auto-laid-out
+from the process graph (authored BPMN carries no `<bpmndi:BPMNDiagram>`, and needs none). The SVG
+is embedded scaled to the column and linked to a full-size copy written beside the page.
+
 ### Changed — the workspace ships no message-standard codec
 
 Every business codec left this workspace for a proprietary repository that composes it as a

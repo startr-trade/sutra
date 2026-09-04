@@ -3,7 +3,7 @@
 //! The crate is a **library only** — the shipped entry point is the `sutra` CLI:
 //!
 //! ```text
-//! sutra docgen --input <folder> [--output <dir>] [--check]
+//! sutra generate docs --input <folder> [--output <dir>] [--check]
 //! ```
 //!
 //! Recurses a folder of user-authored deployment artifacts — BPMN processes, DMN/SRL rules,

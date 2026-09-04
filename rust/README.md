@@ -48,7 +48,7 @@ described in the book's *Engine layering* chapter. This table is the flat index.
 | `sutra-formats` | The schema-less built-ins — `json`, `xml`, `yaml`, `csv`, `raw-text`, `raw-bytes`. |
 | `sutra-codec-schema` | Schema-backed codecs built on demand from a deployment archive's own schemas (XSD structural, JSON Schema). |
 | `sutra-xsd` | An XSD-subset compiler with two back-ends: a streaming instance validator that collects every violation with `line:col`, and navigation-shape emission that lets template and FEEL paths be checked at deploy time. |
-| `sutra-schema-gen` | The offline generator (`sutra schemagen`): parses a directory of message-definition XSDs and emits Rust binding sources — model, lenient decoder, canonical map projection, shape metadata. |
+| `sutra-schema-gen` | The offline generator (`sutra generate schema-handler`): parses a directory of message-definition XSDs and emits Rust binding sources — model, lenient decoder, canonical map projection, shape metadata. |
 | `sutra-redactor-spi`, `sutra-redactor-template` | The content-redactor SPI and the archive-supplied Handlebars redactor built on it. |
 | `sutra-crypto` | The encryption-at-rest seam: an AES-256-GCM payload cipher plus an envelope key provider, so `@sensitive` variables persist as ciphertext. |
 

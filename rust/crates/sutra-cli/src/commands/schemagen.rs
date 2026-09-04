@@ -1,4 +1,4 @@
-//! `sutra schemagen` — (re)generate the Rust binding sources for an XSD message corpus,
+//! `sutra generate schema-handler` — (re)generate the Rust binding sources for an XSD message corpus,
 //! or drift-check the committed tree against a fresh generation. Thin binding over
 //! `sutra_schema_gen`: zero configuration, the XSD files are the only input, and the
 //! emission is byte-identical to the committed sources after `rustfmt`.
@@ -14,7 +14,7 @@ use crate::exit;
 use crate::output::{report_format, Diagnostic, Io, ReportFormat};
 use crate::GlobalArgs;
 
-/// Diagnostic codes owned by `sutra schemagen` (the `SUTRA.SCHEMAGEN.*` family).
+/// Diagnostic codes owned by `sutra generate schema-handler` (the `SUTRA.SCHEMAGEN.*` family).
 pub mod codes {
     pub const DRIFT: &str = "SUTRA.SCHEMAGEN.DRIFT";
     pub const FAILED: &str = "SUTRA.SCHEMAGEN.FAILED";
@@ -136,7 +136,7 @@ fn check(args: CheckArgs, format: ReportFormat, io: &mut Io<'_>) -> i32 {
             } else {
                 let _ = writeln!(
                     io.out,
-                    "check failed: {} file(s) drifted; run `sutra schemagen generate` and commit",
+                    "check failed: {} file(s) drifted; run `sutra generate schema-handler` and commit",
                     report.drift.len()
                 );
             }

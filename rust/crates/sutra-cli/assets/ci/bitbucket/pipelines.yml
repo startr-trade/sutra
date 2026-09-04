@@ -1,0 +1,94 @@
+# generated-by: sutra create ci --provider bitbucket (edit freely — this file is yours)
+#
+# Four steps, in the order that fails cheapest first: validate the package, prove the committed
+# catalog still matches it, prove the flow actually answers, then — on a release tag — print the
+# catalog to a PDF and attach it as a downloadable artifact.
+#
+# CI never WRITES documentation. The catalog is committed, so regenerating here would author bot
+# commits and race the very gate below. CI checks; a human regenerates and commits, in the same
+# change that moved the BPMN — which is what keeps the diff reviewable.
+image: atlassian/default-image:4
+
+definitions:
+  services:
+    docker:
+      memory: 3072
+
+  steps:
+    - step: &verify
+        name: package + catalog drift + smoke
+        services:
+          - docker
+        script:
+          # Pinned, never `latest`: a pre-release tag deliberately does not move `latest`, and
+          # the archive this CLI seals is meant for the engine of the same release.
+          - export SUTRA_TAG="%%CLI_TAG%%"
+          - mkdir -p "$HOME/.local/bin" && export PATH="$HOME/.local/bin:$PATH"
+          - >
+            curl -fsSL --retry 3 --connect-timeout 10
+            "https://github.com/%%CLI_REPO%%/releases/download/${SUTRA_TAG}/%%CLI_BINARY%%-${SUTRA_TAG}-x86_64-unknown-linux-musl.tar.gz"
+            | tar xz -C "$HOME/.local/bin" %%CLI_BINARY%%
+
+          # 1. Fail-closed validation — `package` refuses to seal what the engine would refuse
+          #    to load, so a broken package never reaches a deployments directory.
+          - mkdir -p dist
+          - for pkg in packages/*/; do %%CLI_BINARY%% package "$pkg" -o dist; done
+
+          # 2. Drift gate. On failure the fix is local, not here:
+          #      %%CLI_BINARY%% generate docs --input packages --output catalog
+          #    then commit the refreshed pages alongside the change that caused them.
+          - %%CLI_BINARY%% generate docs --input packages --output catalog --check
+
+          # 3. The flow actually answers — the real engine, against the sealed archive.
+          - cp dist/*.sutra deploy/deployments/
+          - docker compose -f deploy/compose.yaml up -d --wait
+          - ./deploy/smoke.sh || { docker compose -f deploy/compose.yaml logs --no-color engine | tail -200; exit 1; }
+        artifacts:
+          - dist/**
+
+pipelines:
+  default:
+    - step: *verify
+
+  pull-requests:
+    '**':
+      - step: *verify
+
+  tags:
+    'v*':
+      - step: *verify
+      - step:
+          name: catalog PDF
+          script:
+            - set -eu
+            - export PATH="$HOME/.local/bin:$PATH"
+            - mkdir -p "$HOME/.local/bin"
+            - mdbook_version="0.5.4"
+            # `mdbook build` is the only gate on the chapter links: it fails on a SUMMARY.md
+            # entry with no file behind it. The catalog IS the book's source tree
+            # (`book.toml` sets `src = "."`), so nothing is copied or restructured.
+            - >
+              curl -fsSL --retry 3 --connect-timeout 10
+              "https://github.com/rust-lang/mdBook/releases/download/v${mdbook_version}/mdbook-v${mdbook_version}-x86_64-unknown-linux-gnu.tar.gz"
+              | tar xz -C "$HOME/.local/bin" mdbook
+            - mdbook build catalog -d /tmp/book
+            - test -f /tmp/book/print.html || { echo "FATAL: the book built no print.html to print from" >&2; exit 1; }
+
+            # Printed from mdBook's own print.html, so this is the real book rather than a
+            # converted approximation: every chapter in one document, the book's own CSS, and
+            # the BPMN diagrams as vector — they are inline SVG in the page, so unlike a
+            # JavaScript-rendered diagram there is nothing for the print to race.
+            - command -v chromium >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y --no-install-recommends chromium fonts-liberation; }
+            - pdf="%%APP%%-catalog-${BITBUCKET_TAG#v}.pdf"
+            - >
+              chromium --headless --disable-gpu --no-sandbox
+              --virtual-time-budget=30000 --run-all-compositor-stages-before-draw
+              --no-pdf-header-footer --print-to-pdf="$pdf"
+              "file:///tmp/book/print.html"
+            # A print that finished early is still a perfectly valid PDF, and a one-page one is
+            # what a failed print looks like. Assert the shape rather than trusting the exit code.
+            - pages="$(python3 -c "import re,sys;print(len(re.findall(rb'/Type\s*/Page[^s]', open(sys.argv[1],'rb').read())))" "$pdf")"
+            - '[ "$pages" -ge 2 ] || { echo "FATAL: the PDF has only ${pages} page(s) — the print did not complete" >&2; exit 1; }'
+            - echo "pdf built: ${pages} pages, $(du -h "$pdf" | cut -f1)"
+          artifacts:
+            - '*.pdf'

@@ -1,0 +1,12 @@
+# generated-by: sutra create app (edit freely — this file is yours)
+#
+# Sealed archives are BUILD OUTPUT, not source. `sutra package packages/<pkg>` derives one from
+# the package directory — manifest, per-file digests and the content-addressed deployment id are
+# all computed at seal time — and dropping it here is what deploys it. Committing one would
+# check in a binary that changes on every rebuild and can never be reviewed, while the thing it
+# was built from (packages/) is already in the repository.
+deployments/*.sutra
+
+# Local run state: `docker compose` writes nothing here by default, but a bind-mounted volume or
+# an .env with dev credentials is a common local addition, and neither belongs in git.
+.env

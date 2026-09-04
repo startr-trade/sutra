@@ -35,6 +35,31 @@ pub enum CreateAction {
     Deployment(DeploymentArgs),
     /// Generate a process with the validation-gateway wiring into a package.
     Bpmn(BpmnArgs),
+    /// Scaffold the CI pipeline for an existing workspace: package, catalog drift gate, smoke,
+    /// then publish the catalog (GitHub Pages, or a PDF artifact on Bitbucket).
+    Ci(CiArgs),
+}
+
+/// Which CI system to write for. Deliberately explicit — a scaffolded pipeline lands in a repo
+/// that usually already has one, with its own runners and conventions, so guessing the provider
+/// would be guessing wrong in the file most likely to be deleted on sight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum CiProvider {
+    /// `.github/workflows/sutra.yml` — verify, then publish the catalog to GitHub Pages.
+    Github,
+    /// `bitbucket-pipelines.yml` — verify, then print the catalog to a PDF release artifact.
+    Bitbucket,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct CiArgs {
+    /// The CI system to generate for.
+    #[arg(long, value_enum)]
+    pub provider: CiProvider,
+
+    /// Workspace root — the directory holding `packages/` and `deploy/`.
+    #[arg(long, default_value = ".")]
+    pub dir: PathBuf,
 }
 
 #[derive(Debug, clap::Args)]
@@ -138,6 +163,7 @@ pub fn execute(args: CreateArgs, global: &GlobalArgs, io: &mut Io<'_>) -> i32 {
         CreateAction::App(a) => create_app(a, format, io),
         CreateAction::Deployment(a) => create_deployment(a, format, io),
         CreateAction::Bpmn(a) => create_bpmn(a, format, io),
+        CreateAction::Ci(a) => create_ci(a, format, io),
     }
 }
 
@@ -229,6 +255,13 @@ fn create_app(args: AppArgs, format: ReportFormat, io: &mut Io<'_>) -> i32 {
     put(
         root.join("deploy/deployments/README.md"),
         render(asset("app/deploy/deployments/README.md"), &vars),
+        &mut report,
+    );
+    // Keeps sealed archives out of git: they are derived from packages/, change on every
+    // rebuild, and are unreviewable as a diff.
+    put(
+        root.join("deploy/.gitignore"),
+        render(asset("app/deploy/.gitignore"), &vars),
         &mut report,
     );
 
@@ -328,6 +361,100 @@ fn create_app(args: AppArgs, format: ReportFormat, io: &mut Io<'_>) -> i32 {
             root.display()
         ),
     );
+    exit::OK
+}
+
+/// Scaffold the CI pipeline for an existing workspace.
+///
+/// Four steps in the order that fails cheapest first — `package` (fail-closed validation),
+/// `generate docs --check` (the committed catalog still matches), the smoke run (the flow answers),
+/// then publish. Docs publishing alone would have been the prettiest and least useful third of it.
+///
+/// The pipeline CHECKS documentation and never writes it: the catalog is committed, so
+/// regenerating in CI would author bot commits and race its own drift gate.
+fn create_ci(args: CiArgs, format: ReportFormat, io: &mut Io<'_>) -> i32 {
+    let root = args.dir.clone();
+    if !root.join("packages").is_dir() {
+        let _ = writeln!(
+            io.err,
+            "create ci: {} has no packages/ — run this inside an app workspace \
+             (`sutra create app <name>` makes one)",
+            root.display()
+        );
+        return exit::USAGE;
+    }
+    // The workspace name is its directory name — the same thing `create app` used.
+    let app = root
+        .canonicalize()
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| "app".to_string());
+
+    // The release the pipeline installs, read from the SAME distribution seam `self-update`
+    // reads: a distribution's CLI, its engine image and its release channel are one matched set,
+    // and a pipeline that fetched some other distribution's binary would resolve a different
+    // codec registry than the archive it just sealed.
+    let binary = crate::program_name();
+    let tag = format!("v{}", crate::product_version());
+    let repo = crate::update_source()
+        .and_then(|src| match &src.channel {
+            crate::UpdateChannel::GithubReleases { repo } => Some(repo.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| "OWNER/REPO".to_string());
+
+    let vars: Vec<(&str, &str)> = vec![
+        ("APP", app.as_str()),
+        ("CLI_BINARY", binary.as_str()),
+        ("CLI_TAG", tag.as_str()),
+        ("CLI_REPO", repo.as_str()),
+    ];
+
+    let (asset_path, target) = match args.provider {
+        CiProvider::Github => (
+            "ci/github/workflow.yml",
+            root.join(".github/workflows/sutra.yml"),
+        ),
+        CiProvider::Bitbucket => (
+            "ci/bitbucket/pipelines.yml",
+            root.join("bitbucket-pipelines.yml"),
+        ),
+    };
+
+    let mut report = WriteReport::default();
+    let mut failed = false;
+    match scaffold::write_pristine(&target, &render(asset(asset_path), &vars)) {
+        Ok(outcome) => report.record(&target, outcome),
+        Err(e) => {
+            failed = true;
+            report.record(&target, WriteOutcome::SkippedExisting);
+            tracing::error!(path = %target.display(), error = %e, "scaffold write failed");
+        }
+    }
+    if failed {
+        let _ = writeln!(io.err, "create ci: could not write {}", target.display());
+        return exit::USAGE;
+    }
+
+    let next = if repo == "OWNER/REPO" {
+        format!(
+            "next: set CLI_REPO in {} — this build publishes no release channel, so the \
+             install step could not be resolved",
+            target.display()
+        )
+    } else {
+        match args.provider {
+            CiProvider::Github => format!(
+                "next: enable Pages (Settings -> Pages -> Source: GitHub Actions), then push. \
+                 The pipeline pins {binary} {tag}"
+            ),
+            CiProvider::Bitbucket => format!(
+                "next: enable Pipelines, then tag a release (v*) for the catalog PDF. \
+                 The pipeline pins {binary} {tag}"
+            ),
+        }
+    };
+    finish("create ci", &root, &report, format, io, &next);
     exit::OK
 }
 
@@ -739,6 +866,60 @@ mod tests {
     }
 
     #[test]
+    fn create_ci_writes_a_pipeline_per_provider_with_every_token_resolved() {
+        let dir = scratch_dir("create-ci");
+        let (code, out, _) = run(app_args("payments", &dir), None);
+        assert_eq!(code, crate::exit::OK, "{out}");
+        let root = dir.join("payments");
+
+        for (provider, rel) in [
+            (CiProvider::Github, ".github/workflows/sutra.yml"),
+            (CiProvider::Bitbucket, "bitbucket-pipelines.yml"),
+        ] {
+            let action = CreateAction::Ci(CiArgs {
+                provider,
+                dir: root.clone(),
+            });
+            let (code, out, _) = run(action, None);
+            assert_eq!(code, crate::exit::OK, "{out}");
+
+            let body = std::fs::read_to_string(root.join(rel)).unwrap();
+            // An unresolved %%TOKEN%% is a template defect that would ship a broken pipeline.
+            assert!(!body.contains("%%"), "unrendered token in {rel}:\n{body}");
+            // The four steps, in the order that fails cheapest first.
+            assert!(body.contains("package"), "{rel} must seal the packages");
+            assert!(
+                body.contains("generate docs --input packages --output catalog --check"),
+                "{rel} must gate on catalog drift, not regenerate:\n{body}"
+            );
+            assert!(body.contains("smoke.sh"), "{rel} must run the smoke");
+            assert!(
+                body.contains("mdbook build catalog"),
+                "{rel} must build the book"
+            );
+            // The release is pinned to THIS binary's version — a distribution's CLI and its
+            // engine are a matched pair, and `latest` never moves for a pre-release tag.
+            assert!(
+                body.contains(&format!("v{}", crate::product_version())),
+                "{rel} must pin the CLI version:\n{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn create_ci_refuses_a_directory_that_is_not_a_workspace() {
+        let dir = scratch_dir("create-ci-bare");
+        let action = CreateAction::Ci(CiArgs {
+            provider: CiProvider::Github,
+            dir: dir.clone(),
+        });
+        let (code, _, err) = run(action, None);
+        assert_eq!(code, crate::exit::USAGE);
+        assert!(err.contains("has no packages/"), "{err}");
+        assert!(!dir.join(".github/workflows/sutra.yml").exists());
+    }
+
+    #[test]
     fn create_app_scaffolds_the_f3_workspace() {
         let dir = scratch_dir("create-app");
         let (code, out, _) = run(app_args("payments", &dir), None);
@@ -751,6 +932,7 @@ mod tests {
             "deploy/smoke.sh",
             "deploy/k8s/engine.yaml",
             "deploy/deployments/README.md",
+            "deploy/.gitignore",
             "packages/payments-main/package.yaml",
             "packages/payments-main/channels.yaml",
             "packages/payments-main/datastores.yaml",
@@ -763,6 +945,13 @@ mod tests {
         ] {
             assert!(root.join(path).is_file(), "missing {path}");
         }
+        // The point of the ignore is the sealed archives: they are derived from packages/,
+        // change on every rebuild, and are unreviewable as a diff.
+        let ignore = std::fs::read_to_string(root.join("deploy/.gitignore")).unwrap();
+        assert!(
+            ignore.contains("deployments/*.sutra"),
+            "the deploy ignore must cover sealed archives:\n{ignore}"
+        );
         for dir_name in [
             "packages/payments-main/rules",
             "packages/payments-main/scripts",

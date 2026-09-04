@@ -14,7 +14,7 @@
 //! minInclusive), and `simpleContent` + a required attribute (the value/attribute slot pair).
 //!
 //! The `.golden` file is generator OUTPUT, not hand-written: refresh it with
-//! `cargo run -p sutra-cli -- schemagen generate <this dir>/tests/data/schemas <tmp>` and copy
+//! `cargo run -p sutra-cli -- generate schema-handler <this dir>/tests/data/schemas <tmp>` and copy
 //! `test002v03.rs` over it, in the same commit as whatever generator change moved it.
 
 use std::path::Path;

@@ -1,4 +1,4 @@
-//! `sutra docgen` — generate (or drift-check) the authored-artifact markdown catalog for a
+//! `sutra generate docs` — generate (or drift-check) the authored-artifact markdown catalog for a
 //! folder of deployment artifacts: BPMN processes, DMN/SRL rules, Handlebars/XSLT templates and
 //! their manifests, `channels.yaml`, `package.yaml`, coverage files. Thin binding over
 //! `sutra_docgen`, which parses through the engine's OWN loaders so the pages describe
@@ -10,14 +10,16 @@ use crate::exit;
 use crate::output::{report_format, Diagnostic, Io, ReportFormat};
 use crate::GlobalArgs;
 
-/// Diagnostic codes owned by `sutra docgen` (the `SUTRA.DOCGEN.*` family).
+/// Diagnostic codes owned by `sutra generate docs` (the `SUTRA.DOCGEN.*` family — the codes
+/// are a
+/// stable output contract and deliberately keep their name through the command rename).
 pub mod codes {
     pub const DRIFT: &str = "SUTRA.DOCGEN.DRIFT";
     pub const FAILED: &str = "SUTRA.DOCGEN.FAILED";
 }
 
 #[derive(Debug, clap::Args)]
-pub struct DocgenArgs {
+pub struct DocsArgs {
     /// Folder recursed for authored deployment artifacts (BPMN/DMN/SRL/templates/YAML).
     #[arg(long, value_name = "FOLDER")]
     pub input: PathBuf,
@@ -33,18 +35,18 @@ pub struct DocgenArgs {
     pub check: bool,
 }
 
-pub fn execute(args: DocgenArgs, global: &GlobalArgs, io: &mut Io<'_>) -> i32 {
+pub fn execute(args: DocsArgs, global: &GlobalArgs, io: &mut Io<'_>) -> i32 {
     let format = match report_format(global.format.as_deref()) {
         Ok(f) => f,
         Err(msg) => {
-            let _ = writeln!(io.err, "docgen: {msg}");
+            let _ = writeln!(io.err, "docs: {msg}");
             return exit::USAGE;
         }
     };
     if !args.input.is_dir() {
         let _ = writeln!(
             io.err,
-            "docgen: input folder not found: {}",
+            "docs: input folder not found: {}",
             args.input.display()
         );
         return exit::USAGE;
@@ -106,7 +108,7 @@ fn check(cfg: &sutra_docgen::Config, format: ReportFormat, io: &mut Io<'_>) -> i
             } else {
                 let _ = writeln!(
                     io.out,
-                    "{} page(s) drifted; re-run `sutra docgen --input {} --output {}` and commit the refreshed pages",
+                    "{} page(s) drifted; re-run `sutra generate docs --input {} --output {}` and commit the refreshed pages",
                     drift.len(),
                     cfg.input.display(),
                     cfg.output.display()
@@ -150,8 +152,8 @@ mod tests {
             .join("../sutra-docgen/tests/fixtures/mini-package")
     }
 
-    fn args(output: &std::path::Path, check: bool) -> DocgenArgs {
-        DocgenArgs {
+    fn args(output: &std::path::Path, check: bool) -> DocsArgs {
+        DocsArgs {
             input: fixture_input(),
             output: Some(output.to_path_buf()),
             check,
@@ -160,7 +162,7 @@ mod tests {
 
     #[test]
     fn generates_the_catalog_for_a_folder_of_authored_artifacts() {
-        let out = scratch_dir("docgen-generate");
+        let out = scratch_dir("docs-generate");
         let (code, stdout, _) = run_captured("", |io| {
             execute(args(&out, false), &GlobalArgs::default(), io)
         });
@@ -172,7 +174,7 @@ mod tests {
 
     #[test]
     fn check_is_clean_after_a_generate_and_reports_drift_before_one() {
-        let out = scratch_dir("docgen-check");
+        let out = scratch_dir("docs-check");
         let (code, stdout, _) = run_captured("", |io| {
             execute(args(&out, true), &GlobalArgs::default(), io)
         });
@@ -193,7 +195,7 @@ mod tests {
 
     #[test]
     fn json_format_is_machine_consumable() {
-        let out = scratch_dir("docgen-json");
+        let out = scratch_dir("docs-json");
         let global = GlobalArgs {
             format: Some("json".into()),
             verbose: 0,
@@ -208,7 +210,7 @@ mod tests {
 
     #[test]
     fn missing_input_folder_is_a_usage_error() {
-        let a = DocgenArgs {
+        let a = DocsArgs {
             input: "/nonexistent/artifacts".into(),
             output: None,
             check: false,

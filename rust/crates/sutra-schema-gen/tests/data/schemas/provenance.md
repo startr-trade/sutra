@@ -34,7 +34,7 @@ Its committed emission lives next door at `../golden/test002v03.rs.golden`. That
 generator OUTPUT, not hand-written: refresh it with
 
 ```
-cargo run -p sutra-cli -- schemagen generate <this crate>/tests/data/schemas <tmp>
+cargo run -p sutra-cli -- generate schema-handler <this crate>/tests/data/schemas <tmp>
 ```
 
 and copy `test002v03.rs` over it, in the same commit as whatever generator change moved it.

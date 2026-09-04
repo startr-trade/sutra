@@ -159,6 +159,30 @@ The engine picks up the new archive and **flips atomically**: in-flight instance
 the version they started on, new messages land on the new one. No restart, no dropped request.
 That is the same mechanism you would use in production — there is no separate "dev mode".
 
+## 7. Regenerate the documentation
+
+The change you just made is also a documentation change, so refresh the catalog and commit both
+together:
+
+```bash
+sutra generate docs --input packages --output catalog
+```
+
+That writes one page per artifact — each BPMN page opening with a diagram in BPMN notation, laid
+out from the process graph itself (your `.bpmn` carries no coordinates, and needs none) — plus
+the `SUMMARY.md` and `book.toml` that make the whole catalog a buildable mdBook. `mdbook build
+catalog` turns it into a site or a PDF.
+
+This is not optional housekeeping. The catalog is committed, and `--check` is a gate:
+
+```bash
+sutra generate docs --input packages --output catalog --check
+```
+
+`sutra create ci --provider github` (or `bitbucket`) scaffolds a pipeline that runs exactly that,
+so a package whose docs have drifted from its BPMN fails the build. CI only ever *checks* —
+regenerating is yours, in the same commit as the change that caused it.
+
 ## Clean up
 
 ```bash

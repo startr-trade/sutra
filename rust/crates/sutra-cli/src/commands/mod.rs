@@ -20,8 +20,9 @@ pub mod deploy;
 pub mod deployments;
 pub mod describe;
 pub mod dispatch_graph;
-pub mod docgen;
+pub mod docs;
 pub mod explain;
+pub mod generate;
 pub mod lint;
 pub mod migrate;
 pub mod openapi;
@@ -80,13 +81,9 @@ pub enum Command {
     /// Remove a deployment from the shared instance's ConfigMap — the engine drains it
     /// (no new intake) and retires at zero instances + zero pending outbox.
     Undeploy(deploy::UndeployArgs),
-    /// Generate (or drift-check) the markdown catalog for a folder of authored deployment
-    /// artifacts — BPMN, DMN/SRL rules, templates, channels.yaml, package.yaml.
-    Docgen(docgen::DocgenArgs),
-    /// Generate (or drift-check) the Rust binding sources from an XSD corpus.
-    Schemagen(schemagen::SchemagenArgs),
-    /// Generate (or drift-check) the Rust artifact-documentation catalog for the workspace.
-    Catalog(catalog::CatalogArgs),
+    /// Regenerate derived artifacts — `docs`, `catalog`, `schema-handler` — each with the same
+    /// `--check` drift gate. Distinct from `create`, which scaffolds files that become yours.
+    Generate(generate::GenerateArgs),
 }
 
 impl Command {
@@ -113,9 +110,7 @@ impl Command {
             Command::Deployments(args) => deployments::execute(args, global, io),
             Command::Deploy(args) => deploy::execute_deploy(args, global, io),
             Command::Undeploy(args) => deploy::execute_undeploy(args, global, io),
-            Command::Docgen(args) => docgen::execute(args, global, io),
-            Command::Schemagen(args) => schemagen::execute(args, global, io),
-            Command::Catalog(args) => catalog::execute(args, global, io),
+            Command::Generate(args) => generate::execute(args, global, io),
         }
     }
 }

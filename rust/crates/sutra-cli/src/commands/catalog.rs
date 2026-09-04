@@ -1,9 +1,9 @@
-//! `sutra catalog` — generate (or drift-check) the Rust artifact-documentation catalog: one page
+//! `sutra generate catalog` — generate (or drift-check) the Rust artifact-documentation catalog: one page
 //! per source file, one crate-index page per `Cargo.toml`, and the workspace-root page. Thin
 //! binding over `sutra_catalog_gen`, which `syn`-parses the workspace on the stable
 //! toolchain and emits deterministic (sorted, byte-stable) pages.
 //!
-//! Sibling of [`super::docgen`]: this one documents Rust *source*, `docgen` documents *authored
+//! Sibling of [`super::docs`]: this one documents Rust *source*, `docs` documents *authored
 //! deployment artifacts*. Both preserve hand-written notes below the manual-notes sentinel.
 
 use std::path::PathBuf;
@@ -12,7 +12,7 @@ use crate::exit;
 use crate::output::{report_format, Diagnostic, Io, ReportFormat};
 use crate::GlobalArgs;
 
-/// Diagnostic codes owned by `sutra catalog` (the `SUTRA.CATALOG.*` family).
+/// Diagnostic codes owned by `sutra generate catalog` (the `SUTRA.CATALOG.*` family).
 pub mod codes {
     pub const DRIFT: &str = "SUTRA.CATALOG.DRIFT";
     pub const FAILED: &str = "SUTRA.CATALOG.FAILED";

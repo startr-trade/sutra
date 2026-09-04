@@ -123,11 +123,11 @@ and `make lint` cover the whole workspace. This workspace holds no generated bin
 schema corpus large enough to need one belongs to the extension crate that owns that message
 standard, along with whatever slow gate it needs.
 
-What stays here is the GENERATOR, `sutra-schema-gen` (shipped as `sutra schemagen`), fast to
+What stays here is the GENERATOR, `sutra-schema-gen` (shipped as `sutra generate schema-handler`), fast to
 build and fully covered by tier-1 — including a byte-equality golden gate that regenerates an
 authored fixture schema under `crates/sutra-schema-gen/tests/data/` and compares it to the
 committed emission beside it. If you regenerate a downstream tree, the drift gate is
-`sutra schemagen check <schemas-dir> <tree-dir>`: text-level, no rustc, and both paths are
+`sutra generate schema-handler <schemas-dir> <tree-dir> --check`: text-level, no rustc, and both paths are
 arbitrary.
 
 Still worth avoiding: ad-hoc `--all-features` invocations. Feature-set churn busts the build

@@ -12,8 +12,8 @@
 //! The crate is a **library only** — the shipped entry point is the `sutra` CLI:
 //!
 //! ```text
-//! sutra schemagen generate <schemas_dir> <out_dir> [--full]   # (re)generate sources
-//! sutra schemagen check    <schemas_dir> <tree_dir> [--full]  # drift gate: exit 1 on diff
+//! sutra generate schema-handler <schemas_dir> <out_dir> [--full]           # (re)generate
+//! sutra generate schema-handler <schemas_dir> <tree_dir> [--full] --check  # exit 1 on drift
 //! ```
 //!
 //! Default = the **slim** data-driven decode tables (the form a generated binding crate normally

@@ -11,10 +11,22 @@ use std::fmt::Write as _;
 use anyhow::{Context, Result};
 use sutra_bpmn::{BpmnModelLoader, Node, ProcessDefinition};
 
+use crate::render::diagram;
 use crate::util::cell;
 
+/// A rendered BPMN page: the markdown body, plus the standalone diagram the page links to.
+pub struct RenderedBpmn {
+    pub body: String,
+    /// The full-size SVG, written beside the page as a sidecar asset. `None` when the file
+    /// declares no flow nodes at all — an empty diagram is worse than none.
+    pub svg: Option<String>,
+}
+
 /// Render one `.bpmn` file's page body (no header/footer — the caller wraps those).
-pub fn render_bpmn_page(bytes: &[u8], rel: &str) -> Result<String> {
+///
+/// `svg_href` is the sidecar diagram's filename, relative to the page — the inline copy is
+/// wrapped in a link to it so a click opens the full-size diagram in a new tab.
+pub fn render_bpmn_page(bytes: &[u8], rel: &str, svg_href: &str) -> Result<RenderedBpmn> {
     let module = BpmnModelLoader::new()
         .load(bytes)
         .map_err(|e| anyhow::anyhow!("{}", e))
@@ -37,10 +49,32 @@ pub fn render_bpmn_page(bytes: &[u8], rel: &str) -> Result<String> {
         out.push('\n');
     }
 
+    // The diagram comes before the tables: the picture is the fastest way to read a flow, and
+    // the tables are the detail behind it. Authored BPMN carries no BPMNDI, so it is auto-laid
+    // out from the semantic model (see `render::diagram`).
+    let processes: Vec<&ProcessDefinition> = module.processes().iter().collect();
+    let svg = diagram::render_module_svg(&processes);
+    if let Some(svg) = &svg {
+        out.push_str("## Diagram\n\n");
+        // Raw HTML is fine in GFM and mdBook, so the SVG inlines directly — scaled to the column
+        // by its own `max-width:100%`. A reader who needs detail clicks through to the sidecar
+        // file, which opens full size (and zoomable) in a new tab. A markdown viewer that strips
+        // raw HTML still renders the rest of the page; the diagram simply degrades to the link.
+        let _ = writeln!(
+            out,
+            "<a href=\"{svg_href}\" target=\"_blank\" rel=\"noopener noreferrer\" \
+title=\"Open the full-size diagram in a new tab\">{svg}</a>"
+        );
+        let _ = writeln!(
+            out,
+            "\n[⤢ Open the full-size diagram in a new tab]({svg_href})\n"
+        );
+    }
+
     for process in module.processes() {
         render_process(&mut out, process);
     }
-    Ok(out)
+    Ok(RenderedBpmn { body: out, svg })
 }
 
 fn render_process(out: &mut String, p: &ProcessDefinition) {

@@ -53,11 +53,11 @@ of this generator.
 
 ## Usage
 
-The crate is a **library**; it ships through the one tooling binary as `sutra catalog`:
+The crate is a **library**; it ships through the one tooling binary as `sutra generate catalog`:
 
 ```
-sutra catalog --repo-root=<path> --output=<path>           # regenerate in place
-sutra catalog --repo-root=<path> --output=<path> --check   # CI: exit 1 on drift
+sutra generate catalog --repo-root=<path> --output=<path>           # regenerate in place
+sutra generate catalog --repo-root=<path> --output=<path> --check   # CI: exit 1 on drift
 ```
 
 Defaults: `--repo-root=.` and `--output=<repo-root>/catalog`.

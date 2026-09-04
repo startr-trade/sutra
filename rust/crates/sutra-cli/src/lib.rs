@@ -4,7 +4,7 @@
 //! (`lint`, `package`, `deployments`, `deploy`, `undeploy`, `openapi`, `crypto`),
 //! scaffolding (`create`), path coverage (`coverage init|check`), engine-driving test tooling
 //! (`test simulate` — the P1-7 time-skipping CLI wrapper, unrelated to the routing-only
-//! `simulate` above), and the documentation and code generators (`docgen`, `schemagen`,
+//! `simulate` above), and the documentation and code generators (`docs`, `schemagen`,
 //! `catalog`).
 //!
 //! Standing rules behind that surface:

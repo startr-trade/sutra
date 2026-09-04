@@ -86,6 +86,113 @@ fn bpmn_page_summarises_tasks_and_has_no_wait_states() {
 }
 
 #[test]
+fn bpmn_page_embeds_a_scaled_diagram_linked_to_a_sidecar_svg() {
+    let tree = discover::discover(&fixture_root()).unwrap();
+    let pages = render::generate_pages(&tree);
+    let page = find(&pages, "acme--mini-package--1.0.0/bpmn/flow.md");
+
+    // The fixture carries no <bpmndi:BPMNDiagram> — the whole point is that a diagram is still
+    // produced, auto-laid-out from the semantic model.
+    let src =
+        std::fs::read_to_string(fixture_root().join("acme--mini-package--1.0.0/bpmn/flow.bpmn"))
+            .expect("read the fixture BPMN");
+    assert!(
+        !src.contains("BPMNDiagram"),
+        "the fixture must stay DI-free or this test proves nothing"
+    );
+
+    assert!(page.content.contains("## Diagram"));
+    // Scaled inline: the SVG carries a viewBox and shrinks to the column rather than overflowing.
+    assert!(page
+        .content
+        .contains("<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox="));
+    assert!(page
+        .content
+        .contains("style=\"max-width:100%;height:auto\""));
+    // Click-through to the full-size copy, in a new tab.
+    assert!(page
+        .content
+        .contains("<a href=\"flow.svg\" target=\"_blank\""));
+    assert!(page
+        .content
+        .contains("[⤢ Open the full-size diagram in a new tab](flow.svg)"));
+
+    // BPMN notation, not a flowchart approximation: a circle for the events, a diamond for the
+    // gateway, rounded rects for the activities, arrow-headed sequence flows.
+    let svg = &find(&pages, "acme--mini-package--1.0.0/bpmn/flow.svg").content;
+    assert!(
+        svg.starts_with("<svg "),
+        "the sidecar is a standalone SVG document"
+    );
+    assert!(svg.contains("<circle "), "events draw as circles");
+    assert!(
+        svg.contains("marker-end=\"url(#arrow)\""),
+        "flows carry arrowheads"
+    );
+    assert!(
+        svg.contains("stroke-width=\"3\""),
+        "an end event has the thick BPMN ring"
+    );
+    // Every flow node is captioned by id, so the picture and the tables refer to the same thing.
+    assert!(
+        svg.contains("(balance-query-start)") || svg.contains("(Start)"),
+        "node ids caption the shapes:\n{svg}"
+    );
+}
+
+#[test]
+fn the_book_scaffolding_is_generated_and_derived_from_the_pages() {
+    let tree = discover::discover(&fixture_root()).unwrap();
+    let pages = render::generate_pages(&tree);
+    let summary = find(&pages, "SUMMARY.md");
+    let toml = find(&pages, "book.toml");
+
+    // `src = "."` — the catalog IS the book source, nothing is copied or restructured.
+    assert!(toml.content.contains("src = \".\""));
+    // book.toml is configuration too, so it carries the manual-settings sentinel; SUMMARY.md
+    // does not, because mdBook parses that file strictly and trailing prose breaks the build.
+    assert!(toml.content.contains("MANUAL SETTINGS BELOW"));
+    assert!(!summary.content.contains("MANUAL NOTES"));
+    assert!(summary.content.starts_with("# Summary"));
+
+    // EVERY markdown page is listed — `mdbook build` fails on an entry with no file behind it,
+    // and an unlisted page is silently not rendered. Derivation is what keeps the two in step.
+    for page in &pages {
+        if page.path.ends_with(".md") && page.path != "SUMMARY.md" {
+            assert!(
+                summary.content.contains(&format!("]({})", page.path)),
+                "{} is missing from SUMMARY.md:\n{}",
+                page.path,
+                summary.content
+            );
+        }
+    }
+    // Titles come from the pages themselves, so the book and the page can never disagree.
+    assert!(summary
+        .content
+        .contains("[BPMN process — `flow.bpmn`](acme--mini-package--1.0.0/bpmn/flow.md)"));
+    // The sidecar SVG is an asset, not a chapter — mdBook copies it, it is never listed.
+    assert!(!summary.content.contains(".svg"));
+}
+
+#[test]
+fn a_bpmn_file_with_no_flow_nodes_emits_no_diagram_and_no_sidecar() {
+    // An empty diagram is worse than none — the page keeps its tables and simply has no picture.
+    let rendered = render::bpmn::render_bpmn_page(
+        br#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  id="Definitions_empty" targetNamespace="urn:t">
+  <bpmn:process id="empty" isExecutable="true"/>
+</bpmn:definitions>"#,
+        "bpmn/empty.bpmn",
+        "empty.svg",
+    )
+    .expect("an empty process still renders a page");
+    assert!(rendered.svg.is_none());
+    assert!(!rendered.body.contains("## Diagram"));
+}
+
+#[test]
 fn dmn_page_renders_decision_table_and_manifest_applicability() {
     let tree = discover::discover(&fixture_root()).unwrap();
     let pages = render::generate_pages(&tree);

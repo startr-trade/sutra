@@ -10,7 +10,7 @@
 # The catalog has a single LIVE generator: rust/crates/sutra-catalog-gen — it emits the
 # rust/crates/** pages (source-file pages, Cargo.md crate/workspace indexes). Like the other
 # generators (sutra-docgen, sutra-schema-gen) it is a LIBRARY: every invocation goes through
-# the CLI (`sutra catalog` / `sutra docgen` / `sutra schemagen`), the workspace's one tooling
+# the CLI (`sutra generate catalog` / `... docs` / `... schema-handler`), the workspace's one tooling
 # binary. It only ever writes the rust/ subtree of the output directory; any other page
 # already present there is left untouched.
 
@@ -27,10 +27,10 @@ CATALOG_OUTPUT := $(if $(wildcard docs/design/artifact-documentation),docs/desig
 catalog: ## Regenerate the artifact-documentation catalog.
 	$(MAKE) --no-print-directory catalog-rust
 
-## The live generator for the rust/crates/** pages, shipped as the `sutra catalog`
+## The live generator for the rust/crates/** pages, shipped as the `sutra generate catalog`
 ## subcommand (release-it profile: it syn-parses the whole workspace, and debug is too slow).
-catalog-rust: ## Regenerate the Rust catalog pages (sutra catalog; sutra-catalog-gen).
-	cd rust && cargo run -q --profile release-it -p sutra-cli -- catalog \
+catalog-rust: ## Regenerate the Rust catalog pages (sutra generate catalog; sutra-catalog-gen).
+	cd rust && cargo run -q --profile release-it -p sutra-cli -- generate catalog \
 		--repo-root=.. --output=../$(CATALOG_OUTPUT)
 
 ## Check the catalog for drift WITHOUT writing (same as CI). Only the rust/ pages are
@@ -43,7 +43,7 @@ print-catalog-output:
 	@echo $(CATALOG_OUTPUT)
 
 catalog-rust-check: ## Verify the Rust catalog is in sync (generator --check).
-	cd rust && cargo run -q --profile release-it -p sutra-cli -- catalog \
+	cd rust && cargo run -q --profile release-it -p sutra-cli -- generate catalog \
 		--repo-root=.. --output=../$(CATALOG_OUTPUT) --check
 
 ## Install the OPTIONAL pre-commit hook (scripts/hooks/pre-commit) into the

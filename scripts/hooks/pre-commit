@@ -8,7 +8,7 @@
 # run `make install-hooks` once per clone/worktree to opt in (.git/hooks/ is not
 # tracked, so it must be reinstalled after a fresh clone).
 #
-# Fast-exit: `make catalog` runs `cargo run --release -p sutra-cli -- catalog`, which
+# Fast-exit: `make catalog` runs `cargo run --release -p sutra-cli -- generate catalog`, which
 # syn-parses the whole Rust workspace — too slow to pay on every commit. This hook
 # only regenerates when the commit actually stages changes under rust/crates/;
 # every other commit (docs, plan files, non-Rust scripts, etc.) exits immediately.

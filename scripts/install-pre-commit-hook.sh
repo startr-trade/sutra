@@ -6,7 +6,7 @@
 # artifact-documentation pages are a frozen snapshot. The former pre-commit
 # behaviour (auto-regenerating the Java catalog when a frozen-contract artifact
 # was staged) no longer applies. The single live catalog generator is the Rust
-# `sutra-catalog-gen` library (shipped as `sutra catalog`), regenerated on demand
+# `sutra-catalog-gen` library (shipped as `sutra generate catalog`), regenerated on demand
 # with `make catalog` (a release build,
 # too heavy for a commit hook). This installer therefore now writes a pass-through
 # hook; it is kept so a future project-specific check has a place to live.
