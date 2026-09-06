@@ -377,11 +377,7 @@ impl InboundChain {
             });
         }
         let Some(policy) = on_validation else {
-<<<<<<< HEAD
             // No <q:onValidation> means the flow said
-=======
-            // Design `schema-format-binding.md` R5: no <q:onValidation> means the flow said
->>>>>>> 79b95011be283b2fc1fa2abbc68ff3fe0351523c
             // NOTHING about handling a validation failure, so the failure must not enter it — the
             // codec answers the caller instead. This is `reject`, deliberately not `error`: an
             // `error` raises a BPMN error into a process that, by definition, declared no handler
