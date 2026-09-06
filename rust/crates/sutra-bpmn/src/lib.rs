@@ -35,6 +35,7 @@ pub use error::SutraError;
 pub use loader::BpmnModelLoader;
 pub use model::{
     BpmnImport, CoveragePath, DataMapping, DeclaredVariable, FieldType, Node, ProcessAudit,
-    ProcessDefinition, ProcessModule, SequenceFlow,
+    ProcessDefinition, ProcessModule, SequenceFlow, DEFAULT_LOOP_ITEM_VARIABLE,
+    LOOP_COUNTER_VARIABLE,
 };
 pub use timer::{TimerCycleSpec, TimerDefinition, TimerSpecRejection};

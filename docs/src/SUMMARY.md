@@ -23,6 +23,7 @@
 - [Testing time: fast-forwarding durable timers](building/testing-time.md)
 - [Coverage: declared routes as the compliance signal](building/coverage.md)
 - [Worked example: money-transfer](building/worked-example.md)
+- [Worked example: loading a batch file](building/batch-loading.md)
 
 # Architecture
 

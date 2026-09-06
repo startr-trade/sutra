@@ -50,7 +50,20 @@ fn inbound(channel: &str, body: &[u8], content_type: &str) -> InboundMessage {
     }
 }
 
+/// A start event on `orders-in` with the named complex validators on its chain.
+///
+/// When a validator chain IS declared, the fixture also declares `<q:onValidation mode="route"/>`.
+/// That is the explicit opt-in to "let the payload through, the flow triages
+/// `payload.validation.issues`" — which is what these tests are about (the chain accumulating
+/// issues), and which since design `schema-format-binding.md` R5 must be stated rather than
+/// assumed: a contract-bearing intake with NO policy now refuses the message instead of passing
+/// it on. `default_posture_rejects_when_a_validator_chain_has_no_policy` covers that default.
 fn bpmn_with_source(validators: &[&str]) -> String {
+    let policy = if validators.is_empty() {
+        ""
+    } else {
+        r#"<q:onValidation mode="route"/>"#
+    };
     let mut chain = String::new();
     if !validators.is_empty() {
         chain.push_str("<q:validators>");
@@ -67,6 +80,7 @@ fn bpmn_with_source(validators: &[&str]) -> String {
             <bpmn:startEvent id="S">
               <bpmn:extensionElements>
                 <q:source channel="orders-in" name="payload">{chain}</q:source>
+                {policy}
               </bpmn:extensionElements>
             </bpmn:startEvent>
             <bpmn:serviceTask id="T" implementation="capture"/>
@@ -605,6 +619,11 @@ fn simple_validator_runs_on_the_value_resolved_at_its_path() {
                     <q:simpleValidator ref="currency-check" path="payload"/>
                   </q:validators>
                 </q:source>
+                <!-- The explicit opt-in to "let the payload through, the flow triages the
+                     issues": this test is about the value a simple validator is FED, so the
+                     message must reach the flow. Since R5 a contract-bearing intake with no
+                     policy refuses instead. -->
+                <q:onValidation mode="route"/>
               </bpmn:extensionElements>
             </bpmn:startEvent>
             <bpmn:serviceTask id="T" implementation="capture"/>
@@ -1788,4 +1807,65 @@ fn idempotent_failure_requeues_and_records_no_incident() {
         h.incidents.is_empty(),
         "idempotent failure must not dead-letter"
     );
+}
+
+// ---- R5: the fail-closed default posture ----------------------------------------------------
+
+/// A contract-bearing intake (here: a declared validator chain) whose flow states NO
+/// `<q:onValidation>` refuses the message rather than passing it on. The flow said nothing about
+/// handling failure, so the failure must not reach it — design `schema-format-binding.md` R5.
+#[test]
+fn default_posture_rejects_when_a_validator_chain_has_no_policy() {
+    let bpmn = r#"<?xml version="1.0"?>
+        <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                          xmlns:q="urn:sutra:q:1.0">
+          <bpmn:process id="echo">
+            <bpmn:startEvent id="S">
+              <bpmn:extensionElements>
+                <q:source channel="orders-in" name="payload">
+                  <q:validators><q:complexValidator source="boom"/></q:validators>
+                </q:source>
+              </bpmn:extensionElements>
+            </bpmn:startEvent>
+            <bpmn:serviceTask id="T" implementation="capture"/>
+            <bpmn:endEvent id="E"/>
+            <bpmn:sequenceFlow id="f1" sourceRef="S" targetRef="T"/>
+            <bpmn:sequenceFlow id="f2" sourceRef="T" targetRef="E"/>
+          </bpmn:process>
+        </bpmn:definitions>"#;
+    let h = harness(
+        bpmn,
+        vec![Box::new(|r| r.register(FailingValidator::named("boom")))],
+    );
+
+    let diagnostic = drive(h.engine.dispatch(&inbound("orders-in", b"x", "text/plain")))
+        .expect_err("a contract-bearing intake with no policy must refuse");
+    assert_eq!(diagnostic.code, "SUTRA.INBOUND.VALIDATION_REJECT");
+    // The refusal names the remedy, and records that it came from the DEFAULT rather than a
+    // declared `mode="reject"` — the two are the same outcome but not the same authoring event.
+    assert_eq!(
+        diagnostic
+            .attributes
+            .get("defaultPosture")
+            .map(String::as_str),
+        Some("reject")
+    );
+    assert!(
+        diagnostic.message.contains("route"),
+        "the diagnostic must name the opt-out: {}",
+        diagnostic.message
+    );
+}
+
+/// The counterpart that must NOT change: a schema-less channel (a bare format / no codec, no
+/// validators) has no contract to fail. The format layer is fail-open by construction — it never
+/// rejects and leaves the raw bytes at `event.body` — so R5 does not reach it.
+#[test]
+fn schemaless_ingress_keeps_its_fail_open_posture() {
+    let h = harness(&bpmn_with_source(&[]), vec![]);
+    drive(
+        h.engine
+            .dispatch(&inbound("orders-in", b"not-json-at-all", "text/plain")),
+    )
+    .expect("schema-less ingress still proceeds");
 }

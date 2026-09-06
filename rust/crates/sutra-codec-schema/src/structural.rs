@@ -55,6 +55,27 @@ pub struct StructuralCodec {
     /// `Some` only in the validating (`compile_with_formats`) mode: the compiled schema set,
     /// per-root namespace, and per-root declared child order for json/yaml canonicalisation.
     validation: Option<Validation>,
+    /// `Some` when the manifest declared a tabular format (`csv` / `fixed-width`) — the BATCH
+    /// intake. A tabular body is a table, not a document, so it is validated ROW-WISE: each row
+    /// becomes one instance of the declared root and is validated on its own, and every row's
+    /// violations are reported together with a row-indexed path (design
+    /// `schema-format-binding.md` R2).
+    batch: Option<BatchFormats>,
+}
+
+/// The batch (tabular) intakes a codec accepts alongside its document formats — `csv` and/or
+/// `fixed-width`. Held as trait objects because the two differ only in how a line is split;
+/// everything downstream (wrap as a record, transcode, validate, project) is identical.
+///
+/// Both may be declared together: their content types are disjoint (`text/csv` /
+/// `application/csv` against `text/plain` / `application/x-fixed-width`), so an inbound body
+/// selects its parser unambiguously and one schema can serve two wire forms.
+struct BatchFormats {
+    parsers: Vec<std::sync::Arc<dyn PayloadCodec>>,
+    /// True when the tabular formats are the ONLY ones declared, which is what lets a body with
+    /// no content-type at all be read as a table rather than guessed at. With several tabular
+    /// parsers and no content-type, the FIRST declared wins.
+    sole: bool,
 }
 
 struct Validation {
@@ -80,6 +101,7 @@ impl StructuralCodec {
             boolean_fields,
             accepted_content_types: LEGACY_CONTENT_TYPES.iter().map(|s| s.to_string()).collect(),
             validation: None,
+            batch: None,
         }
     }
 
@@ -113,7 +135,7 @@ impl StructuralCodec {
             boolean_fields.extend(coercion.boolean_elements.iter().cloned());
         }
 
-        Ok(StructuralCodec {
+        let codec = StructuralCodec {
             urn: urn.to_string(),
             roots,
             number_fields,
@@ -124,7 +146,145 @@ impl StructuralCodec {
                 root_to_namespace,
                 child_orders,
             }),
-        })
+            batch: formats
+                .contains(&sutra_formats::CsvCodec::NAME)
+                .then(|| BatchFormats {
+                    parsers: vec![std::sync::Arc::new(sutra_formats::CsvCodec::default())],
+                    sole: formats.len() == 1,
+                }),
+        };
+        // `fixed-width` has no zero-config default, so it can only arrive through
+        // `compile_with_layout` carrying its declared columns. Reaching here with it declared
+        // means a caller skipped that path — fail closed rather than decode a table as a document.
+        if formats.contains(&sutra_formats::FixedWidthCodec::NAME) {
+            return Err(format!(
+                "codec '{urn}' declares format 'fixed-width', which carries no default layout — \
+                 build it with compile_with_layout so its declared columns travel with it"
+            ));
+        }
+        Ok(codec)
+    }
+
+    /// Build the validating codec with its manifest-declared tabular parser: the `csv:` block's
+    /// delimiter/header, or the `fixed-width:` block's column layout. `batch` is `None` for a
+    /// codec that declares no tabular format.
+    ///
+    /// A fixed-width layout is additionally checked AGAINST THE SCHEMA here, which is the whole
+    /// reason the layout lives in the manifest rather than being inferred: the columns are the
+    /// only names a fixed-width record has, so if they disagree with the bound type's declared
+    /// elements, every row would fail validation at runtime for a reason that is really a
+    /// configuration mistake. Catching it at package time turns that into one clear error.
+    /// (csv gets no equivalent check — its column names come from the header at RUNTIME, so there
+    /// is nothing to compare at package time.)
+    pub fn compile_with_layout(
+        urn: &str,
+        xsds: &[&[u8]],
+        formats: &[&str],
+        batch: Vec<std::sync::Arc<dyn PayloadCodec>>,
+        declared_columns: &[&str],
+    ) -> Result<StructuralCodec, LayoutCompileError> {
+        let document_formats: Vec<&str> = formats
+            .iter()
+            .copied()
+            .filter(|f| *f != sutra_formats::FixedWidthCodec::NAME)
+            .collect();
+        let mut codec = StructuralCodec::compile_with_formats(urn, xsds, &document_formats)
+            .map_err(LayoutCompileError::Schema)?;
+        codec.accepted_content_types = content_types_for(formats);
+        if !batch.is_empty() {
+            let tabular = batch.len();
+            codec.batch = Some(BatchFormats {
+                parsers: batch,
+                sole: formats.len() == tabular,
+            });
+        }
+        // Verified HERE, not by the caller: a layout that disagrees with the schema is the one
+        // failure mode this format has that csv does not, and leaving the check to whoever
+        // happens to build the codec would make it skippable by construction.
+        if !declared_columns.is_empty() {
+            codec
+                .verify_flat_columns(declared_columns)
+                .map_err(LayoutCompileError::Layout)?;
+        }
+        Ok(codec)
+    }
+
+    /// Check a DECLARED column set against the single root this codec covers: every column must
+    /// be a declared element of that type, and every REQUIRED element must have a column.
+    ///
+    /// This is for a wire form whose field names are configuration rather than data — a
+    /// fixed-width layout, where the columns are the record's only names. If they disagree with
+    /// the bound type, every row fails validation at runtime for what is really a configuration
+    /// mistake; checking at package time turns that into one clear error. A csv codec does NOT
+    /// call this: its column names come from the header at runtime, so there is nothing to
+    /// compare against here.
+    ///
+    /// Skipped (`Ok`) when the codec covers several roots — a flat layout cannot be attributed
+    /// to one of them, and `decode_batch` already refuses that case with its own message.
+    fn verify_flat_columns(&self, columns: &[&str]) -> Result<(), String> {
+        if self.roots.len() != 1 {
+            return Ok(());
+        }
+        let root = self.roots.iter().next().expect("len checked");
+        let Some(validation) = &self.validation else {
+            return Ok(());
+        };
+        let Some(schema) = validation.schema_set.schema_for_root(root) else {
+            return Ok(());
+        };
+        let Some(declared) = schema.fields_of(root) else {
+            return Ok(());
+        };
+        let unknown: Vec<&str> = columns
+            .iter()
+            .copied()
+            .filter(|c| !declared.iter().any(|d| d.name == *c))
+            .collect();
+        if !unknown.is_empty() {
+            let names: Vec<&str> = declared.iter().map(|d| d.name.as_str()).collect();
+            return Err(format!(
+                "fixed-width layout declares column(s) {unknown:?} that type '{root}' does not \
+                 declare (it declares {names:?}) — the columns ARE the record's only field names, \
+                 so every row would fail validation"
+            ));
+        }
+        let missing: Vec<&str> = declared
+            .iter()
+            .filter(|d| d.occurs_min > 0 && !columns.iter().any(|c| *c == d.name))
+            .map(|d| d.name.as_str())
+            .collect();
+        if !missing.is_empty() {
+            return Err(format!(
+                "fixed-width layout has no column for required element(s) {missing:?} of type \
+                 '{root}' — no row could ever validate"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Whether this decode is a tabular BATCH: the inbound content-type selects the tabular
+    /// parser, or there is no content-type at all and the tabular format is the only one
+    /// declared. A codec that declares csv alongside xml/json still reads an XML body as one
+    /// document.
+    fn batch_selected(&self, content_type: Option<&str>) -> bool {
+        self.batch_parser(content_type).is_some()
+    }
+
+    /// The tabular parser an inbound content-type selects: the first declared whose accepted
+    /// types admit it. With no content-type at all, the first declared parser — but only when
+    /// the codec declares nothing BUT tabular formats, so a codec that also serves xml/json
+    /// still reads an untyped body as a document.
+    fn batch_parser(
+        &self,
+        content_type: Option<&str>,
+    ) -> Option<&std::sync::Arc<dyn PayloadCodec>> {
+        let batch = self.batch.as_ref()?;
+        match content_type.map(str::trim).filter(|c| !c.is_empty()) {
+            Some(ct) => batch.parsers.iter().find(|p| {
+                sutra_codec_spi::content_type::accepts(&p.accepted_content_types(), Some(ct))
+            }),
+            None => batch.sole.then(|| &batch.parsers[0]),
+        }
     }
 
     /// The message-type roots this codec covers (diagnostics / routing introspection).
@@ -173,6 +333,9 @@ impl StructuralCodec {
     // ---- validating decode (compile_with_formats) --------------------------------------------
 
     fn decode_validating(&self, validation: &Validation, body: &[u8], ct: &str) -> DecodeResult {
+        if self.batch_selected(Some(ct)) {
+            return self.decode_batch(validation, body, ct);
+        }
         // 1. Canonical XML bytes: XML direct; json/yaml transcoded to the target namespace.
         let xml_bytes = match self.to_xml_bytes(validation, body, Some(ct)) {
             Ok(bytes) => bytes,
@@ -217,6 +380,131 @@ impl StructuralCodec {
             issues,
             content_type: ct.to_string(),
             message_type: (!root.is_empty()).then_some(root),
+        }
+    }
+
+    /// The BATCH decode: every row of a table validated as its own instance of the declared
+    /// root, in one pass, before the process sees anything (design R2).
+    ///
+    /// Each row is wrapped as `{Root: row}` and put through exactly the same transcode →
+    /// validate → project → coerce pipeline a single document takes, so a cell gets the identical
+    /// facet checking an element would — pattern, enumeration, `xs:dateTime`, numeric range —
+    /// and the row-indexed path (`value[3].durationSec`) names the offending cell.
+    ///
+    /// Outcomes follow the design's split: an unparseable FILE is FATAL (there are no rows to
+    /// speak of), while any row's violation is SOFT_ERRORS — the payload still projects and stays
+    /// routable, so `<q:onValidation>` decides whether the batch is refused or triaged in-flow.
+    fn decode_batch(&self, validation: &Validation, body: &[u8], ct: &str) -> DecodeResult {
+        let parser = self
+            .batch_parser(Some(ct))
+            .expect("batch_selected checked")
+            .clone();
+        // A csv codec covers ONE root: a table carries no root element to disambiguate with.
+        let root = match self.roots.len() {
+            1 => self.roots.iter().next().expect("len checked").clone(),
+            n => {
+                return fatal_decode(
+                    &format!(
+                        "codec '{}' declares {n} root elements, so a tabular body cannot be typed                          — a csv row carries no root element to select one. Bind one root per csv                          codec.",
+                        self.urn
+                    ),
+                    ct,
+                )
+            }
+        };
+        let parsed = parser.decode(body, Some(ct));
+        if parsed.outcome == DecodeOutcome::Fatal {
+            return DecodeResult::fatal(parsed.issues, ct);
+        }
+        let Some(CodecValue::Json(serde_json::Value::Array(rows))) = parsed.payload else {
+            return fatal_decode("tabular body did not parse to rows", ct);
+        };
+
+        let schema = validation
+            .schema_set
+            .schema_for_root(&root)
+            .or_else(|| validation.schema_set.schemas().first());
+        // Elements the type declares OPTIONAL. A tabular row has a cell for every column whether
+        // or not it carries a value, so an empty cell must read as ABSENT for these — otherwise
+        // `minOccurs="0"` is unusable with any tabular format: an empty optional column would
+        // emit `<x></x>` and fail the element's own facets (an enumeration rejects `''`), and
+        // every optional column would have to be populated in every row. A REQUIRED element with
+        // an empty cell is left alone: that is a genuine data error and must still be reported.
+        let optional: BTreeSet<String> = schema
+            .and_then(|s| s.fields_of(&root))
+            .map(|fields| {
+                fields
+                    .into_iter()
+                    .filter(|f| f.occurs_min == 0)
+                    .map(|f| f.name)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut issues: Vec<ValidationIssue> = parsed.issues;
+        let mut projected_rows: Vec<serde_json::Value> = Vec::with_capacity(rows.len());
+        for (index, row) in rows.into_iter().enumerate() {
+            let row = match row {
+                serde_json::Value::Object(mut map) => {
+                    map.retain(|k, v| {
+                        !(optional.contains(k) && v.as_str().is_some_and(str::is_empty))
+                    });
+                    serde_json::Value::Object(map)
+                }
+                other => other,
+            };
+            let mut document = serde_json::Map::new();
+            document.insert(root.clone(), row);
+            let xml_bytes = match self.transcode(validation, &serde_json::Value::Object(document)) {
+                Ok(bytes) => bytes,
+                Err(message) => {
+                    issues.push(row_issue(index, "", &message));
+                    continue;
+                }
+            };
+            if let Some(schema) = schema {
+                match schema.validate(&xml_bytes) {
+                    Ok(violations) => {
+                        for v in &violations {
+                            let mut issue = to_issue(v.diagnostic(DiagnosticProfile::MODULE_CODEC));
+                            issue.path = row_path(index, &issue.path);
+                            issues.push(issue);
+                        }
+                    }
+                    // A row that cannot even be read as a document is that ROW's failure, not the
+                    // file's — the rest of the batch is still reported on.
+                    Err(document_error) => {
+                        issues.push(row_issue(index, "", &document_error.to_string()));
+                        continue;
+                    }
+                }
+            }
+            let projected = XmlCodec.decode(&xml_bytes, Some("application/xml"));
+            match projected.payload {
+                Some(CodecValue::Json(row_json)) => {
+                    projected_rows.push(self.coerce(row_json, None))
+                }
+                _ => issues.push(row_issue(index, "", "row did not project")),
+            }
+        }
+
+        let outcome = if issues.is_empty() {
+            DecodeOutcome::Ok
+        } else {
+            DecodeOutcome::SoftErrors
+        };
+        // An array root projects under `value` — the same shape the JSON-schema path produces, so
+        // a flow reads `payload.value[0].<field>` whichever schema kind typed the table.
+        let mut payload = serde_json::Map::new();
+        payload.insert(
+            BATCH_ROOT_KEY.to_string(),
+            serde_json::Value::Array(projected_rows),
+        );
+        DecodeResult {
+            outcome,
+            payload: Some(CodecValue::Json(serde_json::Value::Object(payload))),
+            issues,
+            content_type: ct.to_string(),
+            message_type: Some(root),
         }
     }
 
@@ -353,6 +641,60 @@ impl StructuralCodec {
     }
 }
 
+/// Why `compile_with_layout` refused. The two are NOT interchangeable, and conflating them is
+/// how a layout fault once vanished: a caller that falls back to a shape-only codec on an
+/// unsupported XSD must NOT do the same for a bad layout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LayoutCompileError {
+    /// The XSD set is outside the supported subset. A caller may legitimately fall back to the
+    /// shape-only build: that is a deployment which used to load and still should, with a
+    /// narrower guarantee.
+    Schema(String),
+    /// The declared column layout disagrees with the schema. A configuration fault with exactly
+    /// one correct outcome — refuse — because every row of every upload would fail after it.
+    Layout(String),
+}
+
+impl std::fmt::Display for LayoutCompileError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LayoutCompileError::Schema(m) | LayoutCompileError::Layout(m) => f.write_str(m),
+        }
+    }
+}
+
+/// The key an array (batch) root projects under, so `payload.value[0].field` navigates a table
+/// the same way whichever schema kind typed it.
+pub const BATCH_ROOT_KEY: &str = "value";
+
+/// A row-indexed path: `value[3].durationSec`, or `value[3]` for a whole-row failure.
+///
+/// The XSD validator reports a POSITION (`line 1:362`) into the document it validated — which,
+/// for a batch, is a one-line XML fragment this codec synthesised, so the offset means nothing to
+/// whoever sent the file. A positional path is therefore dropped rather than appended: the row
+/// index is the part that locates the problem, and the message already names the element.
+fn row_path(index: usize, path: &str) -> String {
+    let path = path.trim().trim_start_matches('/').replace('/', ".");
+    if path.is_empty() || is_positional(&path) {
+        format!("{BATCH_ROOT_KEY}[{index}]")
+    } else {
+        format!("{BATCH_ROOT_KEY}[{index}].{path}")
+    }
+}
+
+/// A `line <n>:<col>` document position rather than a field path.
+fn is_positional(path: &str) -> bool {
+    path.starts_with("line ") && path.contains(':')
+}
+
+fn row_issue(index: usize, path: &str, message: &str) -> ValidationIssue {
+    ValidationIssue::error(
+        sutra_codec_spi::codes::RUNTIME_CODEC_DECODE_FAILED,
+        &row_path(index, path),
+        message.to_string(),
+    )
+}
+
 fn to_issue(diag: sutra_xsd::Diagnostic) -> ValidationIssue {
     ValidationIssue {
         code: diag.code,
@@ -403,6 +745,14 @@ fn content_types_for(formats: &[&str]) -> Vec<String> {
                 cts.push("application/x-yaml".to_string());
                 cts.push("application/yaml".to_string());
                 cts.push("text/yaml".to_string());
+            }
+            "csv" => {
+                cts.push("text/csv".to_string());
+                cts.push("application/csv".to_string());
+            }
+            "fixed-width" => {
+                cts.push("text/plain".to_string());
+                cts.push("application/x-fixed-width".to_string());
             }
             _ => {}
         }

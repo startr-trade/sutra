@@ -843,6 +843,14 @@ async fn serve_route(
     body: Bytes,
 ) -> Response {
     let routes = state.routes.current();
+    // Read once, up front: every failure below renders its RFC 7807 problem document in the
+    // format the caller speaks (design R4), so the content-type must be in hand before the first
+    // possible rejection — including the 404 and the 401.
+    let request_content_type = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let problem_ct = request_content_type.as_deref();
     let Some(channel) = routes.get(&route_key) else {
         return problem_response(
             404,
@@ -850,21 +858,18 @@ async fn serve_route(
                 codes::RESOLVE_CHANNEL_UNKNOWN,
                 format!("No channel bound at '{} {}'", route_key.0, route_key.1),
             ),
+            problem_ct,
         );
     };
 
     // 1. Authenticate (constant-time compare; never before reading config).
     if let Err(diagnostic) = authenticate(channel, &headers) {
-        return problem_response(401, &diagnostic);
+        return problem_response(401, &diagnostic, problem_ct);
     }
 
     // 2. Extract the inbound CloudEvent per `cloudevents.mode`. A failed extraction
     //    (missing required attribute, malformed envelope) is a 400 reject.
     let copied_headers = copy_headers(&headers);
-    let request_content_type = headers
-        .get(axum::http::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
     let extraction = match crate::cloudevents::extract(
         channel.ce_mode,
         &channel.channel_name,
@@ -877,7 +882,9 @@ async fn serve_route(
         },
     ) {
         Ok(x) => x,
-        Err(diagnostic) => return problem_response(status_for_code(&diagnostic.code), &diagnostic),
+        Err(diagnostic) => {
+            return problem_response(status_for_code(&diagnostic.code), &diagnostic, problem_ct)
+        }
     };
     // The effective body/content-type ride from the extraction (binary/native keep the
     // request body; structured lifts the envelope's data + inner content type).
@@ -918,7 +925,7 @@ async fn serve_route(
         // failure to the caller as a problem+json carrying the at-most-once incident code.
         Ok(DispatchOutcome::DeadLettered { code, detail, .. }) => {
             let diagnostic = Diagnostic::error(&code, detail);
-            problem_response(status_for_code(&diagnostic.code), &diagnostic)
+            problem_response(status_for_code(&diagnostic.code), &diagnostic, problem_ct)
         }
         // Unreachable: `EngineHandle::dispatch` consumes every handoff on the router side.
         Ok(DispatchOutcome::Handoff { .. }) => problem_response(
@@ -927,8 +934,11 @@ async fn serve_route(
                 codes::RUNTIME_UNEXPECTED,
                 "internal: a shard handoff escaped the engine router",
             ),
+            problem_ct,
         ),
-        Err(diagnostic) => problem_response(status_for_code(&diagnostic.code), &diagnostic),
+        Err(diagnostic) => {
+            problem_response(status_for_code(&diagnostic.code), &diagnostic, problem_ct)
+        }
     }
 }
 
@@ -1141,8 +1151,118 @@ fn status_for_code(code: &str) -> u16 {
     500
 }
 
-/// RFC 7807 `application/problem+json` — the small, stable shape.
-fn problem_response(status: u16, diagnostic: &Diagnostic) -> Response {
+/// The RFC 7807 problem document, rendered in the format the CALLER speaks.
+///
+/// The document's *model* is unchanged and remains the contract — `type`, `title`, `status`,
+/// `detail`, `code`, `attributes`. What varies is the syntax it is serialised in, chosen from the
+/// inbound content-type exactly as a reply is (design `schema-format-binding.md` R4): a client
+/// that posted `text/csv` should not get JSON back mid-conversation, and for a batch of per-cell
+/// violations a table is the more usable answer — the sender can diff it against the file they
+/// posted. `application/problem+json` stays the default and the fallback for any inbound whose
+/// format cannot render one.
+fn problem_response(status: u16, diagnostic: &Diagnostic, inbound: Option<&str>) -> Response {
+    let (content_type, bytes) = render_problem(status, diagnostic, inbound);
+    response_with(
+        StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+        &content_type,
+        bytes,
+    )
+}
+
+/// The problem document's fields, as an ordered name→text map — the one model every rendering
+/// serialises. `attributes` are flattened in (a csv row and an xml element have nowhere to nest a
+/// sub-object, and the flattened form loses nothing: the keys are already unique).
+fn problem_fields(status: u16, diagnostic: &Diagnostic) -> Vec<(String, String)> {
+    let mut fields = vec![
+        (
+            "type".to_string(),
+            format!("urn:bpm:diag:{}", diagnostic.code),
+        ),
+        ("title".to_string(), diagnostic.code.clone()),
+        ("status".to_string(), status.to_string()),
+        ("detail".to_string(), diagnostic.message.clone()),
+        ("code".to_string(), diagnostic.code.clone()),
+    ];
+    for (k, v) in &diagnostic.attributes {
+        fields.push((k.clone(), v.clone()));
+    }
+    fields
+}
+
+/// Serialise the problem document in the caller's format, returning `(content-type, bytes)`.
+fn render_problem(
+    status: u16,
+    diagnostic: &Diagnostic,
+    inbound: Option<&str>,
+) -> (String, Vec<u8>) {
+    let fields = problem_fields(status, diagnostic);
+    let is = |patterns: &[&str]| {
+        let patterns: Vec<String> = patterns.iter().map(|s| s.to_string()).collect();
+        inbound
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+            .is_some_and(|ct| crate::content_type::accepts(&patterns, Some(ct)))
+    };
+
+    if is(&["text/csv", "application/csv"]) {
+        // One row per field: a `name,value` table. For a batch rejection the caller gets the
+        // issue list in the same shape as the file they sent.
+        let rows: Vec<serde_json::Value> = fields
+            .iter()
+            .map(|(k, v)| serde_json::json!({ "field": k.clone(), "value": v.clone() }))
+            .collect();
+        // Reached through the SPI's built-in format registry, not by depending on the concrete
+        // format crate: `sutra-channels` resolves formats by name through the pull registry, and
+        // that layering is deliberate. A binary that did not link the csv format simply falls
+        // through to the JSON rendering below — the fail-safe, not a failure.
+        if let Some(csv) = sutra_codec_spi::builtin_formats()
+            .into_iter()
+            .find(|f| f.name == "csv")
+        {
+            if let Ok(bytes) = csv.codec.encode(
+                &sutra_codec_spi::CodecValue::Json(serde_json::Value::Array(rows)),
+                Some("text/csv"),
+            ) {
+                return ("text/csv".to_string(), bytes);
+            }
+        }
+    } else if is(&["application/xml", "text/xml", "application/*+xml"]) {
+        let mut xml = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?><problem>");
+        for (k, v) in &fields {
+            xml.push_str(&format!("<{k}>{}</{k}>", xml_escape(v)));
+        }
+        xml.push_str("</problem>");
+        return ("application/problem+xml".to_string(), xml.into_bytes());
+    } else if is(&["application/yaml", "application/x-yaml", "text/yaml"]) {
+        let mut yaml = String::new();
+        for (k, v) in &fields {
+            yaml.push_str(&format!("{k}: {}\n", yaml_scalar(v)));
+        }
+        return ("application/problem+yaml".to_string(), yaml.into_bytes());
+    }
+    (
+        "application/problem+json".to_string(),
+        problem_json(status, diagnostic),
+    )
+}
+
+/// Minimal XML text escaping for the problem rendering (the values are diagnostic text, never
+/// markup, so the five predefined entities are the whole job).
+fn xml_escape(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+/// A YAML scalar: always double-quoted, so a value carrying `:`/`#`/a newline stays one scalar.
+fn yaml_scalar(text: &str) -> String {
+    format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// RFC 7807 `application/problem+json` — the small, stable shape, and the default rendering.
+fn problem_json(status: u16, diagnostic: &Diagnostic) -> Vec<u8> {
     let mut body = serde_json::Map::new();
     body.insert(
         "type".to_string(),
@@ -1173,12 +1293,7 @@ fn problem_response(status: u16, diagnostic: &Diagnostic) -> Response {
             ),
         );
     }
-    let bytes = serde_json::to_vec(&serde_json::Value::Object(body)).unwrap_or_default();
-    response_with(
-        StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-        "application/problem+json",
-        bytes,
-    )
+    serde_json::to_vec(&serde_json::Value::Object(body)).unwrap_or_default()
 }
 
 fn copy_headers(headers: &HeaderMap) -> std::collections::BTreeMap<String, String> {
@@ -1204,6 +1319,78 @@ fn now_rfc3339() -> String {
 
 #[cfg(test)]
 mod local_channel_tests {
+
+    // ---- R4: the problem document is rendered in the caller's format ------------------------
+
+    fn diag() -> Diagnostic {
+        Diagnostic::error(codes::INBOUND_VALIDATION_REJECT, "row 3 is malformed")
+            .with_attribute("issueCount", "1")
+    }
+
+    #[test]
+    fn problem_defaults_to_json_and_stays_rfc_7807() {
+        for inbound in [
+            None,
+            Some("application/json"),
+            Some("application/vnd.x+json"),
+        ] {
+            let (ct, bytes) = render_problem(400, &diag(), inbound);
+            assert_eq!(ct, "application/problem+json", "inbound {inbound:?}");
+            let v: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+            assert_eq!(v["status"], 400);
+            assert_eq!(v["code"], codes::INBOUND_VALIDATION_REJECT);
+            assert_eq!(v["detail"], "row 3 is malformed");
+            // The MODEL is unchanged: attributes stay nested on the JSON rendering.
+            assert_eq!(v["attributes"]["issueCount"], "1");
+        }
+    }
+
+    #[test]
+    fn a_csv_caller_gets_the_problem_as_a_table() {
+        let (ct, bytes) = render_problem(400, &diag(), Some("text/csv; charset=utf-8"));
+        assert_eq!(ct, "text/csv");
+        let text = String::from_utf8(bytes).expect("utf-8");
+        // A `field,value` table: one row per problem field, diffable against what was posted.
+        assert!(text.starts_with("field,value\n"), "got: {text}");
+        assert!(text.contains("detail,row 3 is malformed"), "got: {text}");
+        assert!(text.contains(&format!("code,{}", codes::INBOUND_VALIDATION_REJECT)));
+        // Attributes flatten in — a csv row has nowhere to nest a sub-object.
+        assert!(text.contains("issueCount,1"), "got: {text}");
+    }
+
+    #[test]
+    fn an_xml_caller_gets_problem_xml_with_escaped_text() {
+        let diagnostic = Diagnostic::error(codes::INBOUND_VALIDATION_REJECT, "a < b & c");
+        let (ct, bytes) = render_problem(400, &diagnostic, Some("application/xml"));
+        assert_eq!(ct, "application/problem+xml");
+        let text = String::from_utf8(bytes).expect("utf-8");
+        assert!(text.contains("<problem>"), "got: {text}");
+        assert!(text.contains("<status>400</status>"), "got: {text}");
+        assert!(
+            text.contains("<detail>a &lt; b &amp; c</detail>"),
+            "diagnostic text must be escaped, not injected as markup: {text}"
+        );
+    }
+
+    #[test]
+    fn a_yaml_caller_gets_problem_yaml_with_quoted_scalars() {
+        let (ct, bytes) = render_problem(400, &diag(), Some("application/yaml"));
+        assert_eq!(ct, "application/problem+yaml");
+        let text = String::from_utf8(bytes).expect("utf-8");
+        assert!(text.contains("status: \"400\""), "got: {text}");
+        // Quoted, so a value carrying ':' or '#' cannot break the document.
+        assert!(
+            text.contains("detail: \"row 3 is malformed\""),
+            "got: {text}"
+        );
+    }
+
+    #[test]
+    fn an_unrenderable_inbound_format_falls_back_to_problem_json() {
+        // raw bytes / an unknown media type: there is no sensible rendering, so the default holds.
+        let (ct, _) = render_problem(500, &diag(), Some("application/octet-stream"));
+        assert_eq!(ct, "application/problem+json");
+    }
     use super::*;
     use crate::config::{ChannelBinding, ChannelDefinition, Namespace};
     use sutra_executor::DeploymentId;

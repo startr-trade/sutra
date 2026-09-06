@@ -4,7 +4,8 @@
 //! diagnostics), and reader round-trips. `.sutra` is the only deployment model, so the
 //! standalone package directory is the sole authoring input here.
 //!
-//! Both public examples (money-transfer, approval-hold) are single-variant: they commit a
+//! All three public examples (money-transfer, approval-hold, call-log-load) are single-variant:
+//! they commit a
 //! `deployments-src/<pkg>/` directly, which is what these fixtures package. The MULTI-variant
 //! layout (`shared/` + `variants/<name>/`, composed before sealing) belongs to the proprietary
 //! example packages, so its packaging gate lives in the repository that owns them; the loader
@@ -182,4 +183,40 @@ fn approval_hold_packages_one_archive() {
     let loaded = read_archive_file(&archive.file_path).expect("round-trips");
     assert_eq!(loaded.deployment.rules.len(), 1);
     assert_eq!(loaded.deployment.scripts.len(), 2);
+}
+
+#[test]
+fn call_log_load_packages_one_archive() {
+    let dir = package_dir("call-log-load", "default--call-log--1.0.0");
+    assert_lint_clean(&dir);
+    seal_twice(&dir);
+
+    let out = tempfile::tempdir().expect("tempdir");
+    let outcome = assemble_dir(&dir, out.path(), &PackageOptions::default()).expect("packages");
+    let archive = &outcome.archives[0];
+    assert_eq!(
+        archive.file_path.file_name().unwrap().to_string_lossy(),
+        "default--call-log--1.0.0.sutra"
+    );
+    let paths: Vec<&str> = archive
+        .manifest
+        .artifacts
+        .iter()
+        .map(|a| a.path.as_str())
+        .collect();
+    // The transform is a SCRIPT (its render merges into variables), the receipt is a TEMPLATE
+    // (its render is the reply) — the distinction this example turns on, pinned as artifacts.
+    assert!(paths.contains(&"scripts/call-log-entry.hbs"), "{paths:?}");
+    assert!(paths.contains(&"templates/batch-accepted.hbs"), "{paths:?}");
+    // Two codecs: the csv-bound INBOUND schema and the STORAGE schema the projected store
+    // declares as its row type.
+    assert!(paths.contains(&"schemas/cdr/cdr.xsd"), "{paths:?}");
+    assert!(
+        paths.contains(&"schemas/call-log/call-log.xsd"),
+        "{paths:?}"
+    );
+    assert!(
+        paths.contains(&"migrations/call_log/V001__call_log.sql"),
+        "{paths:?}"
+    );
 }

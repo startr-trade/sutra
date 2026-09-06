@@ -1,0 +1,43 @@
+# Codec manifest for the INBOUND `cdr` codec — the vendor's call-detail-record contract.
+# Registers as urn:sutra:module:call-log:1.0.0:cdr; the upload channel binds it as `urn:cdr`.
+#
+# TWO wire forms, ONE schema. Switches hand over call records as CSV or as fixed-width text
+# depending on the vendor, and both are the same records — so both are declared here and
+# cdr.xsd types either. Their content types are disjoint, so an upload selects its parser
+# unambiguously:
+#
+#     Content-Type: text/csv     -> the csv parser      (sample/call-logs.csv)
+#     Content-Type: text/plain   -> the fixed-width one (sample/call-logs.fixed-width.txt)
+#
+# Nothing downstream knows or cares which arrived: the process, the transform and the store are
+# identical either way. Adding a third vendor with a different delimiter is a manifest edit.
+#
+# Whichever parser runs, the body is a BATCH: every row is validated as one CallDetailRecord
+# against cdr.xsd, in one decode, with a row-indexed path (value[3].durationSec) — all rows, all
+# cells, before the process starts.
+schemaKind: xsd
+formats: [csv, fixed-width]
+
+# --- parser config: layout, NOT schema -------------------------------------------------------
+# A header row and a comma need no declaration, so the csv block below is written only to show
+# where layout lives. Delete it and nothing changes.
+csv:
+  delimiter: ","
+  header: true
+
+# A fixed-width record carries NOTHING of its own — without the widths a line is an
+# undifferentiated string — so this block is required, and its field names ARE the record's only
+# field names. `sutra lint` therefore checks them against cdr.xsd at package time: a column the
+# type does not declare, or a required element with no column, fails the build rather than every
+# row at runtime. (csv gets no such check: its columns arrive in the header, at runtime.)
+fixed-width:
+  fields:
+    - {name: recordId,     width: 12}
+    - {name: msisdn,       width: 16}
+    - {name: peerMsisdn,   width: 16}
+    - {name: startTime,    width: 22}
+    - {name: durationSec,  width:  6}
+    - {name: direction,    width: 11}
+    - {name: cellId,       width: 10}
+    - {name: chargeAmount, width: 10}
+    - {name: rateCode,     width:  8}

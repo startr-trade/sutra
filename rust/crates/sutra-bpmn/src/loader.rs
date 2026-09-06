@@ -584,12 +584,14 @@ impl BpmnModelLoader {
                         codes::CONFIG_BPMN_UNSUPPORTED_ELEMENT,
                         format!(
                             "<bpmn:{}> '{}' in process '{}' is not a supported flow node. Supported: \
-                             startEvent, endEvent, intermediateCatchEvent (message, link), \
+                             startEvent, endEvent (plain, terminate, error, cancel), \
+                             intermediateCatchEvent (message, timer, link), \
                              intermediateThrowEvent (compensate, message, signal, escalation, link), \
                              boundaryEvent, serviceTask, scriptTask, sendTask, businessRuleTask, \
                              manualTask, userTask, exclusiveGateway, inclusiveGateway, \
-                             parallelGateway, complexGateway, callActivity, subProcess (embedded), \
-                             sequenceFlow.",
+                             parallelGateway, complexGateway, callActivity, subProcess (embedded, \
+                             transaction, adHoc, error-triggered event), sequenceFlow. Full matrix: \
+                             crates/sutra-bpmn/bpmn-support.md.",
                             fe.local,
                             fe.attr_or_empty("id"),
                             id
@@ -888,8 +890,9 @@ fn build_message_catch_event(
         err(
             codes::PARSE_BPMN_UNSUPPORTED_CATCH_EVENT,
             format!(
-                "<intermediateCatchEvent> {ice_id} must carry a <messageEventDefinition> — \
-                 timer/signal/conditional catch events are not supported yet"
+                "<intermediateCatchEvent> {ice_id} must carry a <messageEventDefinition>, a \
+                 <timerEventDefinition> or a <linkEventDefinition>; signal and conditional catch \
+                 events are not supported"
             ),
         )
     })?;

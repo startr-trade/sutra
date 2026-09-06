@@ -32,8 +32,106 @@ const XSD_EXT: &str = ".xsd";
 const JSON_EXT: &str = ".json";
 const JSON_SCHEMA_EXT: &str = ".schema.json";
 
-const XSD_FORMATS: &[&str] = &["xml", "json", "yaml"];
-const JSON_FORMATS: &[&str] = &["json"];
+/// The wire formats an XSD codec accepts. Bounded by what `StructuralCodec` can turn into
+/// canonical XML: the three syntaxes its `detect` knows, plus `csv` (validated row-wise — see
+/// design `schema-format-binding.md` R2).
+const XSD_FORMATS: &[&str] = &["xml", "json", "yaml", "csv", "fixed-width"];
+
+/// The wire formats a JSON-schema codec accepts. Per the two-kinds ruling
+/// (`codec-format-schema.md` §2), JSON-schema is the contract for every NON-XML tree — json,
+/// yaml, and the parsed tree of csv — while xml belongs to XSD, whose type system JSON-schema
+/// cannot express. So `xml` is deliberately absent here, not an oversight.
+const JSON_FORMATS: &[&str] = &["json", "yaml", "csv", "fixed-width"];
+
+/// The per-format parser config a manifest may carry. Layout is parser config, NOT schema
+/// (design `codec-format-schema.md` §2), so it has no home in the schema file and lives here.
+/// Every field is optional: a header-bearing, comma-delimited CSV names its own columns and
+/// needs no block at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FormatLayout {
+    csv_delimiter: char,
+    csv_header: bool,
+    /// The `fixed-width:` column layout. Empty means undeclared — and unlike csv's defaults that
+    /// is FATAL for a codec that declares the format, because a fixed-width record carries no
+    /// structure of its own to fall back on.
+    fixed_width_fields: Vec<sutra_formats::FixedWidthField>,
+}
+
+impl Default for FormatLayout {
+    fn default() -> FormatLayout {
+        FormatLayout {
+            csv_delimiter: ',',
+            csv_header: true,
+            fixed_width_fields: Vec::new(),
+        }
+    }
+}
+
+/// Build the `MessageFormat` a codec parses with. `csv` is config-bearing, so it is constructed
+/// from the manifest's layout rather than the registry's zero-config default; every other
+/// built-in comes from the registry, wrapped by the generic `PayloadCodecFormat` adapter so a
+/// format added later is bindable without touching this function.
+///
+/// An `Opaque`-shaped format (`raw-text` / `raw-bytes`) is refused: there is no map under raw
+/// bytes for a schema to type, so binding one would assert nothing.
+fn message_format(
+    name: &str,
+    layout: &FormatLayout,
+    codec_name: &str,
+) -> Result<Arc<dyn sutra_codec_spi::MessageFormat>, CodecLoadError> {
+    if name == sutra_formats::FixedWidthCodec::NAME {
+        // No zero-config default: without the widths a line is an undifferentiated string, so an
+        // undeclared layout is a manifest error rather than a guess.
+        if layout.fixed_width_fields.is_empty() {
+            return Err(CodecLoadError::new(
+                codes::CONFIG_CODEC_MANIFEST_INVALID,
+                format!(
+                    "codec '{codec_name}': format 'fixed-width' requires a 'fixed-width:' block \
+                     declaring its column layout — a fixed-width record carries no structure of \
+                     its own"
+                ),
+            ));
+        }
+        let codec = sutra_formats::FixedWidthCodec::new(layout.fixed_width_fields.clone())
+            .map_err(|e| {
+                CodecLoadError::new(
+                    codes::CONFIG_CODEC_MANIFEST_INVALID,
+                    format!("codec '{codec_name}': {e}"),
+                )
+            })?;
+        return Ok(Arc::new(sutra_codec_spi::PayloadCodecFormat::new(
+            Arc::new(codec),
+        )));
+    }
+    if name == sutra_formats::CsvCodec::NAME {
+        return Ok(Arc::new(sutra_codec_spi::PayloadCodecFormat::new(
+            Arc::new(sutra_formats::CsvCodec::new(
+                layout.csv_delimiter,
+                layout.csv_header,
+            )),
+        )));
+    }
+    let builtin = sutra_codec_spi::builtin_formats()
+        .into_iter()
+        .find(|f| f.name == name)
+        .ok_or_else(|| {
+            CodecLoadError::new(
+                codes::CONFIG_CODEC_MANIFEST_INVALID,
+                format!("codec '{codec_name}': format '{name}' is not a built-in format"),
+            )
+        })?;
+    if builtin.shape_class == sutra_codec_spi::ShapeClass::Opaque {
+        return Err(CodecLoadError::new(
+            codes::CONFIG_CODEC_MANIFEST_INVALID,
+            format!(
+                "codec '{codec_name}': format '{name}' is opaque (raw bytes/text) and carries no                  structure for a schema to validate — bind it bare on the channel instead"
+            ),
+        ));
+    }
+    Ok(Arc::new(sutra_codec_spi::PayloadCodecFormat::new(
+        builtin.codec,
+    )))
+}
 
 /// A schema-codec load failure carrying the stable `SUTRA.CONFIG.*` diagnostic code.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -141,7 +239,7 @@ fn load_codec_folder(
             build_xsd_codec(&urn, &codec_name, &manifest, &xsd_files, &json_files)
         }
         ManifestKind::Schema(SchemaKind::JsonSchema) => {
-            build_json_codec(&urn, &codec_name, &xsd_files, &json_files)
+            build_json_codec(&urn, &codec_name, &manifest, &xsd_files, &json_files)
         }
         ManifestKind::Bundle(_) => unreachable!("handled above"),
     }
@@ -224,18 +322,94 @@ fn build_xsd_codec(
     let bytes: Vec<Vec<u8>> = xsd_files.iter().map(read_all).collect::<Result<_, _>>()?;
     let refs: Vec<&[u8]> = bytes.iter().map(Vec::as_slice).collect();
     let formats: Vec<&str> = manifest.formats.iter().map(String::as_str).collect();
-    let codec = StructuralCodec::compile_with_formats(urn, &refs, &formats).map_err(|e| {
-        CodecLoadError::new(
-            codes::CONFIG_SCHEMA_INVALID,
-            format!("invalid XSD in codec '{codec_name}': {}", sanitize(&e)),
-        )
-    })?;
+    let (batch, fixed_columns) = tabular_parser(&formats, &manifest.layout, codec_name)?;
+    // A fixed-width layout's columns ARE the record's only field names, so `compile_with_layout`
+    // checks them against the bound type; a mismatch would otherwise fail every row at runtime
+    // for what is really a configuration mistake.
+    let columns: Vec<&str> = fixed_columns.iter().map(String::as_str).collect();
+    let codec = StructuralCodec::compile_with_layout(urn, &refs, &formats, batch, &columns)
+        .map_err(|e| match e {
+            // A layout that disagrees with the schema is a MANIFEST fault, not a schema one —
+            // the XSD is fine; the columns declared against it are not.
+            crate::structural::LayoutCompileError::Layout(message) => CodecLoadError::new(
+                codes::CONFIG_CODEC_MANIFEST_INVALID,
+                format!("codec '{codec_name}': {}", sanitize(&message)),
+            ),
+            crate::structural::LayoutCompileError::Schema(message) => CodecLoadError::new(
+                codes::CONFIG_SCHEMA_INVALID,
+                format!(
+                    "invalid XSD in codec '{codec_name}': {}",
+                    sanitize(&message)
+                ),
+            ),
+        })?;
     Ok(Arc::new(codec))
+}
+
+/// The tabular parsers a codec reads a BATCH with, and the column names DECLARED for them — a
+/// fixed-width layout's fields, or empty for csv (whose columns arrive in the header at runtime).
+type TabularParsers = (Vec<Arc<dyn PayloadCodec>>, Vec<String>);
+
+/// The tabular parsers a codec reads a BATCH with, built from the manifest's layout blocks, plus
+/// the declared column names when fixed-width is among them (empty otherwise).
+///
+/// BOTH may be declared. Their content types are disjoint — `text/csv` / `application/csv`
+/// against `text/plain` / `application/x-fixed-width` — so an inbound body selects its parser
+/// unambiguously, and one schema can serve a CSV feed and a fixed-width feed over the same
+/// channel. Declaration order decides only the no-content-type fallback.
+fn tabular_parser(
+    formats: &[&str],
+    layout: &FormatLayout,
+    codec_name: &str,
+) -> Result<TabularParsers, CodecLoadError> {
+    let tabular: Vec<&str> = formats
+        .iter()
+        .copied()
+        .filter(|f| {
+            *f == sutra_formats::CsvCodec::NAME || *f == sutra_formats::FixedWidthCodec::NAME
+        })
+        .collect();
+    let mut parsers: Vec<Arc<dyn PayloadCodec>> = Vec::new();
+    let mut columns: Vec<String> = Vec::new();
+    for name in tabular {
+        if name == sutra_formats::FixedWidthCodec::NAME {
+            if layout.fixed_width_fields.is_empty() {
+                return Err(CodecLoadError::new(
+                    codes::CONFIG_CODEC_MANIFEST_INVALID,
+                    format!(
+                        "codec '{codec_name}': format 'fixed-width' requires a 'fixed-width:' \
+                         block declaring its column layout — a fixed-width record carries no \
+                         structure of its own"
+                    ),
+                ));
+            }
+            columns = layout
+                .fixed_width_fields
+                .iter()
+                .map(|f| f.name().to_string())
+                .collect();
+            let parser = sutra_formats::FixedWidthCodec::new(layout.fixed_width_fields.clone())
+                .map_err(|e| {
+                    CodecLoadError::new(
+                        codes::CONFIG_CODEC_MANIFEST_INVALID,
+                        format!("codec '{codec_name}': {e}"),
+                    )
+                })?;
+            parsers.push(Arc::new(parser));
+        } else {
+            parsers.push(Arc::new(sutra_formats::CsvCodec::new(
+                layout.csv_delimiter,
+                layout.csv_header,
+            )));
+        }
+    }
+    Ok((parsers, columns))
 }
 
 fn build_json_codec(
     urn: &str,
     codec_name: &str,
+    manifest: &CodecManifest,
     xsd_files: &[std::path::PathBuf],
     json_files: &[std::path::PathBuf],
 ) -> Result<Arc<dyn PayloadCodec>, CodecLoadError> {
@@ -271,7 +445,13 @@ fn build_json_codec(
         })?;
         schemas.push(schema);
     }
-    let codec = JsonSchemaCodec::of(urn, schemas)
+    // The manifest's declared formats become the parsers this codec negotiates between; the
+    // schema validates the tree they produce, whatever syntax it arrived in.
+    let mut formats = Vec::new();
+    for name in &manifest.formats {
+        formats.push(message_format(name, &manifest.layout, codec_name)?);
+    }
+    let codec = JsonSchemaCodec::with_formats(urn, formats, schemas)
         .map_err(|e| CodecLoadError::new(codes::CONFIG_CODEC_LAYOUT_INVALID, sanitize(&e)))?;
     Ok(Arc::new(codec))
 }
@@ -289,6 +469,7 @@ enum ManifestKind {
 struct CodecManifest {
     kind: ManifestKind,
     formats: Vec<String>,
+    layout: FormatLayout,
 }
 
 fn parse_manifest(manifest_path: &Path, codec_name: &str) -> Result<CodecManifest, CodecLoadError> {
@@ -298,7 +479,62 @@ fn parse_manifest(manifest_path: &Path, codec_name: &str) -> Result<CodecManifes
             format!("codec '{codec_name}': cannot read {CODEC_MANIFEST_FILE}: {e}"),
         )
     })?;
-    let value: serde_yaml_ng::Value = serde_yaml_ng::from_str(&text).map_err(|e| {
+    parse_manifest_text(&text, codec_name)
+}
+
+/// Compile ONE module XSD codec from bytes — the seam the engine assembly builds through, so a
+/// running engine honours the same `formats:` / layout declaration `sutra package` validated.
+///
+/// Without this the assembly had to assume a format set, and did: it hardcoded
+/// `["xml","json","yaml"]`, which made a `formats: [csv]` declaration inert at runtime — the
+/// package would seal cleanly and then reject every upload as an unsupported content-type.
+///
+/// `manifest` absent (or unparseable) falls back to that historical assumption rather than
+/// refusing to serve: a deployment that used to load still loads, with the narrower guarantee.
+pub fn compile_module_codec(
+    urn: &str,
+    codec_name: &str,
+    manifest: Option<&str>,
+    xsds: &[&[u8]],
+) -> Result<Arc<dyn PayloadCodec>, CodecLoadError> {
+    let Some(text) = manifest else {
+        // No manifest at all: the conventional codec, nothing declared to honour.
+        let codec = StructuralCodec::compile_with_formats(urn, xsds, &["xml", "json", "yaml"])
+            .unwrap_or_else(|_| StructuralCodec::compile(urn, xsds));
+        return Ok(Arc::new(codec));
+    };
+    // A manifest that does not parse is PROPAGATED, not swallowed. It was briefly treated as
+    // "absent" and fell back to the historical format set — which meant an unknown format or a
+    // malformed block passed `sutra lint` in silence and then decoded nothing at runtime. There
+    // is no other owner of this check: lint's codec passes read the XSDs and never open the
+    // manifest.
+    let manifest = parse_manifest_text(text, codec_name)?;
+    if !matches!(manifest.kind, ManifestKind::Schema(SchemaKind::Xsd)) {
+        let codec = StructuralCodec::compile_with_formats(urn, xsds, &["xml", "json", "yaml"])
+            .unwrap_or_else(|_| StructuralCodec::compile(urn, xsds));
+        return Ok(Arc::new(codec));
+    }
+    let formats: Vec<&str> = manifest.formats.iter().map(String::as_str).collect();
+    let (batch, fixed_columns) = tabular_parser(&formats, &manifest.layout, codec_name)?;
+    let columns: Vec<&str> = fixed_columns.iter().map(String::as_str).collect();
+    match StructuralCodec::compile_with_layout(urn, xsds, &formats, batch, &columns) {
+        Ok(codec) => Ok(Arc::new(codec)),
+        // A declared layout that disagrees with the schema is a CONFIGURATION fault: refuse it,
+        // loudly, here — falling back would hide it and then fail every row of every upload.
+        Err(crate::structural::LayoutCompileError::Layout(message)) => Err(CodecLoadError::new(
+            codes::CONFIG_CODEC_MANIFEST_INVALID,
+            format!("codec '{codec_name}': {message}"),
+        )),
+        // The XSD set is outside the supported subset: serve the shape-only build, as before —
+        // a deployment that used to load still loads, with a narrower guarantee.
+        Err(crate::structural::LayoutCompileError::Schema(_)) => {
+            Ok(Arc::new(StructuralCodec::compile(urn, xsds)))
+        }
+    }
+}
+
+fn parse_manifest_text(text: &str, codec_name: &str) -> Result<CodecManifest, CodecLoadError> {
+    let value: serde_yaml_ng::Value = serde_yaml_ng::from_str(text).map_err(|e| {
         CodecLoadError::new(
             codes::CONFIG_CODEC_MANIFEST_INVALID,
             format!(
@@ -315,7 +551,150 @@ fn parse_manifest(manifest_path: &Path, codec_name: &str) -> Result<CodecManifes
     };
     let kind = parse_kind(map.get("schemaKind"), codec_name)?;
     let formats = parse_formats(map.get("formats"), kind, codec_name)?;
-    Ok(CodecManifest { kind, formats })
+    let layout = parse_layout(map, codec_name)?;
+    Ok(CodecManifest {
+        kind,
+        formats,
+        layout,
+    })
+}
+
+/// The per-format parser-config blocks a manifest may carry: `csv:` (`delimiter` / `header`,
+/// both defaulting) and `fixed-width:` (`fields`, required when that format is declared).
+fn parse_layout(
+    map: &serde_yaml_ng::Mapping,
+    codec_name: &str,
+) -> Result<FormatLayout, CodecLoadError> {
+    let mut layout = parse_csv_layout(map.get(serde_yaml_ng::Value::from("csv")), codec_name)?;
+    layout.fixed_width_fields = parse_fixed_width_fields(
+        map.get(serde_yaml_ng::Value::from("fixed-width")),
+        codec_name,
+    )?;
+    Ok(layout)
+}
+
+/// The `fixed-width:` block: `fields:` is a list of `{name, width}` mappings, in wire order.
+fn parse_fixed_width_fields(
+    raw: Option<&serde_yaml_ng::Value>,
+    codec_name: &str,
+) -> Result<Vec<sutra_formats::FixedWidthField>, CodecLoadError> {
+    let Some(block) = raw else {
+        return Ok(Vec::new());
+    };
+    let invalid = |detail: String| {
+        CodecLoadError::new(
+            codes::CONFIG_CODEC_MANIFEST_INVALID,
+            format!("codec '{codec_name}': {detail}"),
+        )
+    };
+    let serde_yaml_ng::Value::Mapping(block) = block else {
+        return Err(invalid(
+            "the 'fixed-width' block is not a YAML mapping".to_string(),
+        ));
+    };
+    for key in block.keys() {
+        let key = key.as_str().unwrap_or_default();
+        if key != "fields" {
+            return Err(invalid(format!(
+                "unknown key '{key}' in the 'fixed-width' block (expected 'fields')"
+            )));
+        }
+    }
+    let Some(serde_yaml_ng::Value::Sequence(entries)) =
+        block.get(serde_yaml_ng::Value::from("fields"))
+    else {
+        return Err(invalid(
+            "the 'fixed-width' block needs a non-empty 'fields' list of {name, width}".to_string(),
+        ));
+    };
+    let mut out = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let serde_yaml_ng::Value::Mapping(entry) = entry else {
+            return Err(invalid(
+                "each 'fixed-width.fields' entry must be a {name, width} mapping".to_string(),
+            ));
+        };
+        for key in entry.keys() {
+            let key = key.as_str().unwrap_or_default();
+            if !matches!(key, "name" | "width") {
+                return Err(invalid(format!(
+                    "unknown key '{key}' in a 'fixed-width.fields' entry (expected 'name' / 'width')"
+                )));
+            }
+        }
+        let name = entry
+            .get(serde_yaml_ng::Value::from("name"))
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let width = entry
+            .get(serde_yaml_ng::Value::from("width"))
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| {
+                invalid(format!(
+                    "'fixed-width.fields' entry '{name}' needs a positive integer 'width'"
+                ))
+            })?;
+        out.push(sutra_formats::FixedWidthField::new(name, width as usize).map_err(invalid)?);
+    }
+    if out.is_empty() {
+        return Err(invalid(
+            "the 'fixed-width' block needs a non-empty 'fields' list of {name, width}".to_string(),
+        ));
+    }
+    Ok(out)
+}
+
+/// The optional `csv:` block — `delimiter` (one character) and `header` (bool). Absent, or with
+/// either key absent, the defaults stand (comma, header row).
+fn parse_csv_layout(
+    raw: Option<&serde_yaml_ng::Value>,
+    codec_name: &str,
+) -> Result<FormatLayout, CodecLoadError> {
+    let mut layout = FormatLayout::default();
+    let Some(block) = raw else {
+        return Ok(layout);
+    };
+    let serde_yaml_ng::Value::Mapping(map) = block else {
+        return Err(CodecLoadError::new(
+            codes::CONFIG_CODEC_MANIFEST_INVALID,
+            format!("codec '{codec_name}': the 'csv' block is not a YAML mapping"),
+        ));
+    };
+    for key in map.keys() {
+        let key = key.as_str().unwrap_or_default();
+        if !matches!(key, "delimiter" | "header") {
+            return Err(CodecLoadError::new(
+                codes::CONFIG_CODEC_MANIFEST_INVALID,
+                format!(
+                    "codec '{codec_name}': unknown key '{key}' in the 'csv' block                      (expected 'delimiter' / 'header')"
+                ),
+            ));
+        }
+    }
+    if let Some(raw) = map.get(serde_yaml_ng::Value::from("delimiter")) {
+        let text = raw.as_str().unwrap_or_default();
+        let mut chars = text.chars();
+        match (chars.next(), chars.next()) {
+            (Some(c), None) => layout.csv_delimiter = c,
+            _ => {
+                return Err(CodecLoadError::new(
+                    codes::CONFIG_CODEC_MANIFEST_INVALID,
+                    format!(
+                        "codec '{codec_name}': csv.delimiter must be exactly one character, got                          '{text}'"
+                    ),
+                ))
+            }
+        }
+    }
+    if let Some(raw) = map.get(serde_yaml_ng::Value::from("header")) {
+        layout.csv_header = raw.as_bool().ok_or_else(|| {
+            CodecLoadError::new(
+                codes::CONFIG_CODEC_MANIFEST_INVALID,
+                format!("codec '{codec_name}': csv.header must be true or false"),
+            )
+        })?;
+    }
+    Ok(layout)
 }
 
 fn parse_kind(

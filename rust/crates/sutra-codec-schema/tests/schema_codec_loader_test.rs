@@ -337,3 +337,136 @@ fn an_invalid_json_schema_is_a_deploy_error() {
 
     expect_code(&schemas, "SUTRA.CONFIG.SCHEMA.INVALID");
 }
+
+// ---- the fixed-width layout block (design `schema-format-binding.md` R3) ---------------------
+
+/// A three-column record whose names ARE the type's elements.
+const FW_XSD: &str = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           targetNamespace="urn:ex" xmlns="urn:ex" elementFormDefault="qualified">
+  <xs:element name="Rec"><xs:complexType><xs:sequence>
+    <xs:element name="id" type="xs:string"/>
+    <xs:element name="amount" type="xs:decimal"/>
+  </xs:sequence></xs:complexType></xs:element>
+</xs:schema>"#;
+
+const FW_MANIFEST: &str = "schemaKind: xsd\nformats: [fixed-width]\n\
+     fixed-width:\n  fields:\n    - {name: id, width: 8}\n    - {name: amount, width: 10}\n";
+
+#[test]
+fn a_fixed_width_layout_block_loads_and_decodes_records() {
+    let scratch = Scratch::new();
+    let schemas = scratch.schemas();
+    write_codec(&schemas, "rec", FW_MANIFEST, &[("rec.xsd", FW_XSD)]);
+
+    let codecs = load(&schemas, MODULE_NS).expect("loads");
+    let codec = codecs.first().expect("one codec").clone();
+    assert!(
+        codec
+            .accepted_content_types()
+            .iter()
+            .any(|c| c == "text/plain"),
+        "a fixed-width codec must admit its own content type: {:?}",
+        codec.accepted_content_types()
+    );
+
+    // 8 + 10 columns; the schema types `amount` as a decimal, so it comes back as a number.
+    let body = format!("{:<8}{:<10}\n", "R-1", "12.50");
+    let result = codec.decode(body.as_bytes(), Some("text/plain"));
+    assert_eq!(
+        result.outcome,
+        sutra_codec_spi::DecodeOutcome::Ok,
+        "issues: {:?}",
+        result.issues
+    );
+    assert_eq!(result.message_type.as_deref(), Some("Rec"));
+}
+
+#[test]
+fn declaring_fixed_width_without_the_layout_block_is_a_manifest_error() {
+    let scratch = Scratch::new();
+    let schemas = scratch.schemas();
+    write_codec(
+        &schemas,
+        "rec",
+        "schemaKind: xsd\nformats: [fixed-width]\n",
+        &[("rec.xsd", FW_XSD)],
+    );
+    expect_code(&schemas, "SUTRA.CONFIG.CODEC_MANIFEST.INVALID");
+}
+
+#[test]
+fn a_layout_column_the_type_does_not_declare_is_a_deploy_error() {
+    let scratch = Scratch::new();
+    let schemas = scratch.schemas();
+    write_codec(
+        &schemas,
+        "rec",
+        "schemaKind: xsd\nformats: [fixed-width]\n\
+         fixed-width:\n  fields:\n    - {name: id, width: 8}\n    - {name: amount, width: 10}\n\
+         \x20   - {name: nope, width: 4}\n",
+        &[("rec.xsd", FW_XSD)],
+    );
+    // A MANIFEST fault, not a schema one: the XSD is fine; the columns declared against it are
+    // not. Distinguishing the two is what stops a layout fault being swallowed by the
+    // "unsupported XSD subset" fallback (which serves a shape-only codec instead of refusing).
+    expect_code(&schemas, "SUTRA.CONFIG.CODEC_MANIFEST.INVALID");
+}
+
+#[test]
+fn a_malformed_fixed_width_block_is_a_manifest_error() {
+    for manifest in [
+        // fields missing
+        "schemaKind: xsd\nformats: [fixed-width]\nfixed-width:\n  widths: [1]\n",
+        // width absent
+        "schemaKind: xsd\nformats: [fixed-width]\nfixed-width:\n  fields:\n    - {name: id}\n",
+        // zero width
+        "schemaKind: xsd\nformats: [fixed-width]\nfixed-width:\n  fields:\n    - {name: id, width: 0}\n",
+    ] {
+        let scratch = Scratch::new();
+        let schemas = scratch.schemas();
+        write_codec(&schemas, "rec", manifest, &[("rec.xsd", FW_XSD)]);
+        expect_code(&schemas, "SUTRA.CONFIG.CODEC_MANIFEST.INVALID");
+    }
+}
+
+/// Both tabular formats may be declared together: their content types are disjoint, so one
+/// schema serves a CSV feed and a fixed-width feed over the same channel.
+#[test]
+fn both_tabular_formats_can_be_declared_and_the_content_type_selects() {
+    let scratch = Scratch::new();
+    let schemas = scratch.schemas();
+    write_codec(
+        &schemas,
+        "rec",
+        "schemaKind: xsd\nformats: [csv, fixed-width]\n\
+         fixed-width:\n  fields:\n    - {name: id, width: 8}\n    - {name: amount, width: 10}\n",
+        &[("rec.xsd", FW_XSD)],
+    );
+    let codecs = load(&schemas, MODULE_NS).expect("loads");
+    let codec = codecs.first().expect("one codec").clone();
+
+    let accepted = codec.accepted_content_types();
+    for ct in ["text/csv", "text/plain"] {
+        assert!(accepted.iter().any(|c| c == ct), "{ct} in {accepted:?}");
+    }
+
+    // text/csv -> the header line names the columns.
+    let csv = codec.decode(b"id,amount\nR-1,12.50\n", Some("text/csv"));
+    assert_eq!(
+        csv.outcome,
+        sutra_codec_spi::DecodeOutcome::Ok,
+        "issues: {:?}",
+        csv.issues
+    );
+
+    // text/plain -> the SAME schema, read through the declared column widths.
+    let fixed = format!("{:<8}{:<10}\n", "R-1", "12.50");
+    let fixed = codec.decode(fixed.as_bytes(), Some("text/plain"));
+    assert_eq!(
+        fixed.outcome,
+        sutra_codec_spi::DecodeOutcome::Ok,
+        "issues: {:?}",
+        fixed.issues
+    );
+    assert_eq!(fixed.message_type, csv.message_type, "one schema, one type");
+}

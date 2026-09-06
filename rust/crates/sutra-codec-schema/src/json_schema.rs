@@ -523,24 +523,66 @@ fn string_builtin(node: &serde_json::Value) -> Builtin {
 /// `SOFT_ERRORS` projection (still routable).
 pub struct JsonSchemaCodec {
     name: String,
-    format: JsonNodeFormat,
+    /// The parsers this codec negotiates between, in declared order. A schema validates the
+    /// format-native tree and every non-opaque built-in produces the same `serde_json::Value`
+    /// tree, so one schema can type several syntaxes; the inbound content-type picks which
+    /// parser runs, and the first declared format is the fallback.
+    formats: Vec<Arc<dyn MessageFormat>>,
     schemas: Vec<JsonSchema>,
 }
 
 impl JsonSchemaCodec {
-    /// Build a codec over one or more compiled schemas.
+    /// Build a codec over one or more compiled schemas, parsed by the `json` format.
     pub fn of(name: &str, schemas: Vec<JsonSchema>) -> Result<JsonSchemaCodec, String> {
+        JsonSchemaCodec::with_format(name, Arc::new(JsonNodeFormat), schemas)
+    }
+
+    /// Build a codec over one or more compiled schemas, parsed by ANY message format — the
+    /// binding that lets a JSON schema type a csv/yaml/xml tree, not just a JSON one. A schema
+    /// validates the format-native tree, and every built-in format produces the same
+    /// `serde_json::Value` tree, so the schema is indifferent to the syntax it arrived in.
+    pub fn with_format(
+        name: &str,
+        format: Arc<dyn MessageFormat>,
+        schemas: Vec<JsonSchema>,
+    ) -> Result<JsonSchemaCodec, String> {
+        JsonSchemaCodec::with_formats(name, vec![format], schemas)
+    }
+
+    /// Build a codec that negotiates between several formats by content-type — the manifest's
+    /// `formats:` list. The schema is unchanged across them: it types the tree, not the syntax.
+    pub fn with_formats(
+        name: &str,
+        formats: Vec<Arc<dyn MessageFormat>>,
+        schemas: Vec<JsonSchema>,
+    ) -> Result<JsonSchemaCodec, String> {
         if name.trim().is_empty() {
             return Err("codec name is required".to_string());
         }
         if schemas.is_empty() {
             return Err("at least one JSON schema is required".to_string());
         }
+        if formats.is_empty() {
+            return Err("at least one format is required".to_string());
+        }
         Ok(JsonSchemaCodec {
             name: name.to_string(),
-            format: JsonNodeFormat,
+            formats,
             schemas,
         })
+    }
+
+    /// The parser for an inbound content-type: the first declared format that admits it, else
+    /// the first declared (the fallback for a blank / unrecognised content-type).
+    fn format_for(&self, content_type: Option<&str>) -> &Arc<dyn MessageFormat> {
+        self.formats
+            .iter()
+            .find(|f| {
+                let accepted = f.accepted_content_types();
+                !accepted.is_empty()
+                    && sutra_codec_spi::content_type::accepts(&accepted, content_type)
+            })
+            .unwrap_or(&self.formats[0])
     }
 
     pub fn shape_of(&self, message_type: &str) -> Option<SchemaShape> {
@@ -557,7 +599,15 @@ impl PayloadCodec for JsonSchemaCodec {
     }
 
     fn accepted_content_types(&self) -> Vec<String> {
-        self.format.accepted_content_types()
+        let mut out: Vec<String> = Vec::new();
+        for format in &self.formats {
+            for ct in format.accepted_content_types() {
+                if !out.contains(&ct) {
+                    out.push(ct);
+                }
+            }
+        }
+        out
     }
 
     /// The declared message types (each schema's non-blank message type).
@@ -569,7 +619,7 @@ impl PayloadCodec for JsonSchemaCodec {
     }
 
     fn decode(&self, body: &[u8], content_type: Option<&str>) -> DecodeResult {
-        let parsed = self.format.parse(body, content_type);
+        let parsed = self.format_for(content_type).parse(body, content_type);
         let Some(tree) = parsed.tree else {
             return DecodeResult::fatal(parsed.issues, &parsed.content_type);
         };
@@ -592,7 +642,11 @@ impl PayloadCodec for JsonSchemaCodec {
         };
         if self.schemas.len() == 1 {
             let tree = self.schemas[0].project_to_tree(value, content_type.unwrap_or(""))?;
-            return self.format.encode_tree(&tree, content_type);
+            // Symmetric reply: encode in the format the caller's content-type selects, so a csv
+            // channel answers in csv and a json one in json (design R4).
+            return self
+                .format_for(content_type)
+                .encode_tree(&tree, content_type);
         }
         Err(format!(
             "multi-type JSON codec '{}' cannot encode a reply without an explicit outbound message type",

@@ -3167,7 +3167,7 @@ impl TokenExecutor {
         let cardinality = self.resolve_cardinality(id, loop_cardinality, state)?;
         let collection = self.resolve_collection(id, loop_data_input_ref, state)?;
         let iterations = collection.as_ref().map(|c| c.len()).unwrap_or(cardinality);
-        let item_var = input_data_item.unwrap_or("item");
+        let item_var = input_data_item.unwrap_or(sutra_bpmn::DEFAULT_LOOP_ITEM_VARIABLE);
 
         for i in 0..iterations {
             {
@@ -3179,7 +3179,7 @@ impl TokenExecutor {
                     }
                 }
                 ctx.variables
-                    .insert("loopCounter", FeelValue::from(i as i64));
+                    .insert(sutra_bpmn::LOOP_COUNTER_VARIABLE, FeelValue::from(i as i64));
             }
             self.execute_inner(inner, state).await?;
             if let Some(expr) = completion_condition {
@@ -3226,23 +3226,64 @@ impl TokenExecutor {
         ))
     }
 
+    /// The collection a multi-instance loop iterates.
+    ///
+    /// `<bpmn:loopDataInputRef>` is evaluated as a FEEL EXPRESSION, not looked up as a bare
+    /// variable name. A bare name is itself a valid FEEL expression, so every existing loop is
+    /// unaffected — but a PATH now works too (`payload.value`), and that is what lets a batch
+    /// flow iterate the decoded payload directly instead of copying the whole collection into a
+    /// second variable first. That copy was not free: process variables are persisted in the
+    /// instance snapshot, so a copied batch was a second CLOB of the decoded one on every park.
+    ///
+    /// An expression that resolves to nothing FAILS CLOSED. It used to yield an empty collection,
+    /// which meant a loop over a variable that had been dropped (or misspelled) iterated zero
+    /// times, the instance completed normally, and the batch vanished with no error anywhere —
+    /// silent data loss wearing the shape of success. An explicitly EMPTY list is still a
+    /// legitimate zero-iteration loop; it is absence that is now refused.
     fn resolve_collection(
         &self,
         id: &str,
         loop_data_input_ref: Option<&str>,
         state: &ExecutionState<'_>,
     ) -> Result<Option<Vec<FeelValue>>, Signal> {
-        let Some(name) = loop_data_input_ref else {
+        let Some(expression) = loop_data_input_ref else {
             return Ok(None);
         };
-        match state.ctx.borrow().variables.get(name) {
-            None | Some(FeelValue::Null) => Ok(Some(Vec::new())),
-            Some(FeelValue::List(items)) => Ok(Some(items.clone())),
-            Some(_) => Err(fatal_diag(
+        let vars = state.ctx.borrow().variables.clone();
+        // A BARE name resolves by direct lookup, exactly as before — no FEEL evaluator required.
+        // That keeps every existing loop working in an executor that never wired one (the
+        // evaluator is optional; only data-store keys and assignments needed it until now), and
+        // limits the new dependency to the case that actually needs it: a path.
+        let value = match vars
+            .get(expression)
+            .filter(|_| is_bare_identifier(expression))
+        {
+            Some(value) => value.clone(),
+            None => (self.value_evaluator)(expression, &vars).map_err(|e| {
+                fatal_diag(
+                    codes::RUNTIME_UNEXPECTED,
+                    format!(
+                        "Multi-instance {id} loopDataInputRef '{expression}' could not be \
+                         evaluated: {}",
+                        e.message()
+                    ),
+                )
+            })?,
+        };
+        match value {
+            FeelValue::List(items) => Ok(Some(items)),
+            FeelValue::Null => Err(fatal_diag(
                 codes::RUNTIME_UNEXPECTED,
                 format!(
-                    "Multi-instance {id} loopDataInputRef variable '{name}' is not a collection"
+                    "Multi-instance {id} loopDataInputRef '{expression}' resolved to nothing. A \
+                     loop over an absent collection would silently iterate zero times and report \
+                     success, so it is refused: check the name, and that nothing dropped the \
+                     value (a @transient variable does not survive a park)."
                 ),
+            )),
+            _ => Err(fatal_diag(
+                codes::RUNTIME_UNEXPECTED,
+                format!("Multi-instance {id} loopDataInputRef '{expression}' is not a collection"),
             )),
         }
     }
@@ -3265,7 +3306,7 @@ impl TokenExecutor {
                     .ctx
                     .borrow_mut()
                     .variables
-                    .insert("loopCounter", FeelValue::from(i));
+                    .insert(sutra_bpmn::LOOP_COUNTER_VARIABLE, FeelValue::from(i));
                 self.execute_inner(inner, state).await?;
                 i += 1;
             }
@@ -3275,7 +3316,7 @@ impl TokenExecutor {
                     .ctx
                     .borrow_mut()
                     .variables
-                    .insert("loopCounter", FeelValue::from(i));
+                    .insert(sutra_bpmn::LOOP_COUNTER_VARIABLE, FeelValue::from(i));
                 self.execute_inner(inner, state).await?;
                 i += 1;
                 if !(i < max && self.loop_continues(id, loop_condition, state)?) {
@@ -4591,6 +4632,16 @@ fn merge_task_output(output: FeelValue, variables: &mut Variables) {
 }
 
 /// Parse a script render into the variables to merge — it must be a JSON object.
+/// A plain FEEL identifier — no path segments, indexing or operators — which can therefore be
+/// resolved by a direct variable lookup instead of an evaluation.
+fn is_bare_identifier(expression: &str) -> bool {
+    let expression = expression.trim();
+    !expression.is_empty()
+        && expression
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+}
+
 fn parse_script_output(node_id: &str, rendered: &str) -> Result<Variables, Signal> {
     let parsed: Result<serde_json::Value, _> = serde_json::from_str(rendered);
     match parsed {

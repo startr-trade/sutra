@@ -1,0 +1,165 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  ONE process. A CSV batch of call detail records is uploaded, validated in full, transformed
+  record by record into the storage schema, and written as typed rows.
+
+    startEvent (CSV batch on cdr-upload)
+      then Prep    : data task (FEEL) — rows := payload.value, rowCount := count(payload.value)
+      then Accept  : Handlebars template + <q:reply continue="true"> — the caller gets its
+                     receipt HERE and the connection closes; the instance parks and the engine
+                     self-resumes to run everything below detached (durable, crash-safe)
+      then PerRow  : a sequential multi-instance sub-process, ONE ITERATION PER ROW
+                       Map     : Handlebars SCRIPT — one CallDetailRecord -> one CallLogEntry
+                       Persist : data task — writes call_log[entry.entryId]
+      then End
+
+  WHERE THE INBOUND XSD IS ENFORCED — before this diagram runs at all. The upload channel binds
+  `codec: urn:cdr`, whose manifest declares `formats: [csv]`, so the codec parses the file and
+  validates EVERY ROW AND EVERY CELL against schemas/cdr/cdr.xsd in one decode: patterns,
+  enumerations, xs:dateTime, the duration range. `<q:onValidation mode="reject"/>` below makes
+  the consequence explicit — a batch with a bad cell is refused at intake, with the full issue
+  list rendered in the caller's own content-type, and no instance starts. Nothing in this
+  process re-checks the inbound shape, because nothing needs to.
+
+  WHERE THE STORAGE XSD IS ENFORCED — at the write. The `call_log` store declares
+  `structure: {schema: urn:call-log, type: CallLogEntry}`, so that XSD IS the table's columns:
+  the row is written as typed columns, a field the type does not declare is a fail-closed write
+  error, and on first use the provider verifies the live table can satisfy the projection.
+  `sutra lint` checks the same structure against the migrations' DDL at package time.
+
+  WHY THE TRANSFORM IS A SCRIPT TASK, NOT A TEMPLATE SERVICE TASK. A template's render becomes a
+  reply — bytes — and a template task may not carry data-store associations at all
+  (SUTRA.PARSE.DATA_ASSOCIATION_UNSUPPORTED). A script's render must be a JSON object, which
+  merges TYPED into the instance variables. Same Handlebars template language, same transform,
+  but the result is a record the next node can persist, which is what keeps this to one process.
+-->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0"
+                  id="Definitions_cdr_load"
+                  targetNamespace="urn:sutra:module:call-log:1.0.0">
+
+  <!-- Definitions-scope durable store, referenced BY NAME from datastores.yaml (`call_log`). -->
+  <bpmn:dataStore id="callLogStore" name="call_log"/>
+
+  <bpmn:process id="cdr-load" name="Call-log CSV load" isExecutable="true">
+
+    <bpmn:extensionElements>
+      <!-- RETRY-SAFETY ASSERTION. Re-running this flow on the same batch converges: every record
+           is written by key (call_log[entry.entryId]) and the store write is an upsert, so a
+           second pass rewrites the same values rather than adding rows. Without this the
+           fail-closed default (idempotent="false") applies and a mid-load failure is DEAD-LETTERED
+           and consumed — recorded as an incident, never retried — which is the wrong posture for a
+           file load.
+
+           What it buys: a failed delivery is requeued instead of consumed, and inbox dedup absorbs
+           the duplicate. What it does NOT gate: the multi-instance loop's crash REPLAY, which is
+           at-least-once unconditionally and re-runs the batch from the first record. Both rest on
+           the same property — every per-record effect converges — but only this one is declared.
+           Add a per-record <q:send>, an append or a counter and neither is true any more. -->
+      <q:process idempotent="true"/>
+      <q:variables>
+        <q:variable name="rowCount" type="number"/>  <!-- echoed in the receipt -->
+        <!-- The per-iteration scratch: written and consumed inside ONE turn, never read across a
+             park, and recomputed from `payload` on any replay. @transient keeps them out of the
+             instance snapshot entirely — the decoded batch under `payload` is an unavoidable CLOB,
+             but nothing DERIVED from it needs persisting when re-deriving is free and the store
+             write converges. -->
+        <q:variable name="row"   type="object" transient="true"/>
+        <!-- @schema binds `entry` to the STORAGE shape, so the transform's field reads are
+             checked against call-log.xsd at package time, not first discovered at runtime. -->
+        <q:variable name="entry" schema="call-log" sensitive="true" transient="true"/>
+      </q:variables>
+    </bpmn:extensionElements>
+
+    <!-- One key per store reference. The key is FEEL, evaluated per iteration, so each record
+         writes its own row. -->
+    <bpmn:dataStoreReference id="dsrEntry" name="call_log" dataStoreRef="callLogStore">
+      <bpmn:extensionElements><q:store key="entry.entryId"/></bpmn:extensionElements>
+    </bpmn:dataStoreReference>
+
+    <!-- A data object's NAME is the process-variable name the association moves. -->
+    <bpmn:dataObject id="doEntry" name="entry"/>
+
+    <bpmn:startEvent id="Start" name="CSV batch received (validated)">
+      <bpmn:extensionElements>
+        <!-- dedupKey: the uploader's own request id drives INBOX DEDUP, so re-POSTing the same
+             batch (a retry, a double-click) is absorbed at the door instead of re-running the
+             load. It is a second line of defence, not the only one: the store write is an upsert
+             keyed by entryId, so a genuine re-upload of corrected rows still converges. -->
+        <q:source channel="cdr-upload" name="payload" messageTypeValue="CallDetailRecord"
+                  ack="on-persist" dedupKey="header.X-Request-Id" dataClass="pii"/>
+        <!-- Explicit posture. `reject` is also the DEFAULT when nothing is declared — a flow that
+             states no policy has no handler, so the failure must not enter it — but a batch
+             loader should say so out loud. `route` here would instead let a partly-bad file
+             through and leave the flow to triage payload.validation.issues itself. -->
+        <q:onValidation mode="reject"/>
+      </bpmn:extensionElements>
+      <bpmn:outgoing>F1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="F1" sourceRef="Start" targetRef="Prep"/>
+
+    <!-- Data task: a serviceTask with NO @implementation, whose FEEL assignments ARE its
+         behaviour. A tabular batch projects under `value`, so `payload.value` is the row list —
+         counted here for the receipt, and iterated DIRECTLY by the loop below. Copying it into a
+         second variable first would put a second copy of the whole batch in the instance
+         snapshot. -->
+    <bpmn:serviceTask id="Prep" name="Count the validated rows">
+      <bpmn:incoming>F1</bpmn:incoming><bpmn:outgoing>F2</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>count(payload.value)</bpmn:from><bpmn:to>rowCount</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F2" sourceRef="Prep" targetRef="Accept"/>
+
+    <!-- RESPOND AND CONTINUE. The render is flushed to the caller as the HTTP response body,
+         then the instance parks with a due-now self-resume marker and the poller runs the tail.
+         Distinct from a bare 202 (ack-mode alone): the caller gets a real receipt. -->
+    <bpmn:serviceTask id="Accept" name="Reply batch receipt, then continue"
+                      implementation="batch-accepted.hbs">
+      <bpmn:extensionElements>
+        <q:reply mode="native" continue="true" contentType="application/json"/>
+      </bpmn:extensionElements>
+      <bpmn:incoming>F2</bpmn:incoming><bpmn:outgoing>F3</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F3" sourceRef="Accept" targetRef="PerRow"/>
+
+    <!-- One iteration per record. inputDataItem names the per-iteration variable the body reads
+         (`row`); `loopCounter` is bound too. -->
+    <bpmn:subProcess id="PerRow" name="For each validated record">
+      <bpmn:incoming>F3</bpmn:incoming><bpmn:outgoing>F4</bpmn:outgoing>
+      <!-- loopDataInputRef is a FEEL EXPRESSION, so the loop reads the decoded batch in place.
+           An expression that resolved to nothing would fail the instance rather than iterate zero
+           times and report success. -->
+      <bpmn:multiInstanceLoopCharacteristics isSequential="true">
+        <bpmn:loopDataInputRef>payload.value</bpmn:loopDataInputRef>
+        <bpmn:inputDataItem name="row"/>
+      </bpmn:multiInstanceLoopCharacteristics>
+
+      <bpmn:startEvent id="RowStart"><bpmn:outgoing>R1</bpmn:outgoing></bpmn:startEvent>
+      <bpmn:sequenceFlow id="R1" sourceRef="RowStart" targetRef="Map"/>
+
+      <!-- THE TRANSFORM. Renders a JSON object; its entries merge typed into the variables, so
+           `entry` is a RECORD here, not a string. -->
+      <bpmn:scriptTask id="Map" name="CallDetailRecord to CallLogEntry (Handlebars)">
+        <bpmn:script>call-log-entry.hbs</bpmn:script>
+        <bpmn:incoming>R1</bpmn:incoming><bpmn:outgoing>R2</bpmn:outgoing>
+      </bpmn:scriptTask>
+      <bpmn:sequenceFlow id="R2" sourceRef="Map" targetRef="Persist"/>
+
+      <!-- Data task: writes the record as TYPED COLUMNS, keyed by entry.entryId. Each row commits
+           on its own — the load is incremental, not batch-atomic. -->
+      <bpmn:serviceTask id="Persist" name="Write call-log row">
+        <bpmn:incoming>R2</bpmn:incoming><bpmn:outgoing>R3</bpmn:outgoing>
+        <bpmn:dataOutputAssociation>
+          <bpmn:sourceRef>doEntry</bpmn:sourceRef>
+          <bpmn:targetRef>dsrEntry</bpmn:targetRef>
+        </bpmn:dataOutputAssociation>
+      </bpmn:serviceTask>
+      <bpmn:sequenceFlow id="R3" sourceRef="Persist" targetRef="RowEnd"/>
+      <bpmn:endEvent id="RowEnd"><bpmn:incoming>R3</bpmn:incoming></bpmn:endEvent>
+    </bpmn:subProcess>
+
+    <bpmn:sequenceFlow id="F4" sourceRef="PerRow" targetRef="End"/>
+    <bpmn:endEvent id="End" name="Batch loaded"><bpmn:incoming>F4</bpmn:incoming></bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>

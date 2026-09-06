@@ -17,6 +17,7 @@
 
 pub mod codec;
 pub mod codes;
+pub mod content_type;
 pub mod issue;
 pub mod mapped;
 // `pub` (not `pub(crate)`) so codec crates OUTSIDE this workspace — the proprietary domain
@@ -32,8 +33,8 @@ pub use issue::{IssueSeverity, ValidationIssue};
 pub use mapped::{MappedDecodeResult, MappedMap, MappedValue};
 pub use result::{CodecValue, DecodeOutcome, DecodeResult};
 pub use schema::{
-    FormatOnlyCodec, FormatParse, MessageFormat, MessageSchema, SchemaBoundCodec, SchemaKind,
-    ShapeClass,
+    FormatOnlyCodec, FormatParse, MessageFormat, MessageSchema, PayloadCodecFormat,
+    SchemaBoundCodec, SchemaKind, ShapeClass,
 };
 pub use shape::{PathResolution, SchemaShape, ShapeFieldType};
 

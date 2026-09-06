@@ -1,0 +1,90 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  INBOUND schema — the shape a telephony switch hands over, one call detail record per
+  document. This is the contract the uploaded CSV is validated against: cdr-intake.bpmn
+  renders each CSV row as a <CallDetailRecord> and posts it to the `cdr-record-in` channel,
+  whose codec is this XSD. A row with a malformed number, an unparseable timestamp, a
+  negative duration or an unknown rate code is rejected HERE, per record — the rest of the
+  batch keeps loading.
+
+  Every facet below does real work on a CSV cell:
+    recordId    pattern      — the vendor's record key format
+    msisdn      pattern      — E.164-shaped subscriber / peer numbers
+    startTime   xs:dateTime  — a real timestamp, not "any string"
+    durationSec xs:int + range
+    direction   enumeration
+    chargeAmount decimal, totalDigits 12 / fractionDigits 4
+    rateCode    enumeration, optional (an empty CSV cell is simply omitted)
+-->
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           targetNamespace="urn:sutra:cdr"
+           xmlns="urn:sutra:cdr"
+           elementFormDefault="qualified">
+
+  <xs:simpleType name="RecordId">
+    <xs:restriction base="xs:string">
+      <xs:maxLength value="40"/>
+      <xs:pattern value="CDR-[0-9]{4,12}"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <xs:simpleType name="Msisdn">
+    <xs:restriction base="xs:string">
+      <xs:maxLength value="20"/>
+      <xs:pattern value="\+[0-9]{8,15}"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <xs:simpleType name="DurationSeconds">
+    <xs:restriction base="xs:int">
+      <xs:minInclusive value="0"/>
+      <xs:maxInclusive value="86400"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <xs:simpleType name="Direction">
+    <xs:restriction base="xs:string">
+      <xs:enumeration value="originated"/>
+      <xs:enumeration value="received"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <xs:simpleType name="CellId">
+    <xs:restriction base="xs:string">
+      <xs:maxLength value="16"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <xs:simpleType name="ChargeAmount">
+    <xs:restriction base="xs:decimal">
+      <xs:totalDigits value="12"/>
+      <xs:fractionDigits value="4"/>
+      <xs:minInclusive value="0"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <xs:simpleType name="RateCode">
+    <xs:restriction base="xs:string">
+      <xs:enumeration value="PEAK"/>
+      <xs:enumeration value="OFFPEAK"/>
+      <xs:enumeration value="FLAT"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <xs:element name="CallDetailRecord">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element name="recordId"    type="RecordId"/>
+        <xs:element name="msisdn"      type="Msisdn"/>
+        <xs:element name="peerMsisdn"  type="Msisdn"/>
+        <xs:element name="startTime"   type="xs:dateTime"/>
+        <xs:element name="durationSec" type="DurationSeconds"/>
+        <xs:element name="direction"   type="Direction"/>
+        <xs:element name="cellId"      type="CellId"/>
+        <xs:element name="chargeAmount" type="ChargeAmount"/>
+        <xs:element name="rateCode"    type="RateCode" minOccurs="0"/>
+      </xs:sequence>
+    </xs:complexType>
+  </xs:element>
+
+</xs:schema>

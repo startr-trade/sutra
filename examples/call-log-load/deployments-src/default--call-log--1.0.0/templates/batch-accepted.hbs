@@ -1,0 +1,8 @@
+{{!-- The receipt the uploader gets back IMMEDIATELY, before a single row is stored. Rendered by
+      cdr-load.bpmn's `Accept` task, which carries <q:reply continue="true">: the body is flushed
+      to the caller, the instance parks, and the engine self-resumes to run the load detached.
+
+      By the time this renders, every row has ALREADY passed schemas/cdr/cdr.xsd — a batch with a
+      bad cell never reaches this task, it is refused at intake with the issue list. So
+      "rowsAccepted" means accepted, not "received and we will see". `uuid` is engine-supplied. --}}
+{"batchId":"{{uuid}}","rowsAccepted":{{rowCount}},"status":"loading"}

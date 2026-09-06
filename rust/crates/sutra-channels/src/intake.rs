@@ -351,13 +351,55 @@ impl InboundChain {
         );
 
         // ---- <q:onValidation> policy -----------------------------------------------------
+        //
+        // A clean payload always proceeds. A payload with errors is decided by the flow's declared
+        // posture — and, when the flow declared none, by the fail-CLOSED default below.
         let on_validation = bindings.on_validation.as_ref();
-        if !had_errors || on_validation.is_none() {
+        if !had_errors {
             return Ok(IntakeOutcome::Proceed {
                 start_node_id: Some(node_id.to_string()),
             });
         }
-        let policy = on_validation.expect("checked above");
+        // R5 applies only where there is a CONTRACT to fail. A channel binding a bare format (or
+        // no codec at all) is schema-less ingress: the format layer is fail-open by construction —
+        // it never rejects, and the raw bytes stay available at `event.body` — so an issue there is
+        // an observation, not a verdict, and turning it into a refusal would contradict the layer's
+        // own documented posture. A schema-backed codec or a declared validator chain IS a
+        // contract, and that is where the default below bites.
+        let schemaless = binding.codec.trim().is_empty()
+            || self.formats.contract(binding.codec.trim()).is_some();
+        let has_contract = !schemaless
+            || !source.complex_validators.is_empty()
+            || !source.simple_validators.is_empty();
+        if !has_contract && on_validation.is_none() {
+            return Ok(IntakeOutcome::Proceed {
+                start_node_id: Some(node_id.to_string()),
+            });
+        }
+        let Some(policy) = on_validation else {
+            // Design `schema-format-binding.md` R5: no <q:onValidation> means the flow said
+            // NOTHING about handling a validation failure, so the failure must not enter it — the
+            // codec answers the caller instead. This is `reject`, deliberately not `error`: an
+            // `error` raises a BPMN error into a process that, by definition, declared no handler
+            // for it, reporting "uncaught BPMN error" instead of naming the offending field.
+            //
+            // Authors who want the previous pass-through get it by declaring
+            // <q:onValidation mode="route"/>, which also makes the intent visible in the diagram.
+            return Ok(IntakeOutcome::Reject(
+                Diagnostic::error(
+                    codes::INBOUND_VALIDATION_REJECT,
+                    format!(
+                        "Inbound rejected on intake node {node_id} of process {}: {} validation                          issue(s) and no <q:onValidation> policy to handle them. Declare                          <q:onValidation mode=\"route\"/> to let the flow triage                          payload.validation.issues itself.",
+                        process.id,
+                        accumulated.len()
+                    ),
+                )
+                .with_attribute("processId", &process.id)
+                .with_attribute("nodeId", node_id)
+                .with_attribute("issueCount", accumulated.len().to_string())
+                .with_attribute("defaultPosture", "reject"),
+            ));
+        };
         match policy.mode {
             OnValidationMode::Route => Ok(IntakeOutcome::Proceed {
                 start_node_id: Some(node_id.to_string()),

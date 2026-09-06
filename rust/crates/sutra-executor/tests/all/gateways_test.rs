@@ -558,6 +558,87 @@ async fn empty_collection_runs_zero_iterations() {
     assert!(result.visited_nodes.contains("E"));
 }
 
+/// `loopDataInputRef` is a FEEL EXPRESSION, so a loop can iterate a collection IN PLACE —
+/// `payload.value` — instead of copying it into a variable first. That copy is not free: process
+/// variables are persisted in the instance snapshot, so copying a decoded batch put a second copy
+/// of it on every park.
+#[tokio::test]
+async fn a_loop_data_input_ref_may_be_a_path_into_a_variable() {
+    let process = proc(
+        &mi_process(
+            r#"<bpmn:multiInstanceLoopCharacteristics isSequential="true">
+                 <bpmn:loopDataInputRef>payload.value</bpmn:loopDataInputRef>
+                 <bpmn:inputDataItem name="row"/>
+               </bpmn:multiInstanceLoopCharacteristics>"#,
+        ),
+        "p1",
+    );
+    let seen: Rc<RefCell<Vec<String>>> = Rc::default();
+    let s = Rc::clone(&seen);
+    let registry = TaskRegistry::new().register("tick", move |_, ctx| {
+        s.borrow_mut().push(sutra_feel::value::canonical_string_of(
+            ctx.variable("row").unwrap_or(&FeelValue::Null),
+        ));
+        ok_map(&[])
+    });
+    let batch = FeelValue::Map(
+        [(
+            "value".to_string(),
+            FeelValue::List(vec![
+                FeelValue::String("a".to_string()),
+                FeelValue::String("b".to_string()),
+            ]),
+        )]
+        .into_iter()
+        .collect(),
+    );
+
+    TokenExecutor::builder(registry)
+        .with_feel()
+        .build()
+        .execute_sync(&process, vars(&[("payload", batch)]))
+        .await
+        .unwrap();
+
+    assert_eq!(*seen.borrow(), vec!["a".to_string(), "b".to_string()]);
+}
+
+/// A `loopDataInputRef` that resolves to NOTHING fails the instance. It used to yield an empty
+/// collection, so a loop over a dropped or misspelled variable iterated zero times, the instance
+/// completed normally, and the batch vanished with no error anywhere — silent data loss wearing
+/// the shape of success. An explicitly empty list is still a legitimate zero-iteration loop
+/// (`empty_collection_runs_zero_iterations` above); it is ABSENCE that is refused.
+#[tokio::test]
+async fn a_loop_over_an_absent_collection_fails_rather_than_silently_doing_nothing() {
+    let process = proc(
+        &mi_process(
+            r#"<bpmn:multiInstanceLoopCharacteristics isSequential="true">
+                 <bpmn:loopDataInputRef>missing</bpmn:loopDataInputRef>
+               </bpmn:multiInstanceLoopCharacteristics>"#,
+        ),
+        "p1",
+    );
+    let counter = Rc::new(RefCell::new(0));
+    let c = Rc::clone(&counter);
+    let registry = TaskRegistry::new().register("tick", move |_, _| {
+        *c.borrow_mut() += 1;
+        ok_map(&[])
+    });
+
+    let outcome = TokenExecutor::builder(registry)
+        .with_feel()
+        .build()
+        .execute_sync(&process, vars(&[]))
+        .await;
+
+    let err = outcome.expect_err("an absent collection must fail the instance");
+    assert!(
+        format!("{err:?}").contains("resolved to nothing"),
+        "the diagnostic must say what happened: {err:?}"
+    );
+    assert_eq!(*counter.borrow(), 0, "and nothing ran");
+}
+
 // ---- StandardLoopTest --------------------------------------------------------------
 
 fn looped_task(characteristics: &str) -> String {

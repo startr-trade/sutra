@@ -25,4 +25,4 @@ pub use json_schema::{
     JsonSchemaCodec,
 };
 pub use schema_codec_loader::{codec_urn, load as load_schema_codecs, CodecLoadError};
-pub use structural::StructuralCodec;
+pub use structural::{LayoutCompileError, StructuralCodec};

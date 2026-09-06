@@ -30,13 +30,17 @@
 #![forbid(unsafe_code)]
 
 // --- pure channel MODEL (always compiled; wasm-clean — the deploy-time lint's surface) ---
+/// Media-type matching, shared with the codec layer: it lives in the SPI so a schema codec can
+/// negotiate its own format by content-type exactly as a channel does. Re-exported here because
+/// every existing `crate::content_type::accepts` call site reads better unqualified.
+pub use sutra_codec_spi::content_type;
+
 pub mod ack;
 pub mod auth;
 pub mod bridge;
 pub mod cloudevents;
 pub mod codes;
 pub mod config;
-pub mod content_type;
 pub mod diag;
 pub mod intake;
 pub mod policy;

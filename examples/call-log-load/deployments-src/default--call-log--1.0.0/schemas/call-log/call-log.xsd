@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  STORAGE schema — the canonical call-log row, and the SAME declaration that gives the
+  `call_log` data store its typed columns (datastores.yaml `structure: {schema: urn:call-log,
+  type: CallLogEntry}`). It is deliberately DIFFERENT from the inbound cdr.xsd: different
+  names (msisdn -> subscriber), different vocabulary (originated -> outgoing), and two
+  derived fields (ratedAmount, billable) that the inbound record does not carry.
+
+  Every child is a scalar with maxOccurs=1. That is a hard requirement of a projected store:
+  a nested or repeated child is a package-time lint ERROR
+  (SUTRA.CONFIG.DATASTORE.STRUCTURE_NOT_FLAT), never a silent JSON fallback. Facets are
+  load-bearing here — maxLength sizes the VARCHAR, totalDigits/fractionDigits size the
+  NUMERIC — and `sutra lint` compares them against the DDL in migrations/call_log/.
+-->
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           targetNamespace="urn:sutra:call-log"
+           xmlns="urn:sutra:call-log"
+           elementFormDefault="qualified">
+
+  <xs:simpleType name="EntryId">
+    <xs:restriction base="xs:string"><xs:maxLength value="40"/></xs:restriction>
+  </xs:simpleType>
+
+  <xs:simpleType name="PhoneNumber">
+    <xs:restriction base="xs:string"><xs:maxLength value="20"/></xs:restriction>
+  </xs:simpleType>
+
+  <xs:simpleType name="Bearing">
+    <xs:restriction base="xs:string">
+      <xs:maxLength value="8"/>
+      <xs:enumeration value="outgoing"/>
+      <xs:enumeration value="incoming"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <xs:simpleType name="CellSite">
+    <xs:restriction base="xs:string"><xs:maxLength value="16"/></xs:restriction>
+  </xs:simpleType>
+
+  <xs:simpleType name="Amount">
+    <xs:restriction base="xs:decimal">
+      <xs:totalDigits value="12"/>
+      <xs:fractionDigits value="4"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <xs:element name="CallLogEntry">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element name="entryId"         type="EntryId"/>
+        <xs:element name="subscriber"      type="PhoneNumber"/>
+        <xs:element name="counterparty"    type="PhoneNumber"/>
+        <xs:element name="startedAt"       type="xs:dateTime"/>
+        <xs:element name="durationSeconds" type="xs:int"/>
+        <xs:element name="bearing"         type="Bearing"/>
+        <xs:element name="cellSite"        type="CellSite" minOccurs="0"/>
+        <xs:element name="ratedAmount"     type="Amount"/>
+        <xs:element name="billable"        type="xs:boolean"/>
+      </xs:sequence>
+    </xs:complexType>
+  </xs:element>
+
+</xs:schema>

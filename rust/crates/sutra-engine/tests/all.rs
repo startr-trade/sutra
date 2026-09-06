@@ -22,6 +22,8 @@ use sutra_transport_sqs as _;
 
 #[path = "all/archive_activation_conformance.rs"]
 mod archive_activation_conformance;
+#[path = "all/call_log_csv_e2e.rs"]
+mod call_log_csv_e2e;
 #[path = "all/channel_call_retry_it.rs"]
 mod channel_call_retry_it;
 #[path = "all/concurrency_cluster_it.rs"]
