@@ -250,7 +250,10 @@ async fn a_csv_batch_is_receipted_immediately_and_loads_as_typed_rows() {
         tokio::task::spawn_blocking(move || http_post(addr, "text/csv", "it-csv-1", &csv))
             .await
             .unwrap();
-    assert_eq!(status, 202, "the load is asynchronous — 202, not 200: {body}");
+    assert_eq!(
+        status, 202,
+        "the load is asynchronous — 202, not 200: {body}"
+    );
     assert!(ct.starts_with("application/json"), "ct {ct:?}: {body}");
     let receipt: serde_json::Value = serde_json::from_str(&body)
         .unwrap_or_else(|e| panic!("the 202 must carry the rendered receipt ({e}): {body:?}"));
@@ -281,7 +284,10 @@ async fn a_csv_batch_is_receipted_immediately_and_loads_as_typed_rows() {
     assert_eq!(r.get::<String, _>("bearing"), "outgoing");
     assert_eq!(r.get::<i32, _>("duration_seconds"), 182);
     assert!(r.get::<bool, _>("billable"));
-    assert_eq!(r.get::<Option<String>, _>("cell_site").as_deref(), Some("CELL-0042"));
+    assert_eq!(
+        r.get::<Option<String>, _>("cell_site").as_deref(),
+        Some("CELL-0042")
+    );
 
     // Row 2 is the OTHER branch of both conditionals — `received` maps to incoming, and an
     // incoming call is not billable. A transform that ignored `direction` would still pass on
@@ -306,7 +312,10 @@ async fn a_csv_batch_is_receipted_immediately_and_loads_as_typed_rows() {
         .fetch_one(&pool)
         .await
         .expect("count");
-    assert_eq!(n, 4, "a re-uploaded batch upserts by entryId — it does not append");
+    assert_eq!(
+        n, 4,
+        "a re-uploaded batch upserts by entryId — it does not append"
+    );
 
     // ---- the other wire form, the same rows ---------------------------------------------------
     let fixed = sample("call-logs.fixed-width.txt");
@@ -314,7 +323,10 @@ async fn a_csv_batch_is_receipted_immediately_and_loads_as_typed_rows() {
         tokio::task::spawn_blocking(move || http_post(addr, "text/plain", "it-fw-1", &fixed))
             .await
             .unwrap();
-    assert_eq!(status, 202, "the fixed-width form is receipted alike: {body}");
+    assert_eq!(
+        status, 202,
+        "the fixed-width form is receipted alike: {body}"
+    );
     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
     let n: i64 = sqlx::query_scalar("SELECT count(*) FROM call_log")
         .fetch_one(&pool)

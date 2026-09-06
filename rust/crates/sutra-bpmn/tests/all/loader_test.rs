@@ -450,6 +450,9 @@ fn a_sub_process_sees_the_parent_process_data_objects() {
             _ => None,
         })
         .expect("the nested store write");
-    assert_eq!(write.value_var, "entry", "resolved through the parent's <dataObject>");
+    assert_eq!(
+        write.value_var, "entry",
+        "resolved through the parent's <dataObject>"
+    );
     assert_eq!(write.key_expression, "entry.id");
 }

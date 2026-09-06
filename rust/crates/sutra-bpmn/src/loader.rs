@@ -41,6 +41,21 @@ struct StoreBinding {
     expect_unchanged: bool,
 }
 
+/// The lexical surroundings one `assemble_process` call works within: the element whose flow
+/// elements are being assembled, the document-wide scan, and the data objects visible from the
+/// ENCLOSING container.
+///
+/// That last field is why this is a struct rather than three parameters. BPMN scopes a
+/// `<dataObject>` to its container **and everything nested inside it**, so recursion has to carry
+/// the parent's declarations down; grouping them with the container they qualify keeps the
+/// relationship visible at every call site instead of leaving a bare map at the end of an argument
+/// list nobody can read.
+struct ContainerScope<'a> {
+    container: &'a XmlElement,
+    scan: &'a DocScan,
+    inherited_data: &'a HashMap<String, String>,
+}
+
 /// Document-wide capture maps recovered up front (the loader's DOM-scan phase).
 struct DocScan {
     channels_by_event_id: HashMap<String, Vec<String>>,
@@ -377,9 +392,11 @@ impl BpmnModelLoader {
             name,
             is_executable,
             &module_version,
-            p,
-            scan,
-            &HashMap::new(),
+            ContainerScope {
+                container: p,
+                scan,
+                inherited_data: &HashMap::new(),
+            },
         )?;
         // Path-coverage is a TOP-LEVEL process property — validate against this process's OWN
         // flow set (a callActivity/subProcess's inner flows are a separate process's coverage).
@@ -414,12 +431,13 @@ impl BpmnModelLoader {
         name: Option<String>,
         is_executable: bool,
         module_version: &str,
-        container: &XmlElement,
-        scan: &DocScan,
-        // Data objects visible from the ENCLOSING container. BPMN scopes a `<dataObject>` to
-        // its container and to everything nested inside it, so a sub-process sees its parent's.
-        inherited_data: &HashMap<String, String>,
+        scope: ContainerScope<'_>,
     ) -> Result<ProcessDefinition, SutraError> {
+        let ContainerScope {
+            container,
+            scan,
+            inherited_data,
+        } = scope;
         let mut nodes: Vec<Node> = Vec::new();
         let mut flows: Vec<SequenceFlow> = Vec::new();
         let mut activity_ids: HashSet<String> = HashSet::new();
@@ -702,9 +720,12 @@ impl BpmnModelLoader {
             non_blank(sp.attr_or_empty("name")),
             true,
             "1.0",
-            sp,
-            scan,
-            inherited_data,
+            // Rebuilt here rather than threaded: only `container` changes on the way down.
+            ContainerScope {
+                container: sp,
+                scan,
+                inherited_data,
+            },
         )?;
         // Channel-call tasks and timer catch events park DURABLE wait states; the
         // inline sub-process runners cannot park mid-scope, so fail closed at load.
