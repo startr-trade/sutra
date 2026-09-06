@@ -514,7 +514,17 @@ jobs:
           if [ -f ".github/releases/$TAG.md" ]; then
             notes="--notes-file .github/releases/$TAG.md"
           fi
-          if ! gh release view "$TAG" >/dev/null 2>&1; then
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            # The release already exists — re-push the authored body. This step used to skip
+            # entirely, which meant the body could only ever be written ONCE, at creation: a
+            # correction to .github/releases/<tag>.md changed the file in the repo and left the
+            # published page saying the old thing, with a green workflow run reporting success.
+            # Only authored notes are re-pushed; --generate-notes would clobber a body someone
+            # had edited by hand with GitHub's commit list.
+            if [ -f ".github/releases/$TAG.md" ]; then
+              gh release edit "$TAG" --notes-file ".github/releases/$TAG.md"
+            fi
+          else
             gh release create "$TAG" \
               --title "$TAG" \
               $notes \
