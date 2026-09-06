@@ -15,7 +15,7 @@
 //! 6. alias materialisation ([`stores::AliasStore`] hook; `onConflict` reject/correlate),
 //! 7. `<q:onValidation mode=…>` route / reject,
 //! 8. dispatch (start-event routing — multi-start `<q:source>` message-type match),
-//! 9. ack per ack-mode (`on-persist` → 202-empty semantics; `on-complete` → the sync reply
+//! 9. ack per ack-mode (`on-persist` → 202 + any respond-and-continue receipt; `on-complete` → the sync reply
 //!    rides the connection; broker-style deferred acks via [`ack::DeferredAckRegistry`]).
 //!
 //! Under the sync executor the scope is activation dispatch only: channel-delivered RELAYS

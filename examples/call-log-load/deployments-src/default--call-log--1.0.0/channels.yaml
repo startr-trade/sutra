@@ -5,9 +5,18 @@
 # schemas/cdr/cdr.xsd at intake — every row, every cell — before the process starts. There is no
 # second "validation hop" channel, because there is nothing left to validate later.
 #
-# ack-mode on-persist: the upload is acknowledged once durably persisted, not when the load
-# finishes. Combined with <q:reply continue="true"> in cdr-load.bpmn, the caller gets a real
-# receipt document immediately and the load runs detached.
+# ack-mode on-persist: the upload is acknowledged once the inbound is DURABLY PERSISTED, not when
+# the load finishes — the right posture for a long-running load, which must never hold the
+# caller's connection open for its duration. The answer is `202 Accepted`.
+#
+# That settles WHEN the caller is answered. WHAT it is answered with is the flow's business:
+# <q:reply continue="true"> on the Accept task in cdr-load.bpmn renders a receipt before the
+# instance parks, and that receipt is the 202's body. So the caller gets a real document — a batch
+# id and a row count it can quote in a support call — and the load runs detached behind it. A flow
+# that replies nothing still gets a bare 202.
+#
+# The BPMN does NOT restate this. The ack mode is a property of the transport binding, and naming
+# it in one place means the two can never disagree.
 
 channels:
   - name: cdr-upload

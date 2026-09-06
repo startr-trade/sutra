@@ -15,12 +15,32 @@ POST /channels/cdr-upload        codec: urn:cdr   (formats: [csv, fixed-width])
    ▼
  cdr-load.bpmn
    Prep      rowCount := count(payload.value)
-   Accept    Handlebars receipt + <q:reply continue="true">   ──►  caller answered HERE
+   Accept    Handlebars receipt + <q:reply continue="true">   ──►  202 + receipt HERE
    PerRow    multi-instance over payload.value                     (the load runs detached)
      Map       <scriptTask> — one CallDetailRecord ► one CallLogEntry
      Persist   data task     — call_log[entry.entryId]
    End
 ```
+
+## Answering now, loading later
+
+The channel declares `ack-mode: on-persist`: the caller is answered as soon as the upload is
+durably captured, never held for the load. That alone would send a bare `202`. What makes it a
+*useful* `202` is `<q:reply continue="true">` on `Accept` — the process renders its receipt, that
+render becomes the response body, and the process then parks and resumes detached to run the rows:
+
+```json
+HTTP/1.1 202 Accepted
+Content-Type: application/json
+
+{"batchId":"d36d2c59-0fea-4349-b410-a4b4c7715ab9","rowsAccepted":4,"status":"loading"}
+```
+
+The two declarations are independent and both are needed. The ack mode decides *when* the caller is
+answered; `continue="true"` decides that the reply happens at the park instead of at the end of the
+process. Drop the reply and the caller gets an empty `202` it cannot tell from a lost message; drop
+`continue="true"` and the receipt waits for the whole load. See
+[Acknowledgement modes](../operating/ack-modes.md).
 
 ## Binding a tabular format to a schema
 

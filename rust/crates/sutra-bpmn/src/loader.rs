@@ -372,7 +372,15 @@ impl BpmnModelLoader {
             .cloned()
             .unwrap_or_else(|| "1.0".to_string());
 
-        let process = self.assemble_process(&id, name, is_executable, &module_version, p, scan)?;
+        let process = self.assemble_process(
+            &id,
+            name,
+            is_executable,
+            &module_version,
+            p,
+            scan,
+            &HashMap::new(),
+        )?;
         // Path-coverage is a TOP-LEVEL process property — validate against this process's OWN
         // flow set (a callActivity/subProcess's inner flows are a separate process's coverage).
         let paths = scan
@@ -408,14 +416,22 @@ impl BpmnModelLoader {
         module_version: &str,
         container: &XmlElement,
         scan: &DocScan,
+        // Data objects visible from the ENCLOSING container. BPMN scopes a `<dataObject>` to
+        // its container and to everything nested inside it, so a sub-process sees its parent's.
+        inherited_data: &HashMap<String, String>,
     ) -> Result<ProcessDefinition, SutraError> {
         let mut nodes: Vec<Node> = Vec::new();
         let mut flows: Vec<SequenceFlow> = Vec::new();
         let mut activity_ids: HashSet<String> = HashSet::new();
         let mut boundaries_pending: Vec<&XmlElement> = Vec::new();
 
-        // Index this container's data objects + references by id → variable name.
-        let var_name_by_data_id = index_data_elements(container);
+        // Index the data objects VISIBLE HERE by id → variable name: the enclosing container's
+        // first, this container's own overlaid on top so a nested redeclaration shadows rather
+        // than collides. Without the inherited half a sub-process could not resolve a
+        // process-level `<dataObject>`, and `resolve_var` would fall back to the raw ELEMENT ID —
+        // a name no variable answers to — so a store write silently wrote null.
+        let mut var_name_by_data_id = inherited_data.clone();
+        var_name_by_data_id.extend(index_data_elements(container));
 
         for fe in &container.children {
             if fe.ns.as_deref() != Some(BPMN_NS) {
@@ -571,7 +587,7 @@ impl BpmnModelLoader {
                     activity_ids.insert(fe.attr_or_empty("id").to_string());
                 }
                 "subProcess" | "transaction" | "adHocSubProcess" => {
-                    let node = self.build_sub_process(fe, id, scan)?;
+                    let node = self.build_sub_process(fe, id, scan, &var_name_by_data_id)?;
                     nodes.push(wrap_maybe_loop(fe, node)?);
                     activity_ids.insert(fe.attr_or_empty("id").to_string());
                 }
@@ -655,6 +671,7 @@ impl BpmnModelLoader {
         sp: &XmlElement,
         parent_id: &str,
         scan: &DocScan,
+        inherited_data: &HashMap<String, String>,
     ) -> Result<Node, SutraError> {
         let sp_id = required(sp.attr_or_empty("id"), "subProcess", "id")?;
         let is_transaction = sp.local == "transaction";
@@ -687,6 +704,7 @@ impl BpmnModelLoader {
             "1.0",
             sp,
             scan,
+            inherited_data,
         )?;
         // Channel-call tasks and timer catch events park DURABLE wait states; the
         // inline sub-process runners cannot park mid-scope, so fail closed at load.

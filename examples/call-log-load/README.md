@@ -38,7 +38,7 @@ POST /channels/cdr-upload        cdr-upload    codec: urn:cdr   (manifest: forma
 | CSV in an HTTP POST body | `cdr-upload` binds `codec: urn:cdr`, whose `codec-manifest.yaml` declares `formats: [csv]` |
 | Parsed against an XSD, **all rows and cells, in the codec, before processing** | A tabular body is a *batch*: the codec validates each row as one `CallDetailRecord` against `cdr.xsd` in a single decode, reporting every violation with a row-indexed path (`value[3].durationSec`) |
 | Data store loading to a structured table matching the XSD type | `datastores.yaml` → `structure: {schema: urn:call-log, type: CallLogEntry}`. That XSD **is** the table; `migrations/call_log/V001__call_log.sql` is the author's own DDL and `sutra lint` checks the two agree |
-| Async inbound (long-running load) | `ack-mode: on-persist` **plus** `<q:reply continue="true"/>` on `Accept`: the caller gets a receipt document as soon as the rows are counted, then the instance parks and the engine self-resumes to run the load |
+| Async inbound (long-running load) | `ack-mode: on-persist` **plus** `<q:reply continue="true"/>` on `Accept`: the caller gets a `202` carrying a receipt document as soon as the rows are counted, then the instance parks and the engine self-resumes to run the load |
 | Inbound XSD → storage XSD transform before storing | `scripts/call-log-entry.hbs`, run by the `Map` script task |
 | Incremental transformation | One iteration, one transform, one committed row **per record**. No whole-batch document is ever built |
 
@@ -128,14 +128,33 @@ run all of it before deployment.
 sutra lint    deployments-src/default--call-log--1.0.0     # 0 errors, 0 warnings
 sutra package --out ./out deployments-src/default--call-log--1.0.0
 
-export CALL_LOG_DB_URL=postgres://localhost:5432/calllog
-export CALL_LOG_DB_USER=... CALL_LOG_DB_PASSWORD=...
-export CDR_UPLOAD_API_KEY=...
+```
 
+`channels.yaml` and `datastores.yaml` name their secrets by REFERENCE — `env:CDR_UPLOAD_API_KEY`,
+`env:CALL_LOG_DB_URL` and friends. Those names are resolved by the ENGINE PROCESS, so they have to
+be set in the engine's own environment, not in the shell you type `curl` into. Under
+`docker compose` that means the engine service's `environment:` block:
+
+```yaml
+  engine:
+    environment:
+      CDR_UPLOAD_API_KEY: ${CDR_UPLOAD_API_KEY:-dev-only-cdr-key}
+      CALL_LOG_DB_URL: postgres://engine-db:5432/calllog
+      CALL_LOG_DB_USER: ${CALL_LOG_DB_USER:-sutra_engine}
+      CALL_LOG_DB_PASSWORD: ${CALL_LOG_DB_PASSWORD:-sutra-dev-only}
+```
+
+Miss one and the engine does not start half-configured: an unresolvable channel-auth reference is
+fatal (`startup failed — refusing to serve`), because the alternative is opening an unauthenticated
+port. An unresolvable STORE reference is narrower — that store is not registered and the rest of
+the deployment still serves — so watch the startup log for `store NOT registered` too.
+
+```bash
 curl -sS -X POST http://localhost:<port>/channels/cdr-upload \
-     -H 'Content-Type: text/csv' -H "X-Api-Key: $CDR_UPLOAD_API_KEY" \
+     -H 'Content-Type: text/csv' -H 'X-Api-Key: dev-only-cdr-key' \
      -H 'X-Request-Id: batch-2026-09-06-01' \
      --data-binary @sample/call-logs.csv
+# HTTP 202 Accepted
 # {"batchId":"…","rowsAccepted":4,"status":"loading"}
 ```
 

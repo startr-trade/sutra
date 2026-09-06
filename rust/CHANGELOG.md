@@ -11,6 +11,35 @@ This is the changelog for the **Rust-native** engine (`rust/` workspace). It beg
 
 ## [Unreleased]
 
+### Fixed — three defects the `call-log-load` example only exposed when it was actually run
+
+All three sat behind the same blind spot: the example's end-to-end test booted the engine with no
+datasource, so every valid upload stopped at the persistence check and nothing downstream of intake
+ran. The codec half was well covered; the load half was structurally unreachable. A new tier-2
+suite (`call_log_load_it`) now boots the same archive against a real PostgreSQL and asserts the
+receipt, the transformed rows, and that a re-uploaded batch converges.
+
+- **A `<bpmn:dataObject>` declared on a process was invisible inside its sub-processes**, so a data
+  association referencing one from a nested scope silently resolved to the raw element id instead of
+  the variable name. BPMN scopes a data object to its container *and everything nested in it*; the
+  loader indexed each container in isolation. A store write inside a multi-instance loop therefore
+  wrote `null` for every item — and reported it as `VALUE_NOT_A_RECORD` against a correctly
+  resolved key, pointing at the transform rather than at the association that dropped the value.
+
+- **`ack-mode: on-persist` discarded a respond-and-continue reply.** The ack mode settles *when* the
+  caller is answered; it was also silently settling *what* with, throwing away a `<q:reply
+  continue="true">` render that a process had produced deliberately before parking. An HTTP channel
+  under `on-persist` now answers `202 Accepted` carrying that receipt, and a bare `202` only when
+  the process replied nothing. This makes the two declarations composable, which is what a
+  long-running intake needs: answer immediately, with a document, and load detached.
+
+- **Every intake rejection that was the caller's fault answered `500`.** The status map keyed on the
+  literal `REJECTED.` segment, which `SUTRA.INBOUND.VALIDATION_REJECT` does not carry — so a batch
+  refused for malformed cells told the sender the engine had broken and the identical bytes were
+  worth retrying. Caller faults are now `400`, with `409` for an alias conflict, `413` for an
+  oversized payload, `429` for quota, and `503` for channel capacity. Anything unmapped keeps `500`:
+  a wrong `4xx` is worse than an honest `5xx`.
+
 ### Changed — the generators moved under one `generate` verb (BREAKING)
 
 `sutra docgen`, `sutra catalog` and `sutra schemagen` are replaced by

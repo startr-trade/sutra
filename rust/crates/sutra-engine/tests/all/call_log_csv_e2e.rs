@@ -163,9 +163,11 @@ async fn a_running_engine_accepts_both_wire_forms_and_rejects_a_bad_batch_in_kin
         tokio::task::spawn_blocking(move || http_post(addr, PATH, "text/csv", &bad))
             .await
             .unwrap();
-    assert_ne!(
-        status, 200,
-        "a batch with three bad cells must not be accepted: {body}"
+    assert_eq!(
+        status, 400,
+        "a batch with three bad cells is the CALLER's fault, so it must come back 400 — not a \
+         500, which would tell the sender the engine broke and the same bytes are worth \
+         retrying: {body}"
     );
     assert!(
         body.contains("SUTRA.INBOUND.VALIDATION_REJECT"),

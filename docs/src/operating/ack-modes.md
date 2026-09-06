@@ -59,8 +59,31 @@ channels:
   - name: orders-inbound
     transport: http
     bind: "POST /channels/orders-inbound"
-    ack-mode: on-persist     # HTTP: 202 Accepted, no synchronous reply body
+    ack-mode: on-persist     # HTTP: 202 Accepted as soon as intake is durable
 ```
+
+### An asynchronous channel can still answer with a document
+
+`on-persist` decides **when** the caller is answered — now, not when the work finishes. It does not
+decide **what** with. A process that renders a reply before it parks, with
+[`<q:reply continue="true">`](../building/q-namespace.md), sends that reply as the body of the
+`202`; a process that renders nothing gets a bare `202`.
+
+That combination is what a long-running intake usually wants. The caller is not held for the work,
+and it still gets back something it can act on — a batch id to quote, a count of what was accepted —
+instead of an empty body it cannot distinguish from a message that went nowhere:
+
+```json
+HTTP/1.1 202 Accepted
+Content-Type: application/json
+
+{"batchId":"d36d2c59-0fea-4349-b410-a4b4c7715ab9","rowsAccepted":4,"status":"loading"}
+```
+
+The same render under `on-complete` comes back as a `200` instead. Either way `continue="true"` is
+what puts the reply at the park rather than at the end of the process, which is the only reason a
+load measured in minutes can answer its caller in milliseconds. See
+[Batch loading](../building/batch-loading.md) for a worked example.
 
 ## When to pick which
 

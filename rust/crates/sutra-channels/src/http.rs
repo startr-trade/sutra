@@ -8,7 +8,8 @@
 //!   with the `Authorization: ApiKey <key>` fallback).
 //! - `ack-mode: on-complete` (the HTTP default) keeps the synchronous request/reply
 //!   contract — the flow's `<q:reply mode="native">` rides the connection back with the
-//!   reply's content type; `on-persist` answers `202 Accepted` with an empty body.
+//!   reply's content type; `on-persist` answers `202 Accepted` carrying the flow's receipt if it
+//!   produced one (respond-and-continue), and an empty body if it did not.
 //! - Failures render RFC 7807 `application/problem+json` with the status mapping
 //!   (auth → 401, `SUTRA.INBOUND.REJECTED.*` → 400, `SUTRA.RESOLVE.*` → 404, else 500).
 //!
@@ -914,9 +915,24 @@ async fn serve_route(
         Ok(DispatchOutcome::Duplicate) => StatusCode::ACCEPTED.into_response(),
         Ok(DispatchOutcome::Completed { reply, outputs, .. }) => {
             if async_ack {
-                // on-persist ⇒ asynchronous channel: the flow ran, but the reply does NOT
-                // ride the inbound connection — bare 202 Accepted.
-                return StatusCode::ACCEPTED.into_response();
+                // on-persist ⇒ asynchronous channel: the answer does not wait for the work to
+                // finish. That settles WHEN we respond, not WHETHER the flow had something to
+                // say. A flow that ran `<q:reply continue="true">` produced its receipt
+                // deliberately, before parking, precisely so a long-running load could hand the
+                // caller a batch id and then detach — so that receipt IS the 202's body. A 202
+                // carrying a representation of the accepted work is exactly what the status is
+                // for. Only a flow that replied nothing gets the bare 202.
+                //
+                // It used to be dropped unconditionally, which made the two declarations
+                // silently exclusive: the asynchronous ack mode a long load wants and the
+                // receipt it wants to send could not coexist, and nothing said so — the caller
+                // just got an empty body.
+                return match reply {
+                    Some(r) => {
+                        response_with(StatusCode::ACCEPTED, &r.content_type, r.body.into_inner())
+                    }
+                    None => StatusCode::ACCEPTED.into_response(),
+                };
             }
             render_ok(reply, outputs, content_type.as_deref())
         }
@@ -1138,9 +1154,28 @@ pub fn sha256_truncated(body: &[u8]) -> String {
 // ---- problem rendering ----------------------------------------------------------------------
 
 /// The diagnostic-code → HTTP status mapping.
+/// Map a diagnostic code to its HTTP status.
+///
+/// The `SUTRA.INBOUND.*` prefix is NOT one status class — it mixes the caller's fault (a document
+/// that fails its schema), load shedding (quota, capacity) and the deployment's own fault (a codec
+/// that is not there, a handler that is ambiguous). Only the last of those is a 5xx, so the codes
+/// are mapped deliberately and anything unlisted keeps the fail-safe 500: a wrong 4xx tells a
+/// caller not to retry something that would have succeeded, which is worse than an honest 500.
 fn status_for_code(code: &str) -> u16 {
-    if code == codes::INBOUND_REJECTED_AUTH {
-        return 401;
+    match code {
+        codes::INBOUND_REJECTED_AUTH => return 401,
+        // The caller's document failed its contract — `reject` at intake, or an unhandled
+        // `error` posture. Their file, their fix; a retry of the same bytes cannot succeed.
+        codes::INBOUND_VALIDATION_REJECT | codes::INBOUND_VALIDATION_ERROR => return 400,
+        codes::INBOUND_PAYLOAD_TOO_LARGE => return 413,
+        // A correlation alias this message would bind is already held by another instance.
+        codes::INBOUND_ALIAS_CONFLICT_REJECT => return 409,
+        // Load shedding, not failure: the request was well formed and may succeed later.
+        codes::INBOUND_QUOTA_EXCEEDED_RATE | codes::INBOUND_QUOTA_EXCEEDED_CONCURRENT => {
+            return 429
+        }
+        codes::INBOUND_CHANNEL_AT_CAPACITY => return 503,
+        _ => {}
     }
     if code.starts_with("SUTRA.INBOUND.REJECTED.") {
         return 400;
@@ -1343,6 +1378,26 @@ mod local_channel_tests {
             // The MODEL is unchanged: attributes stay nested on the JSON rendering.
             assert_eq!(v["attributes"]["issueCount"], "1");
         }
+    }
+
+    /// Regression: every intake reject fell through to 500 unless its code carried the literal
+    /// `REJECTED.` segment. `SUTRA.INBOUND.VALIDATION_REJECT` does not, so a CSV batch refused for
+    /// three bad cells answered `500 Internal Server Error` — the engine claiming its own fault
+    /// for the caller's malformed file, and telling every well-behaved client that the identical
+    /// bytes were worth retrying.
+    #[test]
+    fn a_caller_fault_is_a_4xx_and_only_an_engine_fault_is_a_500() {
+        assert_eq!(status_for_code(codes::INBOUND_VALIDATION_REJECT), 400);
+        assert_eq!(status_for_code(codes::INBOUND_VALIDATION_ERROR), 400);
+        assert_eq!(status_for_code(codes::INBOUND_REJECTED_AUTH), 401);
+        assert_eq!(status_for_code(codes::INBOUND_ALIAS_CONFLICT_REJECT), 409);
+        assert_eq!(status_for_code(codes::INBOUND_PAYLOAD_TOO_LARGE), 413);
+        assert_eq!(status_for_code(codes::INBOUND_QUOTA_EXCEEDED_RATE), 429);
+        assert_eq!(status_for_code(codes::INBOUND_CHANNEL_AT_CAPACITY), 503);
+        // The deployment's own fault stays a 500 — the caller can do nothing about either.
+        assert_eq!(status_for_code(codes::INBOUND_CODEC_NOT_FOUND), 500);
+        assert_eq!(status_for_code(codes::INBOUND_AMBIGUOUS_HANDLER), 500);
+        assert_eq!(status_for_code("SUTRA.SOMETHING.UNMAPPED"), 500);
     }
 
     #[test]

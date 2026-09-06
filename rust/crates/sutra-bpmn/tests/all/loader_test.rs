@@ -388,3 +388,68 @@ fn a_non_message_intermediate_catch_is_rejected_fail_closed() {
     );
     assert!(e.message.contains("messageEventDefinition"), "{e}");
 }
+
+/// A `<bpmn:dataObject>` declared on the PROCESS is visible to a store write inside a nested
+/// `<bpmn:subProcess>` — BPMN scopes a data object to its container *and everything nested in
+/// it*, and the loader indexes each container separately, so the inherited half has to be
+/// threaded down explicitly.
+///
+/// Regression: it was not. The nested association's `<sourceRef>doEntry</sourceRef>` resolved
+/// against an index that held only the sub-process's own (empty) declarations, missed, and fell
+/// back to the raw ELEMENT ID — so the write named a variable `doEntry` that nothing ever sets.
+/// The key expression is FEEL over the live variables and kept resolving, which made the failure
+/// maximally confusing at runtime: the store rejected the write for the *right* key with a null
+/// value (`SUTRA.RUNTIME.DATASTORE.VALUE_NOT_A_RECORD`), pointing at the transform rather than at
+/// the association that dropped it.
+#[test]
+fn a_sub_process_sees_the_parent_process_data_objects() {
+    let xml = r#"<?xml version="1.0"?>
+    <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                      xmlns:q="urn:sutra:q:1.0">
+      <bpmn:dataStore id="st" name="entries"/>
+      <bpmn:process id="p">
+        <bpmn:dataObject id="doEntry" name="entry"/>
+        <bpmn:dataStoreReference id="dsr" name="entries" dataStoreRef="st">
+          <bpmn:extensionElements><q:store key="entry.id"/></bpmn:extensionElements>
+        </bpmn:dataStoreReference>
+        <bpmn:startEvent id="S"/>
+        <bpmn:subProcess id="Loop">
+          <bpmn:startEvent id="RS"/>
+          <bpmn:serviceTask id="Persist">
+            <bpmn:dataOutputAssociation>
+              <bpmn:sourceRef>doEntry</bpmn:sourceRef>
+              <bpmn:targetRef>dsr</bpmn:targetRef>
+            </bpmn:dataOutputAssociation>
+          </bpmn:serviceTask>
+          <bpmn:endEvent id="RE"/>
+          <bpmn:sequenceFlow id="r1" sourceRef="RS" targetRef="Persist"/>
+          <bpmn:sequenceFlow id="r2" sourceRef="Persist" targetRef="RE"/>
+        </bpmn:subProcess>
+        <bpmn:endEvent id="E"/>
+        <bpmn:sequenceFlow id="f1" sourceRef="S" targetRef="Loop"/>
+        <bpmn:sequenceFlow id="f2" sourceRef="Loop" targetRef="E"/>
+      </bpmn:process>
+    </bpmn:definitions>"#;
+
+    let module = loader().load(xml.as_bytes()).unwrap();
+    let inner = module
+        .process("p")
+        .unwrap()
+        .nodes()
+        .iter()
+        .find_map(|n| match n {
+            Node::SubProcess { inner, .. } => Some(inner),
+            _ => None,
+        })
+        .expect("sub-process");
+    let write = inner
+        .nodes()
+        .iter()
+        .find_map(|n| match n {
+            Node::DataTask { data_mapping, .. } => data_mapping.store_writes.first(),
+            _ => None,
+        })
+        .expect("the nested store write");
+    assert_eq!(write.value_var, "entry", "resolved through the parent's <dataObject>");
+    assert_eq!(write.key_expression, "entry.id");
+}

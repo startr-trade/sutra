@@ -87,7 +87,7 @@
              load. It is a second line of defence, not the only one: the store write is an upsert
              keyed by entryId, so a genuine re-upload of corrected rows still converges. -->
         <q:source channel="cdr-upload" name="payload" messageTypeValue="CallDetailRecord"
-                  ack="on-persist" dedupKey="header.X-Request-Id" dataClass="pii"/>
+                  dedupKey="header.X-Request-Id" dataClass="pii"/>
         <!-- Explicit posture. `reject` is also the DEFAULT when nothing is declared — a flow that
              states no policy has no handler, so the failure must not enter it — but a batch
              loader should say so out loud. `route` here would instead let a partly-bad file
@@ -113,7 +113,13 @@
 
     <!-- RESPOND AND CONTINUE. The render is flushed to the caller as the HTTP response body,
          then the instance parks with a due-now self-resume marker and the poller runs the tail.
-         Distinct from a bare 202 (ack-mode alone): the caller gets a real receipt. -->
+         Distinct from a bare 202 (ack-mode alone): the caller gets a real receipt.
+
+         The channel runs `ack-mode: on-persist` (channels.yaml), so this render comes back as
+         the body of a `202 Accepted` — the load is not waited on. Under `on-complete` the same
+         render rides the connection as a `200`. Either way the receipt is sent HERE, at the park,
+         and not at End: that is what `continue="true"` decides, and it is the only reason a load
+         measured in minutes can still answer its caller in milliseconds. -->
     <bpmn:serviceTask id="Accept" name="Reply batch receipt, then continue"
                       implementation="batch-accepted.hbs">
       <bpmn:extensionElements>
