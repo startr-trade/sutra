@@ -113,7 +113,7 @@ variable "observability" {
 variable "tenants" {
   description = <<-EOT
     Map of tenant configurations to materialise as kubernetes_config_map_v1 resources mounted into the engine pod at /etc/sutra/resources/tenants/<id>/.
-    Each entry's key is the tenant id; the value is the tenant-configuration.yaml body (status, retention, quotas, inherits, redactors per multi-tenancy.md). Channels live in sibling channels/*.yaml entries — see resource-layout.md. The engine's ResourceLayoutObserver picks up atomic ConfigMap updates within ~1s.
+    Each entry's key is the tenant id; the value is the tenant-configuration.yaml body (status, retention, quotas, inherits, redactors). Channels live in sibling channels/*.yaml entries. The engine's ResourceLayoutObserver picks up atomic ConfigMap updates within ~1s.
 
     Tenants are tofu-applied; mutations flow through `tofu apply`. No K8s Custom Resources.
   EOT
@@ -156,7 +156,7 @@ variable "network_policy" {
 # ===== Autoscaling =====
 
 variable "autoscaling" {
-  description = "KEDA-driven autoscaling on inbox+outbox lagging-work depth (per replica-semantics.md)"
+  description = "KEDA-driven autoscaling on inbox+outbox lagging-work depth (per the replica-semantics contract)"
   type = object({
     enabled             = bool
     min_replicas        = optional(number, 2)

@@ -240,6 +240,31 @@ exclusive gateway fanning into N call activities.
 a soft error *means* — that decision stays in your process, which is what keeps the engine
 domain-neutral.
 
+The three modes are not interchangeable:
+
+| Mode | What happens |
+|---|---|
+| `route` | the payload reaches the flow; you triage `payload.validation.issues` yourself |
+| `reject` | the message is refused at intake; no instance starts; the caller gets the issue list |
+| `error` | a BPMN error is raised *into* the flow, for an error boundary or event sub-process to catch |
+
+**Declaring nothing means `reject`.** An intake that carries a validation *contract* — a
+schema-backed codec, or a declared `<q:validators>` chain — and states no policy refuses a failing
+payload rather than passing it on. A flow that says nothing about handling failure has no handler
+for it by definition, so the failure must not enter it.
+
+That default is `reject` rather than `error` deliberately: `error` is still the flow taking
+control, and raising a BPMN error into a process with no matching boundary reports "uncaught BPMN
+error" instead of naming the offending field — a worse diagnostic for the same refusal.
+
+Schema-less ingress is untouched. A channel binding a bare format (`csv`, `json`, …) has no
+contract to fail, and the format layer is fail-open by construction, so nothing changes there.
+
+If you want the payload through regardless, say so — `<q:onValidation mode="route"/>` — and the
+intent is visible in the diagram instead of resting on a default. `sutra lint` warns
+(`SUTRA.CONFIG.VALIDATION.POSTURE_UNDECLARED`) on any contract-bearing intake that declares no
+policy, naming both choices.
+
 ## `q:process` — the retry-safety assertion
 
 ```xml
@@ -253,11 +278,26 @@ non-idempotent process is consumed (ack, no requeue) and recorded as an incident
 blind-retried. This is a different concern from `q:source`'s `dedupKey`, which only detects that a
 message *is* a redelivery — it says nothing about whether re-processing it is safe.
 
+**What the assertion gates, and what it does not.** It governs the *failure* path: whether a
+delivery that failed is requeued or dead-lettered. It does **not** gate replay after a park. An
+instance that parks — at a wait node, a `<q:retry>` backoff, or a `<q:reply continue="true">` — is
+re-driven at-least-once by the durable poller, unconditionally. A multi-instance loop is one
+durable step, so a crash mid-loop replays it from the first item rather than resuming where it
+stopped.
+
+Both rest on the same property: every effect the flow repeats must converge. A store write keyed
+by something derived from the record does (re-writing is an upsert). A `<q:send>`, an append, or a
+counter increment does not — and no assertion makes it so. Declaring `idempotent="true"` over
+effects that do not converge does not make replay safe; it only changes what happens after a
+failure.
+
 ## `q:variables`, `q:audit`, `q:coverage`
 
 - **`q:variables`** — declares process variables up front (name + scalar type or a schema
   reference), so deploy-time static validation can check every FEEL path against them, and mark a
-  variable `transient` (never persisted — reading it after a wait state is a validation error),
+  variable `transient` (never persisted, so it is dropped at any park — reading it after a wait
+  state, a `<q:retry>` backoff or a `<q:reply continue="true">` is a validation error; it is for
+  scratch that is re-derived, never for anything the flow still needs on the other side),
   `sensitive` (persisted but redacted downstream), or `source`-bound (payload-initialized from a
   named channel).
 - **`q:audit`** — per-process audit sink/target/capture-level configuration.

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Saturation-bench driver (P1-6 Phase 0, docs/design/execution-scale-out.md §7). Runs ONE
+# Saturation-bench driver (P1-6 Phase 0). Runs ONE
 # k6 profile from tools/sutra-load-test/profiles/{burst-start,steady-park-resume,timer-storm,
 # correlation-heavy,mixed}.js against a chosen engine endpoint and writes a structured JSON
 # summary per run under rust/bench/results/<label>/ — same layering as sustained-rps.sh (this
@@ -233,7 +233,7 @@ jq -n \
       },
       timerStormDrain: $timerStormDrain,
       plannedMetrics: {
-        note: "Land with Phase 2 (docs/design/execution-scale-out.md §6.1) — null until then, named here so the result shape does not change again when they arrive.",
+        note: "Land with Phase 2 — null until then, named here so the result shape does not change again when they arrive.",
         perShardQueueDepth: null,
         handoffCount: null,
         claimBounceCount: null,

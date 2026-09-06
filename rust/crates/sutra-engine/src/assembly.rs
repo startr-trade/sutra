@@ -88,7 +88,7 @@ pub(crate) struct DeploymentPlan {
     /// single-engine), unlike `validators` above.
     redactors: Vec<(String, String)>,
     /// `(codec URN, xsd documents)` — compiled to [`StructuralCodec`]s on the actor.
-    codecs: Vec<(String, Vec<Vec<u8>>)>,
+    codecs: Vec<ModuleCodecSource>,
     /// `(archive-scoped codec URN key, codec factory)` — the schema BUNDLES of `schemas/**`
     /// (a `codec-manifest.yaml` kind an extension codec crate serves), already deploy-time
     /// COMPILED here (a bad manifest / uncompilable schema fails `plan_deployment`, mirroring the
@@ -104,7 +104,7 @@ pub(crate) struct DeploymentPlan {
     /// cheap-clone). The backend is picked by the connection URL scheme at plan time.
     stores: Vec<(String, StoreBackend)>,
     /// The deployment's COVERAGE store, built from its own `coverage` declaration in
-    /// `datastores.yaml` (`datastore-schema-projection.md` §7): the author picks the database,
+    /// `datastores.yaml`: the author picks the database,
     /// the engine owns the schema and applies it on first use. `None` when the deployment
     /// declares no `coverage` store (`sutra lint` errors on that combination when
     /// `<q:coverage>` paths exist) — or when its connection could not be resolved, in which case
@@ -285,13 +285,20 @@ pub(crate) fn build_store_backend(
 }
 
 /// Resolve a store's declared `structure` into the [`ProjectedStore`] its provider is built with
-/// (design `datastore-schema-projection.md` §4.1 → §4.6).
+///.
 ///
 /// Everything happens at PLAN time, and every failure refuses the deploy — the deliberate
 /// asymmetry with an unresolvable CONNECTION, which only warns (an env-ref unset in this
 /// environment is an operational fact; a structure that cannot be projected is a package fault
 /// that no environment fixes). Serving it anyway is the outcome §4.2 refuses.
 ///
+/// One module XSD codec as the plan carries it: `(urn, codec name, XSDs, its
+/// `codec-manifest.yaml` text)`. The manifest travels so the RUNNING engine honours the same
+/// `formats:` / layout declaration `sutra package` validated — without it the assembly had to
+/// assume a format set, and did (`["xml","json","yaml"]`), which made a `formats: [csv]` codec
+/// inert at runtime: the package sealed cleanly and then refused every upload.
+type ModuleCodecSource = (String, String, Vec<Vec<u8>>, Option<String>);
+
 /// The type is resolved against the package's OWN `schemas/<folder>` XSD codecs — the same
 /// compiled schemas the codecs use, so there is no second schema source of truth. A JSON-Schema
 /// or bundle codec folder is refused with that stated plainly rather than projected from a model
@@ -1072,11 +1079,18 @@ pub(crate) fn plan_deployment(
         .iter()
         .filter(|(name, _)| !bundle_folders.contains(*name))
         .map(|(name, xsds)| {
+            // The codec's manifest, keyed under `schemas/` exactly as the archive holds it.
+            let manifest = d
+                .schema_files
+                .get(&format!("{}/codec-manifest.yaml", name.replace(':', "/")))
+                .map(|a| a.content.clone());
             (
                 format!("urn:{name}"),
+                name.clone(),
                 xsds.iter()
                     .map(|a| a.content.clone().into_bytes())
                     .collect(),
+                manifest,
             )
         })
         .collect();
@@ -1501,7 +1515,7 @@ pub(crate) fn build_shared_registries(
         for (key, source) in &plan.srl_validators {
             validators.register_under(key, SrlContentValidator::new(key, source));
         }
-        for (urn, xsds) in &plan.codecs {
+        for (urn, name, xsds, manifest) in &plan.codecs {
             let refs: Vec<&[u8]> = xsds.iter().map(|x| x.as_slice()).collect();
             // THE VALIDATING BUILD. `compile` alone produces a shape-only codec — it projects and
             // coerces leaves but runs no XSD validation, so the structural tier emitted no issues
@@ -1512,9 +1526,33 @@ pub(crate) fn build_shared_registries(
             // Falls back to the shape-only build when the XSD set is outside the supported subset:
             // that is a deployment that used to load and still should, and the reply to it is a
             // narrower guarantee rather than a refusal to serve.
-            let codec = StructuralCodec::compile_with_formats(urn, &refs, &["xml", "json", "yaml"])
-                .unwrap_or_else(|_| StructuralCodec::compile(urn, &refs));
-            codecs.register(codec);
+            // Built THROUGH THE MANIFEST, so a `formats: [csv]` / `[fixed-width]` declaration is
+            // live at runtime and not merely validated at package time. Absent or unreadable
+            // manifest falls back to the historical xml/json/yaml assumption inside.
+            match sutra_codec_schema::schema_codec_loader::compile_module_codec(
+                urn,
+                name,
+                manifest.as_deref(),
+                &refs,
+            ) {
+                // `register_shared` keys on the codec's own name, which IS the urn — the same
+                // keying the previous `register(codec)` produced.
+                Ok(codec) => {
+                    codecs.register_shared(codec);
+                }
+                Err(e) => {
+                    // A manifest the loader rejects is a package-time fault that reached runtime;
+                    // serve the shape-only build rather than refusing the whole deployment, and
+                    // say so loudly.
+                    tracing::warn!(
+                        codec = %urn,
+                        code = %e.code(),
+                        "codec manifest rejected at assembly — serving a shape-only codec: {}",
+                        e.message()
+                    );
+                    codecs.register(StructuralCodec::compile(urn, &refs));
+                }
+            }
         }
         // Archive schema bundles under the deployment scope — they win over a built-in of the
         // same logical name for THIS deployment (`CodecRegistry::resolve`'s tier 1), leaving every
@@ -1656,7 +1694,7 @@ pub(crate) fn build_engine(
     };
 
     // The coverage-METRIC store — since 2026-08-04 the ONLY coverage surface
-    // (`datastore-schema-projection.md` §7 retired the module KV covered-set; its rows are left
+    // (the module KV covered-set was retired; its rows are left
     // in place for rollback but never read or written again). SUPERSEDING RULING, same day: it
     // does NOT ride the engine pool. Each deployment's coverage marks go to the store IT declared
     // (`coverage` in its own datastores.yaml), whose data source picks the database and therefore
@@ -2193,7 +2231,7 @@ mod datastore_dispatch_tests {
         // (The KV coverage adapter this test used to exercise here is gone: coverage is typed
         // rows now — in the deployment's OWN declared `coverage` store, with engine-shipped DDL —
         // so there is no KV coverage slot to round-trip. `sutra-datastore`'s per-dialect
-        // coverage suites cover that surface; see `datastore-schema-projection.md` §7.)
+        // coverage suites cover that surface;.
 
         drop(container);
     }
@@ -2566,8 +2604,8 @@ mod archive_artifact_tests {
     }
 }
 
-/// Plan-time resolution of a data store's declared `structure` (design
-/// `datastore-schema-projection.md` §4.1 → §4.6): the store's own `schemas/<folder>` XSD codec is
+/// Plan-time resolution of a data store's declared `structure`: the store's own
+/// `schemas/<folder>` XSD codec is
 /// compiled, the declared type's children enumerated, and the projection derived — or the deploy
 /// is refused. A store WITHOUT a `structure` resolves to no projection at all, which is the
 /// compatibility guarantee (its provider then behaves exactly as before).

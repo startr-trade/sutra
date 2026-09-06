@@ -74,7 +74,7 @@ pub fn rust_migration_root() -> PathBuf {
 }
 
 /// Every migration root the engine applies (shipped set + Rust addenda). Coverage is NOT among
-/// them: since `datastore-schema-projection.md` §7 its tables live in the deployment's own
+/// them: its tables live in the deployment's own
 /// declared `coverage` store, migrated there by `sutra-datastore` with engine-shipped DDL.
 pub fn all_migration_roots() -> Vec<PathBuf> {
     let mut roots = shipped_migration_roots();

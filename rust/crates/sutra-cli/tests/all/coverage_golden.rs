@@ -349,7 +349,7 @@ fn regenerated_coverage_set_is_structurally_equivalent_to_the_golden_files() {
 
     // --- 6. No coverage SQL, anywhere -----------------------------------------------------
     // The engine owns the coverage schema and applies it to the declared store on first use
-    // (`datastore-schema-projection.md` §7), so neither the scaffolder nor the golden package
+    //, so neither the scaffolder nor the golden package
     // ships coverage DDL.
     assert!(!find(&generated_stores)
         .properties

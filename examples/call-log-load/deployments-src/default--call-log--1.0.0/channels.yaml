@@ -1,0 +1,24 @@
+# Channels for the `default` tenant's call-log module, 1.0.0.
+#
+# ONE channel. The CSV upload is a typed message: `codec: urn:cdr` binds the schema codec whose
+# manifest declares `formats: [csv]`, so the whole file is parsed AND validated against
+# schemas/cdr/cdr.xsd at intake — every row, every cell — before the process starts. There is no
+# second "validation hop" channel, because there is nothing left to validate later.
+#
+# ack-mode on-persist: the upload is acknowledged once durably persisted, not when the load
+# finishes. Combined with <q:reply continue="true"> in cdr-load.bpmn, the caller gets a real
+# receipt document immediately and the load runs detached.
+
+channels:
+  - name: cdr-upload
+    transport: http
+    bind: "POST /channels/cdr-upload"
+    codec: urn:cdr
+    ack-mode: on-persist
+    cloudevents-mode: none
+    auth:
+      scheme: apikey
+      apikey:
+        # A resolver reference, not a literal — resolved once at channel startup.
+        value: env:CDR_UPLOAD_API_KEY
+        header: X-Api-Key

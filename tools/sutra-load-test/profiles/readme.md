@@ -1,6 +1,6 @@
 # Saturation-bench profiles (P1-6 Phase 0)
 
-Five k6 profiles for `docs/design/execution-scale-out.md` §7 (the saturation-benchmark plan
+Five k6 profiles for `` §7 (the saturation-benchmark plan
 for keyed actor sharding), plus their dedicated fixture package and driver script. This page
 is the operator's guide: what each profile measures, what it needs, and — most importantly —
 the honesty rule that governs citing any number they produce.
@@ -145,7 +145,7 @@ Prerequisites: docker, curl, k6, jq, the engine image (`SUTRA_ENGINE_IMAGE`, def
 `release` profile vs the `release-it` dev tag), and the `sutra` CLI or `sutra-bench-packager`
 (see "Fixture prerequisites" above) — the driver script itself never builds anything.
 
-After this run, `docs/design/execution-scale-out.md` §8's Phase 0 gate ("recorded results in
+After this run, `` §8's Phase 0 gate ("recorded results in
 `rust/bench/results/`; zero code change") is closed, and the five `summary.json` files are the
 first legitimate numbers this repository can cite for this design.
 

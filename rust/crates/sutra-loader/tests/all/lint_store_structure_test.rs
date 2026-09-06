@@ -1,5 +1,5 @@
 //! Projected data stores — the seven `SUTRA.CONFIG.DATASTORE.*` diagnostics `sutra lint` raises
-//! for a store that declares a `structure:` block (design `datastore-schema-projection.md` §4.7),
+//! for a store that declares a `structure:` block,
 //! driven end-to-end through [`sutra_loader::lint_dir`] over real package directories.
 //!
 //! Every case is built from ONE base package — a flat `AccountRecord` type, a matching table, a

@@ -488,6 +488,8 @@ pub fn validate_deployment_with_manifests(
     check_template_inputs(deployment, &definitions, &dep_label, out);
     check_transient_reads(deployment, &dep_label, out);
     check_never_initialized(deployment, &dep_label, out);
+    check_validation_posture(deployment, &definitions, &dep_label, out);
+    check_codec_manifests(deployment, &dep_label, out);
     check_navigation_paths(deployment, &definitions, &dep_label, out);
     check_output_conformance(deployment, &definitions, manifests, &dep_label, out);
     check_rules_applicability(deployment, &definitions, manifests, &dep_label, out);
@@ -1424,7 +1426,7 @@ fn check_replies(
 /// The static STORE_MISSING check: `<q:coverage>` declared ⇒ a `coverage` store
 /// must be present in `datastores.yaml`.
 ///
-/// KEPT by the 2026-08-04 superseding ruling (`datastore-schema-projection.md` §7), and now for
+/// KEPT by the 2026-08-04 superseding ruling, and now for
 /// the TRUE reason: that store is *where the coverage marks are persisted*. The author chooses
 /// their database by pointing it at a data source; the engine owns the coverage schema and applies
 /// it to that connection on first use, so no coverage SQL — and no `migrations:` key — is the
@@ -2223,7 +2225,7 @@ fn check_migrations(
     }
 }
 
-// ---- projected data stores (design `datastore-schema-projection.md` §4.7) ----------------
+// ---- projected data stores ----------------
 
 /// Verify every store that declares a `structure:` block against the row shape its own
 /// migrations build — statically, with no database and no credentials.
@@ -3256,7 +3258,16 @@ fn nodes_after_wait(process: &ProcessDefinition) -> BTreeSet<String> {
     let mut after: BTreeSet<String> = BTreeSet::new();
     let mut stack: Vec<String> = Vec::new();
     for node in process.nodes() {
-        if node.is_wait_state() {
+        // Every way a node can PARK, matching `is_sync_eligible`'s three conditions. Using
+        // `is_wait_state()` alone was a blind spot: it knows user tasks, catches and channel-call
+        // service tasks, but not `<q:reply continue="true">` or a `<q:retry>` backoff — both of
+        // which park just as durably. A @transient variable set before a respond-and-continue
+        // reply and read after it is dropped at that park and silently reads null, which is
+        // exactly what this gate exists to prevent.
+        if node.is_wait_state()
+            || process.has_continue_reply(node.id())
+            || process.has_retry_policy(node.id())
+        {
             for flow in process.outgoing(node.id()) {
                 stack.push(flow.target_ref.clone());
             }
@@ -3341,6 +3352,150 @@ fn check_transient_reads(
                     }
                 }
             }
+        }
+    }
+}
+
+// ---- codec manifests: build each one the way the ENGINE will ------------------------------
+
+/// Compile every `schemas/<codec>` XSD codec through the SAME entry point the engine assembly
+/// uses, so a manifest fault is a package-time ERROR instead of a deployment-time surprise.
+///
+/// This is what makes the `formats:` / layout declaration checkable at all: lint's other codec
+/// passes read the XSDs directly and never open `codec-manifest.yaml`, so an unknown format, a
+/// tabular format missing its layout block, or a fixed-width layout whose columns disagree with
+/// the bound type all sailed through `sutra lint` and `sutra package` — and then failed every
+/// row of every upload at runtime.
+fn check_codec_manifests(
+    deployment: &LoadedDeployment,
+    dep_label: &str,
+    out: &mut Vec<LintDiagnostic>,
+) {
+    for (name, xsds) in &deployment.codecs {
+        let Some(manifest) = deployment
+            .schema_files
+            .get(&format!("{}/codec-manifest.yaml", name.replace(':', "/")))
+        else {
+            continue; // no manifest: the conventional xml/json/yaml codec, nothing declared to check
+        };
+        // Only the two GENERIC schema kinds are this build's to judge. A bundle kind
+        // (`schemaKind: fednow`, …) is served by a codec crate a DISTRIBUTION links, and this
+        // workspace links none — so `bundle_kinds()` is empty here and the loader would reject a
+        // perfectly valid package that targets a distribution which does serve it. Refusing what
+        // we cannot know about would put the neutrality boundary the wrong way round; a bundle
+        // folder is also excluded from the engine's own `plan.codecs`, so nothing is skipped that
+        // this pass would otherwise cover.
+        if !is_generic_schema_kind(&manifest.content) {
+            continue;
+        }
+        let bytes: Vec<&[u8]> = xsds.iter().map(|a| a.content.as_bytes()).collect();
+        if let Err(e) = sutra_codec_schema::schema_codec_loader::compile_module_codec(
+            &format!("urn:{name}"),
+            name,
+            Some(&manifest.content),
+            &bytes,
+        ) {
+            out.push(
+                LintDiagnostic::error(
+                    codes::CONFIG_CODEC_MANIFEST_REJECTED,
+                    // The loader's message already names the codec; don't say it twice.
+                    format!("deployment {dep_label}: {} [{}]", e.message(), e.code()),
+                )
+                .at_named("codec-manifest.yaml", name),
+            );
+        }
+    }
+}
+
+/// Whether a `codec-manifest.yaml` declares one of the two generic schema kinds (`xsd` /
+/// `json-schema`) — the kinds any build can compile. Read off the raw text rather than through
+/// the loader's parser, because the parser's own verdict on an unserved bundle kind is the thing
+/// being avoided.
+fn is_generic_schema_kind(manifest: &str) -> bool {
+    manifest
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("schemaKind:"))
+        .map(|kind| kind.trim().trim_matches(['"', '\'']).to_ascii_lowercase())
+        .any(|kind| {
+            matches!(
+                kind.as_str(),
+                "xsd" | "json-schema" | "jsonschema" | "json_schema"
+            )
+        })
+}
+
+// ---- R5 migration: an undeclared validation posture on a contract-bearing intake ----------
+
+/// The built-in FORMAT names — a channel binding one of these is schema-less ingress, not a
+/// validation contract (the format layer is fail-open by construction and never rejects).
+fn builtin_format_names() -> &'static BTreeSet<String> {
+    static NAMES: std::sync::OnceLock<BTreeSet<String>> = std::sync::OnceLock::new();
+    NAMES.get_or_init(|| {
+        sutra_codec_spi::builtin_formats()
+            .iter()
+            .map(|f| f.name.to_string())
+            .collect()
+    })
+}
+
+/// The migration notice for the fail-closed validation default.
+///
+/// An intake that carries a validation CONTRACT (a schema-backed codec, or a declared
+/// `<q:validators>` chain) but declares no `<q:onValidation>` used to pass a failing payload
+/// through to the flow and now refuses it. That is a behaviour change for an already-deployed
+/// package, so it is surfaced at package time, naming both explicit choices, rather than being
+/// discovered when a caller starts getting 400s.
+///
+/// Schema-less ingress is deliberately NOT flagged: with no contract there is nothing to fail,
+/// its posture is unchanged, and warning about it would be noise on every raw/format channel.
+fn check_validation_posture(
+    deployment: &LoadedDeployment,
+    definitions: &[ChannelDefinition],
+    dep_label: &str,
+    out: &mut Vec<LintDiagnostic>,
+) {
+    let mut seen = BTreeSet::new();
+    for module in deployment.processes.values() {
+        for process in module.processes() {
+            if !seen.insert(process.id.clone()) {
+                continue;
+            }
+            visit_nodes(process, &mut |owner, node| {
+                let bindings = owner.bindings_for(node.id());
+                if bindings.on_validation.is_some() {
+                    return; // the posture is stated — nothing to migrate
+                }
+                for source in &bindings.sources {
+                    let has_validators = !source.complex_validators.is_empty()
+                        || !source.simple_validators.is_empty();
+                    let codec = definitions
+                        .iter()
+                        .find(|d| d.binding.channel_name == source.channel)
+                        .map(|d| d.binding.codec.trim().to_string())
+                        .unwrap_or_default();
+                    let schema_backed = !codec.is_empty()
+                        && !builtin_format_names().contains(user_codec_name(&codec));
+                    if !schema_backed && !has_validators {
+                        continue; // schema-less ingress: no contract, posture unchanged
+                    }
+                    let contract = if schema_backed {
+                        format!("binds the schema codec '{codec}'")
+                    } else {
+                        "declares a <q:validators> chain".to_string()
+                    };
+                    out.push(
+                        LintDiagnostic::warning(
+                            codes::CONFIG_VALIDATION_POSTURE_UNDECLARED,
+                            format!(
+                                "deployment {dep_label}: process '{}' intake '{}' {contract} but                                  declares no <q:onValidation>. A validation failure is now                                  REFUSED at intake (the caller gets the issue list); it used to                                  be passed through to the flow. State the intent:                                  <q:onValidation mode=\"route\"/> keeps the old behaviour                                  (triage payload.validation.issues in-flow),                                  <q:onValidation mode=\"reject\"/> makes the refusal explicit.",
+                                process.id,
+                                node.id()
+                            ),
+                        )
+                        .at_node(&process.id, node.id()),
+                    );
+                }
+            });
         }
     }
 }
@@ -3468,6 +3623,33 @@ fn variable_writers(process: &ProcessDefinition) -> BTreeSet<String> {
                 Some(data_mapping)
             }
             Node::DataTask { data_mapping, .. } => Some(data_mapping),
+            // Loop characteristics bind their OWN variables on every iteration, with no data
+            // association to see: `run_multi_instance` inserts the item variable and
+            // `loopCounter`, `run_standard_loop` inserts `loopCounter`. They are engine-supplied
+            // writers, so a `<q:variables>` declaration of one is initialised — omitting them here
+            // made every declared loop item variable a false NEVER_INITIALIZED warning.
+            Node::MultiInstance {
+                loop_data_input_ref,
+                input_data_item,
+                ..
+            } => {
+                writers.insert(sutra_bpmn::LOOP_COUNTER_VARIABLE.to_string());
+                // Only a COLLECTION-driven loop binds an item: `run_multi_instance` inserts it
+                // per element, so a cardinality-only loop leaves the name genuinely unwritten.
+                if loop_data_input_ref.is_some() {
+                    writers.insert(
+                        input_data_item
+                            .as_deref()
+                            .unwrap_or(sutra_bpmn::DEFAULT_LOOP_ITEM_VARIABLE)
+                            .to_string(),
+                    );
+                }
+                None
+            }
+            Node::StandardLoop { .. } => {
+                writers.insert(sutra_bpmn::LOOP_COUNTER_VARIABLE.to_string());
+                None
+            }
             _ => None,
         };
         if let Some(mapping) = mapping {
@@ -4596,8 +4778,8 @@ fn check_output_conformance(
             if !seen.insert(process.id.clone()) {
                 continue;
             }
-            // The reply codec = the single-intake channel's codec (a <q:reply> rides the
-            // inbound channel).
+            // The REPLY codec = the single-intake channel's codec (a <q:reply> rides the
+            // inbound channel back to the caller).
             let intake = resolve_intake(deployment, process, definitions);
             let reply_codec = intake.as_ref().and_then(|i| {
                 if i.codec_label == "none" {
@@ -4606,7 +4788,7 @@ fn check_output_conformance(
                     Some(i.codec_label.clone())
                 }
             });
-            visit_nodes(process, &mut |_, node| {
+            visit_nodes(process, &mut |owner, node| {
                 let Node::ServiceTask {
                     id, implementation, ..
                 } = node
@@ -4618,14 +4800,53 @@ fn check_output_conformance(
                     return;
                 };
                 let site = format!("serviceTask '{id}' (template {implementation})");
-                let Some(codec_name) = &reply_codec else {
+                // Which codec must be able to PRODUCE this render depends on where it goes. A
+                // <q:send channel="X"> does not ride the inbound channel — it is encoded for X's
+                // consumer — so checking it against the intake codec compares the render to the
+                // wrong contract (and errors on a perfectly good transform). Resolve the send's
+                // target first; only a reply (or a node with no send) falls back to the intake.
+                let send = owner.bindings_for(id).send.clone();
+                let codec_name = match &send {
+                    Some(send) => match send.channel.as_deref() {
+                        Some(channel) => {
+                            // An outbound channel binding `local://<target>` / `pull://<target>`
+                            // delivers to <target>, so the CONSUMER's codec is the contract.
+                            let target = resolve_local_send_target(definitions, channel);
+                            definitions
+                                .iter()
+                                .find(|d| d.binding.channel_name == target)
+                                .map(|d| d.binding.codec.trim().to_string())
+                                .filter(|c| !c.is_empty())
+                        }
+                        // <q:send destination="…"> names an endpoint, not a declared channel:
+                        // there is no codec to check against in this deployment.
+                        None => {
+                            out.push(
+                                LintDiagnostic::warning(
+                                    codes::CONFIG_TEMPLATE_OUTPUT_UNVERIFIABLE,
+                                    format!(
+                                        "deployment {dep_label}: process '{}' ({site}) declares \
+                                         outputMessageType '{output_type}', not verifiable: the \
+                                         send targets an explicit destination, not a declared \
+                                         channel with a codec",
+                                        process.id
+                                    ),
+                                )
+                                .at_node(&process.id, id),
+                            );
+                            return;
+                        }
+                    },
+                    None => reply_codec.clone(),
+                };
+                let Some(codec_name) = &codec_name else {
                     out.push(
                         LintDiagnostic::warning(
                             codes::CONFIG_TEMPLATE_OUTPUT_UNVERIFIABLE,
                             format!(
                                 "deployment {dep_label}: process '{}' ({site}) declares \
                                  outputMessageType '{output_type}', not verifiable: no single \
-                                 reply codec resolves for this flow",
+                                 codec resolves for this render's destination",
                                 process.id
                             ),
                         )
@@ -4641,8 +4862,8 @@ fn check_output_conformance(
                             codes::CONFIG_TEMPLATE_OUTPUT_UNVERIFIABLE,
                             format!(
                                 "deployment {dep_label}: process '{}' ({site}) declares \
-                                 outputMessageType '{output_type}', not verifiable: the reply \
-                                 codec '{codec_name}' has an open type set",
+                                 outputMessageType '{output_type}', not verifiable: codec \
+                                 '{codec_name}' has an open type set",
                                 process.id
                             ),
                         )
@@ -4654,9 +4875,9 @@ fn check_output_conformance(
                             codes::CONFIG_TEMPLATE_OUTPUT_TYPE_UNKNOWN,
                             format!(
                                 "deployment {dep_label}: process '{}' ({site}) declares \
-                                 outputMessageType '{output_type}', but its reply codec \
-                                 '{codec_name}' can only produce {producible_list:?} — a dead \
-                                 output binding",
+                                 outputMessageType '{output_type}', but the codec this render \
+                                 is destined for ('{codec_name}') can only produce \
+                                 {producible_list:?} — a dead output binding",
                                 process.id
                             ),
                         )

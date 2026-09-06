@@ -15,7 +15,7 @@ publish = true
 # path+version dual form: crates.io strips the `path` key on publish and resolves the
 # dependency by `version` alone, so this must match sutra-feel's published version. Bump both
 # together on every release that changes this pairing.
-sutra-feel = { path = "../sutra-feel", version = "0.2.0-rc.1" }
+sutra-feel = { path = "../sutra-feel", version = "0.2.0-rc.2" }
 quick-xml = { workspace = true }
 # DRG COLLECT-with-aggregation (SUM/COUNT/MIN/MAX) builds numeric decision results.
 bigdecimal = { workspace = true }

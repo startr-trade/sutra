@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  Saturation-bench fixture (docs/design/execution-scale-out.md §7, `steady-park-resume` and
+  Saturation-bench fixture, `steady-park-resume` and
   `correlation-heavy` profiles) — the stateful wait-state relay, end to end. A direct
   structural clone of the approval-hold example
   (examples/approval-hold/deployments-src/default--approval--1.0.0/bpmn/approval-hold.bpmn),

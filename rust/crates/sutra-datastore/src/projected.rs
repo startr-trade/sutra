@@ -1,6 +1,5 @@
 //! The projected-store RUNTIME — the SQL, the value marshalling and the first-use table check a
-//! store that declares a `structure` is served through (design `datastore-schema-projection.md`
-//! §4.6).
+//! store that declares a `structure` is served through.
 //!
 //! Where [`crate::projection`] answers *what columns does this declared type have*, this module
 //! answers *what statements does a store with those columns run, and what goes on the wire*. It is

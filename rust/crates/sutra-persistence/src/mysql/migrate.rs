@@ -121,7 +121,7 @@ mod tests {
         // enforced-bind posture) plus the V605 external-task (pull) table, the V803 timer
         // addendum and the deployment-archive store (V1001 — DB-backed deployment source). No
         // V9xx: coverage is not an engine-database
-        // subsystem (`datastore-schema-projection.md` §7) — its DDL ships with `sutra-datastore`
+        // subsystem — its DDL ships with `sutra-datastore`
         // and is applied to the `coverage` store the deployment declares.
         assert_eq!(
             versions,

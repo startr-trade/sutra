@@ -910,8 +910,8 @@ impl DeployController {
         Ok(retired)
     }
 
-    /// Accept a deploy as a LONG-RUNNING operation (design: async-LRO section of
-    /// `db-backed-deployment-store.md`): validate + store the row ACTIVE synchronously (the fast,
+    /// Accept a deploy as a LONG-RUNNING operation: validate + store the row ACTIVE
+    /// synchronously (the fast,
     /// fail-closed, DURABLE part), mark the id PENDING, then defer the potentially-long activation
     /// flip to a background task. Returns `DeployAccepted` for a `202` immediately — the caller
     /// observes completion by polling `GET /sutra/deployments/{id}` until Active, or by awaiting the

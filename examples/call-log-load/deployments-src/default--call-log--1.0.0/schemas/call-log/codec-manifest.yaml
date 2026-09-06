@@ -1,0 +1,6 @@
+# Codec manifest for the STORAGE `call-log` codec. No channel binds it: its job is to be the
+# `call_log` store's declared row type (datastores.yaml `structure.schema: urn:call-log`), which
+# is what turns the XSD below into typed table columns. Declaring it as a codec is how the store
+# resolves it — the same compiled schema the engine would use if a channel did bind it.
+schemaKind: xsd
+formats: [xml]

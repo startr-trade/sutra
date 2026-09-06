@@ -8,7 +8,7 @@
 //!   ops — plus their reply templates, the two admin channels and the `coverage` store
 //!   declaration (the money-transfer hand-authored set is the golden reference). No coverage
 //!   SQL is scaffolded: the engine owns the coverage schema and applies it to that store's
-//!   connection on first use (`datastore-schema-projection.md` §7), so the declaration carries
+//!   connection on first use, so the declaration carries
 //!   no `migrations:` key — what the author chooses is the DATABASE the marks live in.
 //! - `init <coverage-file> <processId…>` (cross-process): emits the **connectable graph** of
 //!   the named processes into a `coverage/**` file (URN `urn:sutra:coverage:…`) as a
@@ -2317,7 +2317,7 @@ datastores:
         assert!(root.join("templates/coverage-report.hbs").is_file());
         assert!(root.join("templates/coverage-reset.hbs").is_file());
         // No coverage SQL is scaffolded: the engine owns the coverage schema and applies it to
-        // the declared store on first use (`datastore-schema-projection.md` §7).
+        // the declared store on first use.
         assert!(!root.join("migrations/coverage").exists());
 
         // Channels: appended pair copies the codec + auth of the serving channel and the
@@ -3004,7 +3004,7 @@ datastores:
         // ---- FROZEN output shapes (field names, ordering, rounding) -----------------------
         //
         // The coverage implementation moved onto SQL aggregates
-        // (`datastore-schema-projection.md` §7); the outputs did NOT move. These assert the
+        //; the outputs did NOT move. These assert the
         // serialized forms byte-for-byte, so a future refactor cannot quietly rename a field.
 
         fn sample_report() -> CorrelationReport {

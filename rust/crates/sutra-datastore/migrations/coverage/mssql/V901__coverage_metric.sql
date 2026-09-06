@@ -2,7 +2,7 @@
 -- ../postgres/V901__coverage_metric.sql — read it for the ownership + idempotence contract).
 --
 -- Shipped inside the engine and applied to the USER-DECLARED `coverage` store's own connection on
--- first use (datastore-schema-projection.md §7), so it must be re-runnable: the whole CREATE is
+-- first use, so it must be re-runnable: the whole CREATE is
 -- guarded by `IF OBJECT_ID(...) IS NULL`, the T-SQL spelling of `CREATE TABLE IF NOT EXISTS`, and
 -- the secondary index is declared INLINE (SQL Server 2014+) so it is created with the table and
 -- needs no second existence guard.

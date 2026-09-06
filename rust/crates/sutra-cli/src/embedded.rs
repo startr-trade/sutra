@@ -13,7 +13,7 @@
 //! `shipped/{core,audit}` are byte-identical copies of the frozen reference engine
 //! migration trees, so the checksummed `sutra_schema_history` ledger stays interoperable.
 //!
-//! Coverage is deliberately NOT here. Since `datastore-schema-projection.md` §7 its tables live
+//! Coverage is deliberately NOT here. Its tables live
 //! in the deployment's own declared `coverage` data store, so their engine-owned DDL ships with
 //! `sutra-datastore` and is applied to that connection on first use — it is not engine-database
 //! schema and never enters this ledger.

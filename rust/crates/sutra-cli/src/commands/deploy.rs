@@ -106,7 +106,7 @@ pub struct DeployArgs {
     pub secret_from: Option<PathBuf>,
 
     /// Deploy via the engine's SYNCHRONOUS API (`POST /admin/deployments`) instead of patching
-    /// the ConfigMap — the `db` deployment source (design: db-backed-deployment-store.md). Requires
+    /// the ConfigMap — the `db` deployment source. Requires
     /// --engine-url; the call returns only once the deployment is ACTIVE (or fails fast on a
     /// rejected archive). This is the deterministic deploy path (no ConfigMap propagation window).
     #[arg(long)]

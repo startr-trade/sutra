@@ -1,6 +1,6 @@
 //! The coverage store — engine-owned SCHEMA on the connection the AUTHOR declares.
 //!
-//! **SUPERSEDING RULING 2026-08-04** (`datastore-schema-projection.md` §7). Coverage marks are
+//! **SUPERSEDING RULING 2026-08-04**. Coverage marks are
 //! typed rows with SQL-aggregate counts, and they live in the user-declared `coverage` data store:
 //! the author names the store in `datastores.yaml`, its data source decides the database and
 //! therefore the dialect, and the engine hosts nothing of coverage in its own database. What the

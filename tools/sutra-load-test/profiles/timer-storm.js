@@ -1,7 +1,7 @@
 // timer-storm — arm k thousand short-duration timers due at (approximately) one instant;
 // fire-to-complete drain is measured OUTSIDE this script.
 //
-// Design: docs/design/execution-scale-out.md §7 — "Arm k*10^3 timers due in one instant;
+// Design note: "Arm k*10^3 timers due in one instant;
 // isolates poller fan-out (§5's bounded concurrency), shard convoying, claim-defer churn."
 //
 // Fixture: tools/sutra-load-test/fixtures/saturation/bpmn/timer-storm.bpmn — spawn, park on a

@@ -2,7 +2,7 @@
 -- record field, so the Fluent Bit ES output can route the record to a
 -- per-tenant Elasticsearch index via Logstash_Prefix_Key.
 --
--- Path convention (from docs/multi-tenancy.md):
+-- Path convention:
 --   /var/log/sutra-audit/<tenantId>/<yyyy>/<mm>/<dd>/<instance-id>.jsonl
 --
 -- The first segment under /var/log/sutra-audit/ is treated as the tenant id.

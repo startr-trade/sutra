@@ -236,15 +236,15 @@ mod tests {
     #[test]
     fn doc_first_paragraph_demotes_a_design_doc_link_to_a_code_span() {
         let file: syn::File = syn::parse_str(
-            "//! Cross-process coverage (design \
-             [`cross-process-coverage.md`](../../../../docs/design/cross-process-coverage.md), \
+            "//! A design note (design \
+             [`a-design-note.md`](../../../../docs/design/a-design-note.md), \
              §4.2).\npub struct S;",
         )
         .unwrap();
         assert_eq!(
             doc_first_paragraph(&file.attrs).as_deref(),
             Some(
-                "Cross-process coverage (design `cross-process-coverage.md`, \
+                "A design note (design `a-design-note.md`, \
                  §4.2)."
             )
         );
@@ -268,7 +268,7 @@ mod tests {
     #[test]
     fn escapes_into_docs_tree_requires_a_climb_then_docs_prefix() {
         assert!(escapes_into_docs_tree(
-            "../../../../docs/design/cross-process-coverage.md"
+            "../../../../docs/design/a-design-note.md"
         ));
         assert!(escapes_into_docs_tree("../docs/design/x.md#L1"));
         assert!(!escapes_into_docs_tree("docs/design/x.md")); // no climb — not a source-relative escape

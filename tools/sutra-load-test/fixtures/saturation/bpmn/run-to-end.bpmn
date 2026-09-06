@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  Saturation-bench fixture (docs/design/execution-scale-out.md §7, `burst-start` profile) — a
+  Saturation-bench fixture, `burst-start` profile) — a
   minimal RUN-TO-END flow: spawn, one FEEL data assignment, done. No wait node and no
   <q:reply> template — the engine's default channel ack (202 Accepted once the step commits,
   rust/crates/sutra-channels/src/http.rs) is the observed response. This isolates pure shard

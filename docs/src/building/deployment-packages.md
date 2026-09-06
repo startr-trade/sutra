@@ -94,6 +94,57 @@ schemaKind: xsd
 formats: [xml, json, yaml]
 ```
 
+### Tabular formats — `csv` and `fixed-width` {#tabular-formats}
+
+`formats:` is not limited to document syntaxes. A schema codec can bind `csv` or `fixed-width`,
+which is what turns a delimited or fixed-column upload from a bag of untyped strings into a typed
+message:
+
+```yaml
+# examples/call-log-load/.../schemas/cdr/codec-manifest.yaml
+schemaKind: xsd
+formats: [csv, fixed-width]
+
+csv:
+  delimiter: ","          # both default; written here only to show where layout lives
+  header: true
+
+fixed-width:
+  fields:                 # REQUIRED — a fixed-width line has no structure of its own
+    - {name: recordId,    width: 12}
+    - {name: msisdn,      width: 16}
+    - {name: durationSec, width:  6}
+```
+
+A tabular body is a **batch**, so it is validated **row-wise**: each row is checked as one instance
+of the declared root, in a single decode, *before the process starts*. Every violation carries a
+row-indexed path (`value[3].durationSec`), so a bad cell names its record. An unparseable file is
+fatal; any row's violation is a soft error, so the payload still projects and `q:onValidation`
+decides the posture. The batch projects under `value`, so a flow reads `payload.value[0].field`.
+
+The XSD's leaf types reach the cells: an `xs:int` column arrives as a number, not `"182"`. An empty
+cell reads as **absence** for an element the type declares `minOccurs="0"` — without that, an
+optional column would have to be populated in every row. An empty cell for a *required* element is
+still a violation.
+
+Both tabular formats may be declared together. Their content types are disjoint — `text/csv` /
+`application/csv` against `text/plain` / `application/x-fixed-width` — so an upload selects its
+parser unambiguously and one schema serves a CSV feed and a fixed-width feed over the same channel.
+
+Layout is **parser config, not schema**: it cannot be expressed in an XSD or a JSON Schema (neither
+has byte offsets), which is why it lives in the manifest. A header-bearing CSV names its own
+columns and needs no block at all; a fixed-width codec cannot work without one and declaring the
+format without it is a manifest error.
+
+Because a fixed-width layout *is* configuration, its columns are checked against the bound type at
+**package time**: a column the type does not declare, or a required element with no column, fails
+`sutra lint` (`SUTRA.CONFIG.CODEC_MANIFEST.REJECTED`) rather than every row at runtime. A csv codec
+gets no equivalent check — its column names arrive in the header, at runtime, so there is nothing
+to compare against beforehand.
+
+The opaque formats (`raw-text`, `raw-bytes`) are not schema-bindable: there is no map under raw
+bytes for a schema to type, so binding one is refused with that reason.
+
 The reserved token `sutra` may not be used as a first-level subfolder name under any artifact
 folder (`schemas/sutra/`, `bpmn/sutra/`, …) — that would collide with the engine's own
 `urn:sutra:*` namespace. A deeper `sutra` (`schemas/hr/sutra/`) is fine.

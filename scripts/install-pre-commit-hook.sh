@@ -3,7 +3,7 @@
 # Install a pre-commit Git hook.
 #
 # Note: the Java depcat-gen catalog generator was RETIRED and its
-# artifact-documentation pages are a frozen snapshot. The former pre-commit
+# the non-Rust catalog pages are a frozen snapshot. The former pre-commit
 # behaviour (auto-regenerating the Java catalog when a frozen-contract artifact
 # was staged) no longer applies. The single live catalog generator is the Rust
 # `sutra-catalog-gen` library (shipped as `sutra generate catalog`), regenerated on demand

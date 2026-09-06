@@ -340,7 +340,7 @@ async fn a_constraint_failure_is_reported_not_retried_as_a_duplicate() {
     assert_eq!(row.to_string(), full.to_string());
 }
 
-/// The coverage contract on this dialect (`datastore-schema-projection.md` §7): the ENGINE's DDL
+/// The coverage contract on this dialect: the ENGINE's DDL
 /// applied on first use to a connection the AUTHOR chose, an idempotent seed, durable
 /// first-covers-wins carried by the write itself, deployment isolation by the bound predicate,
 /// and — the property the portable aggregate had to preserve — counts that agree with a

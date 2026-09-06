@@ -4,7 +4,7 @@
 //! `sutra-persistence/migrations/shipped/{core,audit,deploy}` — the `core`/`audit` trees are
 //! byte-identical copies of the frozen reference engine migration trees, so the checksummed ledger
 //! stays interoperable). COVERAGE is deliberately absent: since the 2026-08-04 superseding ruling
-//! (`datastore-schema-projection.md` §7) coverage lives in the deployment's OWN declared
+//! coverage lives in the deployment's OWN declared
 //! `coverage` data store, so its engine-owned DDL ships with `sutra-datastore` and is applied to
 //! that connection on first use — never to the engine database, and never through this ledger.
 //! Files are named

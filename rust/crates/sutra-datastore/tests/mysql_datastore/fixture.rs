@@ -181,7 +181,7 @@ pub fn account_record() -> serde_json::Value {
 
 /// A COVERAGE store on database `db`, declared exactly as an author would (one `sql.url`) — and
 /// carrying no migrations of its own, because the engine ships the coverage schema and applies it
-/// to this connection on first use (`datastore-schema-projection.md` §7).
+/// to this connection on first use.
 pub fn coverage_store(db: &str) -> sutra_datastore::CoverageStore {
     let mut properties = BTreeMap::new();
     properties.insert("sql.url".to_string(), db_url(db));

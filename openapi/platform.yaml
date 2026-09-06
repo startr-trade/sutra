@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Sutra engine — platform / system API
-  version: 0.2.0-rc.1
+  version: 0.2.0-rc.2
   description: |
     The **platform (system) API** the Sutra engine serves on its own HTTP port — distinct from the
     per-deployment channel endpoints (those are generated per archive). This surface is the

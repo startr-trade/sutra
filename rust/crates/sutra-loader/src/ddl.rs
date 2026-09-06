@@ -1,6 +1,5 @@
 //! The DDL subset — the effective table shape a package's own migrations produce, derived
-//! **statically** (no database, no credentials) for the projected-store lint (design
-//! `datastore-schema-projection.md` §4.7).
+//! **statically** (no database, no credentials) for the projected-store lint.
 //!
 //! [`parse_migrations`] replays a store's `migrations/<store>/V*.sql` in migration-version order
 //! and applies, in sequence, `CREATE TABLE` column definitions and

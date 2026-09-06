@@ -48,6 +48,17 @@ pub enum BoundaryKind {
 /// The channel-call task prefix on `serviceTask@implementation`.
 pub const CHANNEL_CALL_PREFIX: &str = "channel:";
 
+/// The variable a `<bpmn:multiInstanceLoopCharacteristics>` / `<bpmn:standardLoopCharacteristics>`
+/// binds to the 0-based iteration index on every pass. Engine-supplied: no data association
+/// writes it, so both the executor (which sets it) and the deploy-time linter (which must not
+/// call a declaration of it "never initialised") read the name from here.
+pub const LOOP_COUNTER_VARIABLE: &str = "loopCounter";
+
+/// The variable a COLLECTION-driven multi-instance binds each item to when the activity omits
+/// `<bpmn:inputDataItem name>`. A cardinality-only loop iterates no collection and therefore
+/// binds no item variable at all.
+pub const DEFAULT_LOOP_ITEM_VARIABLE: &str = "item";
+
 /// Scalar type of a declared `<q:variable>`. Unknown types map to [`FieldType::Any`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FieldType {

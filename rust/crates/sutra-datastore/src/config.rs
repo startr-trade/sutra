@@ -47,7 +47,7 @@ const RESERVED_KEYS: &[&str] = &["name", "type", "auth", "auth-scheme", "structu
 const STRUCTURE_KEYS: &[&str] = &["schema", "type", "columns"];
 
 /// The optional `structure:` block of a store declaration — "my rows ARE these declared
-/// scalars" (design `datastore-schema-projection.md` §4.1).
+/// scalars".
 ///
 /// Absent it, a store behaves exactly as it always has: one opaque JSON document per key. It is
 /// purely additive, so every existing deployment is unaffected, and a record too nested to

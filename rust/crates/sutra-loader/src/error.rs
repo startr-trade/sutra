@@ -16,7 +16,7 @@ pub mod codes {
     pub const CONFIG_DATASTORE_INVALID: &str = "SUTRA.CONFIG.DATASTORE.INVALID";
 
     // ---- projected data stores — the `structure:` block verified against the package's own
-    // migrations (design `datastore-schema-projection.md` §4.6). A store that declares no
+    // migrations. A store that declares no
     // `structure:` raises none of these: it stays the opaque key→JSON store it always was.
     //
     // The three-state posture is the point (the `PATH_UNVERIFIABLE` house style): a definite
@@ -136,6 +136,21 @@ pub mod codes {
     /// (`scriptTask` / `businessRuleTask` / a non-template serviceTask that full-merges its output),
     /// so it fires only on the clearest statically-provable never-written case.
     pub const CONFIG_VARIABLE_NEVER_INITIALIZED: &str = "SUTRA.CONFIG.VARIABLE.NEVER_INITIALIZED";
+    /// Deploy-time migration notice for the fail-closed validation default
+    /// an intake that carries a validation CONTRACT — a
+    /// schema-backed codec, or a declared `<q:validators>` chain — but no `<q:onValidation>`
+    /// policy. Such an intake used to pass a failing payload through to the flow; it now refuses
+    /// it. Advisory WARNING naming the two explicit choices (`route` to keep the old behaviour,
+    /// `reject` to state the new one), so the change is discovered at package time rather than in
+    /// production.
+    /// A `schemas/<codec>/codec-manifest.yaml` the codec loader rejects: an unknown format, a
+    /// tabular format declared without its layout block, or — the one that matters most — a
+    /// fixed-width layout whose columns disagree with the bound type. Package-time ERROR: the
+    /// engine builds its codecs through the same entry point, so a manifest that fails here
+    /// fails at deployment, and every row of every upload would fail after that.
+    pub const CONFIG_CODEC_MANIFEST_REJECTED: &str = "SUTRA.CONFIG.CODEC_MANIFEST.REJECTED";
+    pub const CONFIG_VALIDATION_POSTURE_UNDECLARED: &str =
+        "SUTRA.CONFIG.VALIDATION.POSTURE_UNDECLARED";
     pub const CHANNEL_AMBIGUOUS_HANDLER: &str = "SUTRA.CHANNEL.AMBIGUOUS_HANDLER";
     pub const CHANNEL_AMBIGUOUS_PATTERN: &str = "SUTRA.CHANNEL.AMBIGUOUS_PATTERN";
     pub const CHANNEL_NO_IDEMPOTENCY_KEY: &str = "SUTRA.CHANNEL.NO_IDEMPOTENCY_KEY";

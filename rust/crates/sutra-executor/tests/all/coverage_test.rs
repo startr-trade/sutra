@@ -2,7 +2,7 @@
 //! and `CoverageAdminTest` (the `coverage:report` / `coverage:reset` reserved ops).
 //!
 //! Both run against the TYPED metric store — the single coverage surface since the module KV
-//! covered-set was retired (`datastore-schema-projection.md` §7). `execute_sync` runs under
+//! covered-set was retired. `execute_sync` runs under
 //! `DeploymentId::unresolved()`, hence [`DEP`].
 
 use std::cell::RefCell;

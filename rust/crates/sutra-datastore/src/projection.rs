@@ -1,5 +1,5 @@
 //! Schema projection — the flat-structure classification and column naming a typed-column
-//! data store is derived from (design `datastore-schema-projection.md` §4.2–§4.3).
+//! data store is derived from.
 //!
 //! A store that declares a [`StructureRef`](crate::config::StructureRef) says "my rows ARE these
 //! declared scalars". This module turns the declared type's children — enumerated by

@@ -210,6 +210,51 @@ impl PayloadCodec for SchemaBoundCodec {
     }
 }
 
+/// Any [`PayloadCodec`] viewed as a [`MessageFormat`] — the adapter that makes the whole
+/// built-in format family schema-bindable without each one restating the trait.
+///
+/// A built-in format already IS a pure parser; it just happens to be declared through
+/// [`PayloadCodec`] because that is the interface a channel binds. Wrapping is mechanical
+/// ([`FormatParse::from_decode`] is the documented lift), so one adapter here replaces one
+/// hand-written `impl MessageFormat` per format — and, more importantly, means a format added
+/// later is bindable the day it lands rather than after someone remembers to add the impl.
+///
+/// The [`ShapeClass::Opaque`] formats are the deliberate exception, and the caller enforces it:
+/// there is no map to type under raw bytes, so a schema over one asserts nothing. This adapter
+/// does not police that — [`crate::builtin_formats`] carries the `shape_class` a loader checks.
+pub struct PayloadCodecFormat {
+    codec: Arc<dyn PayloadCodec>,
+}
+
+impl PayloadCodecFormat {
+    pub fn new(codec: Arc<dyn PayloadCodec>) -> PayloadCodecFormat {
+        PayloadCodecFormat { codec }
+    }
+}
+
+impl MessageFormat for PayloadCodecFormat {
+    fn name(&self) -> &str {
+        self.codec.name()
+    }
+
+    fn accepted_content_types(&self) -> Vec<String> {
+        self.codec.accepted_content_types()
+    }
+
+    fn parse(&self, body: &[u8], content_type: Option<&str>) -> FormatParse {
+        FormatParse::from_decode(self.codec.decode(body, content_type))
+    }
+
+    fn encode_tree(
+        &self,
+        tree: &serde_json::Value,
+        content_type: Option<&str>,
+    ) -> Result<Vec<u8>, String> {
+        self.codec
+            .encode(&CodecValue::Json(tree.clone()), content_type)
+    }
+}
+
 /// A format used without a schema — the degenerate opaque mode:
 /// it adopts the format's name and emits no typed message type.
 pub struct FormatOnlyCodec {

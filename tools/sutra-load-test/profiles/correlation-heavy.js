@@ -1,7 +1,7 @@
 // correlation-heavy — a high relay:spawn ratio against a small, fixed pool of long-lived
 // instances.
 //
-// Design: docs/design/execution-scale-out.md §7 — "High relay:spawn ratio to few long-lived
+// Design note: "High relay:spawn ratio to few long-lived
 // instances; isolates the handoff path, hot-shard skew, claim-bounce behavior."
 //
 // Fixture: tools/sutra-load-test/fixtures/saturation/bpmn/hold-relay.bpmn (same BPMN as

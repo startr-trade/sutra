@@ -1,6 +1,6 @@
 // burst-start — offered-RPS staircase of run-to-end spawns until the achieved rate flattens.
 //
-// Design: docs/design/execution-scale-out.md §7 — "Offered-RPS ramp of run-to-end spawns
+// Design note: "Offered-RPS ramp of run-to-end spawns
 // until achieved rate flattens; isolates the saturation knee: pure shard parallelism, no
 // claims." At shard-count=1 (today's engine — Phase 0 has no sharding yet) there is exactly
 // one actor thread, so this profile's real job in Phase 0 is recording the SINGLE-LANE

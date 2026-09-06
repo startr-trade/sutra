@@ -1,6 +1,6 @@
 // steady-park-resume — stateful flows: spawn -> park on a correlated wait -> relay -> complete.
 //
-// Design: docs/design/execution-scale-out.md §7 — "Stateful flows: spawn -> park -> correlated
+// Design note: "Stateful flows: spawn -> park -> correlated
 // relay -> complete; isolates step-commit cost, per-instance serialization overhead, handoff
 // rate." At shard-count=1 (Phase 0's only mode) there is no handoff (the arrival shard IS the
 // owner shard, design §1.1) — this run's number is the pre-handoff baseline every N>1 run

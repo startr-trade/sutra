@@ -104,7 +104,7 @@ count inline (e.g. `null  (1 warning)`).
 
 ### Note on "WASM evaluator" naming
 
-`STATUS.md` originally listed this work item as **"FEEL WASM evaluator"**. We
+This work item was originally listed as **"FEEL WASM evaluator"**. We
 shipped the same user-visible capability (live in-browser FEEL evaluation) by
 depending on the canonical JS implementation rather than building a separate
 WebAssembly module — the bundle weight, behavior parity with Camunda Modeler /

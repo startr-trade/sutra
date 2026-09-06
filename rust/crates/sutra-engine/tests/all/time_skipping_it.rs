@@ -5,7 +5,7 @@
 //! milliseconds/seconds under `sutra_engine::{TestClock, fast_forward_until}`, with NOTHING
 //! sleeping for the modelled duration — only a virtual clock moving forward and a real, snappy
 //! timer-poller tick noticing it. Exactly Temporal's most-praised DX, and exactly what the
-//! comparison in `docs/plan/future/project_temporal_comparison.md` promised was cheap here.
+//! comparison against other durable-execution engines promised was cheap here.
 //!
 //! Docker-gated (tier-2), same shape as `timer_channel_call_conformance.rs` and
 //! `timer_start_conformance.rs`: a real PostgreSQL (testcontainers) and the real boot path

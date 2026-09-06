@@ -73,7 +73,7 @@
     <xsd:attribute name="dataClass" type="q:DataClass" default="none">
       <xsd:annotation>
         <xsd:documentation>
-          Per docs/15-factor.md GDPR retention design — drives PayloadRedactor policy selection
+          Per the 15-factor GDPR retention design — drives PayloadRedactor policy selection
           and audit expiry rules.
         </xsd:documentation>
       </xsd:annotation>

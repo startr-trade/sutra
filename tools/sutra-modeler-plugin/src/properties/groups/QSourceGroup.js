@@ -89,7 +89,7 @@ function dataClassEntry(element) {
     id: 'q-source-dataClass',
     component: SelectEntryStub,
     label: 'Data class',
-    description: 'Drives PayloadRedactor chain selection + audit retention policy (per docs/15-factor.md GDPR design)',
+    description: 'Drives PayloadRedactor chain selection + audit retention policy (per the 15-factor GDPR design)',
     options: [
       { value: 'none', label: 'None' },
       { value: 'pii', label: 'PII' },

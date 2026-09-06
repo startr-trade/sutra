@@ -1,5 +1,7 @@
 //! Consolidated integration-test binary for sutra-bpmn (one link unit; modules preserve the original file names as filter paths).
 
+#[path = "all/bpmn_support_doc.rs"]
+mod bpmn_support_doc;
 #[path = "all/contract_and_selection_test.rs"]
 mod contract_and_selection_test;
 #[path = "all/coverage_path_test.rs"]

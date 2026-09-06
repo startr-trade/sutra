@@ -81,9 +81,113 @@ fn csv_rows_tree_is_schema_ready() {
     assert_eq!(arr.len(), 1);
     assert!(arr[0].is_object());
     assert!(arr[0]["Id"].is_string());
-    // Decode-only: replies are template renders, not row re-serialization.
-    let err = codec
+    // The tree is also re-encodable, so a csv channel can answer in csv (see the encode block).
+    let written = codec
         .encode(result.payload.as_ref().unwrap(), Some("text/csv"))
-        .unwrap_err();
-    assert!(err.contains("does not support encode"), "{err}");
+        .expect("rows re-encode");
+    assert_eq!(String::from_utf8(written).unwrap(), "Amt,Id\n100,INB-7\n");
+}
+
+// ---- encode (the symmetric-reply / problem-table inverse) -----------------------------------
+
+fn encode(codec: &CsvCodec, tree: serde_json::Value) -> String {
+    String::from_utf8(
+        codec
+            .encode(&CodecValue::Json(tree), Some("text/csv"))
+            .expect("encodes"),
+    )
+    .expect("utf-8")
+}
+
+#[test]
+fn encode_round_trips_values_and_normalises_column_order() {
+    let codec = CsvCodec::default();
+    // Columns come back SORTED: a decoded row is a BTreeMap, so the source header's order is
+    // already gone by the time encode sees it. Values are faithful; order is normalised.
+    let decoded = parse(&codec, "Id,Amt\nINB-7,100\nINB-8,200\n");
+    let CodecValue::Json(tree) = decoded.payload.expect("payload") else {
+        panic!("json payload");
+    };
+    let written = encode(&codec, tree);
+    assert_eq!(written, "Amt,Id\n100,INB-7\n200,INB-8\n");
+
+    // The contract that DOES hold as an identity: decode(encode(rows)) == rows.
+    let CodecValue::Json(reparsed) = parse(&codec, &written).payload.expect("payload") else {
+        panic!("json payload");
+    };
+    let CodecValue::Json(original) = parse(&codec, "Id,Amt\nINB-7,100\nINB-8,200\n")
+        .payload
+        .expect("payload")
+    else {
+        panic!("json payload");
+    };
+    assert_eq!(reparsed, original);
+}
+
+#[test]
+fn encode_accepts_the_array_root_value_wrapper() {
+    // An array root projects under `value`, so a batch re-encodes without unwrapping first.
+    let tree = serde_json::json!({"value": [{"Id": "INB-7"}, {"Id": "INB-8"}]});
+    assert_eq!(encode(&CsvCodec::default(), tree), "Id\nINB-7\nINB-8\n");
+}
+
+#[test]
+fn encode_writes_the_union_of_every_rows_keys_and_blanks_the_missing() {
+    // Row 2 omits `Amt` and introduces `Note`. Every row must still line up under one header.
+    let tree = serde_json::json!([
+        {"Id": "A", "Amt": 1},
+        {"Id": "B", "Note": "late"},
+    ]);
+    assert_eq!(
+        encode(&CsvCodec::default(), tree),
+        "Amt,Id,Note\n1,A,\n,B,late\n"
+    );
+}
+
+#[test]
+fn encode_quotes_per_rfc_4180_and_decode_reads_it_back() {
+    let codec = CsvCodec::default();
+    let tree = serde_json::json!([{"Id": "a,b", "Note": "he said \"hi\"", "Multi": "one\ntwo"}]);
+
+    let written = encode(&codec, tree);
+    assert_eq!(
+        written,
+        "Id,Multi,Note\n\"a,b\",\"one\ntwo\",\"he said \"\"hi\"\"\"\n"
+    );
+    // The real assertion: the writer's output is readable by this format's own parser.
+    let back = parse(&codec, &written);
+    assert_eq!(back.outcome, DecodeOutcome::Ok);
+    let arr = rows(&back);
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["Id"], "a,b");
+    assert_eq!(arr[0]["Note"], "he said \"hi\"");
+    assert_eq!(arr[0]["Multi"], "one\ntwo");
+}
+
+#[test]
+fn encode_preserves_the_exact_decimal_form_and_blanks_null() {
+    // `arbitrary_precision` is on workspace-wide, so a decimal's WRITTEN scale survives — never
+    // an f64 round trip that would turn "0.0250" into "0.025". Parsed from text, not the json!
+    // macro, because the macro's float literal goes through f64 before serde_json ever sees it.
+    let tree: serde_json::Value =
+        serde_json::from_str(r#"[{"Rate": 0.0250, "Cell": null}]"#).expect("parses");
+    assert_eq!(encode(&CsvCodec::default(), tree), "Cell,Rate\n,0.0250\n");
+}
+
+#[test]
+fn headerless_encode_emits_cell_arrays_positionally() {
+    let codec = CsvCodec::new(';', false);
+    let tree = serde_json::json!([["a", "b"], ["c", "d"]]);
+    assert_eq!(encode(&codec, tree), "a;b\nc;d\n");
+}
+
+#[test]
+fn encode_refuses_a_nested_cell_rather_than_stringifying_it() {
+    let err = CsvCodec::default()
+        .encode(
+            &CodecValue::Json(serde_json::json!([{"Id": "A", "Nested": {"x": 1}}])),
+            Some("text/csv"),
+        )
+        .expect_err("a nested cell is not encodable");
+    assert!(err.contains("flat"), "error should say why: {err}");
 }

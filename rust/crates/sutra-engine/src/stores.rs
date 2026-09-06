@@ -197,7 +197,7 @@ fn to_metric_err(e: DataStoreError) -> StoreError {
 }
 
 /// Adapter + ROUTER: the executor's TYPED [`CoverageMetricStore`] SPI over the per-deployment
-/// coverage stores each deployment DECLARED (`datastore-schema-projection.md` §7).
+/// coverage stores each deployment DECLARED.
 ///
 /// Coverage is no longer an engine-database feature, so there is no single coverage connection to
 /// hold: every deployment's marks go to the store named in ITS `datastores.yaml`, on whatever

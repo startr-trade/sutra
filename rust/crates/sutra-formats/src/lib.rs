@@ -10,8 +10,15 @@
 //!   FEEL paths); data-only posture (no object instantiation, duplicate keys rejected).
 //! - `xml` — XXE-hardened parse (`<!DOCTYPE>` rejected; no external-entity resolution)
 //!   projected to a FEEL-walkable map (local names, repeated siblings → list, `@`-attributes).
-//! - `csv` — comma-delimited, header row → a flat name→value row map. A flat format; it carries
-//!   no composite/nested structure, so it is a format, never schema-bound.
+//! - `fixed-width` — fixed-column records → one flat name→value map per line, and the inverse on
+//!   encode. Schema-bindable like `csv`, but it carries NO zero-config default and so registers no
+//!   `BuiltinFormat`: without the column widths a line is an undifferentiated string, so a channel
+//!   can only reach it through a schema codec whose manifest declares the layout.
+//! - `csv` — comma-delimited, header row → a flat name→value row map, and the inverse on encode
+//!   (so a csv channel can answer in csv). A flat format: it carries no composite structure of
+//!   its own, but it IS schema-bindable — a tabular body is a BATCH, validated row-wise against
+//!   the bound schema's declared root, which is what turns
+//!   untyped cells into typed fields.
 //!
 //! Each self-registers as a `sutra_codec_spi::BuiltinCodec` via `inventory` (the pull model), so
 //! the neutral registry collects them generically. The concrete crate is bundled by the binary
@@ -19,12 +26,14 @@
 #![forbid(unsafe_code)]
 
 pub mod csv;
+pub mod fixed_width;
 pub mod json;
 pub mod raw;
 pub mod xml;
 pub mod yaml;
 
 pub use csv::CsvCodec;
+pub use fixed_width::{FixedWidthCodec, FixedWidthField};
 pub use json::JsonCodec;
 pub use raw::{RawBytesCodec, RawTextCodec};
 pub use xml::XmlCodec;

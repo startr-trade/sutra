@@ -22,7 +22,7 @@
 
 pub mod config;
 /// The COVERAGE store — the engine-owned coverage schema, served over the connection the author
-/// declares (`datastore-schema-projection.md` §7). The statement set + the engine-shipped DDL are
+/// declares. The statement set + the engine-shipped DDL are
 /// pure (strings), so they ride the `--no-default-features` build with `config`/`projection`; the
 /// three dialect modules execute them.
 pub mod coverage;

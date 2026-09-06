@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  Saturation-bench fixture (docs/design/execution-scale-out.md §7, `timer-storm` profile) —
+  Saturation-bench fixture, `timer-storm` profile) —
   arm a durable timer per spawn; the poller fires it at due-at and the instance completes.
   Structurally modeled on the engine's own conformance fixture
   (rust/crates/sutra-engine/tests/resources/conformance/main/bpmn/timer-park.bpmn), dropping

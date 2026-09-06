@@ -6,8 +6,8 @@
 //! `executor.rs`'s "the ONLY retryable failure: a registered task function that threw"), and the
 //! Rust engine's own `serve()` assembly registers NONE — service tasks there route to
 //! channel/template/decision dispatch, never a Rust closure (verified while surveying this
-//! feature; `docs/plan/now/temporal-gap-implementation.md` P1-1 scopes retry to
-//! "registered-task serviceTasks" for exactly this reason). So `<q:retry>` cannot be exercised
+//! feature; the retry design scopes it to "registered-task serviceTasks" for exactly this
+//! reason). So `<q:retry>` cannot be exercised
 //! by pure-BPMN authoring through the shipped engine binary at all, today — not something this
 //! change should paper over with a fault-injection hook wired into production assembly. This
 //! crate is where the retry PARK/re-drive machinery actually lives (and is already unit-tested),

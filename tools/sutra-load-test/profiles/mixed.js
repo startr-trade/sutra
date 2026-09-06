@@ -1,7 +1,7 @@
 // mixed — a weighted blend of the other four saturation profiles' workload shapes, running
 // concurrently against the same engine.
 //
-// Design: docs/design/execution-scale-out.md §7 — "Weighted blend of the above; the number a
+// Design note: "Weighted blend of the above; the number a
 // comparison page may eventually quote." Per the honesty rule (this directory's README, and
 // the design doc's §7 opening line): no throughput/saturation number from ANY run of this
 // profile is cited anywhere until it has actually been run on a committed profile — this

@@ -446,7 +446,7 @@ pub(crate) fn admin_router(state: AppState, gate: AdminGate) -> Router {
         .route_layer(axum::middleware::from_fn_with_state(gate, admin_gate))
         // The sync deploy (POST /admin/deployments) uploads the sealed archive as the body — a
         // large, multi-flow deployment can exceed axum's 2 MiB default. Raise the cap so real
-        // deployments upload (design: db-backed-deployment-store.md "k8s deploy robustness").
+        // deployments upload (the k8s deploy-robustness path).
         .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024))
         .with_state(state)
 }

@@ -6,7 +6,7 @@
 //! reserved `coverage:report` / `coverage:reset` ops, by contrast, fail LOUDLY — a report that
 //! silently read 0% would look like a real measurement.
 //!
-//! ## One store (RULED 2026-08-04, `datastore-schema-projection.md` §7)
+//! ## One store (RULED 2026-08-04)
 //!
 //! [`CoverageMetricStore`] is the single coverage surface: a per-deployment *metric-flag* table
 //! (every declared path URN seeded `covered=false`, flipped `true` on exercise) plus a

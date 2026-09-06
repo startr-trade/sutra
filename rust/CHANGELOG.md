@@ -42,6 +42,147 @@ are an output contract, not a command name.
 from the process graph (authored BPMN carries no `<bpmndi:BPMNDiagram>`, and needs none). The SVG
 is embedded scaled to the column and linked to a full-size copy written beside the page.
 
+### Added — a schema codec can bind any non-opaque built-in format (csv included)
+
+The `format × schema` composition the SPI already carried (`MessageFormat` + `MessageSchema` →
+`SchemaBoundCodec`) is now reachable from a `codec-manifest.yaml`. Previously the two builders
+were hardcoded — an XSD codec accepted `xml`/`json`/`yaml` and a JSON-schema codec was pinned to
+`JsonNodeFormat` — so a CSV upload could only be a bare format, i.e. a bag of untyped strings with
+nothing asserted. Design: ``.
+
+- **`formats:` widens.** `schemaKind: xsd` accepts `xml`/`json`/`yaml`/**`csv`**/**`fixed-width`**;
+  `schemaKind: json-schema` accepts `json`/`yaml`/**`csv`**/**`fixed-width`** — deliberately not `xml`, which belongs to XSD
+  under the standing two-kinds ruling. An `Opaque`-shaped format (`raw-text`, `raw-bytes`) is
+  refused with a message saying why: there is no map under raw bytes for a schema to type.
+- **A tabular body is a BATCH, validated row-wise.** Each row is checked as one instance of the
+  declared root, in a single decode before any process runs, and each violation carries a
+  row-indexed path (`value[3].durationSec`). An unparseable *file* is `FATAL`; any row's violation
+  is `SOFT_ERRORS`, so the payload still projects and `<q:onValidation>` decides the posture. The
+  batch projects under `value`, matching the JSON-schema path.
+- **Format layout is manifest config, not schema.** An optional `csv:` block carries `delimiter` /
+  `header`; both default, so a header-bearing comma file needs no block. This is the home the
+  deleted fixed-width codec lacked.
+- **New:** `PayloadCodecFormat` (any `PayloadCodec` as a `MessageFormat`, so a format added later
+  is bindable without a new impl), `JsonSchemaCodec::with_formats` (content-type negotiation
+  across several parsers), `StructuralCodec::compile_with_layout`.
+- **Moved:** `content_type::accepts` from `sutra-channels` to `sutra-codec-spi` (re-exported), so
+  the codec layer negotiates by content-type the same way a channel does.
+
+### Fixed — the engine ignored `codec-manifest.yaml` entirely
+
+The assembly hardcoded `["xml","json","yaml"]` and never opened the manifest, so a
+`formats: [csv]` (or `[fixed-width]`) codec was inert at RUNTIME: the package sealed cleanly,
+lint passed, the codec unit tests passed — and a running engine then refused every upload as an
+unsupported content-type. `schema_codec_loader::compile_module_codec` is now the single entry
+point both `sutra lint` and the engine assembly build through, so what a package declares is what
+a deployment honours. Guarded end to end by `call_log_csv_e2e`, which boots a real engine on the
+committed example archive and posts both samples.
+
+Consequences:
+
+- **A manifest fault is a package-time ERROR** (`SUTRA.CONFIG.CODEC_MANIFEST.REJECTED`): an
+  unknown format, a tabular format declared without its layout block, or a fixed-width layout
+  whose columns disagree with the bound type. Lint had no other owner for these — its codec passes
+  read the XSDs and never opened the manifest.
+- **A layout fault is distinguished from an unsupported-XSD fault** (`LayoutCompileError`), so the
+  "serve a shape-only codec" fallback that legitimately covers the latter cannot swallow the
+  former.
+
+### Changed — a codec may declare BOTH tabular formats
+
+`formats: [csv, fixed-width]` is supported: their content types are disjoint (`text/csv` /
+`application/csv` against `text/plain` / `application/x-fixed-width`), so an inbound body selects
+its parser unambiguously and one schema serves a CSV feed and a fixed-width feed over the same
+channel. Declaration order decides only the no-content-type fallback. (An earlier cut refused
+this on the incorrect premise that both were indistinguishable plain text.)
+
+### Added — `fixed-width` is reinstated, schema-bound
+
+The format deleted in the `sutra-formats` carve-out is back, with the manifest layout block it
+lacked — the stated reason for its removal was "no xsd/json way to express its column layout".
+
+```yaml
+schemaKind: xsd
+formats: [fixed-width]
+fixed-width:
+  fields: [{name: recordId, width: 12}, {name: msisdn, width: 16}]
+```
+
+It registers **no** `BuiltinFormat` and so cannot be bound bare on a channel: without the widths a
+line is an undifferentiated string. Declaring the format without the block is a manifest error.
+`encode` is implemented (left-aligned, space-padded); an overlong value is an error rather than a
+truncation, because truncating a fixed-width field shifts every column after it.
+
+**The layout is verified against the schema at package time** — the one check csv cannot have,
+since a fixed-width record's columns are its only field names. A column the bound type does not
+declare, or a required element with no column, fails to compile.
+
+### Fixed — an empty tabular cell is absence, not an empty value
+
+A tabular row has a cell for every column whether or not it carries a value. An empty cell for an
+element the type declares `minOccurs="0"` now reads as ABSENT; previously it emitted `<x></x>` and
+failed the element's own facets, which made optional elements unusable with any tabular format. An
+empty cell for a REQUIRED element is untouched and still reported.
+
+Found by decoding the `call-log-load` example's own sample against its own schema — the package
+lints clean, because lint never decodes anything. That round-trip is now a test.
+
+### Fixed — a batch issue path no longer leaks a synthesised-XML offset
+
+The XSD validator reports a position (`line 1:362`) into the one-line fragment the batch decoder
+synthesises for a row. That offset is meaningless to whoever sent the file, so it is dropped rather
+than appended: the path is `value[3]`, and the message already names the element.
+
+### Added — `csv` encodes
+
+`CsvCodec::encode` is implemented (rows → RFC 4180 bytes), so a csv channel can answer in csv and
+an error can come back as a table. Column order is alphabetical: a decoded row is a `BTreeMap`, so
+the source header's order is already gone — `decode(encode(rows)) == rows` holds, while
+`encode(decode(bytes))` returns the same table with columns sorted.
+
+### Changed — validation fails CLOSED when the flow declares no posture
+
+An intake carrying a validation **contract** — a schema-backed codec, or a declared
+`<q:validators>` chain — that declares no `<q:onValidation>` now **refuses** a failing payload
+instead of passing it to the flow. Previously `apply_decoded` returned `Proceed` whenever no
+policy was declared, whatever the issues were; with no `DecodeOutcome` check anywhere in the
+dispatch path, that included a `FATAL` decode starting a process with a null payload.
+
+The default is `reject`, not `error`: `error` raises a BPMN error into a process that by
+definition declared no handler for it, reporting "uncaught BPMN error" instead of naming the
+offending field.
+
+**Migration:** declare `<q:onValidation mode="route"/>` to keep the previous pass-through, or
+`mode="reject"` to state the new behaviour. `sutra lint` emits
+`SUTRA.CONFIG.VALIDATION.POSTURE_UNDECLARED` (WARNING) on every affected intake, naming both.
+**Schema-less ingress is unaffected**: a bare format has no contract to fail, and the format layer
+is fail-open by construction.
+
+### Changed — the RFC 7807 problem document is rendered in the caller's format
+
+The problem *model* is unchanged and remains the contract. Its *serialisation* now follows the
+inbound content-type: `application/problem+json` (default and fallback), `application/problem+xml`,
+`application/problem+yaml`, and `text/csv` — where a batch's per-cell violations come back as a
+table the sender can diff against the file they posted, instead of JSON they must re-parse to find
+row 4,217.
+
+### Fixed — multi-instance loop variables are visible to the linter
+
+`sutra-loader`'s `variable_writers` did not enumerate `Node::MultiInstance`'s
+`<bpmn:inputDataItem>` or `loopCounter`, so declaring the loop item variable — which is
+*mandatory*, since an undeclared root fails the template-input check — produced a false
+`SUTRA.CONFIG.VARIABLE.NEVER_INITIALIZED`. The two names now live in `sutra-bpmn`
+(`DEFAULT_LOOP_ITEM_VARIABLE`, `LOOP_COUNTER_VARIABLE`) and are read by both the executor that
+binds them and the linter that checks them, so they cannot drift. A cardinality-only loop binds no
+item variable, so the warning still fires there.
+
+### Added — the `call-log-load` example
+
+A third public example: a CSV batch of call detail records, validated whole against an inbound
+XSD by the codec, transformed record by record by a Handlebars script task, and written to a
+projected data store whose columns are a second XSD's type. One channel, one process, two schemas.
+Covered by the examples packaging gate.
+
 ### Changed — the workspace ships no message-standard codec
 
 Every business codec left this workspace for a proprietary repository that composes it as a
@@ -128,7 +269,7 @@ examples) on tier-2 (Testcontainers) and tier-3 (k8s) at each phase gate.
 - **XSD validator** — `sutra-xsd`: Tier-1 subset validator + shape emission (0 divergences
   over 206 differential cases against an independent reference validator).
 - **Catalog generator** — `sutra-catalog-gen`: `syn`-parsed `rust/**`
-  artifact-documentation pages (bidirectional Relationships, deterministic `--check`).
+  catalog pages (bidirectional Relationships, deterministic `--check`).
 - **Test harness** — `sutra-testkit`: Testcontainers engine + CLI drivers, container
   reaper.
 - **Deployment** — k8s shared-scenario OpenTofu (one engine + estate `Secret` at mode

@@ -1,4 +1,4 @@
-# Channels for the saturation-bench fixture package (docs/design/execution-scale-out.md §7).
+# Channels for the saturation-bench fixture package.
 # Every channel is HTTP + apikey, matching the rest of tools/sutra-load-test/'s fixtures. Two
 # channels (spawn-in, relay-in) decode a generic JSON body (`codec: json`, no compiled schema)
 # because hold-relay.bpmn's <q:alias> reads `payload.key`; work-in and timer-in never read

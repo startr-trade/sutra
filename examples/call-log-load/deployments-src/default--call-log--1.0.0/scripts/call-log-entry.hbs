@@ -1,0 +1,40 @@
+{{!-- THE TRANSFORM: inbound schema (urn:sutra:cdr) -> storage schema (urn:sutra:call-log),
+      one row at a time.
+
+      A Handlebars SCRIPT task, not a template service task, and the difference is the point: a
+      template's render becomes a reply (bytes on the wire), while a script's render must be a
+      JSON OBJECT whose entries merge — typed — into the instance variables. That is what lets
+      the very next node write `entry` straight into the projected store, with no second process
+      and no round trip through a channel to turn bytes back into a record.
+
+      `row` is the multi-instance item: one already-XSD-validated CallDetailRecord. Its numeric
+      fields arrive as NUMBERS (the codec applied the XSD's leaf types to the CSV's untyped
+      cells), so they render unquoted below and stay numeric all the way into the column.
+
+      What the transform actually does — the two schemas are not a rename apart:
+        recordId    -> entryId            renamed
+        msisdn      -> subscriber         renamed
+        peerMsisdn  -> counterparty       renamed
+        startTime   -> startedAt          renamed
+        durationSec -> durationSeconds    renamed
+        cellId      -> cellSite           renamed, optional both sides
+        chargeAmount-> ratedAmount        renamed
+        direction   -> bearing            VOCABULARY mapped (originated/received -> outgoing/incoming)
+        (derived)   -> billable           a field the inbound record does not carry
+        rateCode    -> (dropped)          an inbound field storage does not keep
+
+      Handlebars renders strict: a missing value aborts the render rather than emitting an empty
+      field, so a drift between the two schemas fails loudly on the record that hit it. `eq` is
+      null-tolerant, which is why it is safe inside #if. An absent cellId renders JSON null, which
+      the projected store writes as a NULL column — the same thing minOccurs="0" means. --}}
+{"entry":{
+  "entryId":         "{{row.recordId}}",
+  "subscriber":      "{{row.msisdn}}",
+  "counterparty":    "{{row.peerMsisdn}}",
+  "startedAt":       "{{row.startTime}}",
+  "durationSeconds":  {{row.durationSec}},
+  "bearing":         "{{#if (eq row.direction "originated")}}outgoing{{else}}incoming{{/if}}",
+  "cellSite":        {{#if row.cellId}}"{{row.cellId}}"{{else}}null{{/if}},
+  "ratedAmount":      {{row.chargeAmount}},
+  "billable":         {{#if (eq row.direction "originated")}}true{{else}}false{{/if}}
+}}

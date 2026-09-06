@@ -2,7 +2,7 @@
 -- ../postgres/V901__coverage_metric.sql — read it for the ownership + idempotence contract).
 --
 -- Shipped inside the engine and applied to the USER-DECLARED `coverage` store's own connection on
--- first use (datastore-schema-projection.md §7), so it must be re-runnable. `CREATE TABLE IF NOT
+-- first use, so it must be re-runnable. `CREATE TABLE IF NOT
 -- EXISTS` carries that; the secondary index is declared INLINE rather than as a separate
 -- `CREATE INDEX` because MySQL 8 has no `CREATE INDEX IF NOT EXISTS` (MariaDB does) — inline, it
 -- inherits the table statement's idempotence on both engines.

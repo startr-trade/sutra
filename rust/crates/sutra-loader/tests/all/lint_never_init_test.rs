@@ -211,3 +211,83 @@ fn opaque_writer_suppresses_the_check() {
         report.diagnostics
     );
 }
+
+// ---- multi-instance / standard-loop item variables (engine-supplied writers) ----------------
+
+/// A collection-driven `<bpmn:multiInstanceLoopCharacteristics>` binds its
+/// `<bpmn:inputDataItem name>` — and `loopCounter` — on every iteration, so a `<q:variables>`
+/// declaration of either IS initialised: by the engine, with no data association to see.
+/// Declaring them is also mandatory (an undeclared root fails the template-input check), so
+/// warning here left an author with no clean way to write the flow at all.
+#[test]
+fn multi_instance_item_variable_is_initialised_by_the_loop() {
+    let dir = tempfile::tempdir().unwrap();
+    build(
+        dir.path(),
+        r#"<q:variable name="rows"/><q:variable name="row"/><q:variable name="loopCounter" type="number"/>"#,
+        r#"<bpmn:serviceTask id="Prep"><bpmn:incoming>f1</bpmn:incoming><bpmn:outgoing>f2</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>payload</bpmn:from><bpmn:to>rows</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:subProcess id="Loop"><bpmn:incoming>f2</bpmn:incoming><bpmn:outgoing>fend</bpmn:outgoing>
+      <bpmn:multiInstanceLoopCharacteristics isSequential="true">
+        <bpmn:loopDataInputRef>rows</bpmn:loopDataInputRef>
+        <bpmn:inputDataItem name="row"/>
+      </bpmn:multiInstanceLoopCharacteristics>
+      <bpmn:startEvent id="LS"><bpmn:outgoing>l1</bpmn:outgoing></bpmn:startEvent>
+      <bpmn:sequenceFlow id="l1" sourceRef="LS" targetRef="LT"/>
+      <bpmn:serviceTask id="LT" implementation="t.hbs"><bpmn:incoming>l1</bpmn:incoming><bpmn:outgoing>l2</bpmn:outgoing></bpmn:serviceTask>
+      <bpmn:sequenceFlow id="l2" sourceRef="LT" targetRef="LE"/>
+      <bpmn:endEvent id="LE"><bpmn:incoming>l2</bpmn:incoming></bpmn:endEvent>
+    </bpmn:subProcess>"#,
+        r#"<bpmn:sequenceFlow id="f1" sourceRef="S" targetRef="Prep"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="Prep" targetRef="Loop"/>
+    <bpmn:sequenceFlow id="fend" sourceRef="Loop" targetRef="E"/>"#,
+        &[("t.hbs", "<v>{{row.id}}<c>{{loopCounter}}</c></v>")],
+        &[],
+    );
+    let report = lint_dir(dir.path());
+    assert_no_errors(&report);
+    assert!(
+        !any_never_init(&report),
+        "the multi-instance item variable and loopCounter are engine-supplied writers; \
+         diagnostics: {:#?}",
+        report.diagnostics
+    );
+}
+
+/// The counterpart that must still fire: a CARDINALITY-only multi-instance iterates no
+/// collection, so `run_multi_instance` binds no item variable — a declaration of one is
+/// genuinely never written and the warning is correct.
+#[test]
+fn cardinality_only_multi_instance_still_warns_for_its_item_variable() {
+    let dir = tempfile::tempdir().unwrap();
+    build(
+        dir.path(),
+        r#"<q:variable name="row"/>"#,
+        r#"<bpmn:subProcess id="Loop"><bpmn:incoming>f1</bpmn:incoming><bpmn:outgoing>fend</bpmn:outgoing>
+      <bpmn:multiInstanceLoopCharacteristics isSequential="true">
+        <bpmn:loopCardinality>3</bpmn:loopCardinality>
+        <bpmn:inputDataItem name="row"/>
+      </bpmn:multiInstanceLoopCharacteristics>
+      <bpmn:startEvent id="LS"><bpmn:outgoing>l1</bpmn:outgoing></bpmn:startEvent>
+      <bpmn:sequenceFlow id="l1" sourceRef="LS" targetRef="LT"/>
+      <bpmn:serviceTask id="LT" implementation="t.hbs"><bpmn:incoming>l1</bpmn:incoming><bpmn:outgoing>l2</bpmn:outgoing></bpmn:serviceTask>
+      <bpmn:sequenceFlow id="l2" sourceRef="LT" targetRef="LE"/>
+      <bpmn:endEvent id="LE"><bpmn:incoming>l2</bpmn:incoming></bpmn:endEvent>
+    </bpmn:subProcess>"#,
+        r#"<bpmn:sequenceFlow id="f1" sourceRef="S" targetRef="Loop"/>
+    <bpmn:sequenceFlow id="fend" sourceRef="Loop" targetRef="E"/>"#,
+        &[("t.hbs", "<v>{{row.id}}</v>")],
+        &[],
+    );
+    let report = lint_dir(dir.path());
+    assert_no_errors(&report);
+    assert!(
+        never_init_for(&report, "row"),
+        "a cardinality-only loop binds no item variable, so the warning must still fire; \
+         diagnostics: {:#?}",
+        report.diagnostics
+    );
+}

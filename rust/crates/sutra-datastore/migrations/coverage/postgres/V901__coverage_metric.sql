@@ -1,6 +1,6 @@
 -- Coverage metric-flag table — PostgreSQL dialect of the ENGINE-OWNED coverage schema.
 --
--- SUPERSEDING RULING 2026-08-04 (datastore-schema-projection.md §7): coverage marks persist in
+-- SUPERSEDING RULING 2026-08-04: coverage marks persist in
 -- the USER-DECLARED `coverage` data store — the author picks the database by pointing that
 -- store's `sql.url` wherever they like — but the SCHEMA is the engine's. The author writes no
 -- coverage SQL; this script is shipped INSIDE the engine binary (include_str! in

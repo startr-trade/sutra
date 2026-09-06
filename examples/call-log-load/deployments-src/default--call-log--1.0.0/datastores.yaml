@@ -1,0 +1,29 @@
+# Data stores for the `default` tenant's call-log module, 1.0.0. Path-derived, version-scoped,
+# and inside the deployment's frozen checksum.
+#
+# `call_log` is a PROJECTED store: the `structure:` block says "my rows ARE this XSD type", so
+# the engine writes one typed COLUMN per declared scalar into the author's own table instead of
+# one opaque JSON blob. The row shape is exactly the declared fields — a write carrying an
+# undeclared field is a fail-closed runtime error
+# (SUTRA.RUNTIME.DATASTORE.UNDECLARED_FIELD), and on first use the provider reads the live
+# table and refuses to serve a projection the columns cannot satisfy.
+#
+# The engine generates NO DDL: migrations/call_log/V001__call_log.sql is the author's, in the
+# author's dialect. `sutra lint` parses it and compares the effective table against the
+# declared structure without any database connection.
+
+datastores:
+  - name: call_log
+    type: sql
+    structure:
+      schema: urn:call-log     # the schemas/call-log codec in this package
+      type: CallLogEntry       # its root element — one column per declared scalar
+      # No `columns:` mapping needed: the default fold (lowerCamel -> snake_case) already
+      # matches the DDL (entryId -> entry_id, durationSeconds -> duration_seconds, ...).
+    sql:
+      # The store's OWN connection, env-indirected (15-factor: no literal secrets).
+      url-ref: env:CALL_LOG_DB_URL
+      username-ref: env:CALL_LOG_DB_USER
+      password-ref: env:CALL_LOG_DB_PASSWORD
+      migrations: migrations/call_log
+    dataClass: pii             # subscriber numbers are personal data.

@@ -5,7 +5,7 @@
  *   - src/properties/util/feelPreview.js : sampleEntry() / previewEntry() descriptors
  *   - integration with QAliasGroup       : preview wired beneath the alias expression entry
  *
- * The naming in STATUS.md said "FEEL WASM evaluator" — we settled on Option A from the
+ * The original naming said "FEEL WASM evaluator" — we settled on Option A from the
  * implementation note (thin wrapper over `@bpmn-io/feelin`, the canonical JS FEEL
  * interpreter used across the bpmn-io ecosystem) since shipping a custom WASM module
  * would duplicate a real, well-tested npm package without any behavior change visible
