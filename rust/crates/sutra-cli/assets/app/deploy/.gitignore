@@ -7,6 +7,9 @@
 # was built from (packages/) is already in the repository.
 deployments/*.sutra
 
-# Local run state: `docker compose` writes nothing here by default, but a bind-mounted volume or
-# an .env with dev credentials is a common local addition, and neither belongs in git.
+# The engine service reads this file (`env_file:` in compose.yaml) to resolve the secrets your
+# packages name by reference — `env:MY_API_KEY`, `env:MY_DB_URL`. It therefore holds credentials
+# by design, dev ones today and easily a real one by accident tomorrow, so it stays out of git.
+# Share the KEY NAMES with your team (a committed `.env.example` is the usual way); never the
+# values. Nothing breaks without the file — compose declares it `required: false`.
 .env

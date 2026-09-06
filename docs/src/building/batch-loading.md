@@ -203,12 +203,170 @@ If batches outgrow what one step should own, the move is to deliver them in chun
 broker transport carrying N records per message. The BPMN names channels, never transports, so
 nothing in the flow changes.
 
-## Try it
+## Run it
+
+The example ships its own two-service stack — engine and PostgreSQL, every secret already set —
+so trying it is `up`, `package`, `curl`. You need the [`sutra` CLI](../getting-started/installation.md)
+and Docker; this is the same local model as the [Quickstart](../getting-started/quickstart.md),
+pointed at a package that already exists.
+
+### 1. Start the engine
 
 ```bash
-sutra lint    examples/call-log-load/deployments-src/default--call-log--1.0.0
-sutra package --out ./out examples/call-log-load/deployments-src/default--call-log--1.0.0
+docker compose -f examples/call-log-load/deploy/compose.yaml up -d
 ```
+
+### 2. Seal the package into the watched directory
+
+```bash
+sutra package examples/call-log-load/deployments-src/default--call-log--1.0.0 \
+     --out examples/call-log-load/deploy/deployments
+```
+
+```
+packaged …/default--call-log--1.0.0.sutra (deploymentId dep-397f20f9669c0e2eaabd0e74)
+```
+
+`package` lints on the way in — the fixed-width layout is checked against the bound XSD, the
+store's `structure` against the migration's DDL — so a mistake in either fails here rather than on
+the first upload. The engine watches that directory and activates the archive without a restart.
+
+The host port is dynamic, because nothing assumes 8080 is free on your machine:
+
+```bash
+ENGINE=$(docker compose -f examples/call-log-load/deploy/compose.yaml port engine 8080)
+curl -s http://$ENGINE/sutra/health/ready
+```
+
+```json
+{"status":"UP","checks":[{"name":"sutra-loader","status":"UP","data":{"deployments":1,"shards":1}}]}
+```
+
+### 3. Upload a batch
+
+```bash
+curl -s -X POST http://$ENGINE/channels/cdr-upload \
+  -H 'Content-Type: text/csv' \
+  -H 'X-Api-Key: dev-only-cdr-key' \
+  --data-binary @examples/call-log-load/sample/call-logs.csv
+```
+
+```json
+{"batchId":"45217d89-a520-4d7b-ba2a-453d1d9fa38a","rowsAccepted":4,"status":"loading"}
+```
+
+`202 Accepted`, in about 30 ms. The load has not finished — it has barely started. That is
+[`ack-mode: on-persist` plus `<q:reply continue="true">`](#answering-now-loading-later) doing
+exactly what the section above describes.
+
+### 4. Read the rows back
+
+```bash
+docker compose -f examples/call-log-load/deploy/compose.yaml exec engine-db \
+  psql -U sutra_engine -d sutra -c \
+  'select entry_id, subscriber, bearing, duration_seconds, rated_amount, billable from call_log order by entry_id'
+```
+
+```
+  entry_id  |  subscriber  | bearing  | duration_seconds | rated_amount | billable
+------------+--------------+----------+------------------+--------------+----------
+ CDR-100001 | +14155550101 | outgoing |              182 |       4.5500 | t
+ CDR-100002 | +14155550101 | incoming |               45 |       0.0000 | f
+ CDR-100003 | +14155550188 | incoming |              930 |       0.0000 | f
+ CDR-100004 | +14155550101 | outgoing |             1204 |      21.6720 | t
+```
+
+Typed columns, not a JSON blob: `duration_seconds` is an integer and `rated_amount` a `NUMERIC`
+because the XSD's leaf types were applied to the CSV's untyped cells at decode. `bearing` and
+`billable` do not exist in the uploaded file at all — the transform derived them from `direction`.
+
+`psql` needs no password here: `sutra_engine` is the engine's own role (owner of `sutra`), and
+inside the container the local socket trusts it. The bootstrap superuser is `postgres`, which you
+only need for creating roles or databases.
+
+### 5. Watch it refuse a bad batch
+
+```bash
+curl -i -X POST http://$ENGINE/channels/cdr-upload \
+  -H 'Content-Type: text/csv' \
+  -H 'X-Api-Key: dev-only-cdr-key' \
+  --data-binary @examples/call-log-load/sample/call-logs-with-a-bad-row.csv
+```
+
+```
+HTTP/1.1 400 Bad Request
+content-type: text/csv
+
+field,value
+type,urn:bpm:diag:SUTRA.INBOUND.VALIDATION_REJECT
+status,400
+detail,"Inbound rejected on intake node Start of process cdr-load: 6 validation issue(s); mode=reject."
+issueCount,6
+```
+
+Three things at once. It is a **400**, not a 500 — a malformed file is the caller's to fix, and a
+5xx would invite a retry of identical bytes. It comes back as **CSV**, because that is what was
+posted. And re-running the query from step 4 still shows four rows: validation runs at intake over
+the *whole* file, so a batch with one bad cell writes nothing at all.
+
+Drop the `X-Api-Key` header and you get `401` instead — the channel declares `apikey` auth, and the
+engine will not wire an unauthenticated HTTP intake.
+
+### 6. The same records, as fixed-width
+
+```bash
+curl -s -X POST http://$ENGINE/channels/cdr-upload \
+  -H 'Content-Type: text/plain' \
+  -H 'X-Api-Key: dev-only-cdr-key' \
+  --data-binary @examples/call-log-load/sample/call-logs.fixed-width.txt
+```
+
+Another `202` with a receipt, and the table still holds four rows — same schema, same keys, so the
+same records upserted rather than appended. One channel, one XSD, [two wire
+forms](#two-wire-forms-one-schema), chosen by content-type.
+
+### Clean up
+
+```bash
+docker compose -f examples/call-log-load/deploy/compose.yaml down -v
+```
+
+### Into an app you already have
+
+If you are already running a scaffolded app rather than this stack, copy the package into it and
+give the engine the secrets the package names:
+
+```bash
+cp -r examples/call-log-load/deployments-src/default--call-log--1.0.0 \
+      my-app/packages/call-log-load
+```
+
+```bash
+# my-app/deploy/.env — read by the engine service (env_file), gitignored by the scaffold
+CDR_UPLOAD_API_KEY=dev-only-cdr-key
+CALL_LOG_DB_URL=postgres://engine-db:5432/sutra
+CALL_LOG_DB_USER=sutra_engine
+CALL_LOG_DB_PASSWORD=sutra-dev-only
+```
+
+Then `sutra package packages/call-log-load --out deploy/deployments` and recreate the engine
+(`docker compose -f deploy/compose.yaml up -d --force-recreate engine`) so it picks the new
+environment up.
+
+**This step is not optional and it fails loudly.** `channels.yaml` and `datastores.yaml` name their
+secrets by *reference* — `env:CDR_UPLOAD_API_KEY`, `env:CALL_LOG_DB_URL` — and the **engine**
+resolves them, in its own environment. Exporting them in your shell does nothing; the engine is not
+your shell. An unresolvable channel-auth reference is fatal:
+
+```
+startup failed — refusing to serve
+  HTTP channel auth value could not be resolved: secret-ref 'env:CDR_UPLOAD_API_KEY'
+  resolves to no value (environment variable 'CDR_UPLOAD_API_KEY' is not set).
+```
+
+The engine will not open an unauthenticated port instead. An unresolvable *store* reference is
+narrower — that store is not registered and the rest of the deployment still serves — so watch the
+startup log for `store NOT registered` too.
 
 ## Next
 

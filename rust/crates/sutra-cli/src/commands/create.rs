@@ -945,12 +945,37 @@ mod tests {
         ] {
             assert!(root.join(path).is_file(), "missing {path}");
         }
+        // A package names its secrets by reference (`env:MY_API_KEY`) and the ENGINE resolves
+        // them in its own environment — so without an env_file the only way to add a package
+        // that needs one is to hand-edit this YAML, which is the step people skip. It is also
+        // unforgiving when skipped: an unresolvable channel-auth reference makes the engine
+        // refuse to serve rather than open an unauthenticated port. `required: false` keeps
+        // `up` working before anyone has written a `.env`.
+        let compose = std::fs::read_to_string(root.join("deploy/compose.yaml")).unwrap();
+        assert!(
+            compose.contains("env_file:") && compose.contains("required: false"),
+            "the engine service must read an OPTIONAL deploy/.env:\n{compose}"
+        );
+        // Compose names a project after the compose file's DIRECTORY when nothing says
+        // otherwise — `deploy` for every app this scaffolds. Two apps on one machine would then
+        // share a project, and `down -v` in either would stop the other's containers and drop
+        // its database volume with them.
+        assert!(
+            compose.contains("\nname: payments\n"),
+            "the stack must be scoped to the app, not to the directory name:\n{compose}"
+        );
+
         // The point of the ignore is the sealed archives: they are derived from packages/,
         // change on every rebuild, and are unreviewable as a diff.
         let ignore = std::fs::read_to_string(root.join("deploy/.gitignore")).unwrap();
         assert!(
             ignore.contains("deployments/*.sutra"),
             "the deploy ignore must cover sealed archives:\n{ignore}"
+        );
+        // …and the env_file it now reads, which holds credentials by design.
+        assert!(
+            ignore.contains(".env"),
+            "the deploy ignore must cover the env_file:\n{ignore}"
         );
         for dir_name in [
             "packages/payments-main/rules",

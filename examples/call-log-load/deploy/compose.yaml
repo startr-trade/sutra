@@ -1,0 +1,77 @@
+# Run the call-log-load example locally: engine + PostgreSQL, nothing to edit.
+#
+# This is the DOCKER (local) path. It is deliberately self-contained — every secret the package
+# names by reference is already set below — so that trying the example is `up`, `package`, `curl`
+# and nothing else. The sibling examples' `deploy/` directories are the tier-3 (Kubernetes/tofu)
+# path against a shared engine instance; this is not that, and the two do not overlap.
+#
+#   docker compose -f examples/call-log-load/deploy/compose.yaml up -d
+#   sutra package examples/call-log-load/deployments-src/default--call-log--1.0.0 \
+#        --out examples/call-log-load/deploy/deployments
+#
+# The engine watches ./deployments and activates the archive without a restart.
+
+name: sutra-call-log-load
+
+services:
+  engine:
+    # One generic image; behaviour comes entirely from the mounted deployments. Override with
+    # SUTRA_ENGINE_IMAGE to run a locally built tag.
+    image: ${SUTRA_ENGINE_IMAGE:-ghcr.io/startr-trade/sutra:0.2.0-rc.2}
+    environment:
+      SUTRA_DEPLOYMENTS_DIR: /deployments
+      SUTRA_HTTP_PORT: "8080"
+
+      # ENGINE-INTERNAL datasource — instances, outbox, leases, audit. Never a package's
+      # business store: those declare their own connections in datastores.yaml.
+      SUTRA_DATASOURCE_URL: postgres://engine-db:5432/sutra
+      # NOT the postgres superuser. The engine refuses to start against a role that can bypass
+      # row-level security (SUTRA.STARTUP.RLS_BYPASS_RISK), because a superuser bypasses it
+      # unconditionally and would leave the deployment-isolation policies inert. engine-db-init.sh
+      # creates a plain NOSUPERUSER/NOBYPASSRLS login role, which is the kind of credential
+      # production hands it too.
+      SUTRA_DATASOURCE_USERNAME: ${ENGINE_DB_USER:-sutra_engine}
+      SUTRA_DATASOURCE_PASSWORD: ${ENGINE_DB_PASSWORD:-sutra-dev-only}
+
+      # --- what the package itself names -------------------------------------------------
+      # channels.yaml says `value: env:CDR_UPLOAD_API_KEY` and datastores.yaml says
+      # `url-ref: env:CALL_LOG_DB_URL` — references, never literals. They are resolved by the
+      # ENGINE, in ITS environment, so they have to be set here: exporting them in your shell
+      # does nothing. Miss the API key and the engine does not start degraded, it refuses to
+      # serve at all, because the alternative is opening an unauthenticated port.
+      CDR_UPLOAD_API_KEY: ${CDR_UPLOAD_API_KEY:-dev-only-cdr-key}
+      # DEMO SHORTCUT: the business store shares the engine's database, which keeps this file to
+      # two services. In anything real it gets its own — the package declares a separate
+      # connection precisely so that it can, without the flow changing.
+      CALL_LOG_DB_URL: postgres://engine-db:5432/sutra
+      CALL_LOG_DB_USER: ${ENGINE_DB_USER:-sutra_engine}
+      CALL_LOG_DB_PASSWORD: ${ENGINE_DB_PASSWORD:-sutra-dev-only}
+    volumes:
+      - ./deployments:/deployments:ro
+    ports:
+      # Dynamic host port, loopback only — nothing here assumes 8080 is free on your machine.
+      # `docker compose -f … port engine 8080` tells you what it landed on.
+      - "127.0.0.1::8080"
+    depends_on:
+      engine-db:
+        condition: service_healthy
+
+  engine-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: sutra
+      # The BOOTSTRAP superuser: used by the image's entrypoint and by the init script below,
+      # never by the engine. Splitting the two is the point — see engine-db-init.sh.
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_BOOTSTRAP_PASSWORD:-bootstrap-dev-only}
+      ENGINE_DB_USER: ${ENGINE_DB_USER:-sutra_engine}
+      ENGINE_DB_PASSWORD: ${ENGINE_DB_PASSWORD:-sutra-dev-only}
+    volumes:
+      # Runs ONCE, when the data volume is first created. `down -v` drops the volume, which is
+      # what makes it run again.
+      - ./engine-db-init.sh:/docker-entrypoint-initdb.d/10-engine-role.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d sutra"]
+      interval: 2s
+      timeout: 3s
+      retries: 30

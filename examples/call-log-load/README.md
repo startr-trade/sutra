@@ -124,39 +124,45 @@ run all of it before deployment.
 
 ## Running it
 
-```bash
-sutra lint    deployments-src/default--call-log--1.0.0     # 0 errors, 0 warnings
-sutra package --out ./out deployments-src/default--call-log--1.0.0
-
-```
-
-`channels.yaml` and `datastores.yaml` name their secrets by REFERENCE — `env:CDR_UPLOAD_API_KEY`,
-`env:CALL_LOG_DB_URL` and friends. Those names are resolved by the ENGINE PROCESS, so they have to
-be set in the engine's own environment, not in the shell you type `curl` into. Under
-`docker compose` that means the engine service's `environment:` block:
-
-```yaml
-  engine:
-    environment:
-      CDR_UPLOAD_API_KEY: ${CDR_UPLOAD_API_KEY:-dev-only-cdr-key}
-      CALL_LOG_DB_URL: postgres://engine-db:5432/calllog
-      CALL_LOG_DB_USER: ${CALL_LOG_DB_USER:-sutra_engine}
-      CALL_LOG_DB_PASSWORD: ${CALL_LOG_DB_PASSWORD:-sutra-dev-only}
-```
-
-Miss one and the engine does not start half-configured: an unresolvable channel-auth reference is
-fatal (`startup failed — refusing to serve`), because the alternative is opening an unauthenticated
-port. An unresolvable STORE reference is narrower — that store is not registered and the rest of
-the deployment still serves — so watch the startup log for `store NOT registered` too.
+The example ships its own engine + PostgreSQL stack with every secret already set, so there is
+nothing to edit:
 
 ```bash
-curl -sS -X POST http://localhost:<port>/channels/cdr-upload \
+docker compose -f deploy/compose.yaml up -d
+
+sutra package deployments-src/default--call-log--1.0.0 --out deploy/deployments
+
+ENGINE=$(docker compose -f deploy/compose.yaml port engine 8080)
+curl -sS -X POST http://$ENGINE/channels/cdr-upload \
      -H 'Content-Type: text/csv' -H 'X-Api-Key: dev-only-cdr-key' \
      -H 'X-Request-Id: batch-2026-09-06-01' \
      --data-binary @sample/call-logs.csv
 # HTTP 202 Accepted
 # {"batchId":"…","rowsAccepted":4,"status":"loading"}
+
+docker compose -f deploy/compose.yaml exec engine-db \
+     psql -U sutra_engine -d sutra -c 'select * from call_log order by entry_id'
 ```
+
+`sample/call-logs-with-a-bad-row.csv` comes back `400` as a CSV table, and
+`sample/call-logs.fixed-width.txt` (posted as `text/plain`) loads the same four records through the
+same channel. `docker compose -f deploy/compose.yaml down -v` when you are done.
+
+**Dropping it into an app you already have** instead: copy `deployments-src/default--call-log--1.0.0`
+under that app's `packages/`, and put the secrets the package names by reference into its
+`deploy/.env` (the scaffolded engine service reads it; it is gitignored):
+
+```
+CDR_UPLOAD_API_KEY=dev-only-cdr-key
+CALL_LOG_DB_URL=postgres://engine-db:5432/sutra
+CALL_LOG_DB_USER=sutra_engine
+CALL_LOG_DB_PASSWORD=sutra-dev-only
+```
+
+Those names are resolved by the **engine**, in its own environment — exporting them in your shell
+does nothing. Miss the API key and the engine refuses to serve at all (`startup failed`), rather
+than open an unauthenticated port. Recreate the engine after writing the file so it picks the new
+environment up.
 
 ```sql
 SELECT entry_id, subscriber, counterparty, started_at,

@@ -10,6 +10,13 @@
 # The engine's host port is DYNAMIC — never assume a fixed host port. Discover it with:
 #   docker compose -f deploy/compose.yaml port engine 8080
 
+# The Compose PROJECT name — what every container, network and volume here is prefixed with.
+# Without it Compose derives the name from this file's DIRECTORY, which is `deploy` for every
+# scaffolded app: a second app on the same machine would then resolve to the same project, and
+# `docker compose down -v` run from one would tear down the other's containers AND delete its
+# database volume. Naming it after the app makes the stacks independent.
+name: %%APP%%
+
 services:
   engine:
     # The engine image — one generic image; behaviour comes entirely from the mounted
@@ -43,6 +50,18 @@ services:
       # Resolves the `${SAMPLE_API_KEY}` reference in packages/*/channels.yaml. A real
       # deployment sources this from its secret store, never from a compose default.
       SAMPLE_API_KEY: ${SAMPLE_API_KEY:-%%APIKEY%%}
+    # Every OTHER package's secrets go here, in `deploy/.env`, one KEY=value per line — not in
+    # the block above. A package names its secrets by reference (`env:MY_API_KEY`,
+    # `env:MY_DB_URL`) and the engine resolves them in ITS OWN environment, so exporting them in
+    # your shell does nothing: the engine is not your shell. Adding a package would otherwise
+    # mean editing this file, which is the one step people skip — and an unresolvable
+    # channel-auth reference is fatal (`startup failed — refusing to serve`), because the
+    # alternative is opening an unauthenticated port.
+    #
+    # `required: false` keeps `up` working when the file does not exist. Do not commit `.env`.
+    env_file:
+      - path: .env
+        required: false
     volumes:
       - ./deployments:/deployments:ro
     ports:
