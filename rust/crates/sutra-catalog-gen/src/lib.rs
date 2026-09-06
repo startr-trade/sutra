@@ -58,18 +58,43 @@ impl Config {
 pub struct Report {
     pub pages: usize,
     pub crates: usize,
+    /// Pages removed because their source file is gone (`--clean` runs only).
+    pub removed: Vec<String>,
 }
 
-/// Regenerate the Rust catalog in place under `cfg.output`, preserving manual notes.
-pub fn run(cfg: &Config) -> Result<Report> {
+/// Regenerate the Rust catalog in place under `cfg.output`, preserving manual notes. With
+/// `clean`, also delete pages whose SOURCE FILE no longer exists.
+///
+/// Pruning is opt-in, and the first cut of this got it wrong twice over. It pruned everything the
+/// run did not produce, which condemned 106 legitimate pages — 67 `index.md` directory stubs the
+/// generator never emits, plus pages for crates that run did not discover — and it did so
+/// automatically, so the mistake landed before anyone could see it. The key is now "has this
+/// page's source disappeared", which is the actual question, and the act is explicit.
+///
+/// `--check` reports stranded pages either way, so CI still catches them without the flag; what
+/// the flag guards is the deletion.
+///
+/// There is no build cache to clear and nothing incremental to reset: every page is rendered from
+/// scratch on every run. The only per-file shortcut is a write-if-changed guard that keeps mtimes
+/// (and livereload) quiet.
+pub fn run(cfg: &Config, clean: bool) -> Result<Report> {
     let ws = workspace::discover(&cfg.repo_root)?;
     let graph = resolve::build(&ws);
     let pages = render::generate_pages(&ws, &graph);
     std::fs::create_dir_all(&cfg.output)?;
     let n = render::write_all(&cfg.output, &pages)?;
+    let mut removed = Vec::new();
+    if clean {
+        for orphan in render::orphans(&cfg.output, &cfg.repo_root, &pages)? {
+            std::fs::remove_file(cfg.output.join(&orphan))
+                .with_context(|| format!("removing stranded page {orphan}"))?;
+            removed.push(orphan);
+        }
+    }
     Ok(Report {
         pages: n,
         crates: ws.crates.len(),
+        removed,
     })
 }
 
@@ -85,7 +110,7 @@ pub fn check(cfg: &Config) -> Result<Vec<String>> {
         .tempdir()
         .context("creating temp dir for --check")?;
     write_raw(tmp.path(), &pages)?;
-    render::diff_against(tmp.path(), &cfg.output, &pages)
+    render::diff_against(tmp.path(), &cfg.output, &cfg.repo_root, &pages)
 }
 
 /// Write the raw generated content (default manual notes) into `root` — used only by `--check`.

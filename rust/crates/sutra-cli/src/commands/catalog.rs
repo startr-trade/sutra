@@ -33,6 +33,11 @@ pub struct CatalogArgs {
     /// is never written (CI / pre-commit gate).
     #[arg(long)]
     pub check: bool,
+
+    /// Also DELETE catalog pages whose source file no longer exists — a page stranded when its
+    /// source was renamed or removed. `--check` reports them regardless; this removes them.
+    #[arg(long)]
+    pub clean: bool,
 }
 
 pub fn execute(args: CatalogArgs, global: &GlobalArgs, io: &mut Io<'_>) -> i32 {
@@ -50,12 +55,17 @@ pub fn execute(args: CatalogArgs, global: &GlobalArgs, io: &mut Io<'_>) -> i32 {
     if args.check {
         check(&cfg, format, io)
     } else {
-        generate(&cfg, format, io)
+        generate(&cfg, args.clean, format, io)
     }
 }
 
-fn generate(cfg: &sutra_catalog_gen::Config, format: ReportFormat, io: &mut Io<'_>) -> i32 {
-    let report = match sutra_catalog_gen::run(cfg) {
+fn generate(
+    cfg: &sutra_catalog_gen::Config,
+    clean: bool,
+    format: ReportFormat,
+    io: &mut Io<'_>,
+) -> i32 {
+    let report = match sutra_catalog_gen::run(cfg, clean) {
         Ok(report) => report,
         Err(e) => return fail(&e, io),
     };
@@ -68,6 +78,9 @@ fn generate(cfg: &sutra_catalog_gen::Config, format: ReportFormat, io: &mut Io<'
                 report.crates,
                 cfg.output.display()
             );
+            for removed in &report.removed {
+                let _ = writeln!(io.out, "removed stranded page {removed}");
+            }
         }
         ReportFormat::Json => {
             let payload = serde_json::json!({
@@ -75,6 +88,7 @@ fn generate(cfg: &sutra_catalog_gen::Config, format: ReportFormat, io: &mut Io<'
                 "output": cfg.output.display().to_string(),
                 "pages": report.pages,
                 "crates": report.crates,
+                "removed": report.removed,
             });
             let _ = writeln!(io.out, "{payload}");
         }
@@ -167,6 +181,7 @@ mod tests {
             repo_root: Some(root.to_path_buf()),
             output: Some(root.join("catalog")),
             check,
+            clean: false,
         }
     }
 

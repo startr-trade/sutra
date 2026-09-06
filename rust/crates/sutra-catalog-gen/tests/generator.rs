@@ -133,8 +133,8 @@ fn run_is_deterministic_and_check_detects_drift() {
     let cfg1 = Config::with_defaults(fixture_root(), Some(out1.path().to_path_buf()));
     let cfg2 = Config::with_defaults(fixture_root(), Some(out2.path().to_path_buf()));
 
-    let r1 = run(&cfg1).expect("run 1");
-    let r2 = run(&cfg2).expect("run 2");
+    let r1 = run(&cfg1, false).expect("run 1");
+    let r2 = run(&cfg2, false).expect("run 2");
     assert_eq!(r1.pages, r2.pages);
     assert!(
         r1.pages >= 5,
@@ -164,7 +164,7 @@ fn run_is_deterministic_and_check_detects_drift() {
         "Hand-written wisdom.",
     );
     std::fs::write(&store_page, with_notes).unwrap();
-    run(&cfg1).expect("re-run");
+    run(&cfg1, false).expect("re-run");
     let after = std::fs::read_to_string(&store_page).unwrap();
     assert!(
         after.contains("Hand-written wisdom."),
@@ -200,4 +200,64 @@ fn collect_files(root: &Path, dir: &Path, out: &mut Vec<String>) {
             );
         }
     }
+}
+
+/// `--clean` removes a page whose SOURCE is gone, and nothing else.
+///
+/// The predicate that matters is "does a sibling file share this stem", not "did this run produce
+/// this page". Two earlier cuts got that wrong and deleted real content: keying on the produced
+/// set condemned 106 pages (directory `index.md` stubs the generator never emits, plus pages for
+/// crates a run did not discover), and assuming a `.rs` extension condemned 40 more (asset pages
+/// for `.bpmn`, `.xsd`, `.hbs` sources). Both are pinned below.
+#[test]
+fn clean_removes_only_pages_whose_source_is_gone() {
+    let out = tempfile::tempdir().expect("tempdir");
+    let cfg = Config::with_defaults(fixture_root(), Some(out.path().to_path_buf()));
+    run(&cfg, false).expect("initial run");
+
+    let rust_dir = out.path().join("rust");
+    // (a) a page with no source at all — the only thing `--clean` should remove.
+    let stranded = rust_dir.join("crates/zzz-gone/src/vanished.md");
+    std::fs::create_dir_all(stranded.parent().unwrap()).unwrap();
+    std::fs::write(&stranded, "# stranded").unwrap();
+    // (b) a directory stub — never has a single source, must survive.
+    let stub = rust_dir.join("index.md");
+    std::fs::write(&stub, "# directory stub").unwrap();
+
+    let report = run(&cfg, true).expect("clean run");
+
+    assert!(!stranded.exists(), "a page with no source must be removed");
+    assert!(
+        stub.exists(),
+        "a directory stub has no source and must survive"
+    );
+    assert_eq!(
+        report.removed,
+        vec!["rust/crates/zzz-gone/src/vanished.md".to_string()],
+        "exactly one page removed, and it is the stranded one"
+    );
+}
+
+/// Without `--clean`, a stranded page is REPORTED by `check` but left on disk. The gate stays
+/// honest; the deletion stays explicit.
+#[test]
+fn check_reports_a_stranded_page_that_a_plain_run_leaves_alone() {
+    let out = tempfile::tempdir().expect("tempdir");
+    let cfg = Config::with_defaults(fixture_root(), Some(out.path().to_path_buf()));
+    run(&cfg, false).expect("initial run");
+
+    let stranded = out.path().join("rust/crates/zzz-gone/src/vanished.md");
+    std::fs::create_dir_all(stranded.parent().unwrap()).unwrap();
+    std::fs::write(&stranded, "# stranded").unwrap();
+
+    let drift = sutra_catalog_gen::check(&cfg).expect("check");
+    assert!(
+        drift
+            .iter()
+            .any(|d| d == "orphaned: rust/crates/zzz-gone/src/vanished.md"),
+        "check must report it; drift: {drift:?}"
+    );
+
+    run(&cfg, false).expect("plain re-run");
+    assert!(stranded.exists(), "a plain run must not delete anything");
 }

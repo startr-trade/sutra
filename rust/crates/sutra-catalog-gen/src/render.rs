@@ -80,11 +80,101 @@ pub fn write_all(output: &Path, pages: &[Page]) -> anyhow::Result<usize> {
     Ok(pages.len())
 }
 
+/// Catalog pages whose SOURCE FILE no longer exists — a page stranded when its source was
+/// renamed or deleted. `docgen.md` outlived `docgen.rs` becoming `docs.rs` exactly this way,
+/// while `--check` reported the catalog in sync: `write_all` only visits pages it produces, and
+/// [`diff_against`] loops that same set, so a stranded page is invisible to both.
+///
+/// The test is "is there still a source file for this page", NOT "did this run produce it".
+/// Those are very different questions and only the first is safe. The catalog legitimately holds
+/// pages this generator does not emit — 67 `index.md` directory stubs, plus pages for crates a
+/// given run may not discover — and keying on the produced set would condemn every one of them.
+/// A page with no derivable source path (an `index.md`) is never a candidate at all.
+///
+/// The walk is scoped to the top-level directories the generated pages occupy, derived from
+/// `pages` rather than hardcoded, so it cannot descend into the frozen non-Rust snapshot or the
+/// hand-curated root `index.md`.
+pub fn orphans(root: &Path, repo_root: &Path, pages: &[Page]) -> anyhow::Result<Vec<String>> {
+    let owned: std::collections::BTreeSet<&str> = pages
+        .iter()
+        .filter_map(|p| p.path.split('/').next())
+        .collect();
+
+    let mut found = Vec::new();
+    for dir in owned {
+        collect_pages(&root.join(dir), root, &mut found)?;
+    }
+    let mut orphaned: Vec<String> = found
+        .into_iter()
+        .filter(|rel| !source_exists(repo_root, rel))
+        .collect();
+    orphaned.sort();
+    Ok(orphaned)
+}
+
+/// Whether the source this page mirrors still exists.
+///
+/// The catalog mirrors the source tree by STEM, not by extension: `…/src/y.md` documents `y.rs`,
+/// but `…/assets/bpmn/process.md` documents `process.bpmn`, `…/schemas/sample.md` documents
+/// `sample.xsd`, and `Cargo.md` documents `Cargo.toml`. Assuming `.rs` condemned 40 perfectly
+/// good asset pages, so the test is "does any sibling file share this stem" — which is the
+/// relationship the catalog actually encodes.
+///
+/// An `index.md` is a directory stub with no single source. It is a candidate only when its whole
+/// DIRECTORY is gone, which is what strands a page when a module is extracted to another crate.
+fn source_exists(repo_root: &Path, page: &str) -> bool {
+    let Some(stem_path) = page.strip_suffix(".md") else {
+        return true; // not a page we understand — never a candidate
+    };
+    let full = repo_root.join(stem_path);
+    let Some(dir) = full.parent() else {
+        return true;
+    };
+    if !dir.is_dir() {
+        return false; // the directory itself is gone (an extracted module)
+    }
+    let Some(stem) = full.file_name().and_then(|n| n.to_str()) else {
+        return true;
+    };
+    if stem == "index" {
+        return true; // a directory stub, and the directory exists
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return true;
+    };
+    entries.filter_map(|e| e.ok()).any(|e| {
+        std::path::Path::new(&e.file_name())
+            .file_stem()
+            .is_some_and(|s| s == stem)
+    })
+}
+
+/// Every `.md` under `dir`, as a path relative to `root`. A missing directory is not an error:
+/// the generator may simply not have written there yet.
+fn collect_pages(dir: &Path, root: &Path, out: &mut Vec<String>) -> anyhow::Result<()> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return Ok(()),
+    };
+    for entry in entries {
+        let path = entry?.path();
+        if path.is_dir() {
+            collect_pages(&path, root, out)?;
+        } else if path.extension().is_some_and(|e| e == "md") {
+            if let Ok(rel) = path.strip_prefix(root) {
+                out.push(rel.to_string_lossy().replace('\\', "/"));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Compare freshly-generated pages (already written into `generated_root`) against the committed
 /// tree at `committed_root`. Returns the drifted page paths (empty = in sync).
 pub fn diff_against(
     generated_root: &Path,
     committed_root: &Path,
+    repo_root: &Path,
     pages: &[Page],
 ) -> anyhow::Result<Vec<String>> {
     let mut drift = Vec::new();
@@ -103,6 +193,11 @@ pub fn diff_against(
         if expected != actual {
             drift.push(format!("differs: {}", p.path));
         }
+    }
+    // A page the generator no longer produces is drift too — the gate said "in sync" with one
+    // present until this was added.
+    for orphan in orphans(committed_root, repo_root, pages)? {
+        drift.push(format!("orphaned: {orphan}"));
     }
     drift.sort();
     Ok(drift)
