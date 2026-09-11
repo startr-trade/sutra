@@ -43,6 +43,15 @@ raise. This is a **permanent reject**, not a retryable one:
 | AWS SQS | `DeleteMessage` — removed, not redelivered |
 | GCP Pub/Sub | `message.ack()` — removed, not redelivered |
 | File | The source file is moved to the `failed/` sub-directory |
+| Dapr | `500` to the sidecar |
+| Knative | `500` to the Broker |
+
+**Dapr and Knative are the exception to "permanent" today.** Both answer this rejection — and every
+other intake rejection except a malformed CloudEvent — with `500`, and both pushers treat `500` as
+retryable: the Dapr sidecar retries under the component's retry policy, and a Knative Broker
+redelivers until the Trigger's `delivery` retries are spent. The same oversized message therefore
+arrives again until the pusher gives up. Configure a dead-letter topic on the Dapr subscription, or a
+`deadLetterSink` on the Trigger, so that it ends somewhere visible.
 
 ## Per-tenant quotas
 

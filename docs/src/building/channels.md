@@ -19,7 +19,7 @@ with no `if transport == "..."` branching anywhere:
 | `aws-sqs` | AWS SDK. |
 | `gcp-pubsub` | Google Cloud client. |
 | `amqp` | `fe2o3-amqp` (AMQP 1.0). |
-| `dapr` | Dapr pub/sub: the sidecar pushes to the engine's own HTTP listener. No vendor client — see [Dapr and Knative](#dapr-and-knative). |
+| `dapr` | Dapr pub/sub: the sidecar pushes to the engine's own HTTP listener. No vendor client — see [Dapr and Knative](channels.md#dapr-and-knative). |
 | `knative` | Knative Eventing: a Trigger or Subscription pushes to the engine's own HTTP listener. No vendor client. |
 | `file` | Air-gapped: file-spool inbound + `file://` outbound sink, no network dependency. |
 
@@ -32,6 +32,7 @@ the delivery as a task a worker fetches instead of dialing anything, which is th
 flowchart LR
     H["http"] --> SPI
     B["kafka · rabbitmq · aws-sqs<br/>gcp-pubsub · amqp"] --> SPI
+    PU["dapr · knative<br/>pushed to the HTTP listener"] --> SPI
     F["file<br/>air-gapped spool"] --> SPI
     LP["local · pull<br/>engine-internal, no wire protocol"] -.-> SPI
     SPI["One transport SPI<br/>bind · activate · drain, generically"] --> CD["The channel's codec<br/>decode + schema-validate"]
@@ -42,16 +43,63 @@ Which transport a channel rides changes only how the bytes arrive: bind, activat
 generic path, and everything past the doorway — decode, validation, subscription — is identical for
 all of them.
 
-Dapr and Knative Eventing ride the HTTP transport as integration patterns rather than dedicated
-crates — the engine speaks plain HTTP (+ CloudEvents) to a Dapr sidecar or a Knative broker, so no
-broker vendor client ever links into the engine for either.
+A hardened or air-gapped build selects a subset of transports at compile time via Cargo features on
+the distribution crate (`cargo build -p sutra-dist --no-default-features --features file`), so the
+unlinked vendor clients (`rdkafka`, the AWS/GCP SDKs, `lapin`, `fe2o3-amqp`) are not compiled in at
+all. `dapr` and `knative` are features too, though neither links a vendor client — leaving them out
+only removes their routes and outbound sinks. An operator can additionally restrict which
+transports a *running* binary accepts via `SUTRA_ALLOWED_TRANSPORTS` — a channel declaring a
+disallowed transport fails the deployment with a clear diagnostic, not a silent no-op.
 
-A hardened or air-gapped build selects a subset of transports at compile time via Cargo features
-(`cargo build -p sutra-engine --no-default-features --features file`), so the unlinked vendor
-clients (`rdkafka`, the AWS/GCP SDKs, `lapin`, `fe2o3-amqp`) are not compiled in at all. An
-operator can additionally restrict which transports a *running* binary accepts via
-`SUTRA_ALLOWED_TRANSPORTS` — a channel declaring a disallowed transport fails the deployment with
-a clear diagnostic, not a silent no-op.
+### Dapr and Knative
+
+Dapr pub/sub and Knative Eventing each have a transport crate of their own (`sutra-transport-dapr`,
+`sutra-transport-knative`), but neither links a vendor client or opens a connection. Both are
+**push** transports: the Dapr sidecar, or a Knative Trigger or Subscription, delivers each event as
+a CloudEvents HTTP POST to a route on the engine's own HTTP listener. There is no long-lived
+consumer to leader-elect — the pusher's at-least-once delivery is the guarantee, and inbox dedup
+absorbs its redeliveries. CloudEvents extraction follows the channel's `cloudevents-mode`, as on
+`http`. Outbound, each rewrites its destination to an HTTP URL and sends it through the same HTTP
+sink the `http` transport uses.
+
+| | `dapr` | `knative` |
+|---|---|---|
+| Inbound route | `POST /dapr/{topic}` | `POST /knative/{subscription}` |
+| Channel property that binds it | `topic` | `subscription` |
+| Pointing the pusher at the engine | A declarative Dapr subscription whose route is `/dapr/<topic>` — the engine does not answer Dapr's programmatic `GET /dapr/subscribe` | A Trigger or Subscription whose subscriber is `/knative/<subscription>` on the engine's HTTP listener |
+| Outbound destination | `dapr://<pubsub>/<topic>`, published through the local sidecar's `/v1.0/publish/<pubsub>/<topic>` | `knative://<namespace>/<broker>`, posted to the Broker ingress |
+| Outbound config (process-wide) | `SUTRA_SINK_DAPR_SIDECAR_PORT` (default `3500`) | `SUTRA_SINK_KNATIVE_BROKER_INGRESS`, else `K_SINK`, else a built-in in-cluster default |
+| `ack-mode: on-complete` | **Not supported, by design** — the channel boots with `SUTRA.ACK.ON_COMPLETE_UNSUPPORTED` and runs `on-persist` | **Supported** — the push response is held until the instance ends, bounded by `on-complete.hold-timeout` (default 30 s) |
+| Inbound guard | A `dapr-topic` header that disagrees with the path's topic is rejected | A request carrying some but not all of `ce-id`, `ce-source`, `ce-type` is rejected (`400`) |
+
+The sidecar port and the Broker ingress are process-wide because an engine process has one sidecar
+and one ingress: a channel's `sidecar.port` or `broker.url` is validated but has no effect.
+
+```yaml
+channels:
+  - name: orders-in                   # a Dapr subscription routes topic orders.created here
+    transport: dapr
+    codec: urn:sutra:codec:json
+    topic: orders.created
+  - name: shipments-in                # a Knative Trigger delivers to /knative/shipments
+    transport: knative
+    codec: urn:sutra:codec:json
+    subscription: shipments
+    ack-mode: on-complete
+    on-complete.hold-timeout: PT20S   # ISO-8601 or bare seconds; keep it below the Trigger's timeout
+```
+
+**Why the two differ on `on-complete`.** On both, the HTTP response to the push *is* the
+acknowledgement; there is no separate ack to defer. Knative bounds that response with a timeout the
+operator sets on the Trigger or Subscription (`delivery.timeout`), so the engine can hold it until
+the instance completes (`202`), fails (`422`, which Knative sends to the `deadLetterSink` rather than
+retrying) or outlives `on-complete.hold-timeout` (`202` with a warning — that one delivery degrades
+to `on-persist`). Keep the hold timeout below the sender's timeout, or every held delivery turns
+into a redelivery. Dapr's equivalent bound belongs to the pub/sub *component* — Redis Streams'
+`processingTimeout`, Service Bus's `handlerTimeoutInSec` — which the engine cannot see, and holding a
+response past it makes the broker deliver the same message again, concurrently. So Dapr runs
+`on-persist`, which answers once the dispatch has run to its first wait state or to completion. The
+full per-transport matrix is in [Acknowledgement modes](../operating/ack-modes.md).
 
 ## Binding a channel
 
