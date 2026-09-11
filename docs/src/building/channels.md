@@ -7,18 +7,20 @@ may send to it.
 
 ## Transports
 
-One neutral transport SPI, seven implementations, all self-registering behind the same lifecycle
+One neutral transport SPI, nine implementations, all self-registering behind the same lifecycle
 trait — the engine binds, activates, and drains every one of them through a single generic path
 with no `if transport == "..."` branching anywhere:
 
 | `transport:` | Notes |
 |---|---|
-| `http` | The universal baseline — always bundled. Also serves `/sutra/health/*`. |
+| `http` | The universal baseline. Also serves `/sutra/health/*`. |
 | `kafka` | `rdkafka`. |
 | `rabbitmq` | `lapin` (AMQP 0.9.1). |
 | `aws-sqs` | AWS SDK. |
 | `gcp-pubsub` | Google Cloud client. |
 | `amqp` | `fe2o3-amqp` (AMQP 1.0). |
+| `dapr` | Dapr pub/sub: the sidecar pushes to the engine's own HTTP listener. No vendor client — see [Dapr and Knative](#dapr-and-knative). |
+| `knative` | Knative Eventing: a Trigger or Subscription pushes to the engine's own HTTP listener. No vendor client. |
 | `file` | Air-gapped: file-spool inbound + `file://` outbound sink, no network dependency. |
 
 Two further `transport:` values are engine-internal rather than vendor clients — they have no wire

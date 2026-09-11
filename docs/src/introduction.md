@@ -79,7 +79,8 @@ Sutra is four things, and this book covers all of them:
   [DMN-TCK conformance](reference/dmn-tck.md) for what that means and what is deliberately out
   of scope.
 - **Channels and transports.** HTTP, five brokers (Kafka, RabbitMQ, AWS SQS, Google Pub/Sub,
-  AMQP 1.0), and an air-gapped file transport, all behind one neutral transport SPI — see
+  AMQP 1.0), Dapr pub/sub, Knative Eventing, and an air-gapped file transport — nine in all, behind
+  one neutral transport SPI — see
   [Channels and transports](building/channels.md).
 - **Typed codecs — the machinery, not a catalog of standards.** Decode and schema-validation are
   one step, and what a codec yields is a `messageType`, a walkable payload, and a *shape* every

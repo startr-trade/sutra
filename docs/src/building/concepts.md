@@ -36,7 +36,8 @@ schema editions) is served.
 ## Channels and transports
 
 Processes are triggered by **messages arriving on channels** — HTTP, five brokers (Kafka,
-RabbitMQ, AWS SQS, Google Pub/Sub, AMQP 1.0), and an air-gapped file transport. `<q:source>`
+RabbitMQ, AWS SQS, Google Pub/Sub, AMQP 1.0), Dapr pub/sub, Knative Eventing, and an air-gapped file
+transport. `<q:source>`
 binds a start event to a channel + message type. Co-deployed processes hand off over an
 in-process `local://` channel.
 

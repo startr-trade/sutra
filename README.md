@@ -35,8 +35,8 @@ orchestrators (Temporal, Cadence, Argo) deliberately *aren't* BPMN. Sutra is bui
   formats are built in; a schema-bound codec comes from the package's own XSDs (no Rust, no
   engine build) or from an extension crate against the public codec SPI.
 - **Message- and channel-native.** Processes are triggered by messages arriving on channels —
-  HTTP, five brokers (Kafka, RabbitMQ, AWS SQS, Google Pub/Sub, AMQP 1.0), and an air-gapped
-  file transport — not by a "start process" API.
+  HTTP, five brokers (Kafka, RabbitMQ, AWS SQS, Google Pub/Sub, AMQP 1.0), Dapr pub/sub, Knative
+  Eventing, and an air-gapped file transport — not by a "start process" API.
 - **Stateful, human-in-the-loop — correlated by *your* business key.** Wait states
   **suspend → persist → rehydrate → resume**; a decision arriving on a channel is correlated to
   the parked instance by a business key you name (`<q:alias>`), durable on PostgreSQL.
