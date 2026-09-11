@@ -31,6 +31,8 @@ jobs:
         with:
           languages: ${{ matrix.language }}
           build-mode: ${{ matrix.build-mode }}
+          # Shared with `make codeql`, so the local gate and this run analyze the same code.
+          config-file: ./scripts/codeql-config.yml
 
       - name: Perform CodeQL analysis
         uses: github/codeql-action/analyze@v4

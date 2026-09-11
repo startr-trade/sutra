@@ -1,0 +1,12 @@
+# CodeQL configuration, shared by .github/workflows/codeql.yml and `make codeql`
+# (scripts/security-scan.sh), so the local run and the GitHub run analyze the same code.
+#
+# Test code is out of scope. It never ships: sutra-conformance and sutra-testkit are dev-only (no
+# crate depends on either as a normal dependency), and `tests/` directories build only into test
+# binaries. What CodeQL flags there is noise rather than exposure: synthetic ids in assert
+# messages, a Kubernetes Secret's name in a panic, the throwaway in-cluster CA an observability
+# test does not verify. The scope is the code that ships.
+paths-ignore:
+  - "**/tests/**"
+  - rust/crates/sutra-conformance/**
+  - rust/crates/sutra-testkit/**

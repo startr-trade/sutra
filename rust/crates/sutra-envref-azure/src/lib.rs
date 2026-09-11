@@ -61,7 +61,7 @@ mod azure_kv {
     /// A parsed `azure-kv:<vault-name>/<secret-name>[#<version>]` reference.
     struct AzureKeyVaultReference {
         vault: String,
-        secret: String,
+        name: String,
         version: Option<String>,
     }
 
@@ -83,13 +83,13 @@ mod azure_kv {
                 }
                 None => (body, None),
             };
-            let (vault, secret) = location.split_once('/').ok_or_else(malformed)?;
-            if vault.is_empty() || secret.is_empty() {
+            let (vault, name) = location.split_once('/').ok_or_else(malformed)?;
+            if vault.is_empty() || name.is_empty() {
                 return Err(malformed());
             }
             Ok(AzureKeyVaultReference {
                 vault: vault.to_string(),
-                secret: secret.to_string(),
+                name: name.to_string(),
                 version,
             })
         }
@@ -131,9 +131,9 @@ mod azure_kv {
             client_id.to_string(),
             client_secret.to_string(),
         );
-        let (vault, secret, version) = (
+        let (vault, name, version) = (
             reference.vault.clone(),
-            reference.secret.clone(),
+            reference.name.clone(),
             reference.version.clone(),
         );
         std::thread::scope(|scope| {
@@ -150,7 +150,7 @@ mod azure_kv {
                         &client_id,
                         &client_secret,
                         &vault,
-                        &secret,
+                        &name,
                         version.as_deref(),
                     ))
                 })
@@ -164,7 +164,7 @@ mod azure_kv {
         client_id: &str,
         client_secret: &str,
         vault: &str,
-        secret: &str,
+        name: &str,
         version: Option<&str>,
     ) -> Result<String, EnvRefError> {
         // rustls transport (the `reqwest` workspace line is default-features off + rustls-tls) —
@@ -178,40 +178,40 @@ mod azure_kv {
         let token = acquire_token(&client, tenant, client_id, client_secret).await?;
 
         // GET https://<vault>.vault.azure.net/secrets/<secret>[/<version>]?api-version=7.4
-        let secret_url = match version {
+        let access_url = match version {
             Some(v) => format!(
-                "https://{vault}.vault.azure.net/secrets/{secret}/{v}?api-version={API_VERSION}"
+                "https://{vault}.vault.azure.net/secrets/{name}/{v}?api-version={API_VERSION}"
             ),
-            None => format!(
-                "https://{vault}.vault.azure.net/secrets/{secret}?api-version={API_VERSION}"
-            ),
+            None => {
+                format!("https://{vault}.vault.azure.net/secrets/{name}?api-version={API_VERSION}")
+            }
         };
         let resp = client
-            .get(&secret_url)
+            .get(&access_url)
             .bearer_auth(&token)
             .send()
             .await
             .map_err(|e| {
                 EnvRefError(format!(
-                    "azure-kv read of '{vault}/{secret}' failed \
+                    "azure-kv read of '{vault}/{name}' failed \
                      (AZURE_TENANT_ID/CLIENT_ID/CLIENT_SECRET): {e}"
                 ))
             })?;
         if !resp.status().is_success() {
             let status = resp.status();
             return Err(EnvRefError(format!(
-                "azure-kv read of '{vault}/{secret}' returned HTTP {status}"
+                "azure-kv read of '{vault}/{name}' returned HTTP {status}"
             )));
         }
         let body: serde_json::Value = resp.json().await.map_err(|e| {
             EnvRefError(format!(
-                "azure-kv secret '{vault}/{secret}' response is not JSON: {e}"
+                "azure-kv secret '{vault}/{name}' response is not JSON: {e}"
             ))
         })?;
         match body.get("value") {
             Some(serde_json::Value::String(s)) => Ok(s.clone()),
             _ => Err(EnvRefError(format!(
-                "azure-kv secret '{vault}/{secret}' response has no string 'value' field"
+                "azure-kv secret '{vault}/{name}' response has no string 'value' field"
             ))),
         }
     }
@@ -264,7 +264,7 @@ mod azure_kv {
         fn parses_a_reference_without_a_version() {
             let r = AzureKeyVaultReference::parse("prod-vault/rabbit-password").unwrap();
             assert_eq!(r.vault, "prod-vault");
-            assert_eq!(r.secret, "rabbit-password");
+            assert_eq!(r.name, "rabbit-password");
             assert_eq!(r.version, None);
         }
 
@@ -272,7 +272,7 @@ mod azure_kv {
         fn parses_a_reference_with_a_version() {
             let r = AzureKeyVaultReference::parse("prod-vault/rabbit-password#abc123").unwrap();
             assert_eq!(r.vault, "prod-vault");
-            assert_eq!(r.secret, "rabbit-password");
+            assert_eq!(r.name, "rabbit-password");
             assert_eq!(r.version.as_deref(), Some("abc123"));
         }
 

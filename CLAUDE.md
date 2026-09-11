@@ -111,6 +111,13 @@ touches Docker-dependent behavior (a transport, persistence, replica semantics),
 `make test-docker P=<the crate you touched>` before considering it verified; don't rely on the
 nightly tier-2 run to catch it first.
 
+The security scanners run locally too — the same ones `.github/workflows/trivy.yml` and
+`codeql.yml` run, except that locally they fail on any finding where the workflows only report.
+Run them by cost: `make scan-deps` (Trivy over the tree; fast) with every change, `make scan-image`
+(Trivy over the engine image, after `make image`) alongside tier-2, and `make codeql` (several
+minutes) before a push. A Trivy finding with no reachable fix goes in `.trivyignore.yaml`,
+time-boxed, with its justification written out.
+
 If your change adds or removes a public type, an SPI trait, a diagnostic code, or a config key,
 regenerate the impact-analysis catalog to see every affected call site: `make catalog` (output is
 git-ignored under `catalog/` — never commit it).

@@ -81,3 +81,48 @@ vulnerabilities:
   - id: CVE-2026-42767
     statement: "libssl3 (OpenSSL 3.0.x as Debian ships it) in the distroless base; no fixed package."
     expired_at: 2026-11-09
+
+  # ---- Published since the 2026-08-09 triage: same base, same position -------------------
+  # Checked against the shipped binary's own tables, not only against Debian's "no fix" status:
+  # `readelf -d` lists libc, libm and libgcc_s as its only libraries (never libssl; its TLS is
+  # rustls), and `readelf --dyn-syms` shows it imports none of the glibc functions named below.
+  # RENEWAL CHECK: pull the base fresh and re-scan; repeat both readelf checks on a new binary.
+  - id: CVE-2026-63072
+    statement: "libssl3 (CMS key unwrapping) in the distroless base; the engine never loads libssl3 (rustls-only; readelf -d lists no libssl). Debian ships no fixed package."
+    expired_at: 2026-11-09
+  - id: CVE-2026-63076
+    statement: "libssl3 (CMP server) in the distroless base; never loaded by the engine (rustls-only). Debian ships no fixed package."
+    expired_at: 2026-11-09
+  - id: CVE-2026-54874
+    statement: "libssl3 (DTLS record buffering) in the distroless base; never loaded by the engine (rustls-only). Debian ships no fixed package."
+    expired_at: 2026-11-09
+  - id: CVE-2026-63074
+    statement: "libssl3 (CMP ExtraCerts cache) in the distroless base; never loaded by the engine (rustls-only). Debian ships no fixed package."
+    expired_at: 2026-11-09
+  - id: CVE-2026-75803
+    statement: "libssl3 (ChaCha20-Poly1305 / AES-OCB decryption) in the distroless base; never loaded by the engine (rustls-only). Debian ships no fixed package."
+    expired_at: 2026-11-09
+  - id: CVE-2026-80489
+    statement: "glibc iconv EUC-JISX0213 converter; the engine imports no iconv symbol. Debian ships no fixed package."
+    expired_at: 2026-11-09
+  - id: CVE-2026-77117
+    statement: "glibc iconv SHIFT_JISX0213 converter; the engine imports no iconv symbol. Debian ships no fixed package."
+    expired_at: 2026-11-09
+  - id: CVE-2026-18374
+    statement: "glibc fopen mode-string parsing; needs an attacker-controlled mode string, and the engine imports no fopen (its only stdio open import is fdopen). Debian ships no fixed package."
+    expired_at: 2026-11-09
+  - id: CVE-2026-19499
+    statement: "glibc strfmon; not imported by the engine. Debian ships no fixed package."
+    expired_at: 2026-11-09
+  - id: CVE-2026-19542
+    statement: "glibc tdelete; not imported by the engine. Debian ships no fixed package."
+    expired_at: 2026-11-09
+  - id: CVE-2026-6791
+    statement: "glibc tilde expansion (wordexp / glob); neither is imported by the engine. Debian ships no fixed package."
+    expired_at: 2026-11-09
+  - id: CVE-2026-6368
+    statement: "glibc wordexp; not imported by the engine. Debian ships no fixed package."
+    expired_at: 2026-11-09
+  - id: CVE-2026-89092
+    statement: "glibc nscd (the name-service cache daemon); nscd is not in the image and the engine does not use it. Debian ships no fixed package."
+    expired_at: 2026-11-09

@@ -20,7 +20,8 @@ CATALOG_OUTPUT := $(if $(wildcard docs/design/artifact-documentation),docs/desig
 
 .PHONY: catalog catalog-rust catalog-check catalog-rust-check install-hooks verify-workflows verify-docs \
 	print-catalog-output \
-	help test test-docker test-all test-k8s lint docker-clean audit image image-it
+	help test test-docker test-all test-k8s lint docker-clean audit scan-deps scan-image codeql \
+	image image-it
 
 ## Regenerate the catalog. Only the rust/ pages are written; anything else in the
 ## output directory is left untouched.
@@ -188,6 +189,19 @@ docker-clean: ## Reap leaked test containers (wraps scripts/dev-docker-cleanup.s
 audit: ## Supply-chain gate: cargo-audit + cargo-deny (licenses/bans/sources/advisories).
 	cd rust && cargo audit
 	cd rust && cargo deny check
+
+## Security scans: the scanners this repository's GitHub workflows run (trivy.yml, codeql.yml),
+## run locally so a finding surfaces before a push. Each FAILS on any finding (the workflows only
+## report). Tiered by cost: scan-deps with every change, scan-image alongside tier-2, codeql
+## before a push. See scripts/security-scan.sh.
+scan-deps: ## Trivy over the source tree (lockfiles, secrets); fast, run with every change.
+	scripts/security-scan.sh deps
+
+scan-image: ## Trivy over the engine image (IMAGE=; `make image` first); run alongside tier-2.
+	scripts/security-scan.sh image $(IMAGE)
+
+codeql: ## CodeQL for Rust, as the workflow runs it; several minutes, run before a push.
+	scripts/security-scan.sh codeql
 
 help: ## Show this help.
 	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'

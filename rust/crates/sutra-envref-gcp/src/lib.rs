@@ -62,7 +62,7 @@ mod gcp_secret {
     /// A parsed `gcp-secret:<project>/<secret>[#<version>]` reference (version → `latest`).
     struct GcpSecretReference {
         project: String,
-        secret: String,
+        name: String,
         version: String,
     }
 
@@ -85,13 +85,13 @@ mod gcp_secret {
                 }
                 None => (body, DEFAULT_VERSION.to_string()),
             };
-            let (project, secret) = location.split_once('/').ok_or_else(malformed)?;
-            if project.is_empty() || secret.is_empty() {
+            let (project, name) = location.split_once('/').ok_or_else(malformed)?;
+            if project.is_empty() || name.is_empty() {
                 return Err(malformed());
             }
             Ok(GcpSecretReference {
                 project: project.to_string(),
-                secret: secret.to_string(),
+                name: name.to_string(),
                 version,
             })
         }
@@ -192,9 +192,9 @@ mod gcp_secret {
         reference: &GcpSecretReference,
     ) -> Result<String, EnvRefError> {
         let (token_uri, assertion) = (token_uri.to_string(), assertion.to_string());
-        let (project, secret, version) = (
+        let (project, name, version) = (
             reference.project.clone(),
-            reference.secret.clone(),
+            reference.name.clone(),
             reference.version.clone(),
         );
         std::thread::scope(|scope| {
@@ -208,7 +208,7 @@ mod gcp_secret {
                                 "gcp-secret resolver could not start a runtime: {e}"
                             ))
                         })?;
-                    runtime.block_on(fetch(&token_uri, &assertion, &project, &secret, &version))
+                    runtime.block_on(fetch(&token_uri, &assertion, &project, &name, &version))
                 })
                 .join()
                 .map_err(|_| EnvRefError("gcp-secret resolver thread panicked".to_string()))?
@@ -219,7 +219,7 @@ mod gcp_secret {
         token_uri: &str,
         assertion: &str,
         project: &str,
-        secret: &str,
+        name: &str,
         version: &str,
     ) -> Result<String, EnvRefError> {
         // rustls transport (the `reqwest` workspace line is default-features off + rustls-tls) —
@@ -233,29 +233,29 @@ mod gcp_secret {
         let token = exchange_jwt(&client, token_uri, assertion).await?;
 
         // GET .../v1/projects/<project>/secrets/<secret>/versions/<version>:access
-        let secret_url = format!(
-            "https://secretmanager.googleapis.com/v1/projects/{project}/secrets/{secret}/versions/{version}:access"
+        let access_url = format!(
+            "https://secretmanager.googleapis.com/v1/projects/{project}/secrets/{name}/versions/{version}:access"
         );
         let resp = client
-            .get(&secret_url)
+            .get(&access_url)
             .bearer_auth(&token)
             .send()
             .await
             .map_err(|e| {
                 EnvRefError(format!(
-                    "gcp-secret read of '{project}/{secret}' failed \
+                    "gcp-secret read of '{project}/{name}' failed \
                      (GOOGLE_APPLICATION_CREDENTIALS): {e}"
                 ))
             })?;
         if !resp.status().is_success() {
             let status = resp.status();
             return Err(EnvRefError(format!(
-                "gcp-secret read of '{project}/{secret}' returned HTTP {status}"
+                "gcp-secret read of '{project}/{name}' returned HTTP {status}"
             )));
         }
         let payload: serde_json::Value = resp.json().await.map_err(|e| {
             EnvRefError(format!(
-                "gcp-secret secret '{project}/{secret}' response is not JSON: {e}"
+                "gcp-secret secret '{project}/{name}' response is not JSON: {e}"
             ))
         })?;
         // The SecretPayload.data field is standard-base64-encoded octets.
@@ -265,19 +265,19 @@ mod gcp_secret {
             .and_then(|d| d.as_str())
             .ok_or_else(|| {
                 EnvRefError(format!(
-                    "gcp-secret secret '{project}/{secret}' response has no payload.data field"
+                    "gcp-secret secret '{project}/{name}' response has no payload.data field"
                 ))
             })?;
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(data_b64.trim())
             .map_err(|e| {
                 EnvRefError(format!(
-                    "gcp-secret secret '{project}/{secret}' payload.data is not valid base64: {e}"
+                    "gcp-secret secret '{project}/{name}' payload.data is not valid base64: {e}"
                 ))
             })?;
         String::from_utf8(bytes).map_err(|e| {
             EnvRefError(format!(
-                "gcp-secret secret '{project}/{secret}' payload is not valid UTF-8: {e}"
+                "gcp-secret secret '{project}/{name}' payload is not valid UTF-8: {e}"
             ))
         })
     }
@@ -327,7 +327,7 @@ mod gcp_secret {
         fn parses_a_reference_defaulting_the_version_to_latest() {
             let r = GcpSecretReference::parse("my-project/rabbit-password").unwrap();
             assert_eq!(r.project, "my-project");
-            assert_eq!(r.secret, "rabbit-password");
+            assert_eq!(r.name, "rabbit-password");
             assert_eq!(r.version, "latest");
         }
 
@@ -335,7 +335,7 @@ mod gcp_secret {
         fn parses_a_reference_with_an_explicit_version() {
             let r = GcpSecretReference::parse("my-project/rabbit-password#7").unwrap();
             assert_eq!(r.project, "my-project");
-            assert_eq!(r.secret, "rabbit-password");
+            assert_eq!(r.name, "rabbit-password");
             assert_eq!(r.version, "7");
         }
 
