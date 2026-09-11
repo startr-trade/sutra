@@ -53,7 +53,10 @@ async fn tc_approval_hold_park_relay_resume_lifecycle() {
 
     // 2) duplicate while parked is rejected — the durable unique-alias correlate guard
     let (status, body) = post_request(&client, port, e2e, "1500.00").await;
-    assert_eq!(status, 500, "duplicate while parked is rejected");
+    assert_eq!(
+        status, 409,
+        "duplicate while parked is rejected as a conflict"
+    );
     assert!(
         body.contains("SUTRA.INBOUND.ALIAS_CONFLICT_REJECT"),
         "alias-conflict code: {body}"

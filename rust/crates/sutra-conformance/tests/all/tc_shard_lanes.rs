@@ -140,7 +140,10 @@ async fn tc_shard_lanes_park_and_relay_across_lanes() {
     // The durable unique-alias guard still rejects a duplicate while parked, on whatever lane
     // the duplicate happens to arrive on.
     let (status, body) = post_request(&client, port, &ids[0], "1500.00").await;
-    assert_eq!(status, 500, "duplicate while parked is rejected: {body}");
+    assert_eq!(
+        status, 409,
+        "duplicate while parked is rejected as a conflict: {body}"
+    );
     assert!(
         body.contains("SUTRA.INBOUND.ALIAS_CONFLICT_REJECT"),
         "alias-conflict code: {body}"
