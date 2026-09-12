@@ -30,7 +30,8 @@
 //! `atexit(3)` handlers — like every Rust destructor — do **not** run on `SIGKILL`, a hard
 //! crash, or `kill -9`. Reaping those is exactly what ryuk would do, and ryuk does not exist
 //! in this crate version. For that residual case only, run `scripts/dev-docker-cleanup.sh`,
-//! which force-removes leaked test-image containers older than a cutoff.
+//! which force-removes leaked fixture-image containers that no compose stack owns — running
+//! ones once they are older than a cutoff, stopped ones at any age.
 
 use std::process::{Command, Stdio};
 use std::sync::{Mutex, Once};

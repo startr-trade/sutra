@@ -80,6 +80,8 @@ crate version. For that residual case only, run:
 scripts/dev-docker-cleanup.sh [cutoff-minutes]   # default 30
 ```
 
-which force-removes leaked test-image containers (postgres/mysql/mariadb/mssql/rabbitmq,
-`sutra-rust-engine:*`) older than the cutoff, leaving the kind cluster, local registry, and
-mkdocs container untouched.
+which force-removes leaked fixture-image containers (postgres/mysql/mariadb/mssql/rabbitmq,
+`sutra-rust-engine:*`) that no compose stack owns — running ones once they are older than the
+cutoff, stopped ones at any age — along with the anonymous volumes they held. A container from
+any other image, or one a `com.docker.compose.project` label claims, is left alone; add `--deep`
+for the host-wide prunes (every stopped container, every unused volume, the idle build cache).

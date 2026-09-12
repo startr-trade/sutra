@@ -100,9 +100,15 @@ after a docker suite shows zero leaked fixtures).
 
 Caveat: `atexit` handlers — like every Rust destructor — do **not** run on `SIGKILL` or a
 hard crash. If a docker run is killed (e.g. `kill -9`, OOM, CI cancel), fixtures can
-survive. `make docker-clean` (`scripts/dev-docker-cleanup.sh`) reaps leaked test
-containers + dangling volumes/images older than a cutoff (default 30 min, `CUTOFF=<min>`
-to change it) without touching the kind cluster, the local registry, or the docs container.
+survive. `make docker-clean` (`scripts/dev-docker-cleanup.sh`) reaps them, together with the
+anonymous volumes they held, and prunes dangling images. It removes a container only when both
+guards pass: the image is one of the fixture images these suites start, and no
+`com.docker.compose.project` label claims it — so a local database, a cluster node, a registry or
+a docs server is never a candidate, running or stopped. A *running* fixture is spared until it is
+older than the cutoff (default 30 min, `CUTOFF=<min>`), so an in-flight suite keeps its own; a
+stopped one goes at any age. Host-wide prunes — every stopped container, every unused volume, the
+idle build cache — are behind `--deep`, which suits an ephemeral CI runner and is destructive on a
+dev machine.
 
 ## Conventions
 
