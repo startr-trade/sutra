@@ -10,6 +10,8 @@ use sutra_transport_http as _;
 mod coverage_golden;
 #[path = "all/deployments_list_it.rs"]
 mod deployments_list_it;
+#[path = "all/package_overlay_cli_test.rs"]
+mod package_overlay_cli_test;
 #[path = "all/pg_migrate_it.rs"]
 mod pg_migrate_it;
 #[path = "all/test_simulate_it.rs"]

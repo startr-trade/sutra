@@ -2,6 +2,11 @@
 //! authoring unit: archive-layout mirror + `package.yaml`) into one deterministic,
 //! content-addressed `.sutra` archive. Validation is fail-closed and shares the exact
 //! code path with `sutra lint`. The `.sutra` archive is the only deployment model.
+//!
+//! `--overlay` composes several layered directories — one shared folder plus a small
+//! per-variant folder — into that one standalone directory first; the seal that follows is
+//! byte-identical to sealing a hand-merged directory of the same content. The layering rules
+//! live with the composition, in `sutra_loader::overlay`.
 
 use std::path::PathBuf;
 
@@ -18,6 +23,21 @@ pub struct PackageArgs {
     /// Output directory: receives the `.sutra` archive.
     #[arg(short = 'o', long = "out", value_name = "DIR", default_value = ".")]
     pub out: PathBuf,
+
+    /// Directory to compose UNDER the package dir; repeatable, lowest layer first.
+    ///
+    /// For the "one shared folder plus per-variant overlays" layout: each --overlay is a
+    /// BASE layer applied in the order given, and the package dir is applied LAST, so the
+    /// package dir's copy of a path wins over every overlay and a later overlay wins over
+    /// an earlier one. The composed tree is what gets validated and sealed, under the
+    /// package dir's own name.
+    ///
+    /// Every overridden path is reported as a warning naming the layer that won. An overlay
+    /// may not carry package.yaml (labels come from the package dir alone), may not contain
+    /// symlinks, and cannot DELETE a file a lower layer provides — composition only adds and
+    /// replaces.
+    #[arg(long = "overlay", value_name = "DIR")]
+    pub overlay: Vec<PathBuf>,
 }
 
 pub fn execute(args: PackageArgs, global: &GlobalArgs, io: &mut Io<'_>) -> i32 {
@@ -36,11 +56,26 @@ pub fn execute(args: PackageArgs, global: &GlobalArgs, io: &mut Io<'_>) -> i32 {
         );
         return exit::USAGE;
     }
+    for overlay in &args.overlay {
+        if !overlay.is_dir() {
+            let _ = writeln!(
+                io.err,
+                "package: overlay directory not found: {}",
+                overlay.display()
+            );
+            return exit::USAGE;
+        }
+    }
     execute_package(&args, format, io)
 }
 
 fn execute_package(args: &PackageArgs, format: ReportFormat, io: &mut Io<'_>) -> i32 {
-    let outcome = match sutra_loader::assemble_dir(&args.input, &args.out, &Default::default()) {
+    let outcome = match sutra_loader::assemble_dir_with_overlays(
+        &args.input,
+        &args.overlay,
+        &args.out,
+        &Default::default(),
+    ) {
         Ok(outcome) => outcome,
         Err(e) => return render_refusal("package", e, format, io),
     };
@@ -128,7 +163,11 @@ mod tests {
     use crate::test_fixtures::scratch_dir;
 
     fn args(input: PathBuf, out: PathBuf) -> PackageArgs {
-        PackageArgs { input, out }
+        PackageArgs {
+            input,
+            out,
+            overlay: Vec::new(),
+        }
     }
 
     #[test]

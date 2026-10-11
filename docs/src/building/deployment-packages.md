@@ -53,10 +53,55 @@ engine:
 ```
 
 `tenant` / `module` / `version` are **opaque labels** — selectors for observability, routing, and
-row-level-security partitioning (`tenant_id`) — never a resource-tree dimension. A package is
-fully self-contained: there is no `tenants/<id>/` overlay tree, no shared-library `modules/`
-folder, and no inheritance between packages. What a tenant "sees" is simply every process in the
-package deployed under its labels.
+row-level-security partitioning (`tenant_id`) — never a resource-tree dimension. A package
+*archive* is fully self-contained: there is no `tenants/<id>/` overlay tree, no shared-library
+`modules/` folder, and no inheritance between packages at deploy time. What a tenant "sees" is
+simply every process in the package deployed under its labels. The *authoring* tree may still be
+layered — see [Composing a package from layers](#composing-a-package-from-layers).
+
+## Composing a package from layers
+
+When one process is deployed several ways — the same flow bound to HTTP for one tenant and to a
+broker for another, or a second edition of the same contract — keep the common content once and let
+each variant hold only what differs:
+
+```text
+order-intake/
+├── shared/                          # common to every variant; no package.yaml here
+│   ├── bpmn/order-intake.bpmn
+│   ├── rules/approval.dmn
+│   └── templates/receipt.hbs
+└── variants/
+    ├── acme--order-intake--1.0.0/
+    │   ├── package.yaml             # this variant's labels
+    │   └── channels.yaml            # HTTP binding
+    └── globex--order-intake--1.0.0/
+        ├── package.yaml
+        └── channels.yaml            # broker binding
+```
+
+Name the shared folder as an overlay, and the two commands see the same composed tree:
+
+```bash
+sutra lint    variants/acme--order-intake--1.0.0 --overlay shared
+sutra package variants/acme--order-intake--1.0.0 --overlay shared -o dist/
+```
+
+The rules, in the order they bite:
+
+- **Overlays are base layers.** `--overlay` may be repeated; each is applied in the order given, and
+  the package directory is applied last — so a variant's file always wins over a shared one.
+- **An overlay carries no `package.yaml`.** Labels belong to the variant, and a `package.yaml` found
+  inside an overlay is refused rather than quietly merged.
+- **Every overridden path is reported,** so a variant shadowing a shared file does it visibly.
+- **Nothing is deleted.** A variant can add to or replace shared content, never remove it. Content a
+  variant must not carry does not belong in `shared/`.
+- **The package directory's name names the archive** (`acme--order-intake--1.0.0.sutra`), which is
+  why variant directories are named after their labels.
+- **Composition happens at package time.** The sealed archive holds the merged file set and knows
+  nothing about layers, and its deployment id is identical to sealing a hand-merged directory with
+  the same content. Layering is an authoring convenience; it changes nothing about what deploys, or
+  about how the engine loads it.
 
 ## Referencing resources — convention over configuration
 

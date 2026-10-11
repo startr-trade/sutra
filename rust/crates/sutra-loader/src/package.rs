@@ -33,8 +33,10 @@
 //!
 //! Unknown top-level FILES (e.g. `README.md`, docs) are ignored; unknown top-level
 //! DIRECTORIES draw a lint WARNING (they look like mistyped content categories and will
-//! not be packaged). There is no overlay tree, no inheritance, no sharing mechanism —
-//! duplication across tenant variants is accepted, and tenant is just a label.
+//! not be packaged). There is no overlay tree, no inheritance, no sharing mechanism inside
+//! a package — tenant is just a label. (Several AUTHORING directories can be composed into
+//! one such standalone directory before the scan — see [`crate::overlay`] — but what the
+//! scan takes, and what the archive holds, is always one flat self-contained package.)
 //!
 //! # `package.yaml` (minimal schema — closed: unknown keys reject)
 //!
@@ -60,6 +62,9 @@
 //! - [`assemble_dir`] = the SAME suite, then exactly ONE fully-deterministic `.sutra`
 //!   archive (`<package-dir-name>.sutra` — the file name is human-oriented; identity
 //!   stays content-addressed inside). Byte-identical over identical inputs.
+//! - [`crate::overlay`] = the same two entry points over SEVERAL layered directories
+//!   (`--overlay`): the layers are composed into one standalone package directory first,
+//!   and this module's unchanged scan → validate → seal path runs over that.
 //! - [`lint`] / [`assemble`] = the RETIRED tenant-overlay tree input. They survive only
 //!   as the engine of the one-shot legacy migration ([`crate::legacy_tree`]) and its
 //!   equivalence proof; new callers use the `_dir` forms.
@@ -633,7 +638,9 @@ fn package_dir_deployment(
 }
 
 /// The archive file name is human-oriented only — identity stays content-addressed.
-fn package_dir_name(package_dir: &Path) -> String {
+/// Shared with [`crate::overlay`], whose composed temp directory must carry exactly this
+/// name so a layered run and a hand-merged run emit the same archive file name.
+pub(crate) fn package_dir_name(package_dir: &Path) -> String {
     package_dir
         .canonicalize()
         .ok()

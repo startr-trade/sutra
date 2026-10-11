@@ -105,11 +105,15 @@ resolve a different codec registry than the archive it had just sealed.
 ### `sutra lint`
 
 ```
-sutra lint <PACKAGE_DIR>
+sutra lint <PACKAGE_DIR> [--overlay <DIR>]...
 ```
 
 Runs the full package-time validation suite (the same fail-closed checks `sutra package` runs)
 and emits nothing on success. The fast pre-flight before every `package`.
+
+`--overlay` composes base layers underneath `<PACKAGE_DIR>` before validating — the same
+composition `package` performs, so you lint exactly what would be sealed. See
+[Composing a package from layers](../building/deployment-packages.md#composing-a-package-from-layers).
 
 ### `sutra describe`
 
@@ -162,12 +166,19 @@ changes — a CI gate on process-contract compatibility between releases.
 ### `sutra package`
 
 ```
-sutra package <INPUT> [-o|--out <DIR>]
+sutra package <INPUT> [--overlay <DIR>]... [-o|--out <DIR>]
 ```
 
 Seals a deployment-package directory into one immutable `.sutra` archive, running the full
 validation suite fail-closed first. The archive manifest (per-file digests, the content-addressed
 deployment id) is derived, never authored. See [Deployment packages](../building/deployment-packages.md).
+
+`--overlay` composes one or more base layers underneath `<INPUT>` — each applied in the order
+given, with `<INPUT>` applied last and winning any conflict — so a shared folder plus a small
+per-variant folder seal into one archive without being copied together by hand. An overlay may not
+contain `package.yaml`, overridden paths are reported, and nothing is ever deleted. The resulting
+deployment id is identical to sealing a hand-merged directory of the same content. See
+[Composing a package from layers](../building/deployment-packages.md#composing-a-package-from-layers).
 
 ### `sutra deployments list`
 
@@ -300,7 +311,7 @@ instance did, offline. See [Logging and audit](../operating/logging.md).
 ### `sutra version`
 
 ```
-sutra version            # sutra 0.2.0-rc.1
+sutra version            # sutra 0.2.0-rc.3
 sutra --version          # identical text
 sutra version --format json
 ```
@@ -312,14 +323,14 @@ binary name prints that name, and one that versions itself independently of the 
 
 ```
 <tool> 2.0.0
-sutra  0.2.0-rc.1 (engine)
+sutra  0.2.0-rc.3 (engine)
 ```
 
 `--format json` is the structured form and always separates the two — `version` is the
 reporting tool's own, `engine` the embedded engine's (equal for this binary):
 
 ```json
-{"name":"sutra","version":"0.2.0-rc.1","engine":"0.2.0-rc.1"}
+{"name":"sutra","version":"0.2.0-rc.3","engine":"0.2.0-rc.3"}
 ```
 
 ---

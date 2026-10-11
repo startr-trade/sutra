@@ -166,6 +166,13 @@ resource "kubectl_manifest" "elasticsearch" {
         count = var.elasticsearch.replicas
         config = {
           "node.store.allow_mmap" = false
+          # ABSOLUTE disk watermarks, not the percentage defaults (85/90/95%): a single node on a
+          # developer filesystem can sit above the 85% LOW watermark with 100+ GB still free, and
+          # Elasticsearch then refuses to allocate shards — which surfaces as the observability
+          # suite timing out rather than as a disk error. Same setting as the local-k8s-infra module.
+          "cluster.routing.allocation.disk.watermark.low"             = "20gb"
+          "cluster.routing.allocation.disk.watermark.high"            = "10gb"
+          "cluster.routing.allocation.disk.watermark.flood_stage"     = "5gb"
         }
         podTemplate = {
           spec = {

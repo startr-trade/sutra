@@ -21,7 +21,8 @@
 //!   either via the structured `<invocation>` element above, or — when its body reduces to a
 //!   literal expression — as an ordinary FEEL function value bound into every decision's context
 //!   under its own name (so `bkm_001(...)` inside a literal expression resolves the same way an
-//!   inline `function(...) ...` literal would).
+//!   inline `function(...) ...` literal would). A BKM can also be invoked directly, its
+//!   parameters bound by name — [`Drg::evaluate_bkm`] (the TCK's `type="bkm"` test-case shape).
 //! - **boxed functionDefinition** — DMN's XML-structured `function(params) body` is translated,
 //!   at parse time, to the equivalent inline FEEL text (`function(p1: t1, ...) body`) and treated
 //!   as an ordinary literal expression — this reuses the whole FEEL literal pipeline (closures,
@@ -139,10 +140,12 @@ struct FormalParam {
 
 struct Bkm {
     params: Vec<FormalParam>,
-    /// The BKM's own declared return typeRef (the `typeRef` attribute on whatever logic element
-    /// sits directly inside `<encapsulatedLogic>` — a boxed `<functionDefinition>` body carries no
-    /// such attribute of its own, so this is `None` for those, which is `Any`/no-op, exactly
-    /// right: DMN doesn't attach an overall return type to a boxed function definition).
+    /// The BKM's own declared return typeRef: the `outputTypeRef` of the `functionItem` its
+    /// `<variable typeRef>` names, when it names one; otherwise the `typeRef` attribute on
+    /// whatever logic element sits directly inside `<encapsulatedLogic>` — a boxed
+    /// `<functionDefinition>` body carries no such attribute of its own, so this is `None` for
+    /// those, which is `Any`/no-op, exactly right: DMN doesn't attach an overall return type to
+    /// a boxed function definition.
     return_type_ref: Option<String>,
     body: Logic,
     /// Names of OTHER BKMs this BKM's own body may call by bare name (via `knowledgeRequirement`)
@@ -208,7 +211,9 @@ pub struct Drg {
     prelude: FeelContext,
     /// `<import>`ed sibling models, alias name → the imported model's own fully-loaded DRG
     /// (recursively resolved — see [`load_drg_with_imports`]). Exposed, at evaluation time, as a
-    /// `FeelValue::Map` of the imported model's decision results, bound under the alias name.
+    /// `FeelValue::Map` of the imported model's input data, decision results and callables, bound
+    /// under the alias name — or, for an empty alias (DMN 1.5's unnamed import), merged
+    /// unqualified into the importing model's own scope (see [`merge_globals`]).
     /// `Arc`, not `Box`: [`Drg::evaluate`]/[`Drg::evaluate_decision_service`] need a live `Arc<Drg>`
     /// to close over (an indirectly-invoked decision service's native `Invocable` re-runs the DRG
     /// from a `'static` closure — see [`decision_service_invocables`]), so every `Drg` an
@@ -254,11 +259,14 @@ fn load_drg_with_imports_at_depth(
     let mut drg = load_drg_from_root(&root)?;
     if depth < MAX_IMPORT_DEPTH {
         for imp in root.children_named("import") {
-            let namespace = imp.attr(None, "namespace");
-            let alias = imp.attr(None, "name").filter(|s| !s.trim().is_empty());
-            let (Some(namespace), Some(alias)) = (namespace, alias) else {
+            let Some(namespace) = imp.attr(None, "namespace") else {
                 continue;
             };
+            // DMN 1.5 allows an EMPTY import name: the imported model's elements are then
+            // referenced unqualified, as if declared in the importing model (`person.name`
+            // rather than `a.person.name`). Kept as the empty alias, which `merge_globals`
+            // reads as "merge into the importing model's own scope".
+            let alias = imp.attr(None, "name").map(str::trim).unwrap_or("");
             let Some(imported_bytes) = resolve_import(namespace) else {
                 continue;
             };
@@ -379,7 +387,16 @@ fn load_drg_from_root(root: &XmlElement) -> Result<Drg, String> {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        let return_type_ref = encapsulated.and_then(own_type_ref);
+        // The BKM's `<variable typeRef>` names its FUNCTION type. When that is a `functionItem`
+        // declaring an `outputTypeRef`, every invocation's result must conform to (and is
+        // implicitly converted to) that output type — `1` from a BKM typed as returning a
+        // number list is `[1]` (DMN-TCK 1157-implicit-conversions). Otherwise the typeRef on
+        // the body element itself is the only return type the model declares.
+        let variable_type_ref = b.child("variable").and_then(|v| v.attr(None, "typeRef"));
+        let return_type_ref = function_item_output(variable_type_ref, &item_defs)
+            .flatten()
+            .map(str::to_string)
+            .or_else(|| encapsulated.and_then(own_type_ref));
         // The BKM body is the logic child of <encapsulatedLogic>.
         let body = match encapsulated {
             Some(e) => parse_logic(e, name),
@@ -867,16 +884,27 @@ fn resolve_named(name: &str, item_defs: &HashMap<String, ItemDef>, depth: u8) ->
 /// `functionItem` as a lambda-VALUED slot, appropriate for a formal parameter, not a service's own
 /// result).
 fn ds_output_shape(type_ref: Option<&str>, item_defs: &HashMap<String, ItemDef>) -> FeelTypeShape {
-    if let Some(t) = type_ref.map(str::trim).filter(|s| !s.is_empty()) {
-        if let Some(ItemDef {
-            kind: ItemDefKind::FunctionItem { output_type_ref },
-            ..
-        }) = item_defs.get(t)
-        {
-            return resolve_type_shape(output_type_ref.as_deref(), item_defs);
-        }
+    if let Some(output_type_ref) = function_item_output(type_ref, item_defs) {
+        return resolve_type_shape(output_type_ref, item_defs);
     }
     resolve_type_shape(type_ref, item_defs)
+}
+
+/// When `type_ref` names a `functionItem` itemDefinition, that function type's declared
+/// `outputTypeRef` — `Some(None)` for a `functionItem` that declares none. `None` when `type_ref`
+/// is absent or names anything else.
+fn function_item_output<'a>(
+    type_ref: Option<&str>,
+    item_defs: &'a HashMap<String, ItemDef>,
+) -> Option<Option<&'a str>> {
+    let t = type_ref.map(str::trim).filter(|s| !s.is_empty())?;
+    match item_defs.get(t) {
+        Some(ItemDef {
+            kind: ItemDefKind::FunctionItem { output_type_ref },
+            ..
+        }) => Some(output_type_ref.as_deref()),
+        _ => None,
+    }
 }
 
 /// Build the "callable prelude": every BKM whose body reduces to a literal expression, as an
@@ -1007,6 +1035,17 @@ fn build_bkm_function(
 /// merged with [`globals_overlay`], over `inputs` — the common base every per-decision context
 /// starts from. A free function (not a `Drg` method) taking `&Arc<Drg>` explicitly: it needs to
 /// hand OUT a live `Arc` clone to each service/BKM invocable closure it builds.
+///
+/// The imported model's own `<inputData>` values are exposed under the alias too: an importing
+/// decision may reference an imported input directly (`a.person.name`, with `person` declared in
+/// the imported model — DMN-TCK 1160-multiple-imports). Inputs are supplied once, by variable
+/// name, for the whole import graph (the imported model is evaluated against the same `inputs`),
+/// so a diamond — C importing both A and B, B itself importing A — sees ONE value for A's input
+/// on every path, which is what DMN requires of a single namespaced input binding.
+///
+/// An import with an EMPTY alias (DMN 1.5's unnamed import) is merged unqualified instead, into
+/// the importing model's own scope; a name the base already binds (a caller input) keeps its
+/// value, and the importing model's own callables still override it below.
 fn merge_globals(drg: &Arc<Drg>, inputs: &FeelContext) -> FeelContext {
     let mut base = inputs.clone();
     for (alias, imported) in &drg.imports {
@@ -1019,7 +1058,18 @@ fn merge_globals(drg: &Arc<Drg>, inputs: &FeelContext) -> FeelContext {
         for (name, value) in globals_overlay(imported) {
             map.entry(name).or_insert(value);
         }
-        base.insert(alias.clone(), FeelValue::Map(map));
+        for name in imported.input_data_names() {
+            if let Some(value) = inputs.get(name) {
+                map.entry(name.to_string()).or_insert_with(|| value.clone());
+            }
+        }
+        if alias.is_empty() {
+            for (name, value) in map {
+                base.entry(name).or_insert(value);
+            }
+        } else {
+            base.insert(alias.clone(), FeelValue::Map(map));
+        }
     }
     for (name, value) in globals_overlay(drg) {
         base.insert(name, value);
@@ -1303,6 +1353,29 @@ impl Drg {
         out
     }
 
+    /// Invoke a named business knowledge model directly (the DMN-TCK `type="bkm"` test-case
+    /// shape): `args` supplies the BKM's formal parameters BY NAME — a parameter `args` does not
+    /// bind is `null`, and entries naming no parameter are ignored. Each argument is gated by its
+    /// parameter's declared typeRef exactly as a structured `<invocation>` gates it (an argument
+    /// that cannot be made to conform means the BKM is never invoked: the result is `null`), and
+    /// the result is coerced to the BKM's declared return type — the `outputTypeRef` of the
+    /// `functionItem` its `<variable typeRef>` names, else its body's own typeRef.
+    ///
+    /// The returned map holds one entry keyed by the BKM's name, mirroring [`Self::evaluate`]'s
+    /// decision-keyed map; an unknown name yields an empty map. An external (`kind="Java"`/
+    /// `"PMML"`) BKM yields an `Err`, as invoking one from a decision does.
+    pub fn evaluate_bkm(
+        self: &Arc<Drg>,
+        bkm_name: &str,
+        args: &FeelContext,
+    ) -> BTreeMap<String, Result<FeelValue, String>> {
+        let mut out = BTreeMap::new();
+        if let Some(bkm) = self.bkms.get(bkm_name) {
+            out.insert(bkm_name.to_string(), invoke_bkm_directly(bkm, args, self));
+        }
+        out
+    }
+
     /// The reachable set of decision ids from `roots`, following `requires` transitively
     /// (BFS/DFS, order-independent — a plain reachability set, not itself a topological order).
     /// Used to scope a decision service's own evaluation to its outputs' dependency closure —
@@ -1374,6 +1447,13 @@ impl Drg {
             }
         }
         out
+    }
+
+    /// The variable name of every `<inputData>` this model itself declares.
+    fn input_data_names(&self) -> impl Iterator<Item = &str> + '_ {
+        self.input_type_refs
+            .keys()
+            .filter_map(|id| self.id_to_var.get(id).map(String::as_str))
     }
 
     fn decision_name(&self, id: &str) -> Option<&str> {
@@ -1669,15 +1749,8 @@ fn eval_invocation(
         .bkms
         .get(bkm_name)
         .ok_or_else(|| format!("invocation of unknown BKM '{bkm_name}'"))?;
-    // An external (kind="Java"/"PMML") BKM: same invocation-time rejection the bare-call path
-    // gets from the evaluator, in the same "[code] message" shape (`bkm.body` here is the raw
-    // binding context — evaluating it would wrongly yield the binding itself as the result).
-    if let Some(binding) = &bkm.external {
-        return Err(format!(
-            "[{}] {}",
-            sutra_feel::codes::FEEL_EVAL_EXTERNAL_UNSUPPORTED,
-            binding.rejection_message()
-        ));
+    if let Some(rejection) = external_bkm_rejection(bkm) {
+        return Err(rejection);
     }
     // Seeded from the callable prelude (not empty) so the BKM's own body can in turn call other
     // BKMs by bare name (DMN-TCK 0034-drg-scopes).
@@ -1695,28 +1768,74 @@ fn eval_invocation(
             // BKM is never invoked (DMN-TCK 0082-feel-coercion#decision_bkm_002/invoke_001).
             return Ok(FeelValue::Null);
         };
-        call_ctx.insert(param.name.clone(), coerced.clone());
-        // DMN-TCK 0037-dt-on-bkm-implicit-params: a dotted formal-parameter name (`Person.Gender`)
-        // must also be navigable from INSIDE the BKM's own body via ordinary FEEL member access
-        // (its `<inputExpression>` text is, verbatim, `Person.Gender`) — the FEEL lexer always
-        // tokenizes a bare `.` as navigation (there is no dot-aware "names with spaces"-style
-        // merge pass for it), so that text parses as `Person` (member) `.Gender`, needing an
-        // actual nested `Person -> {Gender: ..}` map in `call_ctx`, not just the flat key above
-        // (kept too, harmlessly, in case anything else ever looks it up as one literal key).
-        // Only a single dot level is folded — the observed pattern (`Person.Gender`/`Person.Name`/
-        // `Person.Children`) never nests deeper.
-        if let Some((head, rest)) = param.name.split_once('.') {
-            let mut nested = match call_ctx.get(head) {
-                Some(FeelValue::Map(m)) => m.clone(),
-                _ => BTreeMap::new(),
-            };
-            nested.insert(rest.to_string(), coerced);
-            call_ctx.insert(head.to_string(), FeelValue::Map(nested));
-        }
+        bind_bkm_param(&mut call_ctx, &param.name, coerced);
     }
-    let result = eval_logic(&bkm.body, &call_ctx, drg)?;
-    let return_shape = resolve_type_shape(bkm.return_type_ref.as_deref(), &drg.item_defs);
-    let result = coerce_to_shape(&result, &return_shape).unwrap_or(FeelValue::Null);
+    let result = finish_bkm_call(bkm, &call_ctx, drg)?;
     let inv_shape = resolve_type_shape(inv_type_ref, &drg.item_defs);
     Ok(coerce_to_shape(&result, &inv_shape).unwrap_or(FeelValue::Null))
+}
+
+/// A direct invocation of `bkm` (see [`Drg::evaluate_bkm`]): each formal parameter takes its
+/// value from `args` by name (`null` when absent), gated by its declared typeRef exactly as a
+/// structured `<invocation>`'s bindings are — an argument that cannot be made to conform means the
+/// BKM is never invoked, so the result is `null`. The body sees the model's callables (every BKM
+/// and decision service, by bare name) under the parameters.
+fn invoke_bkm_directly(bkm: &Bkm, args: &FeelContext, drg: &Arc<Drg>) -> Result<FeelValue, String> {
+    if let Some(rejection) = external_bkm_rejection(bkm) {
+        return Err(rejection);
+    }
+    let mut call_ctx = globals_overlay(drg);
+    for param in &bkm.params {
+        let raw = args.get(&param.name).cloned().unwrap_or(FeelValue::Null);
+        let shape = resolve_type_shape(param.type_ref.as_deref(), &drg.item_defs);
+        let Some(coerced) = coerce_to_shape(&raw, &shape) else {
+            return Ok(FeelValue::Null);
+        };
+        bind_bkm_param(&mut call_ctx, &param.name, coerced);
+    }
+    finish_bkm_call(bkm, &call_ctx, drg)
+}
+
+/// An external (kind="Java"/"PMML") BKM's invocation-time rejection, in the same "[code] message"
+/// shape the bare-call path gets from the evaluator — `None` for an ordinary BKM. Checked before
+/// the body is touched: an external BKM's `body` is the raw binding context, and evaluating it
+/// would wrongly yield the binding itself as the result.
+fn external_bkm_rejection(bkm: &Bkm) -> Option<String> {
+    bkm.external.as_ref().map(|binding| {
+        format!(
+            "[{}] {}",
+            sutra_feel::codes::FEEL_EVAL_EXTERNAL_UNSUPPORTED,
+            binding.rejection_message()
+        )
+    })
+}
+
+/// Bind one (already typeRef-conforming) argument to a BKM formal parameter in `call_ctx`.
+///
+/// DMN-TCK 0037-dt-on-bkm-implicit-params: a dotted formal-parameter name (`Person.Gender`) must
+/// also be navigable from INSIDE the BKM's own body via ordinary FEEL member access (its
+/// `<inputExpression>` text is, verbatim, `Person.Gender`) — the FEEL lexer always tokenizes a
+/// bare `.` as navigation (there is no dot-aware "names with spaces"-style merge pass for it), so
+/// that text parses as `Person` (member) `.Gender`, needing an actual nested
+/// `Person -> {Gender: ..}` map in `call_ctx`, not just the flat key (kept too, harmlessly, in
+/// case anything else ever looks it up as one literal key). Only a single dot level is folded —
+/// the observed pattern (`Person.Gender`/`Person.Name`/`Person.Children`) never nests deeper.
+fn bind_bkm_param(call_ctx: &mut FeelContext, name: &str, value: FeelValue) {
+    call_ctx.insert(name.to_string(), value.clone());
+    if let Some((head, rest)) = name.split_once('.') {
+        let mut nested = match call_ctx.get(head) {
+            Some(FeelValue::Map(m)) => m.clone(),
+            _ => BTreeMap::new(),
+        };
+        nested.insert(rest.to_string(), value);
+        call_ctx.insert(head.to_string(), FeelValue::Map(nested));
+    }
+}
+
+/// Evaluate `bkm`'s body over `call_ctx` (its parameters already bound) and coerce the result to
+/// the BKM's declared return type — a value that cannot be made to conform is `null`.
+fn finish_bkm_call(bkm: &Bkm, call_ctx: &FeelContext, drg: &Drg) -> Result<FeelValue, String> {
+    let result = eval_logic(&bkm.body, call_ctx, drg)?;
+    let return_shape = resolve_type_shape(bkm.return_type_ref.as_deref(), &drg.item_defs);
+    Ok(coerce_to_shape(&result, &return_shape).unwrap_or(FeelValue::Null))
 }

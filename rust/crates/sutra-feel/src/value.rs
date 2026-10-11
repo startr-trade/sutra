@@ -256,7 +256,35 @@ pub type TypeResolver<'a> = dyn Fn(&str) -> Option<FeelTypeShape> + 'a;
 /// example: substituting `[10]` into a BKM returning `[arg]` gives `[[10]]`, and THAT does not
 /// conform to a scalar `number`, full stop — it is not further unwrapped to find a match several
 /// list-levels down).
+///
+/// DMN 1.5's third implicit type conversion, "date to date and time", applies to the value as a
+/// whole: a `date` value meeting a `date and time` (`dateTime`) target becomes that day's UTC
+/// midnight (`date(2000, 1, 2)` → `2000-01-02T00:00:00Z`; DMN-TCK 1157-implicit-conversions).
+/// Like the spec's other conversions it is keyed on the type of the whole value against the whole
+/// target type, so it is not chained with a singleton-list conversion (`[date]` against `date and
+/// time` stays non-conforming) and does not reach inside a list's elements or a context's
+/// components (a `list<date>` does not conform to `list<date and time>`).
 pub fn coerce_to_shape(value: &FeelValue, shape: &FeelTypeShape) -> Option<FeelValue> {
+    if let (FeelValue::Date(d), FeelTypeShape::Base(name)) = (value, shape) {
+        if is_date_and_time_type(name) {
+            return Some(FeelValue::Instant(
+                d.midnight().assume_utc(),
+                Some(TimeQualifier::Zulu),
+            ));
+        }
+    }
+    conform_to_shape(value, shape)
+}
+
+/// `true` for either spelling of the FEEL `date and time` base type name.
+fn is_date_and_time_type(name: &str) -> bool {
+    matches!(name, "dateTime" | "date and time")
+}
+
+/// The conformance core of [`coerce_to_shape`] — conformance plus the singleton-list conversions,
+/// recursing into list elements and context components. The whole-value "date to date and time"
+/// conversion is applied once, by [`coerce_to_shape`] itself, never here.
+fn conform_to_shape(value: &FeelValue, shape: &FeelTypeShape) -> Option<FeelValue> {
     if value.is_null() || matches!(shape, FeelTypeShape::Any) {
         return Some(value.clone());
     }
@@ -277,11 +305,11 @@ pub fn coerce_to_shape(value: &FeelValue, shape: &FeelTypeShape) -> Option<FeelV
             FeelValue::List(items) => {
                 let mut out = Vec::with_capacity(items.len());
                 for it in items {
-                    out.push(coerce_to_shape(it, elem)?);
+                    out.push(conform_to_shape(it, elem)?);
                 }
                 Some(FeelValue::List(out))
             }
-            other => coerce_to_shape(other, elem).map(|v| FeelValue::List(vec![v])),
+            other => conform_to_shape(other, elem).map(|v| FeelValue::List(vec![v])),
         },
         FeelTypeShape::Record(components) => {
             let target = match value {
@@ -292,7 +320,7 @@ pub fn coerce_to_shape(value: &FeelValue, shape: &FeelTypeShape) -> Option<FeelV
                 return None;
             };
             for (name, comp_shape) in components {
-                coerce_to_shape(m.get(name)?, comp_shape)?;
+                conform_to_shape(m.get(name)?, comp_shape)?;
             }
             Some(target.clone())
         }
@@ -310,7 +338,7 @@ fn base_shape_matches(value: &FeelValue, name: &str) -> bool {
         "boolean" => matches!(value, FeelValue::Boolean(_)),
         "date" => matches!(value, FeelValue::Date(_)),
         "time" => matches!(value, FeelValue::Time(..)),
-        "dateTime" | "date and time" => matches!(value, FeelValue::Instant(..)),
+        name if is_date_and_time_type(name) => matches!(value, FeelValue::Instant(..)),
         "duration" | "dayTimeDuration" | "yearMonthDuration" => {
             matches!(value, FeelValue::Duration(_))
         }

@@ -10,3 +10,5 @@ mod feel_external_functions;
 mod feel_intervals;
 #[path = "all/feel_paths.rs"]
 mod feel_paths;
+#[path = "all/feel_type_conversions.rs"]
+mod feel_type_conversions;

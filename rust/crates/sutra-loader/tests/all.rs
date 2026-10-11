@@ -29,3 +29,5 @@ mod lint_variable_nav_test;
 mod lint_variable_schema_test;
 #[path = "all/package_examples.rs"]
 mod package_examples;
+#[path = "all/package_overlay_test.rs"]
+mod package_overlay_test;

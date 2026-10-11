@@ -8,5 +8,7 @@ mod dmn_external_functions;
 mod dmn_full_hit_policy;
 #[path = "all/dmn_validator.rs"]
 mod dmn_validator;
+#[path = "all/drg_implicit_conversions_and_imports.rs"]
+mod drg_implicit_conversions_and_imports;
 #[path = "all/drg_invocable_and_bkm_chain.rs"]
 mod drg_invocable_and_bkm_chain;

@@ -10,12 +10,16 @@ implementations are measured against — rather than relying on an internal test
 | Level | Result |
 |---|---|
 | **Compliance level 2** | **126/126 (100%)** |
-| **Compliance level 3** | **3349/3369 absolute (99.4%)**, and **100% of attempted assertions** (0 semantic failures among cases the engine attempts) |
+| **Compliance level 3** | **3365/3385 absolute (99.4%)**, and **100% of attempted assertions** (0 semantic failures among cases the engine attempts) |
 
-The gap between "100% of attempted" and "99.4% absolute" is a small, enumerated set of
-constructs the evaluator deliberately doesn't attempt yet — chiefly reflective execution of
-`{java|pmml: …}` external function bodies (the grammar parses and validates their binding shape;
-invoking one returns a clear, deliberate semantic rejection rather than a wrong answer). This is
+Measured against the TCK as of 2026-09-17 (commit `0456e1a`), including its newest tests for
+multiple model imports and DMN 1.5's implicit type conversions.
+
+The gap between "100% of attempted" and "99.4% absolute" is 20 enumerated assertions the
+evaluator deliberately doesn't attempt: 14 are reflective execution of `{java|pmml: …}` external
+function bodies (the grammar parses and validates their binding shape; invoking one returns a
+clear, deliberate semantic rejection rather than a wrong answer), and 6 are dates with nine-digit
+years, beyond the range the engine's temporal values represent. This is
 the honest distinction the numbers are built to preserve: a wrong value on a supported construct
 is a real conformance defect, and the harness that produces these numbers is built specifically to
 never launder one into an "unsupported" bucket. Level 2 has no such gap at all.

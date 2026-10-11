@@ -15,6 +15,10 @@ container fixtures, the DRY-variant composer (`compose_variant`), the host-HTTP 
 recorders, and the tier-3 k8s plumbing (`run_cli`, `deploy_api`, `await_rollout`,
 `engine_image`, `kubeconfig_path`, the MetalLB/ingress resolvers).
 
+`compose_variant` delegates to `sutra_loader::compose_overlays` — the same composition
+`sutra package --overlay` performs — so a suite and the CLI layer a variant exactly one way, and
+a fixture archive is byte-identical to one an operator seals by hand.
+
 It is a **library**, not a suite, so a conformance crate in ANOTHER workspace — one composing
 this engine as a path or submodule dependency — drives the same fixtures and contributes only
 its own payloads and assertions. `sutra-conformance/tests/all/support.rs` is a thin re-export of

@@ -7,9 +7,9 @@
 //! All three public examples (money-transfer, approval-hold, call-log-load) are single-variant:
 //! they commit a
 //! `deployments-src/<pkg>/` directly, which is what these fixtures package. The MULTI-variant
-//! layout (`shared/` + `variants/<name>/`, composed before sealing) belongs to the proprietary
-//! example packages, so its packaging gate lives in the repository that owns them; the loader
-//! itself is variant-agnostic — composition happens before it ever sees a directory.
+//! layout (one shared folder plus a small per-variant folder) is composed into exactly such a
+//! standalone directory first — see `package_overlay_test.rs` for that composition and its
+//! equivalence to a hand-merged directory; the scan below is the same scan either way.
 //!
 //! Nested-subfolder artifact ids ('/'-subpaths, depth ≤ 8) are covered by the money-transfer
 //! fixture below (`migrations/<store>/…`, `schemas/<codec>/…`).

@@ -2,6 +2,10 @@
 //! standalone deployment-package directory (R13 authoring unit) without emitting
 //! anything. Thin binding over `sutra_loader::lint_dir` — lint and package share ONE
 //! validation code path.
+//!
+//! `--overlay` lints the COMPOSED tree: the layers (one shared folder plus a small
+//! per-variant folder) are merged exactly as `sutra package --overlay` merges them, so a
+//! variant that is incomplete on its own is linted as what would actually be sealed.
 
 use std::path::PathBuf;
 
@@ -13,6 +17,21 @@ use crate::GlobalArgs;
 pub struct LintArgs {
     /// Deployment-package directory to validate (contains package.yaml).
     pub package_dir: PathBuf,
+
+    /// Directory to compose UNDER the package dir; repeatable, lowest layer first.
+    ///
+    /// For the "one shared folder plus per-variant overlays" layout: each --overlay is a
+    /// BASE layer applied in the order given, and the package dir is applied LAST, so the
+    /// package dir's copy of a path wins over every overlay and a later overlay wins over
+    /// an earlier one. The composed tree is what gets validated — the same composition
+    /// `sutra package --overlay` seals.
+    ///
+    /// Every overridden path is reported as a warning naming the layer that won. An overlay
+    /// may not carry package.yaml (labels come from the package dir alone), may not contain
+    /// symlinks, and cannot DELETE a file a lower layer provides — composition only adds and
+    /// replaces.
+    #[arg(long = "overlay", value_name = "DIR")]
+    pub overlay: Vec<PathBuf>,
 }
 
 /// Convert a loader diagnostic into the CLI's one printable finding shape.
@@ -44,8 +63,18 @@ pub fn execute(args: LintArgs, global: &GlobalArgs, io: &mut Io<'_>) -> i32 {
         );
         return exit::USAGE;
     }
+    for overlay in &args.overlay {
+        if !overlay.is_dir() {
+            let _ = writeln!(
+                io.err,
+                "lint: overlay directory not found: {}",
+                overlay.display()
+            );
+            return exit::USAGE;
+        }
+    }
 
-    let report = sutra_loader::lint_dir(&args.package_dir);
+    let report = sutra_loader::lint_dir_with_overlays(&args.package_dir, &args.overlay);
     let diagnostics: Vec<Diagnostic> = report.diagnostics.iter().map(diagnostic_of).collect();
     let errors = report.errors().count();
     let warnings = report.warnings().count();
@@ -109,6 +138,7 @@ pub(crate) mod tests {
         let dir = valid_package_dir("lint-clean");
         let args = LintArgs {
             package_dir: dir.clone(),
+            overlay: Vec::new(),
         };
         let (code, out, _) = run_captured("", |io| execute(args, &GlobalArgs::default(), io));
         assert_eq!(code, exit::OK);
@@ -123,6 +153,7 @@ pub(crate) mod tests {
         std::fs::write(dir.join("package.yaml"), "entryProcesses:\n  - \"ghost\"\n").unwrap();
         let args = LintArgs {
             package_dir: dir.clone(),
+            overlay: Vec::new(),
         };
         let (code, out, _) = run_captured("", |io| execute(args, &GlobalArgs::default(), io));
         assert_eq!(code, exit::FINDINGS);
@@ -144,6 +175,7 @@ pub(crate) mod tests {
         };
         let args = LintArgs {
             package_dir: dir.clone(),
+            overlay: Vec::new(),
         };
         let (code, out, _) = run_captured("", |io| execute(args, &global, io));
         assert_eq!(code, exit::OK);
@@ -158,6 +190,7 @@ pub(crate) mod tests {
     fn missing_directory_is_a_usage_error() {
         let args = LintArgs {
             package_dir: "/nonexistent/pkg".into(),
+            overlay: Vec::new(),
         };
         let (code, _, err) = run_captured("", |io| execute(args, &GlobalArgs::default(), io));
         assert_eq!(code, exit::USAGE);

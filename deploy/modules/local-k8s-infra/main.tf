@@ -211,6 +211,17 @@ resource "kubectl_manifest" "elasticsearch" {
           count: 1
           config:
             node.store.allow_mmap: false
+            # ABSOLUTE disk watermarks, not Elasticsearch's percentage defaults
+            # (85/90/95%). This is a single node sharing a developer machine's filesystem,
+            # where 88% full still leaves over 100 GB free — far more than this index set
+            # needs. On the percentage defaults the node sits above the LOW watermark,
+            # Elasticsearch refuses to allocate new shards, the cluster goes red, fluent-bit's
+            # writes fail, and the tier-3 observability suite reports "timed out waiting for
+            # all three OTLP signals": a disk-headroom symptom wearing a test-failure costume.
+            # Absolute thresholds say what actually matters — stop when the disk is nearly full.
+            cluster.routing.allocation.disk.watermark.low: 20gb
+            cluster.routing.allocation.disk.watermark.high: 10gb
+            cluster.routing.allocation.disk.watermark.flood_stage: 5gb
   YAML
 }
 

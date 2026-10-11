@@ -79,7 +79,7 @@ vulnerabilities:
     statement: "libssl3 (OpenSSL 3.0.x as Debian ships it) in the distroless base; no fixed package."
     expired_at: 2026-11-09
   - id: CVE-2026-42767
-    statement: "libssl3 (OpenSSL 3.0.x as Debian ships it) in the distroless base; no fixed package."
+    statement: "libssl3 (OpenSSL 3.0.x as Debian ships it) in the distroless base; Debian has since published 3.0.22-1~deb12u1, but the distroless base still ships 3.0.20 and has no package manager, so the fix arrives only when the base image is rebuilt (re-pulled 2026-10-12: the current cc-debian12 digest carries the same libssl3)."
     expired_at: 2026-11-09
 
   # ---- Published since the 2026-08-09 triage: same base, same position -------------------
@@ -88,19 +88,19 @@ vulnerabilities:
   # rustls), and `readelf --dyn-syms` shows it imports none of the glibc functions named below.
   # RENEWAL CHECK: pull the base fresh and re-scan; repeat both readelf checks on a new binary.
   - id: CVE-2026-63072
-    statement: "libssl3 (CMS key unwrapping) in the distroless base; the engine never loads libssl3 (rustls-only; readelf -d lists no libssl). Debian ships no fixed package."
+    statement: "libssl3 (CMS key unwrapping) in the distroless base; the engine never loads libssl3 (rustls-only; readelf -d lists no libssl). Debian has since published 3.0.22-1~deb12u1, but the distroless base still ships 3.0.20 and has no package manager, so the fix arrives only when the base image is rebuilt (re-pulled 2026-10-12: the current cc-debian12 digest carries the same libssl3)."
     expired_at: 2026-11-09
   - id: CVE-2026-63076
-    statement: "libssl3 (CMP server) in the distroless base; never loaded by the engine (rustls-only). Debian ships no fixed package."
+    statement: "libssl3 (CMP server) in the distroless base; never loaded by the engine (rustls-only). Debian has since published 3.0.22-1~deb12u1, but the distroless base still ships 3.0.20 and has no package manager, so the fix arrives only when the base image is rebuilt (re-pulled 2026-10-12: the current cc-debian12 digest carries the same libssl3)."
     expired_at: 2026-11-09
   - id: CVE-2026-54874
-    statement: "libssl3 (DTLS record buffering) in the distroless base; never loaded by the engine (rustls-only). Debian ships no fixed package."
+    statement: "libssl3 (DTLS record buffering) in the distroless base; never loaded by the engine (rustls-only). Debian has since published 3.0.22-1~deb12u1, but the distroless base still ships 3.0.20 and has no package manager, so the fix arrives only when the base image is rebuilt (re-pulled 2026-10-12: the current cc-debian12 digest carries the same libssl3)."
     expired_at: 2026-11-09
   - id: CVE-2026-63074
-    statement: "libssl3 (CMP ExtraCerts cache) in the distroless base; never loaded by the engine (rustls-only). Debian ships no fixed package."
+    statement: "libssl3 (CMP ExtraCerts cache) in the distroless base; never loaded by the engine (rustls-only). Debian has since published 3.0.22-1~deb12u1, but the distroless base still ships 3.0.20 and has no package manager, so the fix arrives only when the base image is rebuilt (re-pulled 2026-10-12: the current cc-debian12 digest carries the same libssl3)."
     expired_at: 2026-11-09
   - id: CVE-2026-75803
-    statement: "libssl3 (ChaCha20-Poly1305 / AES-OCB decryption) in the distroless base; never loaded by the engine (rustls-only). Debian ships no fixed package."
+    statement: "libssl3 (ChaCha20-Poly1305 / AES-OCB decryption) in the distroless base; never loaded by the engine (rustls-only). Debian has since published 3.0.22-1~deb12u1, but the distroless base still ships 3.0.20 and has no package manager, so the fix arrives only when the base image is rebuilt (re-pulled 2026-10-12: the current cc-debian12 digest carries the same libssl3)."
     expired_at: 2026-11-09
   - id: CVE-2026-80489
     statement: "glibc iconv EUC-JISX0213 converter; the engine imports no iconv symbol. Debian ships no fixed package."
@@ -125,4 +125,63 @@ vulnerabilities:
     expired_at: 2026-11-09
   - id: CVE-2026-89092
     statement: "glibc nscd (the name-service cache daemon); nscd is not in the image and the engine does not use it. Debian ships no fixed package."
+    expired_at: 2026-11-09
+
+  # ---- Published since the 2026-09-12 triage ---------------------------------------------
+  # Unlike the batch above, this one IS reachable: the engine imports getaddrinfo, so glibc's DNS
+  # stub resolver runs whenever it resolves a broker, database or HTTP host.
+  - id: CVE-2026-8674
+    statement: "glibc DNS stub resolver DoS via an overlong search domain. REACHABLE (the engine resolves hostnames through getaddrinfo), but per the advisory the trigger is the resolver's configured search list (resolv.conf), which the deployment platform controls, not a network peer. Debian defers the fix (fix_deferred); no patched package exists."
+    expired_at: 2026-11-09
+
+  # ---- Published since the 2026-09-12 triage; triaged 2026-10-12 for the 0.2.0-rc.3 cut -----
+  # Re-verified against THIS release's binary, not inherited from the previous triage:
+  # `readelf -d` lists libgcc_s.so.1, libm.so.6, libc.so.6 and the loader as its only
+  # dependencies — no libssl3, no libstdc++6, no libgomp1 — and its 213 imported symbols
+  # (`nm -D --undefined-only`) contain no OpenSSL or C++ entry point at all. The image runs as
+  # USER 10001, carries no setuid/setgid binary and has no package manager.
+  # RENEWAL CHECK: repeat both checks on the new binary; re-pull the base and re-scan.
+
+  # libssl3 — present in the base, never loaded by the engine (its TLS is rustls).
+  - id: CVE-2026-84782
+    statement: "libssl3 (DTLS handshake retransmission information disclosure) in the distroless base. The engine never loads libssl3: readelf -d names no OpenSSL library and the binary imports no OpenSSL symbol. Debian ships no fixed package (status: affected)."
+    expired_at: 2026-11-09
+  - id: CVE-2026-54872
+    statement: "libssl3 (ECDSA/SM2 nonce timing side-channel in generic EC scalar multiplication) in the distroless base; never loaded by the engine (rustls-only). Debian ships no fixed package."
+    expired_at: 2026-11-09
+  - id: CVE-2026-77696
+    statement: "libssl3 (SM2 signing timing side-channel) in the distroless base; never loaded by the engine (rustls-only), and the engine uses no SM2 at any layer. Debian ships no fixed package."
+    expired_at: 2026-11-09
+  - id: CVE-2026-75805
+    statement: "libssl3 (NULL dereference on a crafted CMP revocation response) in the distroless base; never loaded by the engine (rustls-only), which is no CMP client. Debian ships no fixed package."
+    expired_at: 2026-11-09
+  - id: CVE-2026-75806
+    statement: "libssl3 (DTLS 1.2 association terminated by an undersized record) in the distroless base; never loaded by the engine (rustls-only), which speaks no DTLS. Debian ships no fixed package."
+    expired_at: 2026-11-09
+  - id: CVE-2026-35189
+    statement: "libssl3 (heap growth caching X.509 CRL distribution points) in the distroless base; never loaded by the engine (rustls-only). Debian ships no fixed package."
+    expired_at: 2026-11-09
+
+  # glibc — the dynamic loader and one architecture-specific string routine.
+  - id: CVE-2026-86805
+    statement: "glibc ld.so TOCTOU on $ORIGIN expansion in DT_RPATH, exploitable only against a setuid/setgid (AT_SECURE) program by a local attacker. The image contains no setuid/setgid binary and no shell or package manager with which to introduce one, and the engine runs as USER 10001. Debian ships no fixed package."
+    expired_at: 2026-11-09
+  - id: CVE-2026-95818
+    statement: "glibc ld.so stack-based buffer overflow on a DT_RPATH/DT_RUNPATH prefix, again only against a setuid/setgid (AT_SECURE) program by a local attacker. Same position as CVE-2026-86805: no such program exists in this image. Debian ships no fixed package."
+    expired_at: 2026-11-09
+  - id: CVE-2026-97399
+    statement: "glibc strncasecmp one-byte over-read. The engine DOES import strncasecmp, but the defect is in the Power8-optimized implementation (ppc64le); the published images are linux/amd64 and linux/arm64, which use a different code path. Debian ships no fixed package."
+    expired_at: 2026-11-09
+
+  # libstdc++ / libgomp — shipped in the base, not linked by a Rust binary.
+  - id: CVE-2026-102010
+    statement: "libstdc++ use-after-free in binary-heap erase_if, reported against gcc-12-base / libgcc-s1 / libgomp1 / libstdc++6. The engine links libgcc_s only — no libstdc++6, no libgomp1 — and imports no C++ symbol, so neither the container nor the erase_if code path is reachable. Debian will not fix (status: will_not_fix)."
+    expired_at: 2026-11-09
+  - id: CVE-2026-95619
+    statement: "libstdc++ integer overflow in the aligned operator new. Same position as CVE-2026-102010: the engine links no libstdc++ and calls no C++ allocator. Debian defers the fix (status: fix_deferred)."
+    expired_at: 2026-11-09
+
+  # tzdata — a data refresh, and the only finding here with a fix we would take if we could.
+  - id: DLA-4792-1
+    statement: "tzdata 2026b in the distroless base; 2026c-0+deb12u1 exists. This is a timezone-data refresh, not an exploitable code path, and a distroless image has no package manager, so the newer data arrives only with a base rebuild — which the current cc-debian12 digest (re-pulled 2026-10-12) has not had. Date arithmetic that depends on a rule changed in 2026c would be wrong until then."
     expired_at: 2026-11-09

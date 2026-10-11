@@ -182,6 +182,11 @@ pub mod codes {
     pub const DEPLOY_ARCHIVE_CONTENT_INVALID: &str = "SUTRA.DEPLOY.ARCHIVE.CONTENT_INVALID";
     /// The packaging bounds (max 4096 entries, max path depth 8) were exceeded.
     pub const DEPLOY_PACKAGE_LIMIT_EXCEEDED: &str = "SUTRA.DEPLOY.PACKAGE.LIMIT_EXCEEDED";
+    /// WARNING — layered composition: a path an upper layer supplied shadowed the copy a
+    /// lower layer supplied. Non-fatal and purely informational, but always reported: an
+    /// override that the author did not intend is otherwise invisible, and the composed tree
+    /// is what gets sealed.
+    pub const DEPLOY_PACKAGE_OVERLAY_OVERRIDE: &str = "SUTRA.DEPLOY.PACKAGE.OVERLAY_OVERRIDE";
     /// The package directory's `package.yaml` is missing, unparseable, or violates the
     /// closed schema (labels / engine.minContract / entryProcesses), or the
     /// directory itself cannot be scanned as a deployment package.

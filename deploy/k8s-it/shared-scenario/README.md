@@ -27,10 +27,11 @@ tofu apply -var "kubeconfig_path=$(tofu -chdir=../cluster output -raw kubeconfig
 # 3. Build the CLI, package an example, hot-deploy it
 cargo build -p sutra-cli --release   # from rust/
 # money-transfer is a single-variant example: deployments-src/<dir> is already a complete
-# package dir, so it is packaged directly. A MULTI-variant example (DRY variants) instead
-# overlays shared/ + variants/<name>/ into a standalone dir BEFORE packaging (build-time only —
-# the same convention the Rust conformance harness's
-# `sutra_testkit::conformance::compose::compose_variant` uses).
+# package dir, so it is packaged directly. A MULTI-variant layout — one shared/ folder plus small
+# per-variant folders — is sealed by naming the shared folder as an overlay, with no hand-copying:
+#   sutra package <example>/variants/<name> --overlay <example>/shared --out /tmp/pkgs
+# The overlay is the base layer and the variant wins; composition is build-time only, so the
+# sealed archive is self-contained and identical to sealing a hand-merged dir.
 V=default--money-transfer--1.0.0
 rust/target/release/sutra package examples/money-transfer/deployments-src/$V --out /tmp/pkgs
 rust/target/release/sutra deploy /tmp/pkgs/$V.sutra

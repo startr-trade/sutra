@@ -209,11 +209,15 @@ struct TckCase {
     /// `errorResult="true"` asserts the decision must FAIL/produce null on the given inputs; a
     /// conformant engine erroring (or yielding null) is a PASS for that node.
     results: Vec<(String, Option<FeelValue>, bool)>,
-    /// The testCase's own `invocableName` attribute — set only for a DIRECT decision-service
-    /// invocation (`type="decisionService"`, DMN-TCK 0085/0082's `decisionService_NNN` cases):
-    /// `inputs` then supplies the service's declared parameters BY NAME (not the model's raw
-    /// inputData), dispatched via `Drg::evaluate_decision_service` rather than `Drg::evaluate`.
+    /// The testCase's own `invocableName` attribute — set only for a DIRECT invocation of a
+    /// decision service (`type="decisionService"`, DMN-TCK 0085/0082's `decisionService_NNN`
+    /// cases) or of a business knowledge model (`type="bkm"`, DMN-TCK 1157): `inputs` then
+    /// supplies the invocable's declared parameters BY NAME (not the model's raw inputData),
+    /// dispatched via `Drg::evaluate_decision_service` / `Drg::evaluate_bkm` rather than
+    /// `Drg::evaluate`.
     invocable_name: Option<String>,
+    /// `true` iff the testCase's `type` attribute is `bkm` — `invocable_name` then names a BKM.
+    invokes_bkm: bool,
 }
 
 fn parse_test_cases(doc: &El) -> (String, Vec<TckCase>) {
@@ -245,11 +249,13 @@ fn parse_test_cases(doc: &El) -> (String, Vec<TckCase>) {
             .attr("invocableName")
             .filter(|s| !s.trim().is_empty())
             .map(str::to_string);
+        let invokes_bkm = tc.attr("type") == Some("bkm");
         cases.push(TckCase {
             id,
             inputs,
             results,
             invocable_name,
+            invokes_bkm,
         });
     }
     (model, cases)
@@ -424,9 +430,10 @@ fn run_level(root: &Path, level: &str, tally: &mut Tally) {
                     None => input_undecodable = true,
                 }
             }
-            let cache_key = format!("{:?}|{ctx:?}", case.invocable_name);
+            let cache_key = format!("{:?}|{}|{ctx:?}", case.invocable_name, case.invokes_bkm);
             let results = eval_cache.entry(cache_key).or_insert_with(|| match &drg {
                 Ok(drg) => match &case.invocable_name {
+                    Some(name) if case.invokes_bkm => drg.evaluate_bkm(name, &ctx),
                     Some(name) => drg.evaluate_decision_service(name, &ctx),
                     None => drg.evaluate(&ctx),
                 },

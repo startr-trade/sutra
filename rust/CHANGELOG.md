@@ -11,6 +11,93 @@ This is the changelog for the **Rust-native** engine (`rust/` workspace). It beg
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.2.0-rc.3] - 2026-10-12
+
+### Added — a package can be composed from layers (`--overlay`)
+
+`sutra package <variant> --overlay <shared>` and `sutra lint <variant> --overlay <shared>` compose
+the layers first and validate and seal the composed tree. Each `--overlay` is a BASE layer applied
+in the order given; the package directory is applied last and wins, and a later overlay wins over
+an earlier one. The archive is sealed under the package directory's own name and is
+**byte-identical** to one sealed from a hand-merged directory of the same content, so the
+`deploymentId` does not depend on how the tree was assembled.
+
+Fail-closed: an overlay may not carry `package.yaml`, no layer may contain a symlink, and a
+file-versus-directory clash between layers is an error. Composition only adds and replaces — a
+layer cannot delete a file a lower layer provides. Every shadowed path is reported as
+`SUTRA.DEPLOY.PACKAGE.OVERLAY_OVERRIDE`, naming the layer that won.
+
+New in `sutra-loader`: `compose_overlays`, `assemble_dir_with_overlays`, `lint_dir_with_overlays`
+and `ComposedPackage`. `sutra-testkit`'s `compose_variant` delegates to the same code, so the
+conformance suites and the CLI compose a variant exactly one way.
+
+### Added — a BKM can be invoked directly
+
+`Drg::evaluate_bkm` evaluates a business knowledge model by name. A BKM that no decision
+references was previously unreachable from outside the decision graph — exactly the case a
+conformance harness has to exercise.
+
+### Added — the security scanners are local gates
+
+`make scan-deps` (Trivy over the source tree), `make scan-image` (Trivy over the engine image) and
+`make codeql` (CodeQL for Rust) fail on any finding, unlike the scheduled workflows that only
+report. Tiered by cost like the test tiers; CodeQL's scope is `scripts/codeql-config.yml`, which
+excludes test code because it never ships.
+
+### Changed — a `date` is accepted where a `date and time` is declared
+
+FEEL's shape coercion refused the value; DMN 1.5 requires the implicit conversion (midnight, UTC).
+A decision typed `date and time` now accepts a `date` input instead of failing the invocation.
+
+### Changed — a secret reference's fields are named for what they are
+
+In the GCP and Azure `envref` crates, `secret` and `secret_url` read as though they held secret
+material; they hold a name and a URL, and they are `name` and `access_url` now. Positional
+construction is unaffected; a named-field construction needs the new names.
+
+### Changed — a scaffolded app's compose stack is scoped to that app
+
+Every app from `sutra create app` resolved to the same compose project name, so
+`docker compose down -v` in one app's deploy directory could tear down another app's stack and its
+volumes.
+
+### Fixed — DMN model imports and `functionItem` output types
+
+A named import carries the imported model's input data under its alias, an import with an empty
+name is merged unqualified, and a diamond import resolves once. A BKM whose `functionItem`
+declares an `outputTypeRef` conforms its result to that type. DMN-TCK standing against the current
+corpus: 3365 of 3385 assertions at compliance level 3 (99.4%), the 20 skipped ones being 14 cases
+that need an external Java function and 6 with a nine-digit year.
+
+### Fixed — the tier-3 Elasticsearch used percentage disk watermarks
+
+A single node on a developer filesystem can sit above Elasticsearch's 85% low watermark with over
+100 GB free; Elasticsearch then refuses to allocate shards, the cluster goes red, fluent-bit's
+writes fail, and the k8s observability suite fails as "timed out waiting for all three OTLP
+signals". The IT cluster sets absolute watermarks now (20 GB / 10 GB / 5 GB).
+
+### Fixed — the fixture reaper reaps only fixtures
+
+`make docker-clean` had host-wide prunes that would remove a developer's stopped compose stack and
+its volumes. Removal now requires both a fixture-image match and the absence of a
+`com.docker.compose.project` label; the host-wide prunes are behind an explicit `--deep`.
+
+### Security
+
+- **rustls 0.23.45** for RUSTSEC-2026-0285, with `rustls-webpki` 0.103.15.
+- **Base-image CVEs re-triaged**, with reachability checked against the shipped binary's own
+  tables (`readelf -d`, `nm -D --undefined-only`) rather than only against the distribution's
+  "no fix" status. Every suppression is time-boxed.
+- **Developer-tooling lockfiles** updated — `brace-expansion` 2.1.7, `js-yaml` 4.3.2,
+  `source-map-js` 1.2.2, `vitest` 4.1.11 — clearing eight advisories.
+
+## [0.2.0-rc.2] - 2026-09-06
+
+Sectioned after the fact: the rc.2 cut wrote release notes but left this file's entries under
+*Unreleased*. Everything below shipped in rc.2.
+
 ### Fixed — three defects the `call-log-load` example only exposed when it was actually run
 
 All three sat behind the same blind spot: the example's end-to-end test booted the engine with no
@@ -241,14 +328,6 @@ Consequences for this workspace:
 - Tier-3 is `k8s_money_transfer` (deploy smoke) + `k8s_observability` (OTLP signals), both
   driving the money-transfer package.
 
-### In flight
-
-The Rust-native GA cycle is in flight on top of this candidate: the retired reference
-baseline moves out of the product tree, the example ITs become a Rust conformance
-harness, three additional brokers (SQS, GCP Pub/Sub, AMQP 1.0) land, and the deferred
-feature gaps (message-level broker auth, inbound CloudEvents over HTTP, inbound bearer,
-the `envref` resolver registry with a Vault KV-v2 resolver) close.
-
 ## [0.2.0-rc.1] - 2026-07-13
 
 First release candidate of the Rust-native engine. The workspace is a from-scratch
@@ -334,5 +413,7 @@ examples) on tier-2 (Testcontainers) and tier-3 (k8s) at each phase gate.
 - The generated binding crate (707k lines) is excluded from routine `make test` /
   `make lint`; its own gates run via `make test-generated` only after a regeneration.
 
-[Unreleased]: https://github.com/startr-trade/sutra/compare/v0.2.0-rc.1...HEAD
+[Unreleased]: https://github.com/startr-trade/sutra/compare/v0.2.0-rc.3...HEAD
+[0.2.0-rc.3]: https://github.com/startr-trade/sutra/releases/tag/v0.2.0-rc.3
+[0.2.0-rc.2]: https://github.com/startr-trade/sutra/releases/tag/v0.2.0-rc.2
 [0.2.0-rc.1]: https://github.com/startr-trade/sutra/releases/tag/v0.2.0-rc.1

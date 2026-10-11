@@ -70,8 +70,15 @@ pub enum Command {
     /// Provision a KEK-wrapped per-tenant DEK into the `data_key` store (envelope encryption).
     Crypto(crypto::CryptoArgs),
     /// Validate a deployment-package directory (full package-time suite, emits nothing).
+    ///
+    /// With one or more --overlay directories the layers are composed first (overlays are
+    /// base layers, the package dir wins) and the composed tree is what gets validated.
     Lint(lint::LintArgs),
     /// Seal a deployment-package directory into one .sutra archive.
+    ///
+    /// With one or more --overlay directories the layers are composed first (overlays are
+    /// base layers, the package dir wins) and the composed tree is what gets sealed — the
+    /// archive is byte-identical to one sealed from a hand-merged directory.
     Package(package::PackageArgs),
     /// Inspect a directory of sealed .sutra archives — list deployment ids + labels.
     Deployments(deployments::DeploymentsArgs),

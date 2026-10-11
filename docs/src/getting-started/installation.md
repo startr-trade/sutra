@@ -30,7 +30,7 @@ Useful knobs:
 
 ```bash
 # Pin a version instead of taking the newest release
-curl -fsSL …/install.sh | sh -s -- --version v0.2.0-rc.1
+curl -fsSL …/install.sh | sh -s -- --version v0.2.0-rc.3
 
 # Install somewhere specific
 curl -fsSL …/install.sh | SUTRA_INSTALL_DIR=~/bin sh
@@ -48,14 +48,14 @@ order worth trying:
 ```bash
 # 1. the SAME installer, served from the release instead of the raw CDN (different host, and
 #    the script is versioned with the binaries it installs)
-curl -fsSL https://github.com/startr-trade/sutra/releases/download/v0.2.0-rc.1/install.sh \
-  | sh -s -- --version v0.2.0-rc.1
+curl -fsSL https://github.com/startr-trade/sutra/releases/download/v0.2.0-rc.3/install.sh \
+  | sh -s -- --version v0.2.0-rc.3
 
 # 2. a token, which moves the API to 5000 requests an hour
 GH_TOKEN=$(gh auth token) curl -fsSL …/install.sh | sh
 
 # 3. no installer at all — the assets are plain files
-gh release download v0.2.0-rc.1 -R startr-trade/sutra \
+gh release download v0.2.0-rc.3 -R startr-trade/sutra \
   -p 'sutra-*-x86_64-unknown-linux-musl.tar.gz' -p SHA256SUMS
 sha256sum --ignore-missing -c SHA256SUMS
 tar xzf sutra-*-x86_64-unknown-linux-musl.tar.gz --strip-components=1 -C ~/.local/bin
@@ -83,7 +83,7 @@ to match), and **windows x86_64**. macOS builds from source for now.
 ## Get the engine image
 
 ```bash
-docker pull ghcr.io/startr-trade/sutra:0.2.0-rc.1
+docker pull ghcr.io/startr-trade/sutra:0.2.0-rc.3
 ```
 
 One generic image runs every application: behavior comes entirely from the deployment

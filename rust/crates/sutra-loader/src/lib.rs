@@ -7,6 +7,10 @@
 //!    [`assemble_dir`] seals one into exactly one `.sutra`. No overlay tree, no
 //!    inheritance, no sharing mechanism; tenant is just a label. The `.sutra` archive is
 //!    the ONE deployment model, in and out — there is no resource-tree source.
+//!    [`overlay`] adds the AUTHORING-time convenience of composing several layered
+//!    directories (one shared folder plus per-variant overlays) into that one standalone
+//!    directory before the scan; the sealed archive is indistinguishable from one sealed
+//!    out of a hand-merged directory.
 //! 2. **Package/lint library** ([`package`], [`lint`]) — the fail-closed package-time
 //!    validation suite (ONE code path for `sutra lint`, `sutra package` and the archive
 //!    reader) and the deterministic archive assembler.
@@ -25,6 +29,7 @@ pub mod coverage;
 pub mod ddl;
 pub mod error;
 pub mod lint;
+pub mod overlay;
 pub mod package;
 pub mod scanner;
 
@@ -35,6 +40,9 @@ pub use archive::{
 pub use coverage::{BusinessCorrelation, CoverageFile, CoverageRoute, Hop};
 pub use error::LoaderError;
 pub use lint::{LintDiagnostic, LintReport, LintSeverity};
+pub use overlay::{
+    assemble_dir_with_overlays, compose_overlays, lint_dir_with_overlays, ComposedPackage,
+};
 pub use package::{
     assemble_dir, lint_dir, CompiledSchemaEmitter, PackageConfig, PackageError, PackageOptions,
     PackageOutcome, PackagedArchive, PACKAGE_FILE_NAME,

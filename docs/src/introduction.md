@@ -73,9 +73,10 @@ Sutra is four things, and this book covers all of them:
   [Coverage: declared routes as the compliance signal](building/coverage.md).
 - **DMN + FEEL conformance — measured, not asserted.** Sutra's DMN/FEEL evaluator is checked
   against the real OMG DMN Technical Compatibility Kit. Current standing: **compliance level 2,
-  100% (126/126)**; **compliance level 3, 99.4% absolute (3349/3369)**, with 100% of attempted
-  cases passing (0 semantic failures — the remaining gap is a small, enumerated set of
-  out-of-scope external-function-execution cases). See
+  100% (126/126)**; **compliance level 3, 99.4% absolute (3365/3385)**, with 100% of attempted
+  cases passing (0 semantic failures — the remaining gap is 20 enumerated assertions it
+  deliberately doesn't attempt: external Java function execution, and dates with nine-digit
+  years). See
   [DMN-TCK conformance](reference/dmn-tck.md) for what that means and what is deliberately out
   of scope.
 - **Channels and transports.** HTTP, five brokers (Kafka, RabbitMQ, AWS SQS, Google Pub/Sub,
