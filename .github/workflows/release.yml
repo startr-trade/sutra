@@ -39,10 +39,57 @@ env:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # Gate. crates.io publishing is irreversible, so it waits on this.
+  # 0. THE GATE. Nothing is built or published from a commit CI has not passed.
+  # ---------------------------------------------------------------------------
+  #
+  # A tag is only a name for a commit, and nothing stops one being pushed while CI is still
+  # running or after CI has failed. Everything below then builds from that tree — and the
+  # crates.io publish cannot be taken back, because a published version is immutable.
+  #
+  # This asks GitHub for ci.yml's run on the commit being released: success proceeds, a failure
+  # or no run at all refuses, and a run still in progress is waited for. Gating on the run that
+  # already exists (rather than on a re-run of part of it) means the answer cannot disagree with
+  # what the repository's own CI reports.
+  tag:
+    name: check the tag (CI passed)
+    runs-on: ubuntu-latest
+    # Longer than the script's own 45-minute wait, so a release tagged while CI is still running
+    # waits for CI rather than being killed by the job timeout.
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      actions: read # reading another workflow's runs
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      # On a workflow_dispatch re-release the ambient GITHUB_SHA is the dispatched BRANCH's head,
+      # not the tagged commit — so the commit under test is resolved from the checked-out ref and
+      # passed to the gate explicitly. Gating the wrong commit is worse than not gating.
+      - name: Resolve the commit being released
+        id: resolve
+        run: |
+          set -eu
+          sha="$(git rev-parse HEAD)"
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+          echo "::notice::releasing ${{ github.event.inputs.tag || github.ref_name }} at ${sha}"
+
+      - name: The tagged commit passed CI
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_SHA: ${{ steps.resolve.outputs.sha }}
+        run: sh scripts/release-ci-gate.sh
+
+  # ---------------------------------------------------------------------------
+  # Second gate, on the tagged tree itself. crates.io publishing is
+  # irreversible, so it waits on this as well as on the CI run above.
   # ---------------------------------------------------------------------------
   test:
     name: verify (make lint + make test)
+    needs: tag
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
@@ -73,6 +120,7 @@ jobs:
   # ---------------------------------------------------------------------------
   image-build:
     name: engine image (${{ matrix.platform }})
+    needs: tag
     strategy:
       fail-fast: false
       matrix:
@@ -324,6 +372,7 @@ jobs:
 
   cli:
     name: sutra CLI (${{ matrix.target }})
+    needs: tag
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     # Every target in this matrix is a required deliverable — a broken target fails the
@@ -548,7 +597,7 @@ jobs:
   #     reports a skip; it never fails the release.
   crates-publish:
     name: crates.io (sutra-feel → sutra-dmn)
-    needs: test
+    needs: [tag, test]
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
