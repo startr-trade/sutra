@@ -44,18 +44,21 @@ while [ $# -gt 0 ]; do
 done
 
 # ---- platform ---------------------------------------------------------------------------
-# Release assets are built for three targets (see .github/workflows/release.yml); anything
+# Release assets are built for five targets (see .github/workflows/release.yml); anything
 # else must build from source rather than get a silently wrong binary.
+#
+# `uname -m` on macOS reports arm64, not aarch64 — and reports x86_64 for BOTH an Intel Mac
+# and an Apple-silicon Mac running this script under Rosetta 2. The Rosetta case resolves to
+# the Intel build, which runs correctly (just translated); detecting it would need
+# sysctl.proc_translated, and a wrong guess there installs a binary that cannot execute.
 os="$(uname -s)"
 arch="$(uname -m)"
 case "${os}/${arch}" in
     Linux/x86_64|Linux/amd64)   TARGET="x86_64-unknown-linux-musl" ;;
     Linux/aarch64|Linux/arm64)  TARGET="aarch64-unknown-linux-musl" ;;
-    Darwin/*)
-        die "macOS binaries are not published yet — build from source:
-    git clone https://github.com/${REPO}.git && cd sutra/rust
-    cargo install --path crates/sutra-cli" 2 ;;
-    *) die "unsupported platform: ${os}/${arch} (published targets: linux x86_64/aarch64 musl, windows x86_64 — see install.ps1)" 2 ;;
+    Darwin/arm64|Darwin/aarch64) TARGET="aarch64-apple-darwin" ;;
+    Darwin/x86_64)              TARGET="x86_64-apple-darwin" ;;
+    *) die "unsupported platform: ${os}/${arch} (published targets: linux x86_64/aarch64 musl, macos arm64/x86_64, windows x86_64 — see install.ps1)" 2 ;;
 esac
 
 # ---- fetching ---------------------------------------------------------------------------

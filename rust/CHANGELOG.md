@@ -13,6 +13,18 @@ This is the changelog for the **Rust-native** engine (`rust/` workspace). It beg
 
 Nothing yet.
 
+## [0.2.0-rc.4] - 2026-10-12
+
+### Added — macOS CLI binaries, both architectures
+
+`aarch64-apple-darwin` and `x86_64-apple-darwin` join the published targets, built natively on a
+runner per architecture (the Apple SDK is not redistributable, so cross-building from Linux would
+need osxcross and a self-supplied SDK). No source change was required: the CLI's only native-code
+dependency is `ring`, and its platform-specific paths are `#[cfg(unix)]`, which macOS satisfies.
+
+`scripts/install.sh` resolves `Darwin/arm64` and `Darwin/x86_64` to those targets, where it
+previously refused macOS outright. The engine image is unchanged and remains Linux-only.
+
 ## [0.2.0-rc.3] - 2026-10-12
 
 ### Added — a package can be composed from layers (`--overlay`)
@@ -413,7 +425,8 @@ examples) on tier-2 (Testcontainers) and tier-3 (k8s) at each phase gate.
 - The generated binding crate (707k lines) is excluded from routine `make test` /
   `make lint`; its own gates run via `make test-generated` only after a regeneration.
 
-[Unreleased]: https://github.com/startr-trade/sutra/compare/v0.2.0-rc.3...HEAD
+[Unreleased]: https://github.com/startr-trade/sutra/compare/v0.2.0-rc.4...HEAD
+[0.2.0-rc.4]: https://github.com/startr-trade/sutra/releases/tag/v0.2.0-rc.4
 [0.2.0-rc.3]: https://github.com/startr-trade/sutra/releases/tag/v0.2.0-rc.3
 [0.2.0-rc.2]: https://github.com/startr-trade/sutra/releases/tag/v0.2.0-rc.2
 [0.2.0-rc.1]: https://github.com/startr-trade/sutra/releases/tag/v0.2.0-rc.1
