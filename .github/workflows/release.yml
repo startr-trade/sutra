@@ -83,6 +83,50 @@ jobs:
           GITHUB_SHA: ${{ steps.resolve.outputs.sha }}
         run: sh scripts/release-ci-gate.sh
 
+      # The tag must name the version the tree actually builds. A tag is just a label: nothing
+      # stops v0.2.0-rc.4 being pushed on a tree whose workspace still says 0.2.0-rc.3, and the
+      # result is not cosmetic —
+      #
+      #   * every CLI archive and the image are NAMED for the tag while the binary inside
+      #     reports the older version, so a checksum or a bug report cannot be tied to a build;
+      #   * the crates.io publish uploads the version in Cargo.toml, not the tag. That version
+      #     is already published, and the publish step treats "already uploaded" as success
+      #     (it has to: a re-run must not fail). So the release would report success having
+      #     published NOTHING, and the omission is silent.
+      #
+      # This happened on the way to rc.4: the curated .github/ and docs/src/ files were pushed
+      # while the exported ones (rust/, openapi/, scripts/) were not, leaving a tree whose
+      # release notes said rc.4 and whose workspace said rc.3.
+      #
+      # Read from [workspace.package]: every crate says `version.workspace = true`, so reading
+      # a crate's own Cargo.toml returns that literal string and compares unequal to every tag.
+      - name: The tag names the version this tree builds
+        run: |
+          set -eu
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          case "$tag" in
+            v*) ;;
+            *) echo "::error::expected a v-prefixed tag, got '$tag'" >&2; exit 1 ;;
+          esac
+          want="${tag#v}"
+          have="$(awk -F'"' '/^\[workspace\.package\]/{f=1} f && /^version *= *"/{print $2; exit}' rust/Cargo.toml)"
+          echo "tag names ${want}; rust/Cargo.toml builds ${have}"
+          if [ "$want" != "$have" ]; then
+            echo "::error::tag ${tag} names ${want}, but [workspace.package] version is ${have}." >&2
+            echo "::error::Push the version bump (and everything exported with it), or re-tag the right commit." >&2
+            exit 1
+          fi
+          # sutra-dmn's dependency on sutra-feel carries a HARDCODED version, because crates.io
+          # strips the `path` key and resolves by version alone. If it lags the workspace, the
+          # publish of sutra-dmn fails after sutra-feel has already been uploaded — and that
+          # upload cannot be withdrawn.
+          dep="$(awk -F'"' '/^sutra-feel *=/{for(i=1;i<=NF;i++) if ($i ~ /^[0-9]+\./) {print $i; exit}}' rust/crates/sutra-dmn/Cargo.toml)"
+          echo "sutra-dmn depends on sutra-feel ${dep:-<unparsed>}"
+          if [ "$dep" != "$have" ]; then
+            echo "::error::sutra-dmn pins sutra-feel ${dep}, but this tree builds ${have} — the crates.io publish would break." >&2
+            exit 1
+          fi
+
   # ---------------------------------------------------------------------------
   # Second gate, on the tagged tree itself. crates.io publishing is
   # irreversible, so it waits on this as well as on the CI run above.

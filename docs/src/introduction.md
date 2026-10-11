@@ -64,6 +64,13 @@ Sutra is four things, and this book covers all of them:
 4. **This book** — Getting Started, Building BPMN Solutions, Architecture, Operating,
    Reference, and Contributing.
 
+**Where these run.** The CLI is published for **linux x86_64/arm64**, **macOS x86_64/arm64** and
+**windows x86_64**; the engine image is **Linux only** (`linux/amd64` + `linux/arm64`). So a Mac
+or Windows developer authors, lints, packages and deploys natively, and the engine runs as a
+Linux container — the same way it runs in production. The two library crates are plain Rust and
+build wherever cargo does. Details in
+[installation](getting-started/installation.md#published-targets).
+
 ## Honest capability summary
 
 - **BPMN 2.0 coverage.** Start/end/intermediate events, all four gateway kinds, embedded /

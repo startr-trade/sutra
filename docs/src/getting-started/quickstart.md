@@ -1,7 +1,9 @@
 # Quickstart
 
 A running engine and your first message flowing through it. About five minutes, and the only
-prerequisites are the [`sutra` CLI](installation.md) and Docker.
+prerequisites are the [`sutra` CLI](installation.md) and Docker — on linux, macOS or windows
+(x86_64 everywhere, arm64 on linux and macOS). The CLI is native on each; the engine runs as
+a Linux container.
 
 What you will have at the end: a BPMN process, bound to an HTTP channel, that decodes and
 schema-validates an XML message, branches on the result, and replies — running on the real

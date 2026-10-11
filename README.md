@@ -79,8 +79,17 @@ The engine, tooling, and libraries are a single Cargo workspace under `rust/`.
 curl -fsSL https://raw.githubusercontent.com/startr-trade/sutra/main/scripts/install.sh | sh
 
 # The engine — one generic image; behaviour comes from the packages you deploy into it
-docker pull ghcr.io/startr-trade/sutra:latest
+docker pull ghcr.io/startr-trade/sutra:0.2.0-rc.4
 ```
+
+**Runtimes:** the CLI is published for **linux x86_64/arm64**, **macOS x86_64/arm64** and
+**windows x86_64**. The engine image is **Linux only** (`linux/amd64` + `linux/arm64`) — on a Mac
+or a Windows box you author and deploy with the native CLI while the engine runs as a Linux
+container, which is what it does in production anyway.
+
+The image tag is pinned on purpose: there is no `latest` yet. Every release so far is a
+pre-release, and a pre-release must not become what an unqualified `docker pull` hands you — so
+`latest` is not published at all until a stable version is cut.
 
 Windows: `irm https://raw.githubusercontent.com/startr-trade/sutra/main/scripts/install.ps1 | iex`.
 Neither needs a Rust toolchain. Then `sutra self-update --check` tells you when a newer

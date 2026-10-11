@@ -78,9 +78,25 @@ Verify the install:
 sutra --version
 ```
 
-Published targets: **linux x86_64**, **linux aarch64** (both static musl — no glibc version
-to match), **macOS arm64** and **macOS x86_64** (built natively on each architecture), and
-**windows x86_64**.
+### Published targets
+
+**linux x86_64**, **linux aarch64**, **macOS arm64**, **macOS x86_64**, **windows x86_64**.
+
+| | x86_64 | arm64 |
+|---|---|---|
+| **Linux** | ✅ static musl | ✅ static musl |
+| **macOS** | ✅ built natively | ✅ built natively |
+| **Windows** | ✅ MSVC | — |
+
+The Linux builds are **static musl**, so there is no glibc version to match — they run on an old
+distribution and a new one alike. The macOS builds are compiled on Apple hardware of each
+architecture rather than cross-compiled.
+
+**This table is the CLI.** The engine is a container, and its image is **Linux only**
+(`linux/amd64` + `linux/arm64`) — which is not a limitation in practice: on macOS or Windows you
+author, lint, package and deploy with the native CLI, and the engine runs as a Linux container
+through Docker Desktop, exactly as it does in production. There is no native macOS or Windows
+engine build, and none is planned.
 
 On an Apple-silicon Mac running the installer under Rosetta 2, `uname -m` answers `x86_64`, so
 you get the Intel build — it runs, translated. Pass `--version` and fetch the

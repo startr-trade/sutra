@@ -8,6 +8,11 @@ cd rust && cargo build --release -p sutra-cli    # -> rust/target/release/sutra
 cargo run -p sutra-cli -- <args>                  # or run ad hoc
 ```
 
+Or install a published build — no Rust toolchain needed. The CLI runs on **linux x86_64/arm64**,
+**macOS x86_64/arm64** and **windows x86_64**; see
+[installation](../getting-started/installation.md#published-targets). The engine image it deploys
+to is Linux only, so on macOS and Windows the CLI is native and the engine is a container.
+
 Commands are grouped below by workflow: author → validate → package → deploy → operate → analyze,
 with the generators last.
 
