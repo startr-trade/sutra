@@ -173,6 +173,71 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # ---- VERIFY BEFORE PUBLISH ---------------------------------------------------
+      # Load this platform's image locally first and prove two things about it before the
+      # registry ever sees it. The second build below is a cache hit on every layer, so this
+      # costs a load, not a rebuild.
+      #
+      # Why it exists: the release pushed, signed and SBOM'd an image that nothing had run and
+      # nothing had scanned. The scheduled trivy.yml scans `main`, not the tagged tree, and the
+      # tier-2 suites run a LOCAL `release-it` build, not this `release`-profile image. So the
+      # one artifact people actually pull was the least examined thing in the pipeline.
+      - name: Build locally for verification
+        uses: docker/build-push-action@v7
+        with:
+          context: ./rust
+          file: ./rust/Dockerfile
+          platforms: ${{ matrix.platform }}
+          push: false
+          load: true
+          tags: sutra-engine:verify
+          cache-from: ${{ matrix.cache_from }}
+
+      # The entrypoint binary EXECUTES on this architecture and its configuration layer runs.
+      # The engine has no --version to interrogate (it is a server, not a CLI), so the signal
+      # is its documented refusal: with no deployments directory it exits non-zero saying
+      # "configuration invalid — refusing to start". A wrong-architecture binary, a broken
+      # ENTRYPOINT path or a missing shared library all fail to reach that message — which is
+      # exactly the class of defect a distroless image hides until someone runs it.
+      - name: The image's engine runs on this architecture
+        run: |
+          set -eu
+          # Both runs below are EXPECTED to exit non-zero, so each failure is captured rather
+          # than left to `set -e` — `cmd; echo $?` and `cmd && { ... }` would both abort this
+          # step on exactly the behaviour being asserted.
+          out=''
+          code=0
+          out="$(docker run --rm sutra-engine:verify 2>&1)" || code=$?
+          printf '%s\n' "$out" | tail -2
+          if [ "$code" = 0 ]; then
+            echo "::error::the engine exited 0 with no configuration — it must refuse to start" >&2
+            exit 1
+          fi
+          if ! printf '%s' "$out" | grep -q 'refusing to start'; then
+            echo "::error::the engine did not refuse with the documented configuration error; it may not have run at all" >&2
+            exit 1
+          fi
+          # --health-check is what the image's HEALTHCHECK invokes. With no server up it must
+          # fail rather than report healthy, or the orchestrator is told a lie. An `if` keeps
+          # the expected non-zero exit out of `set -e`'s reach.
+          if docker run --rm sutra-engine:verify --health-check >/dev/null 2>&1; then
+            echo "::error::--health-check reported success with no engine running" >&2
+            exit 1
+          fi
+          echo "engine runs on ${{ matrix.platform }}, refuses without config, health-check fails closed"
+
+      # Scanned BEFORE the push, on the tagged tree's own image, failing on any finding the
+      # triage record does not already account for. `make scan-image` is this same gate locally.
+      - name: Scan this platform's image before publishing
+        uses: aquasecurity/trivy-action@v0.36.0 # same pin as trivy.yml
+        with:
+          scan-type: image
+          image-ref: sutra-engine:verify
+          severity: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
+          exit-code: "1"
+          format: table
+          trivyignores: .trivyignore.yaml
+
       # Build ONE platform and push BY DIGEST — no tag. Tagging happens once, in the merge
       # job below, because a tag can only point at one thing: if each leg pushed the same tag
       # the second would silently overwrite the first and the "multi-arch" image would be
@@ -348,6 +413,47 @@ jobs:
             "${IMAGE_NAME}@${DIGEST}"
 
       # Handed to the `release` job, which attaches it to the GitHub Release alongside the
+      # ---- VERIFY WHAT WAS PUBLISHED -----------------------------------------------
+      # A signature nobody verifies is a ritual. This checks the one we just made the way a
+      # consumer would: keyless, against the identity that is allowed to sign this repo's
+      # images, so a signature made by some other workflow would not satisfy it.
+      - name: The signature verifies, as a consumer would check it
+        env:
+          DIGEST: ${{ steps.merge.outputs.digest }}
+        run: |
+          set -eu
+          cosign verify \
+            --certificate-identity-regexp "^https://github.com/${{ github.repository }}/\\.github/workflows/release\\.yml@" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "${IMAGE_NAME}@${DIGEST}" > /dev/null
+          echo "signature verifies for ${IMAGE_NAME}@${DIGEST}"
+
+      # The manifest list actually lists BOTH architectures, and carries the version and
+      # commit it claims. A merge that silently produced a single-arch index, or labels naming
+      # a different commit, is invisible to everything else in this workflow.
+      - name: The manifest lists both architectures and names this release
+        env:
+          DIGEST: ${{ steps.merge.outputs.digest }}
+          VERSION: ${{ steps.rel.outputs.version }}
+        run: |
+          set -eu
+          platforms="$(docker buildx imagetools inspect "${IMAGE_NAME}@${DIGEST}" \
+            --format '{{range .Manifest.Manifests}}{{if .Platform}}{{.Platform.OS}}/{{.Platform.Architecture}} {{end}}{{end}}')"
+          echo "platforms: ${platforms}"
+          for want in linux/amd64 linux/arm64; do
+            case " ${platforms} " in
+              *" ${want} "*) ;;
+              *) echo "::error::the manifest list is missing ${want}" >&2; exit 1 ;;
+            esac
+          done
+          revision="$(docker buildx imagetools inspect "${IMAGE_NAME}:${VERSION}" \
+            --format '{{index .Image.Config.Labels "org.opencontainers.image.revision"}}' 2>/dev/null || true)"
+          echo "revision label: ${revision:-<none>}"
+          if [ -n "$revision" ] && [ "$revision" != "$GITHUB_SHA" ]; then
+            echo "::error::the image's revision label is ${revision}, not this commit ${GITHUB_SHA}" >&2
+            exit 1
+          fi
+
       # CLI archives (so consumers get the SBOM without needing cosign).
       - name: Upload SBOM for the Release job
         uses: actions/upload-artifact@v7
@@ -398,6 +504,24 @@ jobs:
           - target: aarch64-unknown-linux-musl
             os: ubuntu-latest
             use_cross: true
+            archive: tar.gz
+          # macOS, built NATIVELY on Apple hardware rather than cross-compiled: the Apple SDK
+          # is not redistributable, so a Linux cross-build would need osxcross and a
+          # self-supplied SDK. A hosted runner per architecture costs nothing and avoids that
+          # entirely. `ring` (the one native-code dependency) builds with the runner's clang,
+          # and the CLI's unix-only paths are `#[cfg(unix)]`, which macOS satisfies.
+          #
+          # The label names a MAJOR version on purpose. `macos-13` was retired, and a job that
+          # names a runner label which no longer exists does not fail — it waits for a runner
+          # forever, which is a release that hangs rather than one that tells you why.
+          - target: aarch64-apple-darwin
+            os: macos-15
+            use_cross: false
+            archive: tar.gz
+          # Intel macOS. `macos-15-intel` is the live x86_64 label; the old `macos-13` is gone.
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+            use_cross: false
             archive: tar.gz
           # Windows: the MSVC dependency tree adds only schannel + windows-sys (pure-Rust
           # bindings to system libraries, no C build), and the CLI's few unix-only bits are

@@ -30,7 +30,7 @@ Useful knobs:
 
 ```bash
 # Pin a version instead of taking the newest release
-curl -fsSL …/install.sh | sh -s -- --version v0.2.0-rc.3
+curl -fsSL …/install.sh | sh -s -- --version v0.2.0-rc.4
 
 # Install somewhere specific
 curl -fsSL …/install.sh | SUTRA_INSTALL_DIR=~/bin sh
@@ -48,14 +48,15 @@ order worth trying:
 ```bash
 # 1. the SAME installer, served from the release instead of the raw CDN (different host, and
 #    the script is versioned with the binaries it installs)
-curl -fsSL https://github.com/startr-trade/sutra/releases/download/v0.2.0-rc.3/install.sh \
-  | sh -s -- --version v0.2.0-rc.3
+curl -fsSL https://github.com/startr-trade/sutra/releases/download/v0.2.0-rc.4/install.sh \
+  | sh -s -- --version v0.2.0-rc.4
 
 # 2. a token, which moves the API to 5000 requests an hour
 GH_TOKEN=$(gh auth token) curl -fsSL …/install.sh | sh
 
 # 3. no installer at all — the assets are plain files
-gh release download v0.2.0-rc.3 -R startr-trade/sutra \
+#    (swap in your target: aarch64-unknown-linux-musl, aarch64-apple-darwin, x86_64-apple-darwin)
+gh release download v0.2.0-rc.4 -R startr-trade/sutra \
   -p 'sutra-*-x86_64-unknown-linux-musl.tar.gz' -p SHA256SUMS
 sha256sum --ignore-missing -c SHA256SUMS
 tar xzf sutra-*-x86_64-unknown-linux-musl.tar.gz --strip-components=1 -C ~/.local/bin
@@ -78,12 +79,29 @@ sutra --version
 ```
 
 Published targets: **linux x86_64**, **linux aarch64** (both static musl — no glibc version
-to match), and **windows x86_64**. macOS builds from source for now.
+to match), **macOS arm64** and **macOS x86_64** (built natively on each architecture), and
+**windows x86_64**.
+
+On an Apple-silicon Mac running the installer under Rosetta 2, `uname -m` answers `x86_64`, so
+you get the Intel build — it runs, translated. Pass `--version` and fetch the
+`aarch64-apple-darwin` archive by hand if you want the native one.
+
+The macOS binaries are **unsigned and un-notarized**. That matters only for how you obtained
+them: a file downloaded by a *browser* carries `com.apple.quarantine`, and Gatekeeper refuses
+it until you clear the attribute —
+
+```bash
+xattr -d com.apple.quarantine ./sutra
+```
+
+— while an archive fetched by the installer (or any `curl`) has no such attribute and simply
+runs. The installer does not strip it for you: quietly removing a security attribute is not an
+installer's business.
 
 ## Get the engine image
 
 ```bash
-docker pull ghcr.io/startr-trade/sutra:0.2.0-rc.3
+docker pull ghcr.io/startr-trade/sutra:0.2.0-rc.4
 ```
 
 One generic image runs every application: behavior comes entirely from the deployment
