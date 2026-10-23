@@ -13,6 +13,43 @@ This is the changelog for the **Rust-native** engine (`rust/` workspace). It beg
 
 Nothing yet.
 
+## [0.3.0] — 2026-10-23
+
+**Minor, not patch**, because of the second item: it changes what an existing package returns to
+its caller.
+
+### Added
+
+- **A start event can select on codec-reported message attributes** — `<q:source
+  filterExpression>`, a FEEL predicate over attributes a codec reports per message, composing
+  with the message-type tiers by conjunction. Codecs declare their vocabulary through
+  `PayloadCodec::declared_attributes` (defaulted, so no codec is forced to change) and report
+  per-message facts through `DecodeResult.attributes`. `sutra lint` refuses a predicate reading a
+  key the bound codec can never emit, and refuses two subscribers it cannot prove disjoint.
+- **A message a flow produces is validated before it leaves** — the codec's decode step is its
+  validator, so the engine reads back what the flow produced. `<q:send codec>` / `<q:reply codec>`
+  state the governing contract. What may be INFERRED is asymmetric: a send infers the codec of the
+  channel it names, a reply infers nothing (a channel's codec is the contract its requests
+  satisfy, and a reply is a different message).
+- `sutra lint` classifies a template's own unrendered text against the governing codec and
+  compares it to `template-manifest.yaml` (`outputMessageType`, `outputAttributes`).
+
+### Changed
+
+- **A render is no longer a synchronous reply unless `<q:reply>` is declared.** `responseBody` is
+  the only slot the executor has for a render, so a terminal task rendering bytes for a
+  `<q:send>` filled it without asking to answer anyone — and since an on-persist ack began
+  carrying a flow's receipt, that made an asynchronous channel deliver the same message twice.
+  A package whose caller depended on the implicit reply will see its response body change.
+- Outbound validation is fail-closed by default on contract-bearing egress
+  (`SUTRA.OUTBOUND.VALIDATION_REJECT`); schema-less egress is unaffected.
+
+### Security
+
+- `zip` 8 → 9 (a high-severity archive-extraction advisory the engine is exposed to, since it
+  extracts `.sutra` archives), plus quinn-proto, rustls 0.23.46, rustls-webpki 0.103.16,
+  webpki-roots/root-certs and ctutils 0.4.5 (RUSTSEC-2026-0385).
+
 ## [0.2.0-rc.4] - 2026-10-12
 
 ### Added — macOS CLI binaries, both architectures
@@ -425,7 +462,8 @@ examples) on tier-2 (Testcontainers) and tier-3 (k8s) at each phase gate.
 - The generated binding crate (707k lines) is excluded from routine `make test` /
   `make lint`; its own gates run via `make test-generated` only after a regeneration.
 
-[Unreleased]: https://github.com/startr-trade/sutra/compare/v0.2.0-rc.4...HEAD
+[Unreleased]: https://github.com/startr-trade/sutra/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/startr-trade/sutra/releases/tag/v0.3.0
 [0.2.0-rc.4]: https://github.com/startr-trade/sutra/releases/tag/v0.2.0-rc.4
 [0.2.0-rc.3]: https://github.com/startr-trade/sutra/releases/tag/v0.2.0-rc.3
 [0.2.0-rc.2]: https://github.com/startr-trade/sutra/releases/tag/v0.2.0-rc.2
