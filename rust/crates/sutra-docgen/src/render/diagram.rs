@@ -218,6 +218,13 @@ fn classify(n: &Node) -> Visual<'_> {
             v.task_icon = "user";
             v
         }
+        // BPMN draws a receive task with a (non-throwing) message envelope — the same marker as
+        // a message catch event, on a task shape, which is exactly what it is.
+        Node::ReceiveTask { name, .. } => {
+            let mut v = base(Class::Task, opt(name));
+            v.task_icon = "message";
+            v
+        }
         Node::CallActivity { name, .. } => {
             let mut v = base(Class::Task, opt(name));
             v.thick = true;
@@ -246,6 +253,13 @@ fn classify(n: &Node) -> Visual<'_> {
             v
         }
         Node::ExclusiveGateway { name, .. } => base(Class::Gateway, opt(name)),
+        // BPMN marks the event-based gateway with a message pentagon inside a double ring; the
+        // closest marker this renderer has is the message icon on a gateway shape.
+        Node::EventBasedGateway { name, .. } => {
+            let mut v = base(Class::Gateway, opt(name));
+            v.icon = "message";
+            v
+        }
         Node::InclusiveGateway { name, .. } => {
             let mut v = base(Class::Gateway, opt(name));
             v.gateway = Gw::Inclusive;

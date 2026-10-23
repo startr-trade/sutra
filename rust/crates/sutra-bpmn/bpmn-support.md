@@ -27,7 +27,7 @@ parks iff its inner/wrapped flow does.
 | `<endEvent>` + `<terminateEventDefinition>` | `TerminateEndEvent` | no | Ends the whole instance, not just this token. |
 | `<endEvent>` + `<errorEventDefinition>` | `ErrorEvent` | no | Throws a BPMN error for a boundary / event sub-process to catch. An empty code means "any error". |
 | `<endEvent>` + `<cancelEventDefinition>` | `CancelEndEvent` | no | Valid only inside a `<transaction>` — rolls its store transaction back. |
-| `<intermediateThrowEvent>` | `IntermediateThrowEvent` | no | Emit-and-continue. `ThrowKind` selects the flavour: none, compensate, message, signal, escalation, link. A message throw requires `<q:send>`. |
+| `<intermediateThrowEvent>` / `<implicitThrowEvent>` | `IntermediateThrowEvent` | no | Emit-and-continue. `ThrowKind` selects the flavour: none, compensate, message, signal, escalation, link. A message throw requires `<q:send>`. |
 | `<intermediateCatchEvent>` + `<linkEventDefinition>` | `LinkCatchEvent` | no | The synchronous goto target of a link throw — a jump, not a park. Each link name must have exactly one catch. |
 | `<intermediateCatchEvent>` + `<messageEventDefinition>` | `MessageCatchEvent` | **yes** | Parks until a correlated inbound arrives on one of its channels. Correlation is by `<q:alias>`. |
 | `<intermediateCatchEvent>` + `<timerEventDefinition>` | `TimerCatchEvent` | **yes** | Parks a durable TIMER `waiting_event` row due at the resolved instant. `<timeDuration>` and `<timeDate>` only — `<timeCycle>` is rejected here (a token cannot park at a node that fires repeatedly). |
@@ -35,7 +35,8 @@ parks iff its inner/wrapped flow does.
 | `<serviceTask implementation="…">` | `ServiceTask` | **when** `@implementation` starts with `channel:` | Routed on `@implementation` by task-kind precedence. A `channel:`-prefixed implementation is a channel call: it parks until the correlated response (or its `<q:timeout>` boundary). Anything else is a registered task or a template, and runs inline. |
 | `<serviceTask>` with data associations, no `@implementation` | `DataTask` | no | Declarative: its store reads, FEEL assignments and store writes ARE its behaviour. No registered task is resolved. |
 | `<scriptTask>` + `<script>` | `ScriptTask` | no | `<bpmn:script>` names a file in the module's `scripts/` folder (SRL). |
-| `<manualTask>` | `ManualTask` | no | A pure no-op pass-through — a modelling marker, not a wait state. |
+| `<manualTask>` / `<task>` | `ManualTask` | no | A pure no-op pass-through — a modelling marker, not a wait state. BPMN's UNTYPED `<task>` loads here too: with no type there is no behaviour to run, which is what this already is. `sutra lint` warns on `<task>`, since an author who meant a concrete task type wants telling. |
+| `<receiveTask>` | `ReceiveTask` | **yes** | Parks until a correlated inbound arrives on one of its `<q:source>` channels — the same park as a message catch event, but as an ACTIVITY it can host boundary events. That is how BPMN says "wait for this message, or time out": attach an interrupting timer boundary. `@instantiate="true"` is rejected — an instantiating receive is a start event's job. |
 | `<sendTask>` | `SendTask` | no | Emit-and-continue; its `<q:send>` is required (enforced at load). |
 | `<businessRuleTask>` | `BusinessRuleTask` | no | Evaluates a DMN decision file and merges the result into the variables. |
 | `<userTask>` | `UserTask` | **yes** | Parks until an external relay resumes the instance on one of its channels. |
@@ -44,6 +45,7 @@ parks iff its inner/wrapped flow does.
 | `<transaction>` | `TransactionSubProcess` | inherited | One store transaction around the inner flow; a `<cancelEventDefinition>` end rolls it back. |
 | `<adHocSubProcess>` | `AdHocSubProcess` | no | Activities with no enforced sequence flow, run in document order until a FEEL `<completionCondition>` holds. |
 | `<subProcess triggeredByEvent="true">` | `EventSubProcess` | no | ERROR-TRIGGERED ONLY. Fires when an error escapes an activity in its enclosing scope and no boundary event catches it. Message/timer/signal triggers are rejected — those are wait states, so model them on the stateful surface instead. |
+| `<eventBasedGateway>` | `EventBasedGateway` | no | Races its outgoing arms: the FIRST to fire wins and the losing arms are retired in the same transaction that advances the winner. The gateway itself does not park — it arms its TARGETS, which are already wait states, so one token enters and one leaves. Every arm must be a catch event or a `<receiveTask>` (an arm that does not wait would resolve instantly and make the others unreachable), and at least two are required. `Exclusive` and non-instantiating only: `eventGatewayType="Parallel"` and `@instantiate="true"` are rejected. |
 | `<exclusiveGateway>` | `ExclusiveGateway` | no | XOR. At most one outgoing flow fires, chosen by FEEL condition in document order, with `@default` as the fallback. |
 | `<inclusiveGateway>` | `InclusiveGateway` | no | OR-fork / OR-join. |
 | `<parallelGateway>` | `ParallelGateway` | no | AND-fork / AND-join. |
@@ -57,10 +59,6 @@ The loader fails closed on these rather than ignoring them — diagnostic `SUTRA
 
 | BPMN 2.0 XML | Model it instead as |
 |---|---|
-| `<task>` | An abstract task has no behaviour to execute — pick a concrete task type. |
-| `<receiveTask>` | Use `<intermediateCatchEvent>` + `<messageEventDefinition>`, or a `<userTask>`. |
-| `<eventBasedGateway>` | Racing wait states are not modelled; park on one catch event. |
-| `<implicitThrowEvent>` | Use `<intermediateThrowEvent>`. |
 | `<event>` | The abstract base element is not a concrete flow node. |
 
 ## Accepted but inert

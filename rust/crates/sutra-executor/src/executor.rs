@@ -691,10 +691,14 @@ impl TokenExecutor {
                 id,
                 kind: BoundaryKind::Timer,
                 attached_to_ref,
+                interrupting,
+                timer,
                 ..
             }) => Some(FiredTimer {
                 boundary_id: id.clone(),
                 host_id: attached_to_ref.clone(),
+                interrupting: *interrupting,
+                timer: timer.clone(),
             }),
             Ok(Node::TimerCatchEvent { .. }) => None,
             Ok(other) => {
@@ -1143,7 +1147,9 @@ impl TokenExecutor {
                 self.emit_send_if_bound(id, state, true)?;
                 self.enqueue_outgoing(node_id, state);
             }
-            Node::UserTask { id, .. } | Node::MessageCatchEvent { id, .. } => {
+            Node::UserTask { id, .. }
+            | Node::MessageCatchEvent { id, .. }
+            | Node::ReceiveTask { id, .. } => {
                 // Wait state (S-X1/S-X2): the token PARKS. A satisfied wait node is
                 // short-circuited by the prior_completed fast-path above; reaching this arm
                 // means the branch suspends here until a relay resumes the instance. The
@@ -1151,14 +1157,33 @@ impl TokenExecutor {
                 // not leave) and the node is not marked visited (waiting, not done).
                 // `execute_sync` rejects wait-state processes up-front, so on the sync path
                 // this arm is unreachable.
-                // An INTERRUPTING timer boundary that fired on this host cancels the
-                // wait and routes the token out through the boundary instead.
-                if let Some(fired) = state.take_fired_timer_for(id) {
-                    self.route_timer_boundary(&fired.boundary_id, id, state)?;
-                } else {
-                    state.waiting.push(id.clone());
-                    self.schedule_timer_boundaries(id, state)?;
-                    left_handled = true;
+                // A fired timer boundary on this host is handled per its own kind.
+                //
+                // INTERRUPTING (BPMN's default): the fire cancels the wait and the token leaves
+                // through the boundary instead.
+                //
+                // NON-interrupting (`@cancelActivity="false"`): the host KEEPS waiting and a
+                // second token goes down the boundary's path — BPMN's escalate-while-waiting
+                // shape. The instance then holds two live tokens, which is not new ground: a
+                // parallel gateway produces exactly that, and `waiting` is a Vec because of it.
+                match state.take_fired_timer_for(id) {
+                    Some(fired) if fired.interrupting => {
+                        self.route_timer_boundary(&fired.boundary_id, id, state)?;
+                    }
+                    Some(fired) => {
+                        self.route_non_interrupting_boundary(&fired.boundary_id, state);
+                        state.waiting.push(id.clone());
+                        // Re-arm before marking the park, so a recurring boundary gets its next
+                        // occurrence from the SAME pass that consumed this one.
+                        self.rearm_fired_boundary(&fired, state)?;
+                        self.schedule_timer_boundaries(id, state)?;
+                        left_handled = true;
+                    }
+                    None => {
+                        state.waiting.push(id.clone());
+                        self.schedule_timer_boundaries(id, state)?;
+                        left_handled = true;
+                    }
                 }
             }
             // Intermediate timer catch: the token parks on a durable TIMER
@@ -1314,6 +1339,32 @@ impl TokenExecutor {
                 ThrowKind::Link => self.jump_to_link_catch(id, reference.as_deref(), state)?,
                 ThrowKind::None => self.enqueue_outgoing(node_id, state),
             },
+            // An event-based gateway parks its ARMS, not itself: each outgoing target becomes a
+            // wait position and the gateway is done. One token entered; one token will leave,
+            // through whichever arm fires first. The losing arms are retired at the resume
+            // boundary (`resolved_waits_for`), in the SAME transaction that advances the winner —
+            // which is what keeps this a race rather than a fork into N independent tokens.
+            Node::EventBasedGateway { id, .. } => {
+                for flow in state.process.outgoing(id) {
+                    let target = flow.target_ref.clone();
+                    if state.prior_completed.contains(&target) {
+                        // This arm already won on an earlier pass; nothing to re-arm.
+                        continue;
+                    }
+                    if !state.waiting.contains(&target) {
+                        state.waiting.push(target.clone());
+                    }
+                    // A timer arm needs its durable row; a message arm is satisfied by a relay
+                    // and needs none.
+                    if let Ok(Node::TimerCatchEvent { timer, .. }) = state.process.node(&target) {
+                        if !state.prior_waiting.contains(&target) {
+                            let due_at = self.compute_due_at(timer, &target)?;
+                            self.record_timer_wait(&target, due_at, state);
+                        }
+                    }
+                }
+                left_handled = true;
+            }
             Node::LinkCatchEvent { .. } => self.enqueue_outgoing(node_id, state),
             Node::ErrorEvent { id, error_code, .. } => {
                 // Throwing an error end-event — propagate up to a matching boundary event.
@@ -1970,6 +2021,76 @@ impl TokenExecutor {
         }
         state.visited.insert(boundary_id.to_string());
         Ok(())
+    }
+
+    /// Route a fired NON-interrupting timer boundary: the boundary's outgoing flows fire and the
+    /// host is left alone.
+    ///
+    /// Deliberately not `route_timer_boundary`: that one raises
+    /// `SUTRA.DISPATCH.CHANNEL_CALL.TIMEOUT` when the boundary has no outgoing flow, which is
+    /// right for an interrupting timeout (the wait was cancelled, so SOMETHING must happen) and
+    /// wrong here. A non-interrupting boundary with nowhere to go is a modelling no-op: the host
+    /// is still waiting and nothing was cancelled, so turning it into a BPMN error would fail an
+    /// instance over a diagram nicety.
+    fn route_non_interrupting_boundary(&self, boundary_id: &str, state: &mut ExecutionState<'_>) {
+        for flow in state.process.outgoing(boundary_id) {
+            state.fire(flow);
+        }
+        // NOT marked visited: a recurring boundary must stay re-enterable, and `visited` is the
+        // replay-as-done set. `rearm_fired_boundary` decides whether another occurrence follows.
+    }
+
+    /// Re-arm a fired non-interrupting boundary for its next occurrence, when it recurs.
+    ///
+    /// A single-shot (`<timeDuration>` / `<timeDate>`) boundary is done once it has fired, so
+    /// this is a no-op for it. A `<timeCycle>` one asks
+    /// [`sutra_bpmn::timer::advance_cycle`] for the next instant — the same function the
+    /// deployment schedule poller uses, so a boundary cycle and a start-event cycle share one
+    /// catch-up policy rather than growing a second: each claim fires exactly once, elapsed slots
+    /// are skipped rather than replayed as a burst, and each skipped slot still spends a repeat.
+    ///
+    /// The remaining-repeat budget is derived from how many times this boundary has already
+    /// fired in this instance, which the completed-occurrence count carries — the alternative,
+    /// a durable per-boundary counter, would be a second source of truth for the same fact.
+    fn rearm_fired_boundary(
+        &self,
+        fired: &FiredTimer,
+        state: &mut ExecutionState<'_>,
+    ) -> Result<(), Signal> {
+        let Some(sutra_bpmn::timer::TimerDefinition::Cycle(spec)) = &fired.timer else {
+            return Ok(()); // single-shot: it has fired, so it is spent
+        };
+        // Unbounded only, enforced at load: a bounded `R<n>` on a boundary would need the
+        // remaining budget to survive the host's park, which means durable per-instance state
+        // (the shape `retry_attempts` has) and a snapshot format change. The loader rejects it
+        // instead, so reaching here with a budget is impossible and nothing has to guess.
+        debug_assert!(
+            spec.repeats.is_none(),
+            "a bounded cycle on a boundary is rejected at load"
+        );
+        let remaining = None;
+        let now = time::OffsetDateTime::parse(
+            &(self.now_supplier)(),
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap_or_else(|_| time::OffsetDateTime::now_utc());
+        // The occurrence that just fired is the one we advance past.
+        let fired_due = now;
+        match sutra_bpmn::timer::advance_cycle(spec, fired_due, remaining, now) {
+            Ok(sutra_bpmn::timer::TimerCycleAdvance::Next { due_at, .. }) => {
+                let due = sutra_bpmn::timer::format_instant(due_at);
+                self.record_timer_wait(&fired.boundary_id, due, state);
+                Ok(())
+            }
+            Ok(sutra_bpmn::timer::TimerCycleAdvance::Exhausted) => Ok(()),
+            Err(rejection) => Err(fatal_diag(
+                codes::RUNTIME_UNEXPECTED,
+                format!(
+                    "recurring boundary '{}' could not advance its cycle: {rejection}",
+                    fired.boundary_id
+                ),
+            )),
+        }
     }
 
     /// Compute the RFC 3339 due-at of a timer being ARMED right now.
@@ -4400,6 +4521,13 @@ struct ExecutionState<'p> {
 struct FiredTimer {
     boundary_id: String,
     host_id: String,
+    /// BPMN `@cancelActivity`. Carried on the fired record rather than re-derived at the park
+    /// arm so the decision is made once, where the boundary node is already in hand.
+    interrupting: bool,
+    /// The boundary's own timer spec, carried for the same reason: a recurring
+    /// (`<timeCycle>`) non-interrupting boundary needs it to compute its NEXT occurrence at the
+    /// moment this one is consumed.
+    timer: Option<sutra_bpmn::timer::TimerDefinition>,
 }
 
 /// The channel-call task-failure marker a [`TokenExecutor::resume_channel_call_failure`] pass
@@ -4957,6 +5085,8 @@ fn node_type(node: &Node) -> &'static str {
         Node::ErrorEvent { .. } => "errorEndEvent",
         Node::IntermediateThrowEvent { .. } => "intermediateThrowEvent",
         Node::MessageCatchEvent { .. } => "intermediateCatchEvent",
+        Node::ReceiveTask { .. } => "receiveTask",
+        Node::EventBasedGateway { .. } => "eventBasedGateway",
         Node::TimerCatchEvent { .. } => "intermediateCatchEvent",
         Node::LinkCatchEvent { .. } => "intermediateCatchEvent",
         Node::BoundaryEvent { .. } => "boundaryEvent",

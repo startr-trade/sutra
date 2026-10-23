@@ -476,8 +476,13 @@ fn bpmn_timer_boundary_on_channel_call_satisfies_the_requirement() {
     ));
 }
 
+/// Inverted 2026-10-23: a non-interrupting timer boundary used to be rejected
+/// (`DISPATCH_TIMER_UNSUPPORTED`, "only INTERRUPTING timer boundaries are supported"). It is now
+/// a supported form — the host keeps waiting and each firing sends a token down the boundary's
+/// path, which is BPMN's escalate-while-waiting shape. The assertion is kept rather than deleted
+/// because the FLAG reaching the model is the thing the executor branches on.
 #[test]
-fn non_interrupting_timer_boundary_is_rejected() {
+fn a_non_interrupting_timer_boundary_loads_and_carries_its_flag() {
     let bpmn = defs(&format!(
         r#"
         <bpmn:startEvent id="S"/>
@@ -491,8 +496,19 @@ fn non_interrupting_timer_boundary_is_rejected() {
         <bpmn:sequenceFlow id="f1" sourceRef="S" targetRef="Call"/>
         <bpmn:sequenceFlow id="f2" sourceRef="Call" targetRef="E"/>"#
     ));
-    let e = load(&bpmn).unwrap_err();
-    assert_eq!(e.code, "SUTRA.DISPATCH.TIMER.UNSUPPORTED", "{e}");
+    let module = load(&bpmn).expect("a non-interrupting timer boundary is a supported form");
+    let process = &module.processes()[0];
+    assert!(
+        matches!(
+            process.node("B").unwrap(),
+            Node::BoundaryEvent {
+                kind: BoundaryKind::Timer,
+                interrupting: false,
+                ..
+            }
+        ),
+        "the park arm routes on this flag, so it has to survive the load"
+    );
 }
 
 #[test]

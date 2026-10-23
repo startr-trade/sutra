@@ -190,7 +190,11 @@ fn send_task_without_send_is_rejected() {
 }
 
 #[test]
-fn event_based_gateway_is_also_rejected() {
+/// Repurposed 2026-10-23: the gateway itself now loads, but this shape stays rejected for a
+/// different and better reason — its single arm goes straight to an end event, which does not
+/// park. An arm that does not wait resolves instantly and makes every other arm unreachable, so
+/// a one-armed race is a modelling mistake rather than a race.
+fn event_based_gateway_with_a_non_parking_arm_is_rejected() {
     let xml = process_body(
         r#"<bpmn:startEvent id="S"/>
            <bpmn:eventBasedGateway id="EBG"/>
@@ -455,4 +459,523 @@ fn a_sub_process_sees_the_parent_process_data_objects() {
         "resolved through the parent's <dataObject>"
     );
     assert_eq!(write.key_expression, "entry.id");
+}
+
+// ---- BPMN's untyped <task> and <implicitThrowEvent> -----------------------------------------
+//
+// Both are CONCRETE types in the BPMN 2.0 XSD (`tTask` and `tImplicitThrowEvent` are not
+// abstract, unlike `tEvent`), so refusing them rejected conformant models and broke round trips
+// from modelling tools. They now load onto the behaviour they already had: an untyped task has
+// no behaviour to run, which is what `<manualTask>` is, and an implicit throw does what an
+// intermediate throw does — the spec distinguishes how it is REACHED, not what it does.
+
+const UNTYPED_TASK_BPMN: &str = r#"<?xml version="1.0"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0">
+  <bpmn:process id="p">
+    <bpmn:startEvent id="S">
+      <bpmn:extensionElements><q:source channel="c"/></bpmn:extensionElements>
+      <bpmn:outgoing>f1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:task id="T"><bpmn:incoming>f1</bpmn:incoming><bpmn:outgoing>f2</bpmn:outgoing></bpmn:task>
+    <bpmn:manualTask id="M"><bpmn:incoming>f2</bpmn:incoming><bpmn:outgoing>f3</bpmn:outgoing></bpmn:manualTask>
+    <bpmn:endEvent id="E"><bpmn:incoming>f3</bpmn:incoming></bpmn:endEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="S" targetRef="T"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="T" targetRef="M"/>
+    <bpmn:sequenceFlow id="f3" sourceRef="M" targetRef="E"/>
+  </bpmn:process>
+</bpmn:definitions>"#;
+
+#[test]
+fn an_untyped_task_loads_as_a_pass_through_and_records_that_it_was_untyped() {
+    let module = BpmnModelLoader::new()
+        .load(UNTYPED_TASK_BPMN.as_bytes())
+        .expect("an untyped <task> is conformant BPMN and must load");
+    let process = &module.processes()[0];
+
+    let spellings: Vec<(&str, bool)> = process
+        .nodes()
+        .iter()
+        .filter_map(|n| match n {
+            Node::ManualTask { id, untyped, .. } => Some((id.as_str(), *untyped)),
+            _ => None,
+        })
+        .collect();
+
+    // Both load onto the same variant — identical behaviour — but the authored spelling is kept,
+    // because that is the only channel from the parse to lint's advisory (the loader has no
+    // warning channel of its own).
+    assert_eq!(
+        spellings,
+        vec![("T", true), ("M", false)],
+        "both spellings load as a pass-through, and which one the author wrote is recorded"
+    );
+}
+
+#[test]
+fn an_implicit_throw_event_loads_as_an_intermediate_throw() {
+    const BPMN: &str = r#"<?xml version="1.0"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0">
+  <bpmn:process id="p">
+    <bpmn:startEvent id="S">
+      <bpmn:extensionElements><q:source channel="c"/></bpmn:extensionElements>
+      <bpmn:outgoing>f1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:implicitThrowEvent id="X"><bpmn:incoming>f1</bpmn:incoming><bpmn:outgoing>f2</bpmn:outgoing></bpmn:implicitThrowEvent>
+    <bpmn:endEvent id="E"><bpmn:incoming>f2</bpmn:incoming></bpmn:endEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="S" targetRef="X"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="X" targetRef="E"/>
+  </bpmn:process>
+</bpmn:definitions>"#;
+
+    let module = BpmnModelLoader::new()
+        .load(BPMN.as_bytes())
+        .expect("<implicitThrowEvent> is conformant BPMN and must load");
+    let process = &module.processes()[0];
+    assert!(
+        process
+            .nodes()
+            .iter()
+            .any(|n| matches!(n, Node::IntermediateThrowEvent { id, .. } if id == "X")),
+        "an implicit throw is an intermediate throw: {:?}",
+        process.nodes().iter().map(|n| n.id()).collect::<Vec<_>>()
+    );
+}
+
+/// `tEvent` IS `abstract="true"` in the BPMN 2.0 XSD — `<event>` is only the substitution-group
+/// head, so no conformant document can use it as a flow node and there is nothing to implement.
+/// Pinned so a later sweep over "unsupported elements" does not helpfully accept it.
+#[test]
+fn the_abstract_event_element_stays_rejected() {
+    const BPMN: &str = r#"<?xml version="1.0"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0">
+  <bpmn:process id="p">
+    <bpmn:startEvent id="S">
+      <bpmn:extensionElements><q:source channel="c"/></bpmn:extensionElements>
+      <bpmn:outgoing>f1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:event id="V"><bpmn:incoming>f1</bpmn:incoming></bpmn:event>
+    <bpmn:sequenceFlow id="f1" sourceRef="S" targetRef="V"/>
+  </bpmn:process>
+</bpmn:definitions>"#;
+
+    let err = BpmnModelLoader::new()
+        .load(BPMN.as_bytes())
+        .expect_err("<event> is the abstract base element, not a flow node");
+    assert_eq!(err.code, sutra_bpmn::codes::CONFIG_BPMN_UNSUPPORTED_ELEMENT);
+}
+
+// ---- <receiveTask> --------------------------------------------------------------------------
+//
+// It parks on a message exactly as a message catch event does. The reason to support it anyway
+// is that it is an ACTIVITY: a boundary event can attach, which is how BPMN says "wait for this
+// message, or time out". An event cannot host a boundary, so the catch event can never express
+// that shape — today the only route to it is a channel-call service task, which needs a request
+// leg the model may not have.
+
+#[test]
+fn a_receive_task_parks_on_its_source_channel() {
+    const BPMN: &str = r#"<?xml version="1.0"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0">
+  <bpmn:process id="p">
+    <bpmn:startEvent id="S">
+      <bpmn:extensionElements><q:source channel="in"/></bpmn:extensionElements>
+      <bpmn:outgoing>f1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:receiveTask id="R" name="Await settlement" messageRef="Settled">
+      <bpmn:extensionElements><q:source channel="responses"/></bpmn:extensionElements>
+      <bpmn:incoming>f1</bpmn:incoming><bpmn:outgoing>f2</bpmn:outgoing>
+    </bpmn:receiveTask>
+    <bpmn:endEvent id="E"><bpmn:incoming>f2</bpmn:incoming></bpmn:endEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="S" targetRef="R"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="R" targetRef="E"/>
+  </bpmn:process>
+</bpmn:definitions>"#;
+
+    let module = BpmnModelLoader::new().load(BPMN.as_bytes()).expect("loads");
+    let process = &module.processes()[0];
+    let node = process
+        .nodes()
+        .iter()
+        .find(|n| n.id() == "R")
+        .expect("the receive task is a flow node");
+
+    match node {
+        Node::ReceiveTask {
+            name,
+            channels,
+            message_ref,
+            ..
+        } => {
+            assert_eq!(name.as_deref(), Some("Await settlement"));
+            assert_eq!(channels, &vec!["responses".to_string()]);
+            assert_eq!(message_ref.as_deref(), Some("Settled"));
+        }
+        other => panic!("expected a ReceiveTask, got {other:?}"),
+    }
+    assert!(
+        node.is_wait_state(),
+        "a receive task parks — which also makes the process ineligible for execute_sync"
+    );
+}
+
+/// The point of the variant: a timer boundary may attach, which a message catch event could
+/// never host. Before this, the only way to model "wait or time out" was a channel-call service
+/// task, which requires a request leg.
+#[test]
+fn a_timer_boundary_may_attach_to_a_receive_task() {
+    const BPMN: &str = r#"<?xml version="1.0"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0">
+  <bpmn:process id="p">
+    <bpmn:startEvent id="S">
+      <bpmn:extensionElements><q:source channel="in"/></bpmn:extensionElements>
+      <bpmn:outgoing>f1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:receiveTask id="R">
+      <bpmn:extensionElements><q:source channel="responses"/></bpmn:extensionElements>
+      <bpmn:incoming>f1</bpmn:incoming><bpmn:outgoing>f2</bpmn:outgoing>
+    </bpmn:receiveTask>
+    <bpmn:boundaryEvent id="B" attachedToRef="R">
+      <bpmn:timerEventDefinition><bpmn:timeDuration>PT30M</bpmn:timeDuration></bpmn:timerEventDefinition>
+      <bpmn:outgoing>f3</bpmn:outgoing>
+    </bpmn:boundaryEvent>
+    <bpmn:endEvent id="E"><bpmn:incoming>f2</bpmn:incoming></bpmn:endEvent>
+    <bpmn:endEvent id="T"><bpmn:incoming>f3</bpmn:incoming></bpmn:endEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="S" targetRef="R"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="R" targetRef="E"/>
+    <bpmn:sequenceFlow id="f3" sourceRef="B" targetRef="T"/>
+  </bpmn:process>
+</bpmn:definitions>"#;
+
+    BpmnModelLoader::new()
+        .load(BPMN.as_bytes())
+        .expect("a receive task is a wait-capable boundary host");
+}
+
+#[test]
+fn a_receive_task_without_a_source_channel_is_rejected() {
+    const BPMN: &str = r#"<?xml version="1.0"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0">
+  <bpmn:process id="p">
+    <bpmn:startEvent id="S">
+      <bpmn:extensionElements><q:source channel="in"/></bpmn:extensionElements>
+      <bpmn:outgoing>f1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:receiveTask id="R"><bpmn:incoming>f1</bpmn:incoming><bpmn:outgoing>f2</bpmn:outgoing></bpmn:receiveTask>
+    <bpmn:endEvent id="E"><bpmn:incoming>f2</bpmn:incoming></bpmn:endEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="S" targetRef="R"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="R" targetRef="E"/>
+  </bpmn:process>
+</bpmn:definitions>"#;
+
+    // A park with no channel could never be satisfied — fail closed rather than load a process
+    // that stops forever at R.
+    let err = BpmnModelLoader::new()
+        .load(BPMN.as_bytes())
+        .expect_err("a receive task must name the channel it waits on");
+    assert_eq!(err.code, sutra_bpmn::codes::CONFIG_BPMN_UNSUPPORTED_ELEMENT);
+    assert!(
+        err.message.contains("q:source"),
+        "the diagnostic must name what is missing: {}",
+        err.message
+    );
+}
+
+/// `@instantiate="true"` makes a receive task a process-INSTANTIATION point, an alternative to a
+/// start event. That is a different contract — it needs the intake-selection surface a start
+/// event has — so it is refused explicitly. Silently ignoring the attribute would load a model
+/// that can never start.
+#[test]
+fn an_instantiating_receive_task_is_refused_explicitly() {
+    const BPMN: &str = r#"<?xml version="1.0"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0">
+  <bpmn:process id="p">
+    <bpmn:receiveTask id="R" instantiate="true">
+      <bpmn:extensionElements><q:source channel="in"/></bpmn:extensionElements>
+      <bpmn:outgoing>f1</bpmn:outgoing>
+    </bpmn:receiveTask>
+    <bpmn:endEvent id="E"><bpmn:incoming>f1</bpmn:incoming></bpmn:endEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="R" targetRef="E"/>
+  </bpmn:process>
+</bpmn:definitions>"#;
+
+    let err = BpmnModelLoader::new()
+        .load(BPMN.as_bytes())
+        .expect_err("an instantiating receive task is a start event's job");
+    assert!(
+        err.message.contains("instantiate") && err.message.contains("startEvent"),
+        "the diagnostic must say what to model instead: {}",
+        err.message
+    );
+}
+
+// ---- non-interrupting timer boundaries, and recurring ones --------------------------------
+//
+// BPMN's escalate-while-waiting shape: the host keeps waiting and each firing sends a token down
+// the boundary's path. Previously the loader refused `cancelActivity="false"` on a timer boundary
+// outright, so the shape could not be modelled at all.
+
+fn with_boundary(attrs: &str, timer_child: &str) -> String {
+    format!(
+        r#"<?xml version="1.0"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0">
+  <bpmn:process id="p">
+    <bpmn:startEvent id="S">
+      <bpmn:extensionElements><q:source channel="in"/></bpmn:extensionElements>
+      <bpmn:outgoing>f1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:userTask id="H"><bpmn:incoming>f1</bpmn:incoming><bpmn:outgoing>f2</bpmn:outgoing></bpmn:userTask>
+    <bpmn:boundaryEvent id="B" attachedToRef="H" {attrs}>
+      <bpmn:timerEventDefinition>{timer_child}</bpmn:timerEventDefinition>
+      <bpmn:outgoing>f3</bpmn:outgoing>
+    </bpmn:boundaryEvent>
+    <bpmn:endEvent id="E"><bpmn:incoming>f2</bpmn:incoming></bpmn:endEvent>
+    <bpmn:endEvent id="T"><bpmn:incoming>f3</bpmn:incoming></bpmn:endEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="S" targetRef="H"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="H" targetRef="E"/>
+    <bpmn:sequenceFlow id="f3" sourceRef="B" targetRef="T"/>
+  </bpmn:process>
+</bpmn:definitions>"#
+    )
+}
+
+#[test]
+fn a_non_interrupting_timer_boundary_loads() {
+    let module = BpmnModelLoader::new()
+        .load(
+            with_boundary(
+                r#"cancelActivity="false""#,
+                "<bpmn:timeDuration>PT30M</bpmn:timeDuration>",
+            )
+            .as_bytes(),
+        )
+        .expect("cancelActivity=\"false\" on a timer boundary is now a supported form");
+    let process = &module.processes()[0];
+    let b = process
+        .nodes()
+        .iter()
+        .find(|n| n.id() == "B")
+        .expect("boundary");
+    assert!(
+        matches!(
+            b,
+            Node::BoundaryEvent {
+                interrupting: false,
+                ..
+            }
+        ),
+        "the flag must reach the model — the executor branches on it: {b:?}"
+    );
+}
+
+#[test]
+fn an_unbounded_cycle_is_allowed_on_a_non_interrupting_boundary() {
+    BpmnModelLoader::new()
+        .load(
+            with_boundary(
+                r#"cancelActivity="false""#,
+                "<bpmn:timeCycle>R/PT2H</bpmn:timeCycle>",
+            )
+            .as_bytes(),
+        )
+        .expect("the escalate-every-N-hours shape");
+}
+
+/// A bounded `R<n>` would need its remaining budget to survive the host's park, which means
+/// durable per-instance state (the shape `retry_attempts` has) and a snapshot format change.
+/// Refused loudly rather than silently firing forever on a spec that asked for three.
+#[test]
+fn a_bounded_cycle_is_refused_on_a_boundary() {
+    let err = BpmnModelLoader::new()
+        .load(
+            with_boundary(
+                r#"cancelActivity="false""#,
+                "<bpmn:timeCycle>R3/PT2H</bpmn:timeCycle>",
+            )
+            .as_bytes(),
+        )
+        .expect_err("a repeat budget cannot survive the park yet");
+    assert_eq!(err.code, sutra_bpmn::codes::DISPATCH_TIMER_UNSUPPORTED);
+    assert!(
+        err.message.contains("R/<interval>"),
+        "the diagnostic must name the supported form: {}",
+        err.message
+    );
+}
+
+/// An INTERRUPTING cycle stays rejected, and for a reason the diagnostic now states: the first
+/// firing cancels the host, so later occurrences could never be reached.
+#[test]
+fn a_cycle_on_an_interrupting_boundary_is_still_rejected() {
+    let err = BpmnModelLoader::new()
+        .load(with_boundary("", "<bpmn:timeCycle>R/PT2H</bpmn:timeCycle>").as_bytes())
+        .expect_err("an interrupting boundary fires once by construction");
+    assert_eq!(err.code, sutra_bpmn::codes::DISPATCH_TIMER_UNSUPPORTED);
+    assert!(
+        err.message.contains("INTERRUPTING"),
+        "the diagnostic must distinguish the two boundary kinds: {}",
+        err.message
+    );
+}
+
+/// And on an intermediate catch, where the token parks exactly once.
+#[test]
+fn a_cycle_on_an_intermediate_catch_is_still_rejected() {
+    const BPMN: &str = r#"<?xml version="1.0"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0">
+  <bpmn:process id="p">
+    <bpmn:startEvent id="S">
+      <bpmn:extensionElements><q:source channel="in"/></bpmn:extensionElements>
+      <bpmn:outgoing>f1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:intermediateCatchEvent id="C">
+      <bpmn:timerEventDefinition><bpmn:timeCycle>R/PT2H</bpmn:timeCycle></bpmn:timerEventDefinition>
+      <bpmn:incoming>f1</bpmn:incoming><bpmn:outgoing>f2</bpmn:outgoing>
+    </bpmn:intermediateCatchEvent>
+    <bpmn:endEvent id="E"><bpmn:incoming>f2</bpmn:incoming></bpmn:endEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="S" targetRef="C"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="C" targetRef="E"/>
+  </bpmn:process>
+</bpmn:definitions>"#;
+    let err = BpmnModelLoader::new()
+        .load(BPMN.as_bytes())
+        .expect_err("a token parks at a catch exactly once");
+    assert_eq!(err.code, sutra_bpmn::codes::DISPATCH_TIMER_UNSUPPORTED);
+}
+
+// ---- <eventBasedGateway> — the race -------------------------------------------------------
+//
+// The gateway does not park: it arms its TARGETS, which are already wait states, so one token
+// enters and one leaves. First-wins is enforced at the resume boundary by retiring the losing
+// arms in the same transaction that advances the winner — see `resolved_waits_for` in
+// sutra-channels. The grouping is static model structure (the gateway's outgoing targets), so
+// nothing has to survive the park.
+
+fn race_process(arms: &str, flows: &str) -> String {
+    format!(
+        r#"<?xml version="1.0"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0">
+  <bpmn:process id="p">
+    <bpmn:startEvent id="S">
+      <bpmn:extensionElements><q:source channel="in"/></bpmn:extensionElements>
+      <bpmn:outgoing>f0</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:eventBasedGateway id="G"><bpmn:incoming>f0</bpmn:incoming></bpmn:eventBasedGateway>
+    {arms}
+    <bpmn:endEvent id="E"/>
+    <bpmn:sequenceFlow id="f0" sourceRef="S" targetRef="G"/>
+    {flows}
+  </bpmn:process>
+</bpmn:definitions>"#
+    )
+}
+
+/// The canonical race: a message arm against a timer arm — "respond, or time out".
+const MESSAGE_VS_TIMER: (&str, &str) = (
+    r#"<bpmn:intermediateCatchEvent id="A">
+         <bpmn:extensionElements><q:source channel="responses"/></bpmn:extensionElements>
+         <bpmn:messageEventDefinition/>
+       </bpmn:intermediateCatchEvent>
+       <bpmn:intermediateCatchEvent id="B">
+         <bpmn:timerEventDefinition><bpmn:timeDuration>PT30M</bpmn:timeDuration></bpmn:timerEventDefinition>
+       </bpmn:intermediateCatchEvent>"#,
+    r#"<bpmn:sequenceFlow id="f1" sourceRef="G" targetRef="A"/>
+       <bpmn:sequenceFlow id="f2" sourceRef="G" targetRef="B"/>
+       <bpmn:sequenceFlow id="f3" sourceRef="A" targetRef="E"/>
+       <bpmn:sequenceFlow id="f4" sourceRef="B" targetRef="E"/>"#,
+);
+
+#[test]
+fn an_event_based_gateway_races_a_message_against_a_timer() {
+    let module = BpmnModelLoader::new()
+        .load(race_process(MESSAGE_VS_TIMER.0, MESSAGE_VS_TIMER.1).as_bytes())
+        .expect("message-vs-timer is the canonical race");
+    let process = &module.processes()[0];
+    let g = process
+        .nodes()
+        .iter()
+        .find(|n| n.id() == "G")
+        .expect("gateway");
+    assert!(matches!(g, Node::EventBasedGateway { .. }));
+    assert!(
+        !g.is_wait_state(),
+        "the gateway arms its targets; the TARGETS park, so it must not claim to"
+    );
+    // Statefulness has to come from the arms, or the process would be run synchronously.
+    assert!(
+        !process.is_sync_eligible(),
+        "a process containing a race is stateful via its arms"
+    );
+}
+
+#[test]
+fn a_receive_task_is_a_valid_race_arm() {
+    let arms = r#"<bpmn:receiveTask id="A">
+         <bpmn:extensionElements><q:source channel="responses"/></bpmn:extensionElements>
+       </bpmn:receiveTask>
+       <bpmn:intermediateCatchEvent id="B">
+         <bpmn:timerEventDefinition><bpmn:timeDuration>PT5M</bpmn:timeDuration></bpmn:timerEventDefinition>
+       </bpmn:intermediateCatchEvent>"#;
+    BpmnModelLoader::new()
+        .load(race_process(arms, MESSAGE_VS_TIMER.1).as_bytes())
+        .expect("BPMN allows a receiveTask as a race arm, and it parks");
+}
+
+/// A one-armed race is not a race. Caught early because the diagnostic can say something
+/// useful — park on the catch event directly.
+#[test]
+fn a_single_armed_race_is_rejected() {
+    let arms = r#"<bpmn:intermediateCatchEvent id="A">
+         <bpmn:extensionElements><q:source channel="responses"/></bpmn:extensionElements>
+         <bpmn:messageEventDefinition/>
+       </bpmn:intermediateCatchEvent>"#;
+    let flows = r#"<bpmn:sequenceFlow id="f1" sourceRef="G" targetRef="A"/>
+       <bpmn:sequenceFlow id="f3" sourceRef="A" targetRef="E"/>"#;
+    let err = BpmnModelLoader::new()
+        .load(race_process(arms, flows).as_bytes())
+        .expect_err("one arm is not a race");
+    assert!(
+        err.message.contains("at least two"),
+        "the diagnostic must say what is wrong: {}",
+        err.message
+    );
+}
+
+/// `Parallel` is only meaningful with `instantiate="true"`, so it is refused explicitly rather
+/// than silently treated as `Exclusive` — which would turn "wait for all" into "wait for one".
+#[test]
+fn a_parallel_event_gateway_is_refused() {
+    let p = race_process(MESSAGE_VS_TIMER.0, MESSAGE_VS_TIMER.1).replace(
+        r#"<bpmn:eventBasedGateway id="G">"#,
+        r#"<bpmn:eventBasedGateway id="G" eventGatewayType="Parallel">"#,
+    );
+    let err = BpmnModelLoader::new()
+        .load(p.as_bytes())
+        .expect_err("Parallel is a different contract");
+    assert!(
+        err.message.contains("Exclusive"),
+        "the diagnostic must name the supported flavour: {}",
+        err.message
+    );
+}
+
+#[test]
+fn an_instantiating_event_gateway_is_refused() {
+    let p = race_process(MESSAGE_VS_TIMER.0, MESSAGE_VS_TIMER.1).replace(
+        r#"<bpmn:eventBasedGateway id="G">"#,
+        r#"<bpmn:eventBasedGateway id="G" instantiate="true">"#,
+    );
+    let err = BpmnModelLoader::new()
+        .load(p.as_bytes())
+        .expect_err("an instantiating race is a start event's job");
+    assert!(err.message.contains("startEvent"), "{}", err.message);
 }

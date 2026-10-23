@@ -56,6 +56,7 @@
 
 # Reference
 
+- [BPMN element support](reference/bpmn-elements.md)
 - [`sutra` CLI](reference/cli.md)
 - [Crates: sutra-feel and sutra-dmn](reference/crates.md)
 - [DMN-TCK conformance](reference/dmn-tck.md)

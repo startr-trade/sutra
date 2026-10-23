@@ -14,9 +14,10 @@ use crate::codes;
 use crate::duration::parse_iso8601_duration;
 use crate::error::SutraError;
 use crate::model::{
-    Assignment, BoundaryKind, BpmnImport, CoveragePath, DataMapping, DeclaredVariable, FieldType,
-    Node, ParamBinding, ProcessAudit, ProcessDefinition, ProcessModule, SequenceFlow, StoreRead,
-    StoreWrite, ThrowKind, CHANNEL_CALL_PREFIX,
+    Assignment, BoundaryKind, BpmnDataSpelling, BpmnImport, CoveragePath, DataMapping,
+    DeclaredVariable, FieldType, Node, ParamBinding, ProcessAudit, ProcessDefinition,
+    ProcessModule, SequenceFlow, ShadowedBpmnVariable, StoreRead, StoreWrite, ThrowKind,
+    CHANNEL_CALL_PREFIX,
 };
 use crate::qbindings::{
     AckMode, AliasBinding, AliasConflict, AuditBinding, AuditCapture, CaseEntry, DataClass,
@@ -65,6 +66,9 @@ struct DocScan {
     params_by_service_task_id: HashMap<String, Vec<ParamBinding>>,
     version_by_process_id: HashMap<String, String>,
     variables_by_process_id: HashMap<String, Vec<DeclaredVariable>>,
+    /// Names a BPMN spelling declared that a `<q:variable>` of the same name won over —
+    /// carried for the `sutra lint` advisory, since the loader has no warning channel.
+    shadowed_variables_by_process_id: HashMap<String, Vec<ShadowedBpmnVariable>>,
     coverage_paths_by_process_id: HashMap<String, Vec<CoveragePath>>,
     /// B1 — process-level `<q:audit sink capture>` policy (single sink + capture level).
     audit_by_process_id: HashMap<String, ProcessAudit>,
@@ -160,7 +164,12 @@ impl BpmnModelLoader {
         }
 
         let mut channels_by_event_id = HashMap::new();
-        for local in ["startEvent", "intermediateCatchEvent", "userTask"] {
+        for local in [
+            "startEvent",
+            "intermediateCatchEvent",
+            "userTask",
+            "receiveTask",
+        ] {
             for event in root.collect_descendants_ns(BPMN_NS, local) {
                 let id = event.attr_or_empty("id");
                 if id.trim().is_empty() {
@@ -225,8 +234,15 @@ impl BpmnModelLoader {
             }
         }
 
+        // `<bpmn:itemDefinition>` is a ROOT element (`substitutionGroup="rootElement"`), so it is
+        // indexed once per document rather than per process: an `@itemSubjectRef` anywhere in the
+        // file may point at any of them.
+        let item_types = item_definition_types(root);
+
         let mut version_by_process_id = HashMap::new();
         let mut variables_by_process_id = HashMap::new();
+        let mut shadowed_variables_by_process_id: HashMap<String, Vec<ShadowedBpmnVariable>> =
+            HashMap::new();
         let mut coverage_paths_by_process_id = HashMap::new();
         let mut audit_by_process_id: HashMap<String, ProcessAudit> = HashMap::new();
         let mut idempotent_by_process_id: HashMap<String, bool> = HashMap::new();
@@ -328,8 +344,36 @@ impl BpmnModelLoader {
                     }
                 }
             }
+            // BPMN's own data vocabulary, mapped onto the SAME declared-variable model. A model
+            // authored in a BPMN tool spells its variables `<property>`/`<dataObject>`; read
+            // nothing and those declarations vanish without a word, which is the fault the
+            // `<task>` advisory exists to prevent, one layer down.
+            //
+            // `<q:variables>` stays authoritative because it says strictly more: `transient`,
+            // `sensitive`, `subjectKey` and `source` have no BPMN equivalent, so a BPMN spelling
+            // can only ever contribute a name and a type. On a collision the richer declaration
+            // therefore wins outright — taking the BPMN type as well, since a `<q:variable>` with
+            // no `@type` is a deliberate "any", not an omission to be filled in from elsewhere.
+            let q_declared: HashSet<String> = decls.iter().map(|d| d.name.clone()).collect();
+            let mut shadowed: Vec<ShadowedBpmnVariable> = Vec::new();
+            for d in bpmn_data_declarations(process, &item_types) {
+                if q_declared.contains(&d.var.name) {
+                    shadowed.push(ShadowedBpmnVariable {
+                        name: d.var.name,
+                        element_id: d.element_id,
+                        spelling: d.spelling,
+                    });
+                } else if !decls.iter().any(|existing| existing.name == d.var.name) {
+                    decls.push(d.var);
+                }
+                // A second BPMN spelling of a name a BPMN spelling already declared is dropped in
+                // silence: both carry only name and type, so nothing an author said is lost.
+            }
             if !decls.is_empty() {
                 variables_by_process_id.insert(id.to_string(), decls);
+            }
+            if !shadowed.is_empty() {
+                shadowed_variables_by_process_id.insert(id.to_string(), shadowed);
             }
 
             let mut paths = Vec::new();
@@ -361,6 +405,7 @@ impl BpmnModelLoader {
             params_by_service_task_id,
             version_by_process_id,
             variables_by_process_id,
+            shadowed_variables_by_process_id,
             coverage_paths_by_process_id,
             audit_by_process_id,
             idempotent_by_process_id,
@@ -420,7 +465,15 @@ impl BpmnModelLoader {
             .get(&id)
             .copied()
             .unwrap_or(false);
-        Ok(process.with_audit(audit).with_idempotent(idempotent))
+        let shadowed = scan
+            .shadowed_variables_by_process_id
+            .get(&id)
+            .cloned()
+            .unwrap_or_default();
+        Ok(process
+            .with_audit(audit)
+            .with_idempotent(idempotent)
+            .with_shadowed_bpmn_variables(shadowed))
     }
 
     /// Assemble a [`ProcessDefinition`] from a container's flow elements — shared by a
@@ -489,11 +542,15 @@ impl BpmnModelLoader {
                     });
                 }
                 "endEvent" => nodes.push(build_end_or_error_event(fe, &scan.error_code_by_id)?),
-                "intermediateThrowEvent" => nodes.push(build_intermediate_throw_event(
-                    fe,
-                    &scan.escalation_code_by_id,
-                    &scan.signal_name_by_id,
-                )?),
+                // `<implicitThrowEvent>` is the same throw with the same payload shape; the
+                // spec distinguishes how it is REACHED, not what it does.
+                "intermediateThrowEvent" | "implicitThrowEvent" => {
+                    nodes.push(build_intermediate_throw_event(
+                        fe,
+                        &scan.escalation_code_by_id,
+                        &scan.signal_name_by_id,
+                    )?)
+                }
                 "intermediateCatchEvent" => {
                     if has_event_definition(fe, "linkEventDefinition") {
                         nodes.push(build_link_catch_event(fe)?);
@@ -502,6 +559,50 @@ impl BpmnModelLoader {
                     } else {
                         nodes.push(build_message_catch_event(fe, &scan.channels_by_event_id)?);
                     }
+                }
+                // A receive task parks on a message like a catch event, but as an ACTIVITY it
+                // can host boundary events — which is the whole reason to support it.
+                "receiveTask" => {
+                    let rt_id = required(fe.attr_or_empty("id"), "receiveTask", "id")?;
+                    // `@instantiate="true"` makes a receive task a process-INSTANTIATION point,
+                    // an alternative to a start event. That is a different contract (it needs
+                    // the intake-selection surface a start event has), so it is refused
+                    // explicitly rather than silently ignored — a model relying on it would
+                    // otherwise never start.
+                    if fe.attr_or_empty("instantiate").trim() == "true" {
+                        return Err(err(
+                            codes::CONFIG_BPMN_UNSUPPORTED_ELEMENT,
+                            format!(
+                                "<bpmn:receiveTask> '{rt_id}' in process '{id}' sets \
+                                 @instantiate=\"true\", which makes it a process-instantiation \
+                                 point rather than a mid-flow wait. Model the instantiating \
+                                 receive as a <startEvent> with its <q:source>; a receive task \
+                                 here parks an already-running instance."
+                            ),
+                        ));
+                    }
+                    let channels = scan
+                        .channels_by_event_id
+                        .get(&rt_id)
+                        .cloned()
+                        .unwrap_or_default();
+                    if channels.is_empty() {
+                        return Err(err(
+                            codes::CONFIG_BPMN_UNSUPPORTED_ELEMENT,
+                            format!(
+                                "<bpmn:receiveTask> '{rt_id}' in process '{id}' declares no \
+                                 <q:source channel>. A receive task parks until a correlated \
+                                 inbound arrives, so it must name the channel it waits on."
+                            ),
+                        ));
+                    }
+                    nodes.push(Node::ReceiveTask {
+                        id: rt_id,
+                        name: non_blank(fe.attr_or_empty("name")),
+                        channels,
+                        message_ref: non_blank(fe.attr_or_empty("messageRef")),
+                    });
+                    activity_ids.insert(fe.attr_or_empty("id").to_string());
                 }
                 "boundaryEvent" => boundaries_pending.push(fe),
                 "serviceTask" => {
@@ -515,13 +616,20 @@ impl BpmnModelLoader {
                     nodes.push(wrap_maybe_loop(fe, node)?);
                     activity_ids.insert(fe.attr_or_empty("id").to_string());
                 }
-                "manualTask" => {
-                    let mt_id = required(fe.attr_or_empty("id"), "manualTask", "id")?;
+                // `<task>` is BPMN's untyped task: concrete in the XSD, and with no type there
+                // is no behaviour to run, so it executes as the pass-through `<manualTask>`
+                // already is. Accepting it keeps a round trip from a modelling tool loadable.
+                // It is NOT silent — `sutra lint` warns, because an author who meant a service
+                // task and typed `<task>` wants to be told, and the loader has no warning
+                // channel of its own (it fails closed or accepts).
+                "manualTask" | "task" => {
+                    let mt_id = required(fe.attr_or_empty("id"), &fe.local, "id")?;
                     nodes.push(wrap_maybe_loop(
                         fe,
                         Node::ManualTask {
                             id: mt_id,
                             name: non_blank(fe.attr_or_empty("name")),
+                            untyped: fe.local == "task",
                         },
                     )?);
                     activity_ids.insert(fe.attr_or_empty("id").to_string());
@@ -613,16 +721,53 @@ impl BpmnModelLoader {
                 // Non-flow-node flow elements do not participate in token flow — ignored.
                 "dataObject" | "dataObjectReference" | "dataStoreReference" | "dataStore" => {}
                 // Fail closed on a flow NODE the engine does not execute.
-                "task" | "receiveTask" | "eventBasedGateway" | "implicitThrowEvent" | "event" => {
+                // An event-based gateway races its outgoing catch events. BPMN requires every
+                // outgoing flow to target a catch event or a receive task — enforced below,
+                // because a race against a non-parking node would resolve instantly and
+                // silently make the other branches unreachable.
+                "eventBasedGateway" => {
+                    let gw_id = required(fe.attr_or_empty("id"), "eventBasedGateway", "id")?;
+                    if fe.attr_or_empty("instantiate").trim() == "true" {
+                        return Err(err(
+                            codes::CONFIG_BPMN_UNSUPPORTED_ELEMENT,
+                            format!(
+                                "<bpmn:eventBasedGateway> '{gw_id}' in process '{id}' sets \
+                                 @instantiate=\"true\", making it a process-instantiation point \
+                                 rather than a mid-flow race. Model the instantiating form as \
+                                 <startEvent>s with their own <q:source>."
+                            ),
+                        ));
+                    }
+                    let gateway_type = fe.attr_or_empty("eventGatewayType").trim().to_string();
+                    if !gateway_type.is_empty() && gateway_type != "Exclusive" {
+                        return Err(err(
+                            codes::CONFIG_BPMN_UNSUPPORTED_ELEMENT,
+                            format!(
+                                "<bpmn:eventBasedGateway> '{gw_id}' in process '{id}' declares \
+                                 eventGatewayType=\"{gateway_type}\". Only \"Exclusive\" (the \
+                                 BPMN default — first event wins, the rest are retired) is \
+                                 supported; \"Parallel\" is meaningful only with \
+                                 @instantiate=\"true\"."
+                            ),
+                        ));
+                    }
+                    nodes.push(Node::EventBasedGateway {
+                        id: gw_id,
+                        name: non_blank(fe.attr_or_empty("name")),
+                    });
+                }
+                "event" => {
                     return Err(err(
                         codes::CONFIG_BPMN_UNSUPPORTED_ELEMENT,
                         format!(
                             "<bpmn:{}> '{}' in process '{}' is not a supported flow node. Supported: \
                              startEvent, endEvent (plain, terminate, error, cancel), \
                              intermediateCatchEvent (message, timer, link), \
-                             intermediateThrowEvent (compensate, message, signal, escalation, link), \
+                             intermediateThrowEvent / implicitThrowEvent (compensate, message, \
+                             signal, escalation, link), \
                              boundaryEvent, serviceTask, scriptTask, sendTask, businessRuleTask, \
-                             manualTask, userTask, exclusiveGateway, inclusiveGateway, \
+                             manualTask, task, receiveTask, userTask, exclusiveGateway, \
+                             inclusiveGateway, eventBasedGateway, \
                              parallelGateway, complexGateway, callActivity, subProcess (embedded, \
                              transaction, adHoc, error-triggered event), sequenceFlow. Full matrix: \
                              crates/sutra-bpmn/bpmn-support.md.",
@@ -966,7 +1111,7 @@ fn build_timer_catch_event(ice: &XmlElement) -> Result<Node, SutraError> {
         .children_ns(BPMN_NS, "timerEventDefinition")
         .last()
         .expect("caller checked timerEventDefinition presence");
-    let timer = extract_timer_definition(def, &ice_id, "intermediateCatchEvent", false)?;
+    let timer = extract_timer_definition(def, &ice_id, "intermediateCatchEvent", false, false)?;
     Ok(Node::TimerCatchEvent {
         id: ice_id,
         name: non_blank(ice.attr_or_empty("name")),
@@ -988,13 +1133,19 @@ fn build_start_timer(
     let Some(def) = fe.children_ns(BPMN_NS, "timerEventDefinition").last() else {
         return Ok(None);
     };
-    extract_timer_definition(def, start_id, "startEvent", true).map(Some)
+    extract_timer_definition(def, start_id, "startEvent", true, false).map(Some)
 }
 
 /// Extract + validate the single time specification of one `<timerEventDefinition>`.
 ///
 /// `allow_cycle` is the host's repeat capability: true on a START event (a durable schedule row
-/// may fire many times), false on an intermediate catch / boundary (one park, one fire).
+/// may fire many times), false on an intermediate catch (one park, one fire).
+///
+/// `allow_cycle_on_boundary` is the second repeat axis: true for a NON-interrupting timer
+/// boundary, where each occurrence sends a token down the boundary while the host keeps waiting.
+/// It is separate from `allow_cycle` because the two admit different FORMS — a start event takes
+/// a bounded `R<n>`, a boundary takes only an unbounded `R/` (a budget would have to survive the
+/// host's park, which needs durable per-instance state this engine does not keep).
 ///
 /// Diagnostic split, deliberately three-way so an operator can act on it:
 /// - out-of-contract FORM (cron cycle, calendar duration) → the host's unsupported-form code
@@ -1009,6 +1160,7 @@ fn extract_timer_definition(
     host_id: &str,
     host_kind: &str,
     allow_cycle: bool,
+    allow_cycle_on_boundary: bool,
 ) -> Result<crate::timer::TimerDefinition, SutraError> {
     // Only a START event routes out-of-contract FORMS to their own code — that is the P1-5a
     // narrowing. On a catch / boundary every bad spec keeps the per-form invalid code it has
@@ -1062,14 +1214,41 @@ fn extract_timer_definition(
     };
 
     if let Some(cycle) = cycle {
+        // A recurring NON-interrupting boundary is supported: the host keeps waiting and each
+        // occurrence sends a token down the boundary's path (BPMN's escalate-while-waiting
+        // shape). It is UNBOUNDED-only, and that restriction is real rather than fussy: an
+        // `R<n>` budget would have to survive the host's park, which means durable
+        // per-instance state and a snapshot format change. Rejecting it here keeps the engine
+        // honest instead of silently firing forever on a bounded spec.
+        if allow_cycle_on_boundary {
+            let spec = crate::timer::parse_timer_cycle(&cycle)
+                .map_err(|r| classify(r, codes::DISPATCH_TIMER_CYCLE_INVALID))?;
+            if spec.repeats.is_some() {
+                return Err(err(
+                    codes::DISPATCH_TIMER_UNSUPPORTED,
+                    format!(
+                        "<{host_kind}> {host_id} declares a BOUNDED <bpmn:timeCycle> \
+                         ('{cycle}') on a non-interrupting boundary. Only an unbounded cycle \
+                         (R/<interval>) is supported there: a repeat budget would have to \
+                         survive the host activity's park, which this engine does not yet \
+                         persist per instance. Use R/<interval> and end the recurrence by \
+                         completing the host, or model the count in the flow."
+                    ),
+                ));
+            }
+            return Ok(crate::timer::TimerDefinition::Cycle(spec));
+        }
         if !allow_cycle {
             return Err(err(
                 codes::DISPATCH_TIMER_UNSUPPORTED,
                 format!(
                     "<{host_kind}> {host_id} declares a <bpmn:timeCycle> ('{cycle}'); a repeating \
-                     timer is supported only on a START event, where it arms a durable deployment \
-                     schedule. A token parks at an intermediate catch / boundary exactly once, so \
-                     use <bpmn:timeDuration> or <bpmn:timeDate> here."
+                     timer is supported on a START event (where it arms a durable deployment \
+                     schedule) and on a NON-interrupting boundary (where each occurrence sends a \
+                     token down the boundary while the host keeps waiting). Not here: a token \
+                     parks at an intermediate catch exactly once, and an INTERRUPTING boundary \
+                     cancels its host on the first fire, so later occurrences could never be \
+                     reached. Use <bpmn:timeDuration> or <bpmn:timeDate>."
                 ),
             ));
         }
@@ -1163,11 +1342,18 @@ fn build_boundary_event(
             "cancelEventDefinition" => kind = Some(BoundaryKind::Cancel),
             "timerEventDefinition" => {
                 kind = Some(BoundaryKind::Timer);
+                // A timer boundary is interrupting by BPMN default, so "non-interrupting" is
+                // exactly an explicit cancelActivity="false" — readable here, before the
+                // kind-dependent `interrupting` below is resolved.
+                let non_interrupting = be
+                    .attr(None, "cancelActivity")
+                    .is_some_and(|v| v == "false");
                 timer = Some(extract_timer_definition(
                     d,
                     be_id.as_str(),
                     "boundaryEvent",
                     false,
+                    non_interrupting,
                 )?);
             }
             _ => {}
@@ -1189,18 +1375,6 @@ fn build_boundary_event(
         Some(v) => v == "true",
         None => kind != BoundaryKind::Escalation,
     };
-    // Timer boundaries are INTERRUPTING only (interrupting: cancel the host task's wait);
-    // a non-interrupting timer would need its own semantics.
-    if kind == BoundaryKind::Timer && !interrupting {
-        return Err(err(
-            codes::DISPATCH_TIMER_UNSUPPORTED,
-            format!(
-                "<boundaryEvent> {be_id} is a timer boundary with cancelActivity=\"false\"; \
-                 only INTERRUPTING timer boundaries are supported (the fire cancels the host \
-                 task's wait)."
-            ),
-        ));
-    }
     Ok(Node::BoundaryEvent {
         id: be_id,
         name: non_blank(be.attr_or_empty("name")),
@@ -1407,6 +1581,188 @@ fn node_name(n: &Node) -> Option<String> {
         | Node::AdHocSubProcess { name, .. } => name.clone(),
         _ => None,
     }
+}
+
+// ---- BPMN's own data vocabulary -> declared variables --------------------------------------
+
+/// One declared variable contributed by a BPMN spelling, with the element id an advisory would
+/// have to name to be actionable (a `<property>` has no id of its own worth quoting, so it
+/// reports the process).
+struct BpmnDataDeclaration {
+    var: DeclaredVariable,
+    element_id: String,
+    spelling: BpmnDataSpelling,
+}
+
+/// Index the document's root-level `<bpmn:itemDefinition>` by id, to the scalar type its
+/// `@structureRef` names.
+fn item_definition_types(root: &XmlElement) -> HashMap<String, FieldType> {
+    let mut by_id = HashMap::new();
+    for item in root.children_ns(BPMN_NS, "itemDefinition") {
+        let id = item.attr_or_empty("id");
+        if id.trim().is_empty() {
+            continue;
+        }
+        // `@isCollection` says the item is a LIST of the structure, which no scalar `FieldType`
+        // describes; leaving it unset is the honest answer and matches a `<q:variable>` that gives
+        // no `@type`.
+        let ty = if item
+            .attr_or_empty("isCollection")
+            .eq_ignore_ascii_case("true")
+        {
+            FieldType::Any
+        } else {
+            structure_scalar_type(item.attr_or_empty("structureRef"))
+        };
+        by_id.insert(id.to_string(), ty);
+    }
+    by_id
+}
+
+/// The scalar type an `@structureRef` QName names. Anything that is not a recognised XSD built-in
+/// is a structure the engine cannot reduce to a scalar -- a WSDL message, a complex type, a class
+/// name -- so it answers [`FieldType::Any`] rather than guessing.
+fn structure_scalar_type(structure_ref: &str) -> FieldType {
+    match local_part(structure_ref).to_lowercase().as_str() {
+        "string" | "normalizedstring" | "token" | "anyuri" => FieldType::String,
+        "boolean" => FieldType::Boolean,
+        "number" | "decimal" | "double" | "float" | "int" | "integer" | "long" | "short"
+        | "byte" | "unsignedint" | "unsignedlong" | "unsignedshort" | "nonnegativeinteger"
+        | "positiveinteger" => FieldType::Number,
+        _ => FieldType::Any,
+    }
+}
+
+/// The local part of a QName (`xsd:string` -> `string`). An `@itemSubjectRef` is a QName whose
+/// prefix depends on whatever the modelling tool bound, so only the local part is comparable to
+/// an `itemDefinition`'s `@id`, which is an NCName and never prefixed.
+fn local_part(qname: &str) -> &str {
+    let q = qname.trim();
+    match q.rfind(':') {
+        Some(i) => &q[i + 1..],
+        None => q,
+    }
+}
+
+/// Every variable a process declares in BPMN's own vocabulary, in document order: its
+/// `<bpmn:property>` children, then the `<bpmn:dataObject>` / `<bpmn:dataObjectReference>`
+/// elements a data association names.
+///
+/// Scope is deliberately asymmetric. A `<property>` is read only from the process element itself,
+/// because BPMN also allows one on an activity, where it is that activity's own scratch data and
+/// not a process variable. A data object is read from anywhere in the process, because the engine
+/// has one instance-scoped variable space and a data association inside a sub-process resolves
+/// into it just the same; `index_data_elements` resolves the mapping side the same way, and the
+/// two must agree or a mapping would write to a name no declaration covers.
+///
+/// Only a data object some association NAMES is declared. An unreferenced one stays inert by
+/// decision -- it carries no token and participates in no flow -- and declaring a variable for it
+/// would invent state the model never reads or writes.
+fn bpmn_data_declarations(
+    process: &XmlElement,
+    item_types: &HashMap<String, FieldType>,
+) -> Vec<BpmnDataDeclaration> {
+    let process_id = process.attr_or_empty("id").to_string();
+    let mut out: Vec<BpmnDataDeclaration> = Vec::new();
+
+    for prop in process.children_ns(BPMN_NS, "property") {
+        let name = prop.attr_or_empty("name");
+        if name.trim().is_empty() {
+            continue;
+        }
+        out.push(BpmnDataDeclaration {
+            var: DeclaredVariable::scalar(name, item_type(prop, item_types)),
+            element_id: process_id.clone(),
+            spelling: BpmnDataSpelling::Property,
+        });
+    }
+
+    let mut associated: HashSet<&str> = HashSet::new();
+    for local in ["dataInputAssociation", "dataOutputAssociation"] {
+        for a in process.collect_descendants_ns(BPMN_NS, local) {
+            for end in ["sourceRef", "targetRef"] {
+                for r in a.children_ns(BPMN_NS, end) {
+                    let t = r.trimmed_text();
+                    if !t.is_empty() {
+                        associated.insert(t);
+                    }
+                }
+            }
+        }
+    }
+    if associated.is_empty() {
+        return out;
+    }
+
+    let objects = process.collect_descendants_ns(BPMN_NS, "dataObject");
+    for obj in &objects {
+        let id = obj.attr_or_empty("id");
+        if id.trim().is_empty() || !associated.contains(id) {
+            continue;
+        }
+        out.push(data_declaration(
+            data_element_name(obj.attr_or_empty("name"), id),
+            item_type(obj, item_types),
+            id,
+        ));
+    }
+    for r in process.collect_descendants_ns(BPMN_NS, "dataObjectReference") {
+        let id = r.attr_or_empty("id");
+        if id.trim().is_empty() || !associated.contains(id) {
+            continue;
+        }
+        // A reference may carry neither name nor type of its own, standing purely for the
+        // `<dataObject>` it points at; both then come from the target, exactly as the data-mapping
+        // side resolves them.
+        let target = objects
+            .iter()
+            .find(|o| o.attr_or_empty("id") == r.attr_or_empty("dataObjectRef"));
+        let name = if r.attr_or_empty("name").trim().is_empty() {
+            target
+                .map(|t| data_element_name(t.attr_or_empty("name"), t.attr_or_empty("id")))
+                .unwrap_or_else(|| id.to_string())
+        } else {
+            r.attr_or_empty("name").to_string()
+        };
+        let ty = match item_type(r, item_types) {
+            FieldType::Any => target
+                .map(|t| item_type(t, item_types))
+                .unwrap_or(FieldType::Any),
+            resolved => resolved,
+        };
+        out.push(data_declaration(name, ty, id));
+    }
+    out
+}
+
+fn data_declaration(name: String, ty: FieldType, element_id: &str) -> BpmnDataDeclaration {
+    BpmnDataDeclaration {
+        var: DeclaredVariable::scalar(name, ty),
+        element_id: element_id.to_string(),
+        spelling: BpmnDataSpelling::DataObject,
+    }
+}
+
+/// The variable name a data element denotes: its `@name`, falling back to its id -- the same
+/// fallback `index_data_elements` applies, so a declaration always covers the name a mapping
+/// resolves to.
+fn data_element_name(name: &str, id: &str) -> String {
+    if name.trim().is_empty() { id } else { name }.to_string()
+}
+
+/// The scalar type an element's `@itemSubjectRef` resolves to, or [`FieldType::Any`] when it names
+/// no `itemDefinition` this document defines. An unresolvable reference leaves the type unsaid
+/// rather than failing the load: the BPMN spelling is an additive front door, and an
+/// `itemDefinition` may legitimately live in an imported file the engine does not read.
+fn item_type(el: &XmlElement, item_types: &HashMap<String, FieldType>) -> FieldType {
+    let r = el.attr_or_empty("itemSubjectRef");
+    if r.trim().is_empty() {
+        return FieldType::Any;
+    }
+    item_types
+        .get(local_part(r))
+        .copied()
+        .unwrap_or(FieldType::Any)
 }
 
 // ---- data associations ---------------------------------------------------------
@@ -2688,6 +3044,47 @@ fn validate_channel_calls_and_timers(
     };
     for n in nodes {
         match n {
+            // Every outgoing flow of an event-based gateway must reach a node that PARKS.
+            // BPMN requires catch events or receive tasks there, and the reason bites here
+            // rather than being pedantry: a race whose arm does not park resolves instantly,
+            // which silently makes every other arm unreachable. Fail closed on the model the
+            // author cannot have meant.
+            Node::EventBasedGateway { id, .. } => {
+                let targets: Vec<&str> = flows
+                    .iter()
+                    .filter(|f| &f.source_ref == id)
+                    .map(|f| f.target_ref.as_str())
+                    .collect();
+                if targets.len() < 2 {
+                    return Err(err(
+                        codes::CONFIG_BPMN_UNSUPPORTED_ELEMENT,
+                        format!(
+                            "<eventBasedGateway> '{id}' in process '{process_id}' has \
+                             {} outgoing flow(s). A race needs at least two arms; with one, \
+                             park on that catch event directly.",
+                            targets.len()
+                        ),
+                    ));
+                }
+                for t in targets {
+                    let parks = nodes
+                        .iter()
+                        .find(|n| n.id() == t)
+                        .is_some_and(|n| n.is_wait_state());
+                    if !parks {
+                        return Err(err(
+                            codes::CONFIG_BPMN_UNSUPPORTED_ELEMENT,
+                            format!(
+                                "<eventBasedGateway> '{id}' in process '{process_id}' has an \
+                                 outgoing flow to '{t}', which does not park. Every arm of a \
+                                 race must be a catch event or a receiveTask: an arm that does \
+                                 not wait resolves immediately and makes the other arms \
+                                 unreachable."
+                            ),
+                        ));
+                    }
+                }
+            }
             Node::ServiceTask {
                 id, implementation, ..
             } if implementation.starts_with(CHANNEL_CALL_PREFIX) => {
@@ -2767,9 +3164,10 @@ fn validate_channel_calls_and_timers(
                 ..
             } => {
                 let host_is_wait_capable = is_channel_call(attached_to_ref)
-                    || nodes
-                        .iter()
-                        .any(|h| matches!(h, Node::UserTask { id, .. } if id == attached_to_ref));
+                    || nodes.iter().any(|h| {
+                        matches!(h, Node::UserTask { id, .. } if id == attached_to_ref)
+                            || matches!(h, Node::ReceiveTask { id, .. } if id == attached_to_ref)
+                    });
                 if !host_is_wait_capable {
                     return Err(err(
                         codes::DISPATCH_TIMER_UNSUPPORTED,
@@ -2777,7 +3175,8 @@ fn validate_channel_calls_and_timers(
                             "<boundaryEvent> '{id}' in process '{process_id}' is a timer \
                              boundary attached to '{attached_to_ref}', which is not a \
                              wait-capable activity; a timer boundary is supported on a \
-                             channel-call service task or a userTask (the activities that \
+                             channel-call service task, a receiveTask or a userTask (the \
+                             activities that \
                              PARK — a synchronous activity can never be interrupted by a \
                              timer in this engine)."
                         ),

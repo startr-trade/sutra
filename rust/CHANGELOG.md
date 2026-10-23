@@ -13,6 +13,42 @@ This is the changelog for the **Rust-native** engine (`rust/` workspace). It beg
 
 Nothing yet.
 
+## [0.4.0] — 2026-10-23
+
+A **minor** release: BPMN standard convergence. Where BPMN 2.0 already spells something the
+engine does, the engine now accepts the standard spelling and maps it onto existing behaviour.
+Four of the five flow nodes it used to reject now load, and the rejected list is down to one —
+`<event>`, which is `abstract="true"` in the BPMN 2.0 XSD and so cannot be implemented by anyone.
+
+Purely additive: no element that loaded before loads differently, and nothing in the `q:` surface
+changed (it is frozen; a change there would be semver-major). What is new is that conformant models
+which previously failed to load now work, and that a model authored in a BPMN tool stops losing its
+data declarations silently.
+
+### Added
+
+- `<task>` and `<implicitThrowEvent>` load (both concrete in the BPMN 2.0 XSD, so rejecting them
+  was a conformance gap). `Node::ManualTask` gained `untyped` to carry the authored spelling to
+  `sutra lint`, which warns on the untyped form — the loader has no warning channel of its own.
+- `Node::ReceiveTask` — a wait-capable ACTIVITY, so timer boundaries attach.
+- `Node::EventBasedGateway` — arms its targets rather than parking itself; first-wins retirement
+  widens `resolved_waits_for`, so the losing arms resolve in the same transaction as the winner.
+  The wait group is static model structure (the gateway's outgoing targets), so nothing has to
+  survive the park: no snapshot field, no counter.
+- Non-interrupting timer boundaries, and unbounded `<timeCycle>` on them, reusing
+  `advance_cycle()` so the boundary and the schedule poller share one catch-up policy.
+- BPMN data declarations (`<property>`, `<dataObject>`/`<dataObjectReference>`,
+  `itemDefinition`) merge into `ProcessDefinition::declared_variables`;
+  `shadowed_bpmn_variables` records a collision for lint.
+
+### Fixed
+
+- `bpmn-support.md`'s REJECTED table claimed to be "verbatim from the loader's reject arm" and
+  nothing checked it — the existing tests pin the `Node` enum against the page, not the LOADER
+  against it, so when two elements began loading the page went on calling them rejected while
+  every gate stayed green. A test now loads a minimal process per listed element and requires the
+  rejection, with the converse for the accepted spellings.
+
 ## [0.3.0] — 2026-10-23
 
 **Minor, not patch**, because of the second item: it changes what an existing package returns to
@@ -462,7 +498,8 @@ examples) on tier-2 (Testcontainers) and tier-3 (k8s) at each phase gate.
 - The generated binding crate (707k lines) is excluded from routine `make test` /
   `make lint`; its own gates run via `make test-generated` only after a regeneration.
 
-[Unreleased]: https://github.com/startr-trade/sutra/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/startr-trade/sutra/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/startr-trade/sutra/releases/tag/v0.4.0
 [0.3.0]: https://github.com/startr-trade/sutra/releases/tag/v0.3.0
 [0.2.0-rc.4]: https://github.com/startr-trade/sutra/releases/tag/v0.2.0-rc.4
 [0.2.0-rc.3]: https://github.com/startr-trade/sutra/releases/tag/v0.2.0-rc.3

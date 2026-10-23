@@ -940,7 +940,7 @@ fn classify_type(name: &str, args: &[String]) -> SqlType {
         | "LONG VARCHAR" | "STRING" => SqlType::Text { max_chars: None },
         "NUMERIC" | "DECIMAL" | "DEC" | "NUMBER" => SqlType::Numeric {
             precision: arg(0),
-            scale: arg(1).or(Some(0).filter(|_| args.len() == 1)),
+            scale: arg(1).or((args.len() == 1).then_some(0)),
         },
         "TINYINT" => {
             if arg(0) == Some(1) {

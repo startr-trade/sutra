@@ -205,11 +205,13 @@ fn kind_of(n: &Node) -> Kind {
         | Node::DataTask { .. }
         | Node::ScriptTask { .. }
         | Node::ManualTask { .. }
+        | Node::ReceiveTask { .. }
         | Node::SendTask { .. }
         | Node::BusinessRuleTask { .. }
         | Node::UserTask { .. }
         | Node::CallActivity { .. } => Kind::Task,
         Node::ExclusiveGateway { .. }
+        | Node::EventBasedGateway { .. }
         | Node::InclusiveGateway { .. }
         | Node::ParallelGateway { .. }
         | Node::ComplexGateway { .. } => Kind::Gateway,
@@ -237,6 +239,7 @@ fn name_of(n: &Node) -> Option<&str> {
         | Node::DataTask { name, .. }
         | Node::ScriptTask { name, .. }
         | Node::ManualTask { name, .. }
+        | Node::ReceiveTask { name, .. }
         | Node::SendTask { name, .. }
         | Node::BusinessRuleTask { name, .. }
         | Node::UserTask { name, .. }
@@ -247,6 +250,7 @@ fn name_of(n: &Node) -> Option<&str> {
         | Node::EventSubProcess { name, .. }
         | Node::CancelEndEvent { name, .. }
         | Node::ExclusiveGateway { name, .. }
+        | Node::EventBasedGateway { name, .. }
         | Node::InclusiveGateway { name, .. }
         | Node::ParallelGateway { name, .. }
         | Node::ComplexGateway { name, .. }
@@ -366,6 +370,22 @@ fn label_and_detail(n: &Node) -> (&'static str, String) {
         ),
         Node::ScriptTask { script_file, .. } => ("Script task", format!("script={script_file}")),
         Node::ManualTask { .. } => ("Manual task", String::new()),
+        // Same facts as a message catch event — it is the same park; what differs is that a
+        // boundary event can attach here.
+        Node::ReceiveTask {
+            channels,
+            message_ref,
+            ..
+        } => {
+            let mut parts = Vec::new();
+            if !channels.is_empty() {
+                parts.push(format!("channels={}", channels.join(", ")));
+            }
+            if let Some(m) = message_ref {
+                parts.push(format!("messageRef={m}"));
+            }
+            ("Receive task", parts.join(" · "))
+        }
         Node::SendTask { .. } => ("Send task", String::new()),
         Node::BusinessRuleTask { decision_file, .. } => {
             ("Business rule task", format!("decision={decision_file}"))
@@ -414,6 +434,10 @@ fn label_and_detail(n: &Node) -> (&'static str, String) {
             ("Event sub-process", d)
         }
         Node::CancelEndEvent { .. } => ("Cancel end event", String::new()),
+        Node::EventBasedGateway { .. } => (
+            "Event-based gateway (race)",
+            "first arm to fire wins; the rest are retired".to_string(),
+        ),
         Node::ExclusiveGateway {
             default_flow_id, ..
         } => (

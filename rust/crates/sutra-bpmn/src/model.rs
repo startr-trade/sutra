@@ -112,6 +112,33 @@ impl DeclaredVariable {
     }
 }
 
+/// Which BPMN element spelled a declared variable that a `<q:variable>` of the same name
+/// overrode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BpmnDataSpelling {
+    /// `<bpmn:property name="x">` on the process.
+    Property,
+    /// `<bpmn:dataObjectReference>` (or the `<bpmn:dataObject>` it points at) named by a data
+    /// association.
+    DataObject,
+}
+
+/// A BPMN-spelled data declaration that a `<q:variable>` of the same name won over.
+///
+/// Accepting two spellings for one name buys a round trip from a modelling tool at the cost of
+/// ambiguity, and the author is the only one who can say which they meant. The loader cannot ask —
+/// it fails closed or accepts — so it records the collision here and `sutra lint` reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShadowedBpmnVariable {
+    /// The variable name declared twice.
+    pub name: String,
+    /// The id of the BPMN element that lost: the process for a `<property>`, the data element
+    /// itself otherwise.
+    pub element_id: String,
+    /// The losing spelling, so the advisory can name the element the author would recognise.
+    pub spelling: BpmnDataSpelling,
+}
+
 /// A scoped parameter declared on a service task via `<q:param name= expression=/>`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParamBinding {
@@ -265,6 +292,36 @@ pub enum Node {
         channels: Vec<String>,
         message_ref: Option<String>,
     },
+    /// Event-based gateway — races its outgoing catch events; the FIRST to fire wins and the
+    /// others are retired.
+    ///
+    /// The gateway is not itself a wait state: it is the fork that parks its TARGETS, and those
+    /// targets are already wait states, so a process containing one is correctly stateful without
+    /// this node claiming to park. One token enters and one token leaves — which is the whole
+    /// difficulty, because N parked targets would otherwise be N independent tokens (what a
+    /// parallel gateway means). First-wins is enforced at the resume boundary by retiring the
+    /// losing siblings in the SAME transaction that advances the winner.
+    ///
+    /// `Exclusive`, non-instantiating only. BPMN's `Parallel` flavour is meaningful only with
+    /// `instantiate="true"`, and both are rejected at load.
+    EventBasedGateway {
+        id: String,
+        name: Option<String>,
+    },
+    /// Receive task — parks until a correlated inbound arrives, exactly as
+    /// [`Node::MessageCatchEvent`] does.
+    ///
+    /// A separate variant rather than an alias of the catch event, because the difference is not
+    /// cosmetic: a receive task is an ACTIVITY, so a boundary event can attach to it. That is
+    /// BPMN's way to say "wait for this message, or time out" — and without it the only route to
+    /// that shape here is a channel-call service task, which requires a request leg the model may
+    /// not have. An event cannot host a boundary, so the catch event could never express it.
+    ReceiveTask {
+        id: String,
+        name: Option<String>,
+        channels: Vec<String>,
+        message_ref: Option<String>,
+    },
     /// Intermediate Timer Catch Event (Rust-only): a wait state that parks a durable TIMER
     /// `waiting_event` row due at the instant `timer` resolves to.
     TimerCatchEvent {
@@ -314,6 +371,15 @@ pub enum Node {
     ManualTask {
         id: String,
         name: Option<String>,
+        /// True when the author wrote BPMN's UNTYPED `<task>` rather than `<manualTask>`.
+        ///
+        /// Both execute identically — with no type there is no behaviour to run — but they do
+        /// not MEAN the same thing: a manual task is work done outside the system on purpose,
+        /// while an untyped task is unspecified, and an author who typed `<task>` meaning a
+        /// service task has written a step that silently does nothing. Carrying the spelling is
+        /// what lets `sutra lint` say so at package time; the loader has no warning channel of
+        /// its own, so the model is the only route from the parse to the advice.
+        untyped: bool,
     },
     /// Send task — emit-and-continue; its `<q:send>` is required (enforced at load).
     SendTask {
@@ -431,6 +497,8 @@ impl Node {
             | Node::IntermediateThrowEvent { id, .. }
             | Node::LinkCatchEvent { id, .. }
             | Node::MessageCatchEvent { id, .. }
+            | Node::ReceiveTask { id, .. }
+            | Node::EventBasedGateway { id, .. }
             | Node::TimerCatchEvent { id, .. }
             | Node::BoundaryEvent { id, .. }
             | Node::ServiceTask { id, .. }
@@ -460,7 +528,9 @@ impl Node {
     /// ineligible for `execute_sync`.
     pub fn is_wait_state(&self) -> bool {
         match self {
-            Node::UserTask { .. } | Node::MessageCatchEvent { .. } => true,
+            Node::UserTask { .. } | Node::MessageCatchEvent { .. } | Node::ReceiveTask { .. } => {
+                true
+            }
             // A timer catch parks until the due-at; a channel-call
             // service task parks until the correlated response (or its timer boundary).
             Node::TimerCatchEvent { .. } => true,
@@ -491,6 +561,10 @@ pub struct ProcessDefinition {
     bindings: HashMap<String, NodeBindings>,
     /// Process variables declared by `<q:variables>`, in declaration order.
     pub declared_variables: Vec<DeclaredVariable>,
+    /// Names declared BOTH by a BPMN spelling and by a `<q:variable>`, where the `<q:variable>`
+    /// won. Carried for `sutra lint` only — the runtime sees just the merged
+    /// [`Self::declared_variables`].
+    pub shadowed_bpmn_variables: Vec<ShadowedBpmnVariable>,
     /// Path-coverage metric — the tracked routes declared by `<q:coverage>` on this process.
     pub coverage_paths: Vec<CoveragePath>,
     /// Process-level `<q:audit>` policy (single sink + capture level). `None` = the process
@@ -599,10 +673,22 @@ impl ProcessDefinition {
             incoming_by_target,
             bindings,
             declared_variables,
+            shadowed_bpmn_variables: Vec::new(),
             coverage_paths: Vec::new(),
             audit: None,
             idempotent: false,
         })
+    }
+
+    /// A copy of this process with its BPMN/`q:` declaration collisions recorded (applied by the
+    /// parser after assembly, like coverage — the merge is a document-wide scan result, not a
+    /// per-node one).
+    pub fn with_shadowed_bpmn_variables(
+        mut self,
+        shadowed: Vec<ShadowedBpmnVariable>,
+    ) -> ProcessDefinition {
+        self.shadowed_bpmn_variables = shadowed;
+        self
     }
 
     /// A copy of this process with its `<q:coverage>` paths set (applied by the parser after

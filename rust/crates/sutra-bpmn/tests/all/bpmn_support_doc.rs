@@ -49,6 +49,7 @@ enum NodeKind {
     DataTask,
     ScriptTask,
     ManualTask,
+    ReceiveTask,
     SendTask,
     BusinessRuleTask,
     UserTask,
@@ -57,6 +58,7 @@ enum NodeKind {
     TransactionSubProcess,
     AdHocSubProcess,
     EventSubProcess,
+    EventBasedGateway,
     ExclusiveGateway,
     InclusiveGateway,
     ParallelGateway,
@@ -82,6 +84,7 @@ fn kind_of(node: &Node) -> NodeKind {
         Node::DataTask { .. } => NodeKind::DataTask,
         Node::ScriptTask { .. } => NodeKind::ScriptTask,
         Node::ManualTask { .. } => NodeKind::ManualTask,
+        Node::ReceiveTask { .. } => NodeKind::ReceiveTask,
         Node::SendTask { .. } => NodeKind::SendTask,
         Node::BusinessRuleTask { .. } => NodeKind::BusinessRuleTask,
         Node::UserTask { .. } => NodeKind::UserTask,
@@ -90,6 +93,7 @@ fn kind_of(node: &Node) -> NodeKind {
         Node::TransactionSubProcess { .. } => NodeKind::TransactionSubProcess,
         Node::AdHocSubProcess { .. } => NodeKind::AdHocSubProcess,
         Node::EventSubProcess { .. } => NodeKind::EventSubProcess,
+        Node::EventBasedGateway { .. } => NodeKind::EventBasedGateway,
         Node::ExclusiveGateway { .. } => NodeKind::ExclusiveGateway,
         Node::InclusiveGateway { .. } => NodeKind::InclusiveGateway,
         Node::ParallelGateway { .. } => NodeKind::ParallelGateway,
@@ -119,7 +123,8 @@ impl NodeKind {
             ServiceTask => DataTask,
             DataTask => ScriptTask,
             ScriptTask => ManualTask,
-            ManualTask => SendTask,
+            ManualTask => ReceiveTask,
+            ReceiveTask => SendTask,
             SendTask => BusinessRuleTask,
             BusinessRuleTask => UserTask,
             UserTask => CallActivity,
@@ -127,7 +132,8 @@ impl NodeKind {
             SubProcess => TransactionSubProcess,
             TransactionSubProcess => AdHocSubProcess,
             AdHocSubProcess => EventSubProcess,
-            EventSubProcess => ExclusiveGateway,
+            EventSubProcess => EventBasedGateway,
+            EventBasedGateway => ExclusiveGateway,
             ExclusiveGateway => InclusiveGateway,
             InclusiveGateway => ParallelGateway,
             ParallelGateway => ComplexGateway,
@@ -223,7 +229,7 @@ fn row(kind: NodeKind) -> Row {
             notes: "Valid only inside a `<transaction>` — rolls its store transaction back.",
         },
         IntermediateThrowEvent => Row {
-            xml: "`<intermediateThrowEvent>`",
+            xml: "`<intermediateThrowEvent>` / `<implicitThrowEvent>`",
             variant: "IntermediateThrowEvent",
             wait: Wait::No,
             notes: "Emit-and-continue. `ThrowKind` selects the flavour: none, compensate, \
@@ -283,10 +289,23 @@ fn row(kind: NodeKind) -> Row {
             notes: "`<bpmn:script>` names a file in the module's `scripts/` folder (SRL).",
         },
         ManualTask => Row {
-            xml: "`<manualTask>`",
+            xml: "`<manualTask>` / `<task>`",
             variant: "ManualTask",
             wait: Wait::No,
-            notes: "A pure no-op pass-through — a modelling marker, not a wait state.",
+            notes: "A pure no-op pass-through — a modelling marker, not a wait state. BPMN's \
+                    UNTYPED `<task>` loads here too: with no type there is no behaviour to run, \
+                    which is what this already is. `sutra lint` warns on `<task>`, since an \
+                    author who meant a concrete task type wants telling.",
+        },
+        ReceiveTask => Row {
+            xml: "`<receiveTask>`",
+            variant: "ReceiveTask",
+            wait: Wait::Yes,
+            notes: "Parks until a correlated inbound arrives on one of its `<q:source>` \
+                    channels — the same park as a message catch event, but as an ACTIVITY it can \
+                    host boundary events. That is how BPMN says \"wait for this message, or time \
+                    out\": attach an interrupting timer boundary. `@instantiate=\"true\"` is \
+                    rejected — an instantiating receive is a start event's job.",
         },
         SendTask => Row {
             xml: "`<sendTask>`",
@@ -344,6 +363,19 @@ fn row(kind: NodeKind) -> Row {
                     triggers are rejected — those are wait states, so model them on the \
                     stateful surface instead.",
         },
+        EventBasedGateway => Row {
+            xml: "`<eventBasedGateway>`",
+            variant: "EventBasedGateway",
+            wait: Wait::No,
+            notes: "Races its outgoing arms: the FIRST to fire wins and the losing arms are \
+                    retired in the same transaction that advances the winner. The gateway itself \
+                    does not park — it arms its TARGETS, which are already wait states, so one \
+                    token enters and one leaves. Every arm must be a catch event or a \
+                    `<receiveTask>` (an arm that does not wait would resolve instantly and make \
+                    the others unreachable), and at least two are required. `Exclusive` and \
+                    non-instantiating only: `eventGatewayType=\"Parallel\"` and \
+                    `@instantiate=\"true\"` are rejected.",
+        },
         ExclusiveGateway => Row {
             xml: "`<exclusiveGateway>`",
             variant: "ExclusiveGateway",
@@ -392,25 +424,10 @@ fn row(kind: NodeKind) -> Row {
 // ---------------------------------------------------------------------------
 
 /// Flow nodes the loader FAILS CLOSED on, verbatim from the loader's reject arm.
-const REJECTED: &[(&str, &str)] = &[
-    (
-        "`<task>`",
-        "An abstract task has no behaviour to execute — pick a concrete task type.",
-    ),
-    (
-        "`<receiveTask>`",
-        "Use `<intermediateCatchEvent>` + `<messageEventDefinition>`, or a `<userTask>`.",
-    ),
-    (
-        "`<eventBasedGateway>`",
-        "Racing wait states are not modelled; park on one catch event.",
-    ),
-    ("`<implicitThrowEvent>`", "Use `<intermediateThrowEvent>`."),
-    (
-        "`<event>`",
-        "The abstract base element is not a concrete flow node.",
-    ),
-];
+const REJECTED: &[(&str, &str)] = &[(
+    "`<event>`",
+    "The abstract base element is not a concrete flow node.",
+)];
 
 /// Elements the loader accepts and IGNORES — they carry no token flow.
 const IGNORED: &[(&str, &str)] = &[
@@ -574,6 +591,7 @@ fn wait_state_column_matches_engine() {
         Node::ManualTask {
             id: id("n"),
             name: None,
+            untyped: false,
         },
         Node::SendTask {
             id: id("n"),
@@ -667,6 +685,68 @@ fn wait_state_column_matches_engine() {
             actual, expected,
             "bpmn-support.md claims {claimed:?} for {kind:?}, but Node::is_wait_state() says \
              {actual} for {node:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The REJECTED table, held to the loader rather than to a comment
+// ---------------------------------------------------------------------------
+
+/// A minimal process carrying `element` as its only flow node besides the start.
+fn process_with(element: &str) -> String {
+    format!(
+        r#"<?xml version="1.0"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0">
+  <bpmn:process id="p">
+    <bpmn:startEvent id="S">
+      <bpmn:extensionElements><q:source channel="c"/></bpmn:extensionElements>
+      <bpmn:outgoing>f1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:{element} id="N"><bpmn:incoming>f1</bpmn:incoming><bpmn:outgoing>f2</bpmn:outgoing></bpmn:{element}>
+    <bpmn:endEvent id="E"><bpmn:incoming>f2</bpmn:incoming></bpmn:endEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="S" targetRef="N"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="N" targetRef="E"/>
+  </bpmn:process>
+</bpmn:definitions>"#
+    )
+}
+
+/// The table said "verbatim from the loader's reject arm", and nothing checked it — so when
+/// `<task>` and `<implicitThrowEvent>` began loading, the page went on calling them rejected and
+/// every gate stayed green. The other three tests pin the enum against the table; this one pins
+/// the LOADER against it, which is the axis that actually drifted.
+#[test]
+fn the_rejected_table_is_what_the_loader_rejects() {
+    for (xml, _) in REJECTED {
+        let element = xml
+            .trim_matches('`')
+            .trim_start_matches('<')
+            .trim_end_matches('>');
+        let result = sutra_bpmn::BpmnModelLoader::new().load(process_with(element).as_bytes());
+        let err = result.err().unwrap_or_else(|| {
+            panic!("bpmn-support.md lists <{element}> as rejected, but the loader accepts it")
+        });
+        assert_eq!(
+            err.code,
+            sutra_bpmn::codes::CONFIG_BPMN_UNSUPPORTED_ELEMENT,
+            "<{element}> must be rejected AS an unsupported element, not incidentally: {}",
+            err.message
+        );
+    }
+}
+
+/// The converse: an element the page presents as supported must load. Guards the pairing the
+/// other direction, so a row cannot claim support the loader does not give.
+#[test]
+fn the_newly_accepted_spellings_load() {
+    for element in ["task", "manualTask"] {
+        let result = sutra_bpmn::BpmnModelLoader::new().load(process_with(element).as_bytes());
+        assert!(
+            result.is_ok(),
+            "bpmn-support.md presents <{element}> as a supported no-op: {:?}",
+            result.err().map(|e| e.message)
         );
     }
 }

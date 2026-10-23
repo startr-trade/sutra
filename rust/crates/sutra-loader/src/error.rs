@@ -110,6 +110,25 @@ pub mod codes {
     /// A `payload`-rooted FEEL path (alias / dispatch case / idempotencyKey / simpleValidator /
     /// flow condition) navigates a field absent from a *closed* intake-schema container — a
     /// provable typo, deploy-blocking.
+    /// WARNING — a node is BPMN's UNTYPED `<task>`, which executes as a pass-through because an
+    /// untyped task has no behaviour to run.
+    ///
+    /// Advisory rather than an error: `<task>` is a concrete, conformant BPMN element
+    /// (`tTask` is not abstract in the BPMN 2.0 XSD), so refusing it would reject a valid model
+    /// and break a round trip from a modelling tool. But an author who meant `<serviceTask>` and
+    /// typed `<task>` has written a step that silently does nothing, and silence is the one
+    /// outcome worth preventing. So it loads, and lint says so.
+    pub const CONFIG_BPMN_UNTYPED_TASK: &str = "SUTRA.CONFIG.BPMN.UNTYPED_TASK";
+    /// One variable name is declared twice over: once in BPMN's own data vocabulary
+    /// (`<property>`, `<dataObject>`) and once as a `<q:variable>`.
+    ///
+    /// Advisory rather than an error: both spellings are accepted on purpose, so a model can
+    /// round-trip through a modelling tool, and precedence is defined -- the `<q:variable>` wins,
+    /// because it is the only spelling that can say `transient`, `sensitive`, `subjectKey` or
+    /// `source`. What is left is ambiguity about which the author meant, and only the author can
+    /// settle it, so lint names the element and says which declaration took effect.
+    pub const CONFIG_BPMN_VARIABLE_SPELLING_CONFLICT: &str =
+        "SUTRA.CONFIG.BPMN.VARIABLE_SPELLING_CONFLICT";
     pub const CONFIG_BPMN_PATH_UNKNOWN_FIELD: &str = "SUTRA.CONFIG.BPMN.PATH_UNKNOWN_FIELD";
     /// A FEEL path used in a numeric operator resolves to a declared non-numeric field (or a
     /// `<q:variables>`-declared non-number variable) — deploy-blocking.

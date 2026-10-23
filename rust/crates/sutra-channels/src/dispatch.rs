@@ -3268,6 +3268,30 @@ fn timer_records(timer_waits: &[TimerWait]) -> Vec<TimerWaitRecord> {
 /// timeout; the timeout cancels the wait).
 fn resolved_waits_for(process: &ProcessDefinition, satisfied: &str) -> Vec<String> {
     let mut out = vec![satisfied.to_string()];
+    // An event-based gateway is a RACE: the arm that fired wins and every sibling arm must stop
+    // waiting. Retiring them here puts it in the same transaction as the winner's advance, which
+    // is what makes first-wins atomic — a losing timer row left pending would fire later and send
+    // a second token through a gateway that already resolved.
+    //
+    // The group is static model structure (the gateway's outgoing targets), so nothing has to be
+    // remembered across the park: no snapshot field, no counter, nothing to get out of step.
+    for gw in process.nodes() {
+        if !matches!(gw, Node::EventBasedGateway { .. }) {
+            continue;
+        }
+        let arms: Vec<&str> = process
+            .outgoing(gw.id())
+            .iter()
+            .map(|f| f.target_ref.as_str())
+            .collect();
+        if arms.contains(&satisfied) {
+            for arm in arms {
+                if arm != satisfied {
+                    out.push(arm.to_string());
+                }
+            }
+        }
+    }
     let host = match process.node(satisfied) {
         Ok(Node::BoundaryEvent {
             attached_to_ref, ..
@@ -3919,5 +3943,115 @@ mod transient_sensitive_tests {
         );
         // The subject var still persists (it is not transient).
         assert!(pv.kept.iter().any(|(n, _)| n == "customerId"));
+    }
+}
+
+/// `resolved_waits_for` is the first-wins guard of an event-based gateway, so it is unit-tested
+/// directly rather than only through a dispatch: if a losing arm is left out of the retirement
+/// list, its wait row stays pending and fires later, sending a SECOND token through a gateway
+/// that already resolved. That is instance corruption, not a glitch, and it would not show up in
+/// a happy-path integration test — only in one that waits for the loser's timer.
+#[cfg(test)]
+mod event_gateway_race_tests {
+    use super::*;
+    use sutra_bpmn::BpmnModelLoader;
+
+    /// Two message arms and a timer arm on one gateway, plus an UNRELATED catch event that must
+    /// never be dragged into the retirement list.
+    const RACE: &str = r#"<?xml version="1.0"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0">
+  <bpmn:process id="p">
+    <bpmn:startEvent id="S">
+      <bpmn:extensionElements><q:source channel="in"/></bpmn:extensionElements>
+      <bpmn:outgoing>f0</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:eventBasedGateway id="G"><bpmn:incoming>f0</bpmn:incoming></bpmn:eventBasedGateway>
+    <bpmn:intermediateCatchEvent id="Accept">
+      <bpmn:extensionElements><q:source channel="accepts"/></bpmn:extensionElements>
+      <bpmn:messageEventDefinition/>
+    </bpmn:intermediateCatchEvent>
+    <bpmn:intermediateCatchEvent id="Reject">
+      <bpmn:extensionElements><q:source channel="rejects"/></bpmn:extensionElements>
+      <bpmn:messageEventDefinition/>
+    </bpmn:intermediateCatchEvent>
+    <bpmn:intermediateCatchEvent id="Expire">
+      <bpmn:timerEventDefinition><bpmn:timeDuration>PT30M</bpmn:timeDuration></bpmn:timerEventDefinition>
+    </bpmn:intermediateCatchEvent>
+    <bpmn:intermediateCatchEvent id="Unrelated">
+      <bpmn:extensionElements><q:source channel="other"/></bpmn:extensionElements>
+      <bpmn:messageEventDefinition/>
+    </bpmn:intermediateCatchEvent>
+    <bpmn:endEvent id="E"/>
+    <bpmn:sequenceFlow id="f0" sourceRef="S" targetRef="G"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="G" targetRef="Accept"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="G" targetRef="Reject"/>
+    <bpmn:sequenceFlow id="f3" sourceRef="G" targetRef="Expire"/>
+    <bpmn:sequenceFlow id="f4" sourceRef="Accept" targetRef="Unrelated"/>
+    <bpmn:sequenceFlow id="f5" sourceRef="Reject" targetRef="E"/>
+    <bpmn:sequenceFlow id="f6" sourceRef="Expire" targetRef="E"/>
+    <bpmn:sequenceFlow id="f7" sourceRef="Unrelated" targetRef="E"/>
+  </bpmn:process>
+</bpmn:definitions>"#;
+
+    fn race_process() -> sutra_bpmn::model::ProcessDefinition {
+        BpmnModelLoader::new()
+            .load(RACE.as_bytes())
+            .expect("the race fixture loads")
+            .processes()[0]
+            .clone()
+    }
+
+    #[test]
+    fn the_winning_arm_retires_every_sibling() {
+        let p = race_process();
+        for winner in ["Accept", "Reject", "Expire"] {
+            let mut got = resolved_waits_for(&p, winner);
+            got.sort();
+            assert_eq!(
+                got,
+                vec![
+                    "Accept".to_string(),
+                    "Expire".to_string(),
+                    "Reject".to_string()
+                ],
+                "whichever arm wins, all three must be resolved in the SAME transaction — a \
+                 losing row left pending fires later and double-advances the gateway (winner: \
+                 {winner})"
+            );
+        }
+    }
+
+    #[test]
+    fn a_catch_event_outside_the_race_retires_only_itself() {
+        let p = race_process();
+        assert_eq!(
+            resolved_waits_for(&p, "Unrelated"),
+            vec!["Unrelated".to_string()],
+            "the group is the gateway's own arms; an unrelated wait must not be swept up"
+        );
+    }
+
+    /// The grouping is derived from the gateway's outgoing flows, so it holds with no snapshot
+    /// field, no counter and nothing to survive the park — which is why there is no state here
+    /// to get out of step with the model.
+    #[test]
+    fn the_group_is_the_gateways_outgoing_arms() {
+        let p = race_process();
+        let arms: Vec<&str> = p
+            .outgoing("G")
+            .iter()
+            .map(|f| f.target_ref.as_str())
+            .collect();
+        let mut arms_sorted = arms.clone();
+        arms_sorted.sort();
+        assert_eq!(arms_sorted, vec!["Accept", "Expire", "Reject"]);
+        let mut resolved = resolved_waits_for(&p, "Accept");
+        resolved.sort();
+        assert_eq!(
+            resolved.len(),
+            arms.len(),
+            "the retirement list is exactly the arm set"
+        );
     }
 }

@@ -22,7 +22,9 @@ use std::sync::Arc;
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use sutra_bpmn::model::{DeclaredVariable, FieldType, Node, ProcessDefinition, SequenceFlow};
+use sutra_bpmn::model::{
+    BpmnDataSpelling, DeclaredVariable, FieldType, Node, ProcessDefinition, SequenceFlow,
+};
 use sutra_bpmn::qbindings::SourceBinding;
 use sutra_channels::{load_channel_definitions, ChannelDefinition, CODEC_BUILTIN_URN_PREFIX};
 use sutra_codec_spi::shape::{PathResolution, SchemaShape};
@@ -512,6 +514,8 @@ pub fn validate_deployment_with_manifests(
     let definitions = parse_channels(deployment, &dep_label, out);
     let stores = parse_stores(deployment, &dep_label, out);
 
+    check_untyped_tasks(deployment, &dep_label, out);
+    check_variable_spelling_conflicts(deployment, &dep_label, out);
     check_partial_shadow(deployment, &dep_label, out);
     check_reserved_first_level_folders(deployment, &dep_label, out);
     check_reserved_codec_names(deployment, &dep_label, out);
@@ -5311,6 +5315,100 @@ fn resolve_nav_intake(
 /// pin (the same-intake rule).
 fn same_nav_intake(a: &SourceBinding, b: &SourceBinding) -> bool {
     a.channel == b.channel && a.name == b.name && a.message_type_value == b.message_type_value
+}
+
+// ---- untyped tasks ------------------------------------------------------------------------
+
+/// Warn on BPMN's untyped `<task>`.
+///
+/// It loads — `tTask` is concrete in the BPMN 2.0 XSD, so rejecting a conformant element would
+/// break a round trip from a modelling tool — and it executes as a pass-through, because an
+/// untyped task has no behaviour to run. The hazard is only that an author who meant
+/// `<serviceTask>` and typed `<task>` gets a step that silently does nothing, which is precisely
+/// the failure a package-time advisory exists to catch.
+///
+/// The authored spelling comes from the model rather than the XML: the loader records it on
+/// [`Node::ManualTask`], because the loader itself has no warning channel — it fails closed or
+/// accepts — and re-scanning the source for `<bpmn:task` would depend on the namespace prefix
+/// the modelling tool happened to emit.
+fn check_untyped_tasks(
+    deployment: &LoadedDeployment,
+    dep_label: &str,
+    out: &mut Vec<LintDiagnostic>,
+) {
+    let mut seen = BTreeSet::new();
+    for module in deployment.processes.values() {
+        for process in module.processes() {
+            if !seen.insert(process.id.clone()) {
+                continue;
+            }
+            visit_nodes(process, &mut |_owner, node| {
+                if let Node::ManualTask {
+                    id, untyped: true, ..
+                } = node
+                {
+                    out.push(
+                        LintDiagnostic::warning(
+                            codes::CONFIG_BPMN_UNTYPED_TASK,
+                            format!(
+                                "deployment {dep_label}: process '{}' node '{id}' is an untyped \
+                                 <bpmn:task>, which executes as a pass-through and does nothing. \
+                                 That is valid BPMN and may be deliberate — a placeholder, or a \
+                                 step performed outside the system. If you meant behaviour, name \
+                                 a concrete task type (<serviceTask>, <scriptTask>, \
+                                 <businessRuleTask>, <sendTask>, <userTask>); if you meant work \
+                                 done by a person off-system, <manualTask> says so.",
+                                process.id
+                            ),
+                        )
+                        .at_node(&process.id, id),
+                    );
+                }
+            });
+        }
+    }
+}
+
+/// A name declared both in BPMN's data vocabulary and in `<q:variables>`.
+///
+/// Like the untyped-task advisory, the collision comes from the model rather than the XML: the
+/// loader merges the two spellings into one declared-variable list and records what it dropped on
+/// [`sutra_bpmn::model::ProcessDefinition::shadowed_bpmn_variables`], because by the time anything
+/// can warn, the BPMN element is no longer there to find.
+fn check_variable_spelling_conflicts(
+    deployment: &LoadedDeployment,
+    dep_label: &str,
+    out: &mut Vec<LintDiagnostic>,
+) {
+    let mut seen = BTreeSet::new();
+    for module in deployment.processes.values() {
+        for process in module.processes() {
+            if !seen.insert(process.id.clone()) {
+                continue;
+            }
+            for shadowed in &process.shadowed_bpmn_variables {
+                let spelling = match shadowed.spelling {
+                    BpmnDataSpelling::Property => "<bpmn:property>",
+                    BpmnDataSpelling::DataObject => "<bpmn:dataObject>/<dataObjectReference>",
+                };
+                out.push(
+                    LintDiagnostic::warning(
+                        codes::CONFIG_BPMN_VARIABLE_SPELLING_CONFLICT,
+                        format!(
+                            "deployment {dep_label}: process '{}' declares variable '{}' twice: \
+                             as {spelling} on '{}' and as <q:variable>. The <q:variable> wins, \
+                             because it is the only spelling that can say transient, sensitive, \
+                             subjectKey or source; the BPMN spelling contributes nothing further \
+                             and its type (if any) is ignored. Drop one of the two so the model \
+                             says what you mean.",
+                            process.id, shadowed.name, shadowed.element_id
+                        ),
+                    )
+                    .at_node(&process.id, &shadowed.element_id),
+                );
+            }
+        }
+    }
 }
 
 // ---- output conformance (template-manifest.yaml) ------------------------------------------
