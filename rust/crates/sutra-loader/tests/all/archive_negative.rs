@@ -294,7 +294,7 @@ fn entries_of(bytes: &[u8]) -> BTreeMap<String, Vec<u8>> {
         let mut file = archive.by_index(i).unwrap();
         let mut buf = Vec::new();
         file.read_to_end(&mut buf).unwrap();
-        out.insert(file.name().to_string(), buf);
+        out.insert(file.name().expect("utf-8 name").to_string(), buf);
     }
     out
 }

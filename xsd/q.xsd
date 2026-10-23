@@ -9,6 +9,11 @@
 
   Frozen surface — changes are semver-major and batched at wave boundaries per
   docs/calendar-schedule.md "freeze gates".
+
+  With one carve-out that policy already grants and this header used to omit: backwards-compatible
+  ADDITIONS (a new optional attribute or element, a new enum variant) are allowed without
+  ceremony — they are not breaking and do not trigger the freeze process. Only a change that could
+  invalidate an existing package waits for a wave boundary.
 -->
 <xsd:schema xmlns:xsd="http://www.w3.org/2001/XMLSchema"
             xmlns:q="urn:sutra:q:1.0"
@@ -24,7 +29,8 @@
       <xsd:documentation>
         The consolidated inbound trigger on a Message Start Event (absorbs the former q:input).
         Binds the start event to one inbound channel, declares the message type it handles
-        (messageTypeValue / messageTypePattern), the payload variable name, and the validator chain
+        (messageTypeValue / messageTypePattern, optionally narrowed by filterExpression over the
+        codec's reported message attributes), the payload variable name, and the validator chain
         (nested q:validators). The codec is NOT declared here — it is bound on the channel YAML
         (YAML-authoritative); declaring @codec on q:source is a parse error. At most one q:source per
         start event: it names the single message type the start event handles, forcing the downstream
@@ -95,6 +101,41 @@
           matched against the decoded messageType, e.g. "pacs\.008\..*". The pattern is anchored:
           it must match the whole message type, not a substring. Mutually exclusive with
           messageTypeValue.
+        </xsd:documentation>
+      </xsd:annotation>
+    </xsd:attribute>
+    <xsd:attribute name="filterExpression" type="xsd:string">
+      <xsd:annotation>
+        <xsd:documentation>
+          A FEEL predicate over the message ATTRIBUTES the channel's codec reported for THIS
+          message, read under the attr root (attr.name). The start event is eligible only when the
+          predicate evaluates true; false, null (an attribute the message did not carry), and an
+          evaluation error all mean "not this start event".
+
+          Composes with messageTypeValue / messageTypePattern by CONJUNCTION rather than replacing
+          them: the message-type clause still decides which tier a subscriber sits in (exact beats
+          pattern beats catch-all) and the predicate narrows that tier. This is what lets two start
+          events subscribe to the SAME message type and be told apart by an attribute — one with
+          filterExpression="attr.direction = 'incoming'" and the other "attr.direction = 'outgoing'",
+          for a message type the codec can report in either direction.
+
+          The predicate sees the attributes and messageType ONLY — never headers, never the
+          payload. Headers are an open map and a payload an arbitrary tree, so admitting either
+          would make package-time analysis of the predicate impossible and would let the same
+          business message route differently per transport. Both stay readable inside the process
+          once a start event has been chosen.
+
+          DELIBERATELY RESTRICTED, and permanently: sutra lint must be able to PROVE that two
+          subscribers on one non-broadcast channel cannot both match the same message, which is
+          undecidable for an arbitrary expression. A predicate built from and / or / not over
+          attr.name comparisons (=, !=, in, relational operators on a numeric attribute, and
+          matches() against a closed declared domain) is analysable; anything else is refused at
+          package time once a second subscriber exists on the channel. That is a design limit, not
+          a gap waiting to be filled — a lone subscriber or a broadcast channel may use any
+          predicate, since there is then nothing to be ambiguous with.
+
+          Must be deterministic: a non-deterministic builtin (now(), today(), random) is a
+          deploy-time error, because routing that depends on the clock cannot be replayed.
         </xsd:documentation>
       </xsd:annotation>
     </xsd:attribute>
@@ -250,6 +291,30 @@
         </xsd:documentation>
       </xsd:annotation>
     </xsd:attribute>
+    <xsd:attribute name="codec" type="xsd:string">
+      <xsd:annotation>
+        <xsd:documentation>
+          The codec whose contract this reply must satisfy, stated rather than inferred.
+
+          A flow is a translator: it may accept one wire format and answer or forward in another,
+          so the codec that validated the inbound message is not necessarily the one that governs
+          what leaves. Naming it here makes the governing contract explicit at the point the
+          output is declared, and it is the only way to validate a send that addresses an
+          @destination endpoint rather than a declared @channel, since an endpoint carries no
+          codec to infer one from.
+
+          Absent, NOTHING is inferred and the reply is unvalidated — deliberately. The tempting fallback is the
+          codec of the channel the reply rides back out on, but a channel's codec is the contract its REQUESTS
+          satisfy and a reply is by definition a different message, so inferring it rejects correct replies. A
+          &lt;q:send&gt; is the asymmetric case and does infer, because its bytes are addressed to a named channel
+          whose codec is exactly what the consumers there decode with. When stated, the produced bytes — a codec-encoded
+          object or a template / script / decision render, which reaches the wire without passing
+          through an encode step at all — are read back by that codec before they leave, and a
+          contract breach stops the message (SUTRA.OUTBOUND.VALIDATION_REJECT). Egress bound to a
+          bare format or no codec asserts no schema and is unaffected.
+        </xsd:documentation>
+      </xsd:annotation>
+    </xsd:attribute>
     <xsd:attribute name="required" type="xsd:boolean" default="false"/>
     <xsd:attribute name="type" type="xsd:string"/>
     <xsd:attribute name="source" type="xsd:string"/>
@@ -304,6 +369,27 @@
     <xsd:attribute name="destination" type="xsd:string"/>
     <xsd:attribute name="channel" type="xsd:string"/>
     <xsd:attribute name="mode" type="q:ReplyMode" default="native"/>
+    <xsd:attribute name="codec" type="xsd:string">
+      <xsd:annotation>
+        <xsd:documentation>
+          The codec whose contract this message must satisfy, stated rather than inferred.
+
+          A flow is a translator: it may accept one wire format and answer or forward in another,
+          so the codec that validated the inbound message is not necessarily the one that governs
+          what leaves. Naming it here makes the governing contract explicit at the point the
+          output is declared, and it is the only way to validate a send that addresses an
+          @destination endpoint rather than a declared @channel, since an endpoint carries no
+          codec to infer one from.
+
+          Absent, the engine infers it: the codec of the @channel named here, when one is. Either way the produced bytes — a codec-encoded
+          object or a template / script / decision render, which reaches the wire without passing
+          through an encode step at all — are read back by that codec before they leave, and a
+          contract breach stops the message (SUTRA.OUTBOUND.VALIDATION_REJECT). Egress bound to a
+          bare format or no codec asserts no schema and is unaffected.
+        </xsd:documentation>
+      </xsd:annotation>
+    </xsd:attribute>
+
     <xsd:attribute name="contentType" type="xsd:string"/>
     <xsd:attribute name="messageType" type="xsd:string"/>
     <xsd:attribute name="type" type="xsd:string"/>

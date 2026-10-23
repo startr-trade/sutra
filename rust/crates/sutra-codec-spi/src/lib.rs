@@ -31,12 +31,18 @@ pub mod shape;
 pub use codec::PayloadCodec;
 pub use issue::{IssueSeverity, ValidationIssue};
 pub use mapped::{MappedDecodeResult, MappedMap, MappedValue};
-pub use result::{CodecValue, DecodeOutcome, DecodeResult};
+pub use result::{
+    is_valid_attribute_key, AttributeKind, AttributeLiteral, AttributeSpec, CodecValue,
+    DecodeOutcome, DecodeResult,
+};
 pub use schema::{
     FormatOnlyCodec, FormatParse, MessageFormat, MessageSchema, PayloadCodecFormat,
     SchemaBoundCodec, SchemaKind, ShapeClass,
 };
 pub use shape::{PathResolution, SchemaShape, ShapeFieldType};
+/// Re-exported because it is part of this SPI's surface: `DecodeResult.attributes` is a map of
+/// these, so a codec can report attributes without naming the expression crate itself.
+pub use sutra_feel::value::FeelValue;
 
 /// A self-registered global built-in codec. A codec module `inventory::submit!`s one of
 /// these next to its impl, so IMPLEMENTING a zero-config codec IS registering it — there is

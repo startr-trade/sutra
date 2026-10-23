@@ -226,3 +226,47 @@ fn matches_golden() {
         "generated spec drifted from the golden; if intentional, regenerate with UPDATE_GOLDEN=1"
     );
 }
+
+#[test]
+fn a_predicated_subscriber_is_reported_and_tagged() {
+    // A `<q:source filterExpression>` accepts a SUBSET of its message type, so the published
+    // surface must say so: otherwise two subscribers partitioning one type read as two processes
+    // both claiming every message of it.
+    const FILTERED_BPMN: &[u8] = br##"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0"
+                  targetNamespace="urn:sutra:module:mini-package:1.0.0">
+  <bpmn:process id="incoming-leg" isExecutable="true">
+    <bpmn:startEvent id="S_in">
+      <bpmn:extensionElements>
+        <q:source channel="balance" messageTypeValue="Transfer"
+                  filterExpression="attr.direction = &quot;incoming&quot;"/>
+      </bpmn:extensionElements>
+      <bpmn:outgoing>f1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:endEvent id="E"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="S_in" targetRef="E"/>
+  </bpmn:process>
+</bpmn:definitions>"##;
+
+    let module = BpmnModelLoader::new()
+        .load(FILTERED_BPMN)
+        .expect("bpmn parse");
+    let modules = vec![Arc::new(module)];
+    let reach = reachable_processes(&modules, "balance", &BTreeMap::new());
+
+    assert_eq!(reach.len(), 1);
+    assert_eq!(
+        reach[0].filter_expression.as_deref(),
+        Some(r#"attr.direction = "incoming""#)
+    );
+    let json = reach_to_json(&reach[0]);
+    assert_eq!(
+        json.get("filterExpression").and_then(Value::as_str),
+        Some(r#"attr.direction = "incoming""#)
+    );
+    assert_eq!(
+        inbound_message_types(&reach),
+        vec!["Transfer[filtered]".to_string()]
+    );
+}

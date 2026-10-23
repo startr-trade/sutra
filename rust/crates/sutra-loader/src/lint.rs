@@ -26,7 +26,7 @@ use sutra_bpmn::model::{DeclaredVariable, FieldType, Node, ProcessDefinition, Se
 use sutra_bpmn::qbindings::SourceBinding;
 use sutra_channels::{load_channel_definitions, ChannelDefinition, CODEC_BUILTIN_URN_PREFIX};
 use sutra_codec_spi::shape::{PathResolution, SchemaShape};
-use sutra_codec_spi::PayloadCodec;
+use sutra_codec_spi::{AttributeSpec, PayloadCodec};
 use sutra_datastore::projection::Projection;
 use sutra_datastore::{parse_datastores, StoreDefinition, StructureRef};
 use sutra_feel::paths::Usage;
@@ -34,6 +34,7 @@ use sutra_templates::HandlebarsTemplateEngine;
 
 use crate::error::codes;
 use crate::scanner::LoadedDeployment;
+use crate::selector::{self, Analysis, Cube};
 
 /// Diagnostic severity — ERROR is deploy-blocking (fail-closed); WARNING is advisory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -272,6 +273,13 @@ pub struct ValidationManifests {
     pub rule_applicability: BTreeMap<String, Vec<String>>,
     /// template file (archive-local id under `templates/`) → declared outputMessageType.
     pub template_outputs: BTreeMap<String, String>,
+    /// template file id → the message ATTRIBUTES the author declares its render will carry
+    /// (`outputAttributes:` in `template-manifest.yaml`), as authored key/value strings.
+    ///
+    /// The engine attaches no meaning to either side: a key is checked against what the
+    /// destination codec says it can report, and the value against what that codec says the
+    /// render actually carries. Both answers come from the codec SPI.
+    pub template_output_attributes: BTreeMap<String, BTreeMap<String, String>>,
 }
 
 impl ValidationManifests {
@@ -375,6 +383,20 @@ impl ValidationManifests {
                 self.template_outputs
                     .insert(join_prefix(prefix, &file), output);
             }
+            if let Some(attrs) = map_of(&entry, "outputAttributes") {
+                if attrs.is_empty() {
+                    out.push(LintDiagnostic::error(
+                        codes::CONFIG_MODULE_MANIFEST_INVALID,
+                        format!(
+                            "{source}: templates[] entry '{file}' declares an empty \
+                             'outputAttributes'; omit the key instead"
+                        ),
+                    ));
+                } else {
+                    self.template_output_attributes
+                        .insert(join_prefix(prefix, &file), attrs);
+                }
+            }
         }
     }
 }
@@ -429,6 +451,26 @@ fn parse_manifest_entries(
             .filter_map(|v| v.as_mapping().cloned())
             .collect(),
     )
+}
+
+/// A flat mapping of scalar key → scalar value, as authored. Non-scalar values are skipped:
+/// an attribute is a routing/classification LABEL, and the codec SPI carries only scalars.
+fn map_of(entry: &serde_yaml::Mapping, key: &str) -> Option<BTreeMap<String, String>> {
+    let mapping = entry.get(serde_yaml::Value::from(key))?.as_mapping()?;
+    let mut out = BTreeMap::new();
+    for (k, v) in mapping {
+        let Some(k) = k.as_str().map(str::trim).filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        let value = match v {
+            serde_yaml::Value::String(s) => s.trim().to_string(),
+            serde_yaml::Value::Bool(b) => b.to_string(),
+            serde_yaml::Value::Number(n) => n.to_string(),
+            _ => continue,
+        };
+        out.insert(k.to_string(), value);
+    }
+    Some(out)
 }
 
 fn string_of(entry: &serde_yaml::Mapping, key: &str) -> Option<String> {
@@ -899,6 +941,92 @@ fn resolve_codec_for_shape(
         .map(|codec| Arc::new(codec) as Arc<dyn PayloadCodec>)
 }
 
+/// What a channel's codec declares about the ATTRIBUTES it can report — the vocabulary a
+/// `<q:source filterExpression>` is checked against, and the sibling of [`DeclaredTypes`].
+enum DeclaredAttributes {
+    /// No codec bound — schema-less ingress, nothing to check against.
+    NoCodec,
+    /// The codec declares no attributes, so its key set is OPEN: a predicate over it is
+    /// unverifiable, never provably wrong.
+    Open,
+    /// A CLOSED key set, keyed by attribute name. Each spec's own `domain` closes or leaves open
+    /// the value side independently.
+    Closed(BTreeMap<String, AttributeSpec>),
+    /// The codec name resolves to nothing — already deploy-blocking as `INBOUND_CODEC_NOT_FOUND`,
+    /// so the predicate checks stay silent rather than piling a second fault on one cause.
+    Unknown,
+}
+
+/// Resolve the attribute vocabulary a subscriber's predicate is checked against.
+///
+/// `pinned_type` is the subscriber's `messageTypeValue`. When it pins nothing the answer is the
+/// UNION over the codec's declared message types, with `required` degraded to `false`: an
+/// attribute that only some types carry is still spellable, and claiming it is always present
+/// would make a legitimate predicate look wrong. A key whose declared KIND differs between two
+/// types degrades the whole resolution to [`DeclaredAttributes::Open`] — a union of
+/// contradictory kinds is not a vocabulary, and guessing one would manufacture a type mismatch.
+fn declared_attributes(
+    deployment: &LoadedDeployment,
+    codec_name: &str,
+    pinned_type: Option<&str>,
+) -> DeclaredAttributes {
+    match declared_types(deployment, codec_name) {
+        DeclaredTypes::NoCodec => return DeclaredAttributes::NoCodec,
+        DeclaredTypes::Unknown => return DeclaredAttributes::Unknown,
+        DeclaredTypes::Open | DeclaredTypes::Closed(_) => {}
+    }
+    // No instance (an XSD outside the parsed subset) — conservative: open, never a false error.
+    let Some(codec) = resolve_codec_for_shape(deployment, codec_name) else {
+        return DeclaredAttributes::Open;
+    };
+    let specs = match pinned_type {
+        Some(message_type) => codec.declared_attributes(Some(message_type)),
+        None => {
+            let types = codec.declared_message_types();
+            if types.is_empty() {
+                codec.declared_attributes(None)
+            } else {
+                let mut union: BTreeMap<String, AttributeSpec> = BTreeMap::new();
+                for message_type in &types {
+                    for spec in codec.declared_attributes(Some(message_type)) {
+                        match union.get_mut(&spec.key) {
+                            None => {
+                                union.insert(
+                                    spec.key.clone(),
+                                    AttributeSpec {
+                                        required: false,
+                                        ..spec
+                                    },
+                                );
+                            }
+                            Some(existing) => {
+                                if existing.kind != spec.kind {
+                                    return DeclaredAttributes::Open;
+                                }
+                                // One open value side opens the union's.
+                                if existing.domain.is_empty() || spec.domain.is_empty() {
+                                    existing.domain.clear();
+                                } else {
+                                    for literal in spec.domain {
+                                        if !existing.domain.contains(&literal) {
+                                            existing.domain.push(literal);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                union.into_values().collect()
+            }
+        }
+    };
+    if specs.is_empty() {
+        return DeclaredAttributes::Open;
+    }
+    DeclaredAttributes::Closed(specs.into_iter().map(|s| (s.key.clone(), s)).collect())
+}
+
 // ---- channel declaration checks --------------------------------------------------------
 
 fn check_channel_declarations(
@@ -1079,9 +1207,41 @@ fn resolve_local_send_target<'a>(
 
 // ---- channel uniqueness suite --------------------------------------------------------------
 
+/// The four documented escapes from a selector diagnostic, in the order a diagnostic must list
+/// them. There is deliberately NO per-source override: an `allow-overlap` attribute would turn a
+/// package-time proof into a runtime coin-flip on process-id ordering.
+const SELECTOR_ESCAPES: &str = "rewrite the predicate into the recognised form (and / or / not \
+                                over `attr.<key>` equality, `!=`, `in [..]`, a relational \
+                                operator on a numerically-declared attribute, or `matches()` \
+                                over a closed declared domain); split the channel; make the \
+                                message-type clauses distinct; or declare the channel \
+                                `broadcast: true`";
+
+/// One subscriber's analysed `<q:source filterExpression>`.
+struct SelectPredicate {
+    /// The predicate source, for the diagnostic text.
+    source_text: String,
+    /// The parsed AST — `None` when the text does not parse. The parse failure itself is already
+    /// reported by [`check_feel_sites`], so the vocabulary checks stay quiet on it rather than
+    /// reporting one fault twice.
+    expr: Option<sutra_feel::ast::FeelExpr>,
+    analysis: Analysis,
+}
+
 struct Subscriber<'a> {
     process_id: &'a str,
+    node_id: &'a str,
     source: &'a SourceBinding,
+    /// Filled in by [`check_channel_uniqueness`], which is the first place that knows the
+    /// channel's codec and so the vocabulary to analyse against. `None` = no `filterExpression`.
+    predicate: Option<SelectPredicate>,
+}
+
+/// The analysis of a subscriber that declares no predicate: one cube constraining nothing, i.e.
+/// eligible for every message its message-type clause admits.
+fn catch_all_analysis() -> &'static Analysis {
+    static ANY: std::sync::OnceLock<Analysis> = std::sync::OnceLock::new();
+    ANY.get_or_init(|| Analysis::Cubes(vec![Cube::any()]))
 }
 
 impl Subscriber<'_> {
@@ -1090,6 +1250,16 @@ impl Subscriber<'_> {
     }
     fn pattern(&self) -> Option<&str> {
         self.source.message_type_pattern.as_deref()
+    }
+    /// The predicate's cube set, or the catch-all when it declares none.
+    fn analysis(&self) -> &Analysis {
+        match &self.predicate {
+            Some(predicate) => &predicate.analysis,
+            None => catch_all_analysis(),
+        }
+    }
+    fn has_predicate(&self) -> bool {
+        self.predicate.is_some()
     }
 }
 
@@ -1110,7 +1280,9 @@ fn subscribers_of<'a>(deployment: &'a LoadedDeployment, channel: &str) -> Vec<Su
                         if source.channel == channel {
                             subs.push(Subscriber {
                                 process_id: &process.id,
+                                node_id: id,
                                 source,
+                                predicate: None,
                             });
                         }
                     }
@@ -1127,6 +1299,35 @@ fn full_match(message_type: &str, pattern: &str) -> bool {
         .unwrap_or(false) // a malformed pattern matches nothing here
 }
 
+/// Analyse one subscriber's `filterExpression` against the channel's declared vocabulary.
+///
+/// An unparseable predicate is `Opaque`: `check_feel_sites` owns the parse diagnostic, and
+/// treating it as analysable here would be the unsound direction.
+fn analyse_predicate(source_text: &str, vocabulary: &DeclaredAttributes) -> SelectPredicate {
+    let specs = match vocabulary {
+        DeclaredAttributes::Closed(specs) => specs.clone(),
+        _ => BTreeMap::new(),
+    };
+    match sutra_feel::expressions::parse(source_text) {
+        Ok(expr) => {
+            let analysis = selector::analyse(&expr, &specs);
+            SelectPredicate {
+                source_text: source_text.to_string(),
+                expr: Some(expr),
+                analysis,
+            }
+        }
+        Err(e) => SelectPredicate {
+            source_text: source_text.to_string(),
+            expr: None,
+            analysis: Analysis::Opaque {
+                construct: format!("a predicate that does not parse ({})", e.message),
+                offset: 0,
+            },
+        },
+    }
+}
+
 fn check_channel_uniqueness(
     deployment: &LoadedDeployment,
     definitions: &[ChannelDefinition],
@@ -1138,7 +1339,7 @@ fn check_channel_uniqueness(
             continue;
         }
         let channel = &def.binding.channel_name;
-        let subscribers = subscribers_of(deployment, channel);
+        let mut subscribers = subscribers_of(deployment, channel);
         if subscribers.is_empty() {
             out.push(
                 LintDiagnostic::warning(
@@ -1159,6 +1360,55 @@ fn check_channel_uniqueness(
         } else {
             def.binding.codec.clone()
         };
+
+        // Each subscriber's predicate is analysed against the vocabulary its OWN pinned message
+        // type scopes (an unpinned source gets the union over the codec's declared types).
+        for sub in &mut subscribers {
+            let Some(text) = sub.source.filter_expression.as_deref() else {
+                continue;
+            };
+            let vocabulary = declared_attributes(
+                deployment,
+                &def.binding.codec,
+                sub.source.message_type_value.as_deref(),
+            );
+            let predicate = analyse_predicate(text, &vocabulary);
+            check_select_vocabulary(
+                sub.process_id,
+                sub.node_id,
+                channel,
+                &codec_label,
+                &vocabulary,
+                &predicate,
+                dep_label,
+                out,
+            );
+            sub.predicate = Some(predicate);
+        }
+
+        // ERROR — a predicate no message can satisfy: a dead start event, reported whether or
+        // not the channel has other subscribers (the same posture as a `messageTypeValue` pin
+        // that can never match).
+        for sub in &subscribers {
+            let Some(predicate) = &sub.predicate else {
+                continue;
+            };
+            if predicate.analysis.is_unsatisfiable() {
+                out.push(
+                    LintDiagnostic::error(
+                        codes::CHANNEL_SELECTOR_UNSATISFIABLE,
+                        format!(
+                            "deployment {dep_label}: process '{}' subscribes to channel \
+                             '{channel}' with filterExpression '{}', which no message can \
+                             satisfy — its conjuncts contradict each other (or exclude every \
+                             value the codec declares), so the start event is dead",
+                            sub.process_id, predicate.source_text
+                        ),
+                    )
+                    .at_node(sub.process_id, sub.node_id),
+                );
+            }
+        }
 
         // WARN — schema-less channel: no message type can be derived.
         if declared_list.is_empty() && !matches!(declared, DeclaredTypes::Unknown) {
@@ -1224,13 +1474,303 @@ fn check_channel_uniqueness(
             }
         }
 
-        // ERROR — non-broadcast uniqueness (broadcast channels are exempt: pub/sub).
+        // ERROR — non-broadcast uniqueness (broadcast channels are exempt: pub/sub, so any
+        // predicate including an opaque one is accepted there).
         if !def.binding.broadcast {
             check_non_broadcast_uniqueness(channel, &subscribers, &declared_list, dep_label, out);
         }
     }
 
     check_replies(deployment, definitions, dep_label, out);
+}
+
+/// The four `SELECT_*` vocabulary checks for one subscriber's predicate.
+///
+/// They run independently of the disjointness tier — including on an OPAQUE predicate, because
+/// [`selector::attribute_refs`] / [`selector::attribute_comparisons`] see inside the constructs
+/// the analyser refuses. A typo in a key is worth catching whether or not the predicate as a
+/// whole is in the recognised form.
+#[allow(clippy::too_many_arguments)]
+fn check_select_vocabulary(
+    process_id: &str,
+    node_id: &str,
+    channel: &str,
+    codec_label: &str,
+    vocabulary: &DeclaredAttributes,
+    predicate: &SelectPredicate,
+    dep_label: &str,
+    out: &mut Vec<LintDiagnostic>,
+) {
+    let Some(expr) = &predicate.expr else {
+        return; // the parse failure is `check_feel_sites`'s diagnostic
+    };
+    let text = &predicate.source_text;
+    let specs = match vocabulary {
+        // `INBOUND_CODEC_NOT_FOUND` already blocks the deployment; a second code on one cause is
+        // noise.
+        DeclaredAttributes::Unknown => return,
+        DeclaredAttributes::NoCodec | DeclaredAttributes::Open => {
+            let mut keys: Vec<String> = selector::attribute_refs(expr)
+                .into_iter()
+                .map(|r| r.key)
+                .collect();
+            keys.sort();
+            keys.dedup();
+            if !keys.is_empty() {
+                out.push(
+                    LintDiagnostic::warning(
+                        codes::CONFIG_BPMN_SELECT_UNVERIFIABLE,
+                        format!(
+                            "deployment {dep_label}: process '{process_id}' filters channel \
+                             '{channel}' on attr.{keys:?}, but its codec ({codec_label}) \
+                             declares no attributes — the predicate's keys and values cannot be \
+                             verified. Declaring the codec's attribute vocabulary turns a typo \
+                             here into a package-time error; an open vocabulary is \
+                             unverifiable, not wrong."
+                        ),
+                    )
+                    .at_node(process_id, node_id),
+                );
+            }
+            return;
+        }
+        DeclaredAttributes::Closed(specs) => specs,
+    };
+
+    let declared_keys: Vec<&String> = specs.keys().collect();
+    let mut reported_keys: BTreeSet<String> = BTreeSet::new();
+    for reference in selector::attribute_refs(expr) {
+        match specs.get(&reference.key) {
+            None => {
+                if !reported_keys.insert(reference.key.clone()) {
+                    continue;
+                }
+                let hint = match selector::nearest_key(&reference.key, specs.keys()) {
+                    Some(near) => format!(" — did you mean 'attr.{near}'?"),
+                    None => String::new(),
+                };
+                out.push(
+                    LintDiagnostic::error(
+                        codes::CONFIG_BPMN_SELECT_ATTRIBUTE_UNKNOWN,
+                        format!(
+                            "deployment {dep_label}: process '{process_id}' filters channel \
+                             '{channel}' on 'attr.{}' (offset {} in '{text}'), but its codec \
+                             ({codec_label}) declares only {declared_keys:?} — the comparison \
+                             can never be true{hint}",
+                            reference.key, reference.start
+                        ),
+                    )
+                    .at_node(process_id, node_id),
+                );
+            }
+            Some(spec) if reference.numeric && !is_numeric_kind(spec.kind) => {
+                out.push(
+                    LintDiagnostic::error(
+                        codes::CONFIG_BPMN_SELECT_TYPE_MISMATCH,
+                        format!(
+                            "deployment {dep_label}: process '{process_id}' applies a relational \
+                             operator to 'attr.{}' (offset {} in '{text}') on channel \
+                             '{channel}', but its codec ({codec_label}) declares that attribute \
+                             {} — a relational comparison needs a numeric attribute",
+                            reference.key,
+                            reference.start,
+                            selector::kind_name(spec.kind)
+                        ),
+                    )
+                    .at_node(process_id, node_id),
+                );
+            }
+            Some(_) => {}
+        }
+    }
+
+    for comparison in selector::attribute_comparisons(expr) {
+        let Some(spec) = specs.get(&comparison.key) else {
+            continue; // already reported as an unknown key
+        };
+        if !comparison.literal.matches_kind(spec.kind) {
+            out.push(
+                LintDiagnostic::error(
+                    codes::CONFIG_BPMN_SELECT_TYPE_MISMATCH,
+                    format!(
+                        "deployment {dep_label}: process '{process_id}' compares 'attr.{}' \
+                         against {} (offset {} in '{text}') on channel '{channel}', but its \
+                         codec ({codec_label}) declares that attribute {} — a FEEL comparison \
+                         across types is null, so the start event can never match",
+                        comparison.key,
+                        comparison.literal,
+                        comparison.start,
+                        selector::kind_name(spec.kind)
+                    ),
+                )
+                .at_node(process_id, node_id),
+            );
+            continue;
+        }
+        if let Some(domain) = selector::closed_domain(spec) {
+            if !domain.contains(&comparison.literal) {
+                let permitted: Vec<String> = domain.iter().map(|v| v.to_string()).collect();
+                out.push(
+                    LintDiagnostic::error(
+                        codes::CONFIG_BPMN_SELECT_VALUE_UNKNOWN,
+                        format!(
+                            "deployment {dep_label}: process '{process_id}' compares 'attr.{}' \
+                             against {} (offset {} in '{text}') on channel '{channel}', but its \
+                             codec ({codec_label}) declares that attribute can only be one of \
+                             [{}] — the comparison can never be true",
+                            comparison.key,
+                            comparison.literal,
+                            comparison.start,
+                            permitted.join(", ")
+                        ),
+                    )
+                    .at_node(process_id, node_id),
+                );
+            }
+        }
+    }
+}
+
+fn is_numeric_kind(kind: sutra_codec_spi::AttributeKind) -> bool {
+    matches!(
+        kind,
+        sutra_codec_spi::AttributeKind::Integer | sutra_codec_spi::AttributeKind::Decimal
+    )
+}
+
+/// The verdict for a set of subscribers the message-type tier could NOT separate.
+enum GroupVerdict {
+    /// Every pair is provably disjoint by its predicate.
+    Disjoint,
+    /// Some pair provably co-matches one message; the witness is the assignment (empty = any
+    /// message at all).
+    Overlap(BTreeMap<String, String>),
+    /// Some pair's predicate left the Recognised Predicate Normal Form, so neither verdict can
+    /// be proven.
+    Unanalysable {
+        process: String,
+        node: String,
+        construct: String,
+        offset: usize,
+        predicate: String,
+    },
+}
+
+/// The ONE disjointness procedure. Callers supply a group the message-type clauses do not
+/// separate (so `mt_disjoint` is already false for every pair in it) and this answers the
+/// `pred_disjoint` half of `mt_disjoint ∨ pred_disjoint`. A provable overlap outranks an
+/// unanalysable one: it is the stronger fault and the more actionable message.
+fn group_verdict(group: &[&Subscriber<'_>]) -> GroupVerdict {
+    let mut unanalysable: Option<GroupVerdict> = None;
+    for (i, a) in group.iter().enumerate() {
+        for b in &group[i + 1..] {
+            match selector::pred_disjoint(a.analysis(), b.analysis()) {
+                selector::Disjointness::Disjoint => {}
+                selector::Disjointness::Overlap(witness) => return GroupVerdict::Overlap(witness),
+                selector::Disjointness::Unanalysable { construct, offset } => {
+                    if unanalysable.is_none() {
+                        // Name the side that is actually opaque — a subscriber with no
+                        // predicate never is.
+                        let culprit = if a.analysis().is_opaque() { a } else { b };
+                        unanalysable = Some(GroupVerdict::Unanalysable {
+                            process: culprit.process_id.to_string(),
+                            node: culprit.node_id.to_string(),
+                            construct,
+                            offset,
+                            predicate: culprit
+                                .predicate
+                                .as_ref()
+                                .map(|p| p.source_text.clone())
+                                .unwrap_or_default(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    unanalysable.unwrap_or(GroupVerdict::Disjoint)
+}
+
+/// Decide and report one message-type-overlapping group.
+fn report_group(
+    channel: &str,
+    message_type: &str,
+    group: &[&Subscriber<'_>],
+    dep_label: &str,
+    out: &mut Vec<LintDiagnostic>,
+) {
+    if group.len() < 2 {
+        return;
+    }
+    match group_verdict(group) {
+        GroupVerdict::Disjoint => {}
+        GroupVerdict::Overlap(witness) => {
+            let processes: Vec<&str> = group.iter().map(|s| s.process_id).collect();
+            if !group.iter().any(|s| s.has_predicate()) {
+                // The message-type-only overlap this check has always reported — same code,
+                // same text, now derived from the one procedure.
+                out.push(
+                    LintDiagnostic::error(
+                        codes::CHANNEL_AMBIGUOUS_HANDLER,
+                        format!(
+                            "deployment {dep_label}: non-broadcast channel '{channel}': message \
+                             type {message_type} is claimed by {processes:?}. A non-broadcast \
+                             channel must resolve to exactly one process — this is an ambiguous \
+                             routing target, so the deployment must not package."
+                        ),
+                    )
+                    .at_named("channels.yaml", channel),
+                );
+                return;
+            }
+            let assignment = if witness.is_empty() {
+                "any message".to_string()
+            } else {
+                witness
+                    .iter()
+                    .map(|(key, value)| format!("{key} = {value}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            out.push(
+                LintDiagnostic::error(
+                    codes::CHANNEL_SELECTOR_OVERLAP,
+                    format!(
+                        "deployment {dep_label}: non-broadcast channel '{channel}': message type \
+                         {message_type} is claimed by {processes:?}, and their <q:source \
+                         filterExpression> predicates do not separate them — a message with \
+                         {assignment} is eligible for more than one of them. To fix: \
+                         {SELECTOR_ESCAPES}."
+                    ),
+                )
+                .at_named("channels.yaml", channel),
+            );
+        }
+        GroupVerdict::Unanalysable {
+            process,
+            node,
+            construct,
+            offset,
+            predicate,
+        } => {
+            let processes: Vec<&str> = group.iter().map(|s| s.process_id).collect();
+            out.push(
+                LintDiagnostic::error(
+                    codes::CHANNEL_SELECTOR_NOT_ANALYSABLE,
+                    format!(
+                        "deployment {dep_label}: non-broadcast channel '{channel}': message type \
+                         {message_type} is claimed by {processes:?}, so their predicates must be \
+                         PROVEN disjoint — but process '{process}' uses {construct} at offset \
+                         {offset} of '{predicate}', which is outside the analysable form, so \
+                         neither disjointness nor overlap can be established. The analysable \
+                         form is permanent, not a temporary limitation. To fix: \
+                         {SELECTOR_ESCAPES}."
+                    ),
+                )
+                .at_node(&process, &node),
+            );
+        }
+    }
 }
 
 fn check_non_broadcast_uniqueness(
@@ -1278,34 +1818,20 @@ fn check_non_broadcast_uniqueness(
         }
     }
 
-    let ambiguous = |message_type: &str, processes: Vec<&str>| {
-        LintDiagnostic::error(
-            codes::CHANNEL_AMBIGUOUS_HANDLER,
-            format!(
-                "deployment {dep_label}: non-broadcast channel '{channel}': message type \
-                 {message_type} is claimed by {processes:?}. A non-broadcast channel must \
-                 resolve to exactly one process — this is an ambiguous routing target, so \
-                 the deployment must not package."
-            ),
-        )
-        .at_named("channels.yaml", channel)
-    };
-
-    // (A) Catch-all overlap: >1 catch-all, or a catch-all coexisting with typed claims.
-    let has_typed = !exact.is_empty() || !patterns.is_empty();
-    if catch_all.len() > 1 || (!catch_all.is_empty() && has_typed) {
-        let mut ids: Vec<&str> = catch_all.iter().map(|s| s.process_id).collect();
-        if catch_all.len() == 1 {
-            ids.extend(exact.iter().map(|s| s.process_id));
-            ids.extend(patterns.iter().map(|s| s.process_id));
-        }
-        let mut distinct = Vec::new();
-        for id in ids {
-            if !distinct.contains(&id) {
-                distinct.push(id);
-            }
-        }
-        out.push(ambiguous("(catch-all)", distinct));
+    // (A) Catch-all overlap: a catch-all claims every message type, so it overlaps every other
+    // subscriber, and two catch-alls overlap each other. One group, one verdict.
+    if catch_all.len() > 1 || (!catch_all.is_empty() && (!exact.is_empty() || !patterns.is_empty()))
+    {
+        let mut group: Vec<&Subscriber<'_>> = catch_all.clone();
+        group.extend(exact.iter().copied());
+        group.extend(patterns.iter().copied());
+        report_group(
+            channel,
+            "(catch-all)",
+            &dedup_by_process(group),
+            dep_label,
+            out,
+        );
     }
 
     // (B) Concrete-type overlap: candidates = exact values ∪ the codec's declared set.
@@ -1322,23 +1848,35 @@ fn check_non_broadcast_uniqueness(
         }
     }
     for message_type in &candidates {
-        let mut matchers: Vec<&str> = Vec::new();
+        let mut group: Vec<&Subscriber<'_>> = Vec::new();
         for sub in &exact {
-            if sub.value() == Some(message_type) && !matchers.contains(&sub.process_id) {
-                matchers.push(sub.process_id);
+            if sub.value() == Some(message_type) {
+                group.push(sub);
             }
         }
         for sub in &patterns {
-            if full_match(message_type, sub.pattern().expect("pattern"))
-                && !matchers.contains(&sub.process_id)
-            {
-                matchers.push(sub.process_id);
+            if full_match(message_type, sub.pattern().expect("pattern")) {
+                group.push(sub);
             }
         }
-        if matchers.len() > 1 {
-            out.push(ambiguous(message_type, matchers));
-        }
+        report_group(
+            channel,
+            message_type,
+            &dedup_by_process(group),
+            dep_label,
+            out,
+        );
     }
+}
+
+/// Keep one subscriber per process, as this check has always done: two start events of ONE
+/// process on one channel resolve by the runtime's own ambiguity check, not here.
+fn dedup_by_process<'s, 'a>(group: Vec<&'s Subscriber<'a>>) -> Vec<&'s Subscriber<'a>> {
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    group
+        .into_iter()
+        .filter(|sub| seen.insert(sub.process_id))
+        .collect()
 }
 
 /// Outbound reply conformance: every `<q:reply messageType>` must be emittable on the
@@ -2923,6 +3461,21 @@ fn check_feel_sites(deployment: &LoadedDeployment, dep_label: &str, out: &mut Ve
                         alias.name
                     );
                     check_feel_pure(&alias.expression, &site, node_anchor(), dep_label, out);
+                }
+                // The intake predicate is replay-bound the same way a dispatch case is: it
+                // decides which process handles a message, so a `now()` in it would make routing
+                // depend on the clock. Parse + determinism live here; the vocabulary and
+                // disjointness analysis lives in the channel-uniqueness suite, which is the
+                // first place that knows the bound codec.
+                if let Some(source) = bindings.source() {
+                    if let Some(filter) = &source.filter_expression {
+                        let site = format!(
+                            "process '{}' node '{}' <q:source filterExpression=\"{filter}\">",
+                            process.id,
+                            node.id()
+                        );
+                        check_feel_pure(filter, &site, node_anchor(), dep_label, out);
+                    }
                 }
                 if let Some(dispatch) = &bindings.dispatch {
                     for case in &dispatch.cases {
@@ -4805,9 +5358,43 @@ fn check_output_conformance(
                 // consumer — so checking it against the intake codec compares the render to the
                 // wrong contract (and errors on a perfectly good transform). Resolve the send's
                 // target first; only a reply (or a node with no send) falls back to the intake.
-                let send = owner.bindings_for(id).send.clone();
-                let codec_name = match &send {
-                    Some(send) => match send.channel.as_deref() {
+                let node_bindings = owner.bindings_for(id);
+                let send = node_bindings.send.clone();
+                // A STATED codec settles it, wherever the bytes are headed. Inference only
+                // answers "which codec will carry this"; the author answers "which contract must
+                // this satisfy", and a translating flow is exactly the case where the two differ.
+                let stated = send
+                    .as_ref()
+                    .and_then(|s| s.codec.as_deref())
+                    .or_else(|| {
+                        node_bindings
+                            .reply
+                            .as_ref()
+                            .and_then(|r| r.codec.as_deref())
+                    })
+                    .map(str::trim)
+                    .filter(|c| !c.is_empty())
+                    .map(str::to_string);
+                if let Some(stated) = &stated {
+                    if matches!(declared_types(deployment, stated), DeclaredTypes::Unknown) {
+                        out.push(
+                            LintDiagnostic::error(
+                                codes::CONFIG_OUTPUT_CODEC_UNKNOWN,
+                                format!(
+                                    "deployment {dep_label}: process '{}' ({site}) states codec \
+                                     '{stated}' for its output, but this deployment carries no \
+                                     such codec",
+                                    process.id
+                                ),
+                            )
+                            .at_node(&process.id, id),
+                        );
+                        return;
+                    }
+                }
+                let codec_name = match (&stated, &send) {
+                    (Some(stated), _) => Some(stated.clone()),
+                    (None, Some(send)) => match send.channel.as_deref() {
                         Some(channel) => {
                             // An outbound channel binding `local://<target>` / `pull://<target>`
                             // delivers to <target>, so the CONSUMER's codec is the contract.
@@ -4828,7 +5415,8 @@ fn check_output_conformance(
                                         "deployment {dep_label}: process '{}' ({site}) declares \
                                          outputMessageType '{output_type}', not verifiable: the \
                                          send targets an explicit destination, not a declared \
-                                         channel with a codec",
+                                         channel with a codec. State <q:send codec=\"…\"> to \
+                                         have the render held to a contract anyway.",
                                         process.id
                                     ),
                                 )
@@ -4837,7 +5425,7 @@ fn check_output_conformance(
                             return;
                         }
                     },
-                    None => reply_codec.clone(),
+                    (None, None) => reply_codec.clone(),
                 };
                 let Some(codec_name) = &codec_name else {
                     out.push(
@@ -4883,9 +5471,199 @@ fn check_output_conformance(
                         )
                         .at_node(&process.id, id),
                     );
+                    return;
                 }
+                // The render itself, asked of the codec that must carry it. Everything above
+                // compares two DECLARATIONS; this compares the declaration to the artifact.
+                check_render_against_codec(
+                    deployment,
+                    codec_name,
+                    implementation.trim(),
+                    output_type,
+                    manifests
+                        .template_output_attributes
+                        .get(implementation.trim()),
+                    dep_label,
+                    &process.id,
+                    id,
+                    &site,
+                    out,
+                );
             });
         }
+    }
+}
+
+/// Ask the destination codec what the template's own bytes ARE, and hold the author's
+/// declaration to that answer.
+///
+/// This is the only check in the family that is not declaration-against-declaration. A template
+/// is text with holes, and for every text-shaped wire format the holes are leaf content: the
+/// element and attribute structure that decides a message's classification is present in the
+/// unrendered file, so the codec can classify it. That makes the check cheap and, more to the
+/// point, SOUND in the direction that matters — it cannot pass a template whose structure is
+/// wrong, which is the failure a declared `outputMessageType` alone cannot see.
+///
+/// Nothing here knows a wire format, a standard or a vocabulary. The codec answers both
+/// questions — what type did I just read, and which attributes did I recognise — and the engine
+/// only compares. A codec that cannot classify the unrendered text (a binary format, a template
+/// whose holes straddle the structure) yields a WARNING, never an error: the author declared
+/// something this check simply cannot adjudicate, and a lint that errors on what it cannot prove
+/// is a lint authors route around.
+#[allow(clippy::too_many_arguments)]
+fn check_render_against_codec(
+    deployment: &LoadedDeployment,
+    codec_name: &str,
+    template_id: &str,
+    output_type: &str,
+    declared_attributes: Option<&BTreeMap<String, String>>,
+    dep_label: &str,
+    process_id: &str,
+    node_id: &str,
+    site: &str,
+    out: &mut Vec<LintDiagnostic>,
+) {
+    let Some(codec) = resolve_codec_for_shape(deployment, codec_name) else {
+        return; // unresolvable codec — the type check above already warned
+    };
+
+    // ---- the declared attribute vocabulary, against what the codec says it reports ----
+    if let Some(declared) = declared_attributes {
+        let specs = codec.declared_attributes(Some(output_type));
+        if !specs.is_empty() {
+            for (key, value) in declared {
+                let Some(spec) = specs.iter().find(|s| &s.key == key) else {
+                    let known: Vec<&str> = specs.iter().map(|s| s.key.as_str()).collect();
+                    out.push(
+                        LintDiagnostic::error(
+                            codes::CONFIG_TEMPLATE_OUTPUT_ATTRIBUTE_UNKNOWN,
+                            format!(
+                                "deployment {dep_label}: process '{process_id}' ({site}) \
+                                 declares outputAttributes.{key}, but codec '{codec_name}' \
+                                 reports no such attribute on '{output_type}' — it reports \
+                                 {known:?}"
+                            ),
+                        )
+                        .at_node(process_id, node_id),
+                    );
+                    continue;
+                };
+                if !spec.domain.is_empty()
+                    && !spec
+                        .domain
+                        .iter()
+                        .any(|lit| attribute_literal_text(lit) == *value)
+                {
+                    let domain: Vec<String> =
+                        spec.domain.iter().map(attribute_literal_text).collect();
+                    out.push(
+                        LintDiagnostic::error(
+                            codes::CONFIG_TEMPLATE_OUTPUT_ATTRIBUTE_VALUE_UNKNOWN,
+                            format!(
+                                "deployment {dep_label}: process '{process_id}' ({site}) \
+                                 declares outputAttributes.{key} = '{value}', outside the \
+                                 values codec '{codec_name}' declares for it on \
+                                 '{output_type}': {domain:?}"
+                            ),
+                        )
+                        .at_node(process_id, node_id),
+                    );
+                }
+            }
+        }
+    }
+
+    // ---- the render, classified by the codec that will carry it ----
+    let Some(template) = deployment.templates.get(template_id) else {
+        return; // a missing template is a separate, louder diagnostic
+    };
+    let decoded = codec.decode(template.content.as_bytes(), None);
+    let Some(reported) = decoded.message_type.as_deref() else {
+        out.push(
+            LintDiagnostic::warning(
+                codes::CONFIG_TEMPLATE_OUTPUT_UNVERIFIABLE,
+                format!(
+                    "deployment {dep_label}: process '{process_id}' ({site}) declares \
+                     outputMessageType '{output_type}', not verifiable: codec '{codec_name}' \
+                     cannot classify the unrendered template, so only the declaration was \
+                     checked. The render is still validated at run time before it leaves."
+                ),
+            )
+            .at_node(process_id, node_id),
+        );
+        return;
+    };
+    if reported != output_type {
+        out.push(
+            LintDiagnostic::error(
+                codes::CONFIG_TEMPLATE_OUTPUT_MISMATCH,
+                format!(
+                    "deployment {dep_label}: process '{process_id}' ({site}) declares \
+                     outputMessageType '{output_type}', but codec '{codec_name}' reads the \
+                     template as '{reported}' — the template produces a different message than \
+                     the manifest claims"
+                ),
+            )
+            .at_node(process_id, node_id),
+        );
+        return;
+    }
+    if let Some(declared) = declared_attributes {
+        for (key, value) in declared {
+            let Some(actual) = decoded.attributes.get(key) else {
+                out.push(
+                    LintDiagnostic::error(
+                        codes::CONFIG_TEMPLATE_OUTPUT_MISMATCH,
+                        format!(
+                            "deployment {dep_label}: process '{process_id}' ({site}) declares \
+                             outputAttributes.{key} = '{value}', but codec '{codec_name}' \
+                             reports no '{key}' when it reads the template"
+                        ),
+                    )
+                    .at_node(process_id, node_id),
+                );
+                continue;
+            };
+            let actual_text = feel_scalar_text(actual);
+            if actual_text.as_deref() != Some(value.as_str()) {
+                let shown = actual_text.unwrap_or_else(|| format!("{actual:?}"));
+                out.push(
+                    LintDiagnostic::error(
+                        codes::CONFIG_TEMPLATE_OUTPUT_MISMATCH,
+                        format!(
+                            "deployment {dep_label}: process '{process_id}' ({site}) declares \
+                             outputAttributes.{key} = '{value}', but codec '{codec_name}' reads \
+                             '{shown}' from the template"
+                        ),
+                    )
+                    .at_node(process_id, node_id),
+                );
+            }
+        }
+    }
+}
+
+/// The authored text of one declared attribute literal, so a manifest's string value can be
+/// compared to a typed domain without the manifest having to carry types of its own.
+fn attribute_literal_text(lit: &sutra_codec_spi::AttributeLiteral) -> String {
+    use sutra_codec_spi::AttributeLiteral;
+    match lit {
+        AttributeLiteral::Text(s) => s.clone(),
+        AttributeLiteral::Integer(i) => i.to_string(),
+        AttributeLiteral::Decimal(d) => d.clone(),
+        AttributeLiteral::Boolean(b) => b.to_string(),
+    }
+}
+
+/// The authored text of a scalar FEEL value — the only values an attribute declaration can
+/// name. `None` for anything else, which the caller reports as a mismatch rather than guessing.
+fn feel_scalar_text(value: &sutra_feel::value::FeelValue) -> Option<String> {
+    use sutra_feel::value::FeelValue;
+    match value {
+        FeelValue::String(s) => Some(s.clone()),
+        FeelValue::Boolean(b) => Some(b.to_string()),
+        FeelValue::Number(n) => Some(n.to_string()),
+        _ => None,
     }
 }
 
@@ -5513,6 +6291,7 @@ mod tests {
             mode: ReplyMode::Native,
             destination: channel.is_none().then(|| "external".to_string()),
             channel: channel.map(str::to_string),
+            codec: None,
             content_type: None,
             ce_type: None,
             ce_source: None,
@@ -5547,6 +6326,7 @@ mod tests {
             redactors: vec![],
             message_type_value: None,
             message_type_pattern: None,
+            filter_expression: None,
         }
     }
 

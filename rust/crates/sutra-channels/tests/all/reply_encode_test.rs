@@ -21,6 +21,11 @@ const TENANT: &str = "acme";
 
 /// Start event decodes via the channel codec; the `reply` service task echoes the payload
 /// back as `responseObject`.
+///
+/// The task carries an explicit `<q:reply/>`, because that declaration is what asks the engine
+/// to answer the caller at all. These tests are about HOW a declared reply is encoded, not about
+/// whether one was declared — the fixture used to lean on an implicit reply, which is precisely
+/// the conflation that made an asynchronous channel deliver its message twice.
 const BPMN: &str = r#"<?xml version="1.0"?>
 <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
                   xmlns:q="urn:sutra:q:1.0">
@@ -28,7 +33,9 @@ const BPMN: &str = r#"<?xml version="1.0"?>
     <bpmn:startEvent id="S">
       <bpmn:extensionElements><q:source channel="reply-in" name="payload"/></bpmn:extensionElements>
     </bpmn:startEvent>
-    <bpmn:serviceTask id="T" implementation="reply"/>
+    <bpmn:serviceTask id="T" implementation="reply">
+      <bpmn:extensionElements><q:reply/></bpmn:extensionElements>
+    </bpmn:serviceTask>
     <bpmn:endEvent id="E"/>
     <bpmn:sequenceFlow id="f1" sourceRef="S" targetRef="T"/>
     <bpmn:sequenceFlow id="f2" sourceRef="T" targetRef="E"/>
@@ -141,5 +148,78 @@ fn no_response_object_leaves_outputs_untouched() {
     assert_eq!(
         outputs.get("processed"),
         Some(&serde_json::Value::Bool(true))
+    );
+}
+
+/// A flow that renders but declares no `<q:reply>` answers nothing.
+///
+/// `responseBody` is the only slot the executor has for a template / script / decision render,
+/// so a terminal task that renders bytes for a `<q:send>` fills it without ever asking to
+/// answer the caller. Treating that as a reply made an asynchronous channel deliver the same
+/// message twice — once out of band through its send, and once back in the ack's body — which
+/// is what this pins shut. The distinction is the DECLARATION, not the presence of bytes.
+#[test]
+fn a_render_with_no_declared_reply_answers_nothing() {
+    const NO_REPLY_BPMN: &str = r#"<?xml version="1.0"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0">
+  <bpmn:process id="echo">
+    <bpmn:startEvent id="S">
+      <bpmn:extensionElements><q:source channel="reply-in" name="payload"/></bpmn:extensionElements>
+    </bpmn:startEvent>
+    <bpmn:serviceTask id="T" implementation="reply"/>
+    <bpmn:endEvent id="E"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="S" targetRef="T"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="T" targetRef="E"/>
+  </bpmn:process>
+</bpmn:definitions>"#;
+
+    let module = BpmnModelLoader::new()
+        .load(NO_REPLY_BPMN.as_bytes())
+        .expect("BPMN");
+    let deployment = DeploymentId::of("dep-000000000000000000000042").expect("valid deployment id");
+    let tasks = TaskRegistry::new().register("reply", move |_input, _ctx| {
+        // Exactly what a template service task produces.
+        Ok(FeelValue::Map(BTreeMap::from([(
+            "responseBody".to_string(),
+            FeelValue::String("<Rendered/>".to_string()),
+        )])))
+    });
+    let sink = Rc::new(DrainingSink::new());
+    let executor = TokenExecutor::builder(tasks)
+        .with_feel()
+        .with_emission_sink(Rc::clone(&sink) as Rc<dyn sutra_executor::EmissionSink>)
+        .build();
+    let engine = ChannelEngine::builder(
+        executor,
+        sink,
+        InboundChain::new(
+            CodecRegistry::with_builtins(),
+            sutra_channels::FormatRegistry::with_builtins(),
+            ValidatorRegistry::new(),
+        ),
+    )
+    .with_binding(ChannelBinding::new(
+        "reply-in",
+        namespace(),
+        deployment.clone(),
+        "json",
+    ))
+    .with_module(&deployment, &module)
+    .build();
+
+    let DispatchOutcome::Completed { reply, outputs, .. } =
+        drive(engine.dispatch(&inbound(b"{\"k\":\"v\"}", "application/json"))).expect("dispatch")
+    else {
+        panic!("expected Completed");
+    };
+    assert!(
+        reply.is_none(),
+        "no <q:reply> was declared, so there is nothing to answer with"
+    );
+    // The render is still there for a `<q:send>` to carry — suppressed as a REPLY, not lost.
+    assert!(
+        outputs.get("responseBody").is_some(),
+        "the render stays available to the flow: {outputs}"
     );
 }

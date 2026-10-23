@@ -116,6 +116,19 @@ pub struct SourceBinding {
     pub redactors: Vec<String>,
     pub message_type_value: Option<String>,
     pub message_type_pattern: Option<String>,
+    /// `<q:source filterExpression>`: a FEEL predicate over the message ATTRIBUTES the channel's
+    /// codec reported, read under the `attr` root. Held as source text, not a parsed AST — this
+    /// crate carries no expression evaluator, exactly as it does for `<q:case when>` and
+    /// `<q:alias expression>`; `sutra-channels` compiles and evaluates it, and the deploy-time
+    /// lint analyses it.
+    ///
+    /// Narrows [`Self::message_type_value`] / [`Self::message_type_pattern`] by conjunction
+    /// rather than replacing them, which is what lets two start events share one message type and
+    /// be told apart by an attribute.
+    ///
+    /// Not to be confused with [`Self::message_type`], which is the CloudEvents `type` — a
+    /// different attribute with a confusingly similar name.
+    pub filter_expression: Option<String>,
 }
 
 /// Parsed `<q:case>` — one row of a [`DispatchTable`].
@@ -158,6 +171,14 @@ pub struct ReplyBinding {
     pub auth_secret_ref: Option<String>,
     pub auth_header: Option<String>,
     pub message_type: Option<String>,
+    /// `@codec` — the codec whose contract this output must satisfy, stated rather than inferred.
+    ///
+    /// A flow may accept one wire format and emit another, so the codec that validated the
+    /// inbound message need not govern what leaves. Absent, the engine infers the codec from the
+    /// channel the bytes leave by; an endpoint `@destination` has none to infer, which is why
+    /// stating it is the only way to hold such a send to a contract. Carried as an opaque name —
+    /// resolution and the read-back check live in `sutra-channels`.
+    pub codec: Option<String>,
     /// Respond-and-continue (`@continue="true"`): flush this reply when the task completes, then
     /// park + self-resume the remaining nodes asynchronously. Meaningful on a non-terminal
     /// `serviceTask`; `false` is the synchronous reply (caller waits for completion).
@@ -184,6 +205,14 @@ pub struct SendBinding {
     pub auth_secret_ref: Option<String>,
     pub auth_header: Option<String>,
     pub message_type: Option<String>,
+    /// `@codec` — the codec whose contract this output must satisfy, stated rather than inferred.
+    ///
+    /// A flow may accept one wire format and emit another, so the codec that validated the
+    /// inbound message need not govern what leaves. Absent, the engine infers the codec from the
+    /// channel the bytes leave by; an endpoint `@destination` has none to infer, which is why
+    /// stating it is the only way to hold such a send to a contract. Carried as an opaque name —
+    /// resolution and the read-back check live in `sutra-channels`.
+    pub codec: Option<String>,
     /// Author-declared `<q:header>` attributes; each `value` is FEEL over the
     /// sending process context, resolved at dispatch and carried as a transport header so a hop
     /// `key` can name a header the sender sets and the receiver correlates on.

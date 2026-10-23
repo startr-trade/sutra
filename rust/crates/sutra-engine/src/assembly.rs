@@ -1562,6 +1562,23 @@ pub(crate) fn build_shared_registries(
         }
     }
 
+    // A `<q:source>` selector that did not compile — a malformed `messageTypePattern`, or a
+    // `filterExpression` that does not parse or consults the clock. `sutra lint` refuses these at
+    // package time, so reaching here means a package bypassed it.
+    //
+    // Reported rather than fatal, following the codec-manifest posture above: refusing the whole
+    // deployment would stop every other process in it from serving over one bad selector. The
+    // start event itself is NOT served — its predicate answers false for every message, so it
+    // matches nothing instead of matching everything.
+    for (process_id, node_id, code, detail) in processes.selector_faults() {
+        tracing::error!(
+            code = %code,
+            process.id = %process_id,
+            node.id = %node_id,
+            "<q:source> selector did not compile — this start event will match no message: {detail}"
+        );
+    }
+
     Arc::new(SharedRegistries {
         processes: Arc::new(processes),
         templates: Arc::new(templates),

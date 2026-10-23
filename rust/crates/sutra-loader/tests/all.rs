@@ -17,6 +17,8 @@ mod lint_navigation_test;
 mod lint_never_init_test;
 #[path = "all/lint_output_conformance_test.rs"]
 mod lint_output_conformance_test;
+#[path = "all/lint_selector_test.rs"]
+mod lint_selector_test;
 #[path = "all/lint_store_structure_test.rs"]
 mod lint_store_structure_test;
 #[path = "all/lint_template_fields_test.rs"]

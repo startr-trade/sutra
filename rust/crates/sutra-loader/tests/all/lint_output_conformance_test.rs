@@ -175,3 +175,119 @@ fn a_send_to_a_bare_destination_is_unverifiable_not_wrong() {
         report.diagnostics
     );
 }
+
+// ---- the render itself, classified by the codec that must carry it -------------------------
+//
+// Everything above compares two DECLARATIONS: the manifest's `outputMessageType` against the
+// destination codec's type set. That cannot see the failure that actually matters — a template
+// that renders the wrong message while declaring the right one. The checks below ask the codec
+// what the template's own text IS.
+//
+// They work because a template is text with holes, and for a text-shaped wire format the holes
+// are leaf content: the element structure that decides classification is already present
+// unrendered.
+
+const MISMATCH: &str = "SUTRA.CONFIG.TEMPLATE.OUTPUT_MISMATCH";
+const CODEC_UNKNOWN: &str = "SUTRA.CONFIG.OUTPUT.CODEC_UNKNOWN";
+
+/// The fixture above, with the template body and the manifest entry under the author's control.
+fn report_for_render(node_ext: &str, template: &str, manifest_entry: &str) -> LintReport {
+    let dir = tempfile::tempdir().unwrap();
+    build(dir.path(), node_ext, "Outbound");
+    write(dir.path(), "templates/t.hbs", template);
+    write(
+        dir.path(),
+        "templates/template-manifest.yaml",
+        &format!("templates:\n  - file: t.hbs\n{manifest_entry}"),
+    );
+    lint_dir(dir.path())
+}
+
+fn codes_of(report: &LintReport) -> Vec<&str> {
+    report.diagnostics.iter().map(|d| d.code.as_str()).collect()
+}
+
+#[test]
+fn a_template_rendering_the_declared_message_passes() {
+    let report = report_for_render(
+        r#"<q:send channel="to-out" messageType="Outbound"/>"#,
+        r#"<Outbound xmlns="urn:t:out"><id>{{payload.id}}</id></Outbound>"#,
+        "    outputMessageType: Outbound\n",
+    );
+    assert!(
+        !has(&report, MISMATCH),
+        "a template that renders what it declares must pass: {:?}",
+        codes_of(&report)
+    );
+}
+
+/// The failure the declaration check cannot see: the manifest says `Outbound` and the codec
+/// agrees `Outbound` is producible, but the template renders something else entirely.
+#[test]
+fn a_template_rendering_a_different_message_than_it_declares_is_caught() {
+    let report = report_for_render(
+        r#"<q:send channel="to-out" messageType="Outbound"/>"#,
+        r#"<Inbound xmlns="urn:t:in"><id>{{payload.id}}</id></Inbound>"#,
+        "    outputMessageType: Outbound\n",
+    );
+    assert!(
+        has(&report, MISMATCH),
+        "a wrong-envelope template must be caught: {:?}",
+        codes_of(&report)
+    );
+    let reported = report
+        .diagnostics
+        .iter()
+        .find(|d| d.code == MISMATCH)
+        .expect("checked above");
+    // Both halves of the comparison must be in the message, or the author cannot tell which of
+    // the two to change — the manifest or the template.
+    assert!(
+        reported.message.contains("'Outbound'") && reported.message.contains("'Inbound'"),
+        "the declared and the actual message type must both be named: {}",
+        reported.message
+    );
+}
+
+/// A codec named on the output but absent from the deployment is fail-closed, not a warning:
+/// stating it is how an author ASKS for the contract check, so a typo must not silently exempt
+/// the one output that requested one.
+#[test]
+fn a_stated_codec_the_deployment_does_not_carry_is_an_error() {
+    let report = report_for_render(
+        r#"<q:send channel="to-out" codec="urn:nobody" messageType="Outbound"/>"#,
+        r#"<Outbound xmlns="urn:t:out"><id>{{payload.id}}</id></Outbound>"#,
+        "    outputMessageType: Outbound\n",
+    );
+    assert!(
+        has(&report, CODEC_UNKNOWN),
+        "an unresolvable stated codec must error: {:?}",
+        codes_of(&report)
+    );
+}
+
+/// A send to a bare `@destination` has no channel to infer a codec from — but STATING one holds
+/// the render to a contract anyway, which is the case inference can never reach.
+#[test]
+fn a_stated_codec_governs_a_destination_send_that_inference_cannot_reach() {
+    let inferred = report_for_render(
+        r#"<q:send destination="https://example.test/out" messageType="Outbound"/>"#,
+        r#"<Outbound xmlns="urn:t:out"><id>{{payload.id}}</id></Outbound>"#,
+        "    outputMessageType: Outbound\n",
+    );
+    assert!(
+        has(&inferred, UNVERIFIABLE),
+        "an endpoint send carries no codec to infer: {:?}",
+        codes_of(&inferred)
+    );
+    let stated = report_for_render(
+        r#"<q:send destination="https://example.test/out" codec="urn:out" messageType="Outbound"/>"#,
+        r#"<Outbound xmlns="urn:t:out"><id>{{payload.id}}</id></Outbound>"#,
+        "    outputMessageType: Outbound\n",
+    );
+    assert!(
+        !has(&stated, UNVERIFIABLE) && !has(&stated, MISMATCH),
+        "stating the codec makes the same send verifiable: {:?}",
+        codes_of(&stated)
+    );
+}

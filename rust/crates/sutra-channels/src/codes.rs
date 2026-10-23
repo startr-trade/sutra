@@ -35,6 +35,17 @@ pub const INBOUND_CAPABILITY_MISMATCH: &str = "SUTRA.INBOUND.CAPABILITY_MISMATCH
 pub const INBOUND_NO_START_EVENT_FOR_MESSAGE_TYPE: &str =
     "SUTRA.INBOUND.NO_START_EVENT_FOR_MESSAGE_TYPE";
 pub const INBOUND_AMBIGUOUS_HANDLER: &str = "SUTRA.INBOUND.AMBIGUOUS_HANDLER";
+/// A start event's `<q:source filterExpression>` could not be decided for one message: the
+/// predicate errored, or returned a non-boolean. The start event is treated as NOT eligible
+/// (fail closed) and the dispatch continues, because another subscriber may legitimately match
+/// and one broken process must not deny a shared channel. Parse and determinism failures cannot
+/// surface here — activation refuses a deployment whose selectors do not compile.
+pub const INBOUND_SELECT_PREDICATE_FAILED: &str = "SUTRA.INBOUND.SELECT_PREDICATE_FAILED";
+/// A start event's selector could not be COMPILED at activation: a malformed
+/// `messageTypePattern`, or a `filterExpression` that does not parse or is not deterministic.
+/// Activation refuses the deployment, so such a selector never reaches the inbound path — where
+/// a malformed pattern used to be skipped in silence and match nothing at all.
+pub const SELECTOR_COMPILE_FAILED: &str = "SUTRA.RESOLVE.SELECTOR_COMPILE_FAILED";
 pub const INBOUND_VALIDATION_REJECT: &str = "SUTRA.INBOUND.VALIDATION_REJECT";
 pub const INBOUND_VALIDATION_ERROR: &str = "SUTRA.INBOUND.VALIDATION_ERROR";
 pub const INBOUND_PERSISTENCE_REQUIRED: &str = "SUTRA.INBOUND.PERSISTENCE_REQUIRED";
@@ -97,6 +108,21 @@ pub const RUNTIME_RESUME_PIN_UNRESOLVABLE: &str = "SUTRA.RUNTIME.RESUME.PIN_UNRE
 /// `StuckInstanceScanner`, never held forever.
 pub const RUNTIME_RESUME_CLAIM_HELD: &str = "SUTRA.RUNTIME.RESUME.CLAIM_HELD";
 pub const OUTBOUND_ENCODE_FAILED: &str = "SUTRA.OUTBOUND.ENCODE_FAILED";
+/// A message the flow produced failed the validation of the very codec that was about to put it
+/// on the wire, so it was not sent.
+///
+/// Validation is a property of the contract, not of a direction. A channel that binds a
+/// schema-backed codec asserts that what crosses it conforms — and a flow that renders its own
+/// payload (a template) bypasses the encode path entirely, so without this check the engine
+/// would validate every byte it accepts and none of the bytes it emits. The same codec answers
+/// both directions: its decode step IS its validator, so asking it to read back what the flow
+/// just produced is the symmetric question, with no second contract to keep in step.
+///
+/// Fail-closed by default and for the inbound reason: a flow that declared no posture toward a
+/// validation failure has said nothing about handling one, so the invalid message must not leave.
+/// Schema-less egress is untouched — a bare format never rejects, so there is no contract to
+/// fail.
+pub const OUTBOUND_VALIDATION_REJECT: &str = "SUTRA.OUTBOUND.VALIDATION_REJECT";
 pub const OUTBOUND_SEND_FAILED: &str = "SUTRA.OUTBOUND.SEND.FAILED";
 pub const OUTBOUND_HTTP_AUTH_REF_UNRESOLVED: &str = "SUTRA.OUTBOUND.HTTP.AUTH_REF_UNRESOLVED";
 pub const OUTBOUND_HTTP_MTLS_UNSUPPORTED: &str = "SUTRA.OUTBOUND.HTTP.MTLS_UNSUPPORTED";

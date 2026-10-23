@@ -85,7 +85,9 @@ docker pull ghcr.io/startr-trade/sutra:0.2.0-rc.4
 **Runtimes:** the CLI is published for **linux x86_64/arm64**, **macOS x86_64/arm64** and
 **windows x86_64**. The engine image is **Linux only** (`linux/amd64` + `linux/arm64`) — on a Mac
 or a Windows box you author and deploy with the native CLI while the engine runs as a Linux
-container, which is what it does in production anyway.
+container, which is what it does in production anyway. On Apple silicon that container runs
+**natively**: the image is multi-arch, so the pull resolves to `linux/arm64`, built on a native
+arm64 runner — no emulation.
 
 The image tag is pinned on purpose: there is no `latest` yet. Every release so far is a
 pre-release, and a pre-release must not become what an unqualified `docker pull` hands you — so

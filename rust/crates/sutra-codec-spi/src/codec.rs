@@ -1,7 +1,7 @@
 //! The payload-codec contract for the built-in, schema-less codecs
 //! (the format-only view over a `MessageFormat`).
 
-use crate::result::{CodecValue, DecodeResult};
+use crate::result::{AttributeSpec, CodecValue, DecodeResult};
 use crate::shape::SchemaShape;
 
 /// A payload codec: name + accepted content types + total decode + encode (the inverse).
@@ -27,6 +27,22 @@ pub trait PayloadCodec: Send + Sync {
     /// default (opaque / open-typed codecs) — the declared-message-types
     /// default. Consumed by the deploy-time lint's message-type declaration cross-check.
     fn declared_message_types(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// The attributes this codec can report for one message type — the vocabulary a start
+    /// event's intake predicate is checked against. Empty by default, which means OPEN: the
+    /// codec makes no promise, so the deploy-time lint can only warn that a predicate over its
+    /// attributes is unverifiable. A non-empty declaration CLOSES the key set (and, per
+    /// [`crate::result::AttributeSpec::domain`], optionally the value set), which turns a
+    /// predicate that could never match from a silently dead start event into a package-time
+    /// error.
+    ///
+    /// `message_type` scopes the answer the way [`Self::shape_of`] does, because a codec's
+    /// attributes may differ per type. `None` asks for the vocabulary common to every type it
+    /// declares.
+    fn declared_attributes(&self, message_type: Option<&str>) -> Vec<AttributeSpec> {
+        let _ = message_type;
         Vec::new()
     }
 

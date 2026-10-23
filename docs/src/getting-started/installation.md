@@ -98,6 +98,14 @@ author, lint, package and deploy with the native CLI, and the engine runs as a L
 through Docker Desktop, exactly as it does in production. There is no native macOS or Windows
 engine build, and none is planned.
 
+On **Apple silicon that container runs natively**, which is why the absence costs so little. The
+image is a multi-arch manifest, so `docker pull` resolves to `linux/arm64` on its own, and that
+arm64 build is compiled on a native arm64 runner rather than cross-built or emulated. Docker on
+macOS is always a Linux VM, and on Apple silicon that VM is arm64 — so you get native-speed
+execution of the same artifact production runs. (The reverse would be emulated: an `linux/amd64`
+image on Apple silicon goes through Rosetta 2 or QEMU, which is slower and occasionally fails
+outright. Nothing here asks you to do that.)
+
 On an Apple-silicon Mac running the installer under Rosetta 2, `uname -m` answers `x86_64`, so
 you get the Intel build — it runs, translated. Pass `--version` and fetch the
 `aarch64-apple-darwin` archive by hand if you want the native one.

@@ -16,7 +16,10 @@
         { "name": "ack", "isAttr": true, "type": "String", "default": "on-persist" },
         { "name": "dedupKey", "isAttr": true, "type": "String" },
         { "name": "type", "isAttr": true, "type": "String" },
-        { "name": "dataClass", "isAttr": true, "type": "String", "default": "none" }
+        { "name": "dataClass", "isAttr": true, "type": "String", "default": "none" },
+        { "name": "messageTypeValue", "isAttr": true, "type": "String" },
+        { "name": "messageTypePattern", "isAttr": true, "type": "String" },
+        { "name": "filterExpression", "isAttr": true, "type": "String" }
       ]
     },
     {

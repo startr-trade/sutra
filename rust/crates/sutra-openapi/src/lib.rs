@@ -241,6 +241,7 @@ struct Reach {
     start_event_id: String,
     message_type_value: Option<String>,
     message_type_pattern: Option<String>,
+    filter_expression: Option<String>,
     payload_var: String,
     emits: Vec<OutMsg>,
 }
@@ -269,6 +270,7 @@ fn reachable_processes(
                     start_event_id: id.clone(),
                     message_type_value: src.and_then(|s| s.message_type_value.clone()),
                     message_type_pattern: src.and_then(|s| s.message_type_pattern.clone()),
+                    filter_expression: src.and_then(|s| s.filter_expression.clone()),
                     payload_var: src
                         .map(|s| s.name.clone())
                         .unwrap_or_else(|| "payload".into()),
@@ -291,6 +293,9 @@ fn reach_to_json(r: &Reach) -> Value {
     if let Some(v) = &r.message_type_pattern {
         m.insert("messageTypePattern".into(), json!(v));
     }
+    if let Some(v) = &r.filter_expression {
+        m.insert("filterExpression".into(), json!(v));
+    }
     if !r.emits.is_empty() {
         m.insert(
             "emits".into(),
@@ -305,17 +310,20 @@ fn reach_to_json(r: &Reach) -> Value {
 fn inbound_message_types(reach: &[Reach]) -> Vec<String> {
     let mut set = BTreeSet::new();
     for r in reach {
-        match (&r.message_type_value, &r.message_type_pattern) {
-            (Some(v), _) => {
-                set.insert(v.clone());
-            }
-            (None, Some(p)) => {
-                set.insert(format!("~{p}"));
-            }
-            (None, None) => {
-                set.insert("*".to_string());
-            }
-        }
+        let tag = match (&r.message_type_value, &r.message_type_pattern) {
+            (Some(v), _) => v.clone(),
+            (None, Some(p)) => format!("~{p}"),
+            (None, None) => "*".to_string(),
+        };
+        // A predicated subscriber does NOT accept every message of its type — it accepts the
+        // subset its `filterExpression` admits. Publishing the bare type would claim more than
+        // the process answers, and would make two subscribers on one type look like a
+        // contradiction rather than a partition.
+        set.insert(if r.filter_expression.is_some() {
+            format!("{tag}[filtered]")
+        } else {
+            tag
+        });
     }
     set.into_iter().collect()
 }

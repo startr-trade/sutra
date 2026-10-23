@@ -128,38 +128,6 @@ jobs:
           fi
 
   # ---------------------------------------------------------------------------
-  # Second gate, on the tagged tree itself. crates.io publishing is
-  # irreversible, so it waits on this as well as on the CI run above.
-  # ---------------------------------------------------------------------------
-  test:
-    name: verify (make lint + make test)
-    needs: tag
-    runs-on: ubuntu-latest
-    timeout-minutes: 90
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          ref: ${{ github.event.inputs.tag || github.ref }}
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      # Restores ci.yml's main-branch cache (same `shared-key`), so this gate re-verifies the
-      # tagged tree without recompiling the dependency graph from zero. Cargo's own
-      # fingerprinting decides what is still valid — the gate itself is unchanged, it still
-      # runs the whole of `make lint` and `make test`.
-      #
-      # `save-if: false` because this job runs on a TAG ref: a cache saved here is readable
-      # only by that same tag, so writing one would spend upload time on something the next
-      # release can never hit, while evicting main's caches from the 10 GB budget.
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: rust
-          shared-key: verify
-          save-if: false
-      - run: make lint
-      - run: make test
-
-  # ---------------------------------------------------------------------------
   # 1. Engine image — multi-arch, signed, SBOM'd.
   # ---------------------------------------------------------------------------
   image-build:
@@ -217,71 +185,6 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # ---- VERIFY BEFORE PUBLISH ---------------------------------------------------
-      # Load this platform's image locally first and prove two things about it before the
-      # registry ever sees it. The second build below is a cache hit on every layer, so this
-      # costs a load, not a rebuild.
-      #
-      # Why it exists: the release pushed, signed and SBOM'd an image that nothing had run and
-      # nothing had scanned. The scheduled trivy.yml scans `main`, not the tagged tree, and the
-      # tier-2 suites run a LOCAL `release-it` build, not this `release`-profile image. So the
-      # one artifact people actually pull was the least examined thing in the pipeline.
-      - name: Build locally for verification
-        uses: docker/build-push-action@v7
-        with:
-          context: ./rust
-          file: ./rust/Dockerfile
-          platforms: ${{ matrix.platform }}
-          push: false
-          load: true
-          tags: sutra-engine:verify
-          cache-from: ${{ matrix.cache_from }}
-
-      # The entrypoint binary EXECUTES on this architecture and its configuration layer runs.
-      # The engine has no --version to interrogate (it is a server, not a CLI), so the signal
-      # is its documented refusal: with no deployments directory it exits non-zero saying
-      # "configuration invalid — refusing to start". A wrong-architecture binary, a broken
-      # ENTRYPOINT path or a missing shared library all fail to reach that message — which is
-      # exactly the class of defect a distroless image hides until someone runs it.
-      - name: The image's engine runs on this architecture
-        run: |
-          set -eu
-          # Both runs below are EXPECTED to exit non-zero, so each failure is captured rather
-          # than left to `set -e` — `cmd; echo $?` and `cmd && { ... }` would both abort this
-          # step on exactly the behaviour being asserted.
-          out=''
-          code=0
-          out="$(docker run --rm sutra-engine:verify 2>&1)" || code=$?
-          printf '%s\n' "$out" | tail -2
-          if [ "$code" = 0 ]; then
-            echo "::error::the engine exited 0 with no configuration — it must refuse to start" >&2
-            exit 1
-          fi
-          if ! printf '%s' "$out" | grep -q 'refusing to start'; then
-            echo "::error::the engine did not refuse with the documented configuration error; it may not have run at all" >&2
-            exit 1
-          fi
-          # --health-check is what the image's HEALTHCHECK invokes. With no server up it must
-          # fail rather than report healthy, or the orchestrator is told a lie. An `if` keeps
-          # the expected non-zero exit out of `set -e`'s reach.
-          if docker run --rm sutra-engine:verify --health-check >/dev/null 2>&1; then
-            echo "::error::--health-check reported success with no engine running" >&2
-            exit 1
-          fi
-          echo "engine runs on ${{ matrix.platform }}, refuses without config, health-check fails closed"
-
-      # Scanned BEFORE the push, on the tagged tree's own image, failing on any finding the
-      # triage record does not already account for. `make scan-image` is this same gate locally.
-      - name: Scan this platform's image before publishing
-        uses: aquasecurity/trivy-action@v0.36.0 # same pin as trivy.yml
-        with:
-          scan-type: image
-          image-ref: sutra-engine:verify
-          severity: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
-          exit-code: "1"
-          format: table
-          trivyignores: .trivyignore.yaml
-
       # Build ONE platform and push BY DIGEST — no tag. Tagging happens once, in the merge
       # job below, because a tag can only point at one thing: if each leg pushed the same tag
       # the second would silently overwrite the first and the "multi-arch" image would be
@@ -323,6 +226,71 @@ jobs:
 
       # The digest is how the merge job finds this leg. One file per platform, named by the
       # digest itself, so the two matrix jobs cannot collide in the shared artifact.
+      # ---- VERIFY BEFORE IT BECOMES PULLABLE ---------------------------------------
+      # The digest above is pushed but UNTAGGED, and an untagged digest is not something
+      # anyone can pull: `docker pull ghcr.io/…/sutra:<tag>` resolves through the manifest list
+      # that the merge job creates. So the publish boundary is that tag, not this push — which
+      # means verifying here is still verifying before publication, and if either check below
+      # fails this leg fails, the merge job never runs, and the digest is never tagged.
+      #
+      # Verifying the PUSHED bytes rather than a separately built local image is also the
+      # stronger check: it is the artifact the tag will point at, pulled back from the registry
+      # exactly as a consumer would get it. (It used to be a second `load: true` build of the
+      # same context — a whole extra build per architecture to examine something that was, at
+      # best, bit-identical to what was pushed.)
+      - name: Pull back the pushed digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: docker pull "${IMAGE_NAME}@${DIGEST}"
+
+      # The entrypoint binary EXECUTES on this architecture and its configuration layer runs.
+      # The engine has no --version to interrogate (it is a server, not a CLI), so the signal is
+      # its documented refusal: with no deployments directory it exits non-zero saying
+      # "configuration invalid — refusing to start". A wrong-architecture binary, a broken
+      # ENTRYPOINT path or a missing shared library never reach that message — which is exactly
+      # the class of defect a distroless image hides until someone runs it.
+      - name: The image's engine runs on this architecture
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -eu
+          img="${IMAGE_NAME}@${DIGEST}"
+          # Both runs below are EXPECTED to exit non-zero, so each failure is captured rather
+          # than left to `set -e` — `cmd; echo $?` and `cmd && { ... }` would both abort this
+          # step on exactly the behaviour being asserted.
+          out=''
+          code=0
+          out="$(docker run --rm "$img" 2>&1)" || code=$?
+          printf '%s\n' "$out" | tail -2
+          if [ "$code" = 0 ]; then
+            echo "::error::the engine exited 0 with no configuration — it must refuse to start" >&2
+            exit 1
+          fi
+          if ! printf '%s' "$out" | grep -q 'refusing to start'; then
+            echo "::error::the engine did not refuse with the documented configuration error; it may not have run at all" >&2
+            exit 1
+          fi
+          # --health-check is what the image's HEALTHCHECK invokes. With no server up it must
+          # fail rather than report healthy, or the orchestrator is told a lie. An `if` keeps the
+          # expected non-zero exit out of `set -e`'s reach.
+          if docker run --rm "$img" --health-check >/dev/null 2>&1; then
+            echo "::error::--health-check reported success with no engine running" >&2
+            exit 1
+          fi
+          echo "engine runs on ${{ matrix.platform }}, refuses without config, health-check fails closed"
+
+      # Scanned before the tag exists, on the tagged tree's own image, failing on any finding the
+      # triage record does not already account for. `make scan-image` is this same gate locally.
+      - name: Scan this platform's image before it is tagged
+        uses: aquasecurity/trivy-action@v0.36.0 # same pin as trivy.yml
+        with:
+          scan-type: image
+          image-ref: ${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+          severity: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
+          exit-code: "1"
+          format: table
+          trivyignores: .trivyignore.yaml
+
       - name: Export the digest
         run: |
           set -eu
@@ -765,7 +733,11 @@ jobs:
   #     reports a skip; it never fails the release.
   crates-publish:
     name: crates.io (sutra-feel → sutra-dmn)
-    needs: [tag, test]
+    # `tag` alone: the CI gate there proves ci.yml — fmt, lint, test AND audit — succeeded on
+    # this very commit, and the tagged tree IS that commit's tree. A release-local re-run of
+    # lint+test (a strict subset) used to sit here and cost ~90 minutes per release to answer a
+    # question already answered.
+    needs: tag
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:

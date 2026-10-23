@@ -2792,3 +2792,40 @@ fn matches_still_rejects_malformed_backreference_patterns() {
         );
     }
 }
+
+#[test]
+fn parse_with_context_names_resolves_spaced_builtins() {
+    // The precompile case: an AST built once and evaluated per message. `parse` alone performs no
+    // name resolution, so a multi-word builtin never merges into one call-name token and the
+    // expression does not parse at all — which would make `starts with` unusable at every
+    // precompiled site while working everywhere else.
+    let names: std::collections::HashSet<String> = ["attr".to_string()].into_iter().collect();
+
+    for expr in [
+        r#"starts with("Transfer", "Trans")"#,
+        r#"ends with("Transfer", "fer")"#,
+        r#"string length("abc") = 3"#,
+    ] {
+        assert!(
+            expressions::parse(expr).is_err(),
+            "plain parse is expected to fail on a spaced builtin: {expr}"
+        );
+        let parsed = expressions::parse_with_context_names(expr, &names);
+        assert!(parsed.is_ok(), "{expr}: {:?}", parsed.err());
+        // And the precompiled AST evaluates to the same answer the string entry point gives.
+        let compiled = sutra_feel::evaluator::eval_boolean(&parsed.unwrap(), &empty());
+        assert_eq!(
+            compiled.expect("evaluates"),
+            expressions::eval_boolean(expr, &empty()).expect("evaluates"),
+            "{expr}"
+        );
+    }
+}
+
+#[test]
+fn parse_with_context_names_still_resolves_caller_names() {
+    // A caller-supplied spaced name merges as well, which is what the DMN BKM-prelude case needs.
+    let names: std::collections::HashSet<String> =
+        ["Existing Loans".to_string()].into_iter().collect();
+    assert!(expressions::parse_with_context_names("Existing Loans > 2", &names).is_ok());
+}

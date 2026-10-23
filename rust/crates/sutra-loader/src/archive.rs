@@ -916,7 +916,13 @@ mod tests {
 
         let mut za = zip::ZipArchive::new(Cursor::new(one.as_slice())).expect("opens");
         let names: Vec<String> = (0..za.len())
-            .map(|i| za.by_index(i).unwrap().name().to_string())
+            .map(|i| {
+                za.by_index(i)
+                    .unwrap()
+                    .name()
+                    .expect("utf-8 name")
+                    .to_string()
+            })
             .collect();
         assert_eq!(names, vec!["a.txt", "b.txt"], "byte-sorted entry order");
         let f = za.by_index(0).expect("entry");

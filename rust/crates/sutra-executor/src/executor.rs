@@ -1790,6 +1790,7 @@ impl TokenExecutor {
         let adapter = ReplyBinding {
             mode: resolved.mode,
             destination: Some(resolved.destination.clone()),
+            codec: None,
             content_type: None,
             required: true,
             ce_type: None,
@@ -4922,6 +4923,7 @@ fn send_as_reply(sb: &SendBinding, destination: Option<String>) -> ReplyBinding 
     ReplyBinding {
         mode: sb.mode,
         destination,
+        codec: sb.codec.clone(),
         content_type: sb.content_type.clone(),
         required: true,
         ce_type: sb.ce_type.clone(),

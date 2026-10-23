@@ -36,7 +36,9 @@ const BPMN = `<?xml version="1.0" encoding="UTF-8"?>
                   ack="on-complete"
                   dedupKey="header.X-Request-Id"
                   type="order.created.v1"
-                  dataClass="financial"/>
+                  dataClass="financial"
+                  messageTypeValue="OrderCreated"
+                  filterExpression="attr.direction = &quot;incoming&quot;"/>
         <q:input name="payload" codec="xml" accept="application/xml">
           <q:validators source="orders/order-created" scope="common" consolidate="true"/>
           <q:validators source="acme/order-created-overlay" scope="tenant"/>
@@ -264,8 +266,8 @@ describe('QAuditGroup — xsd/q.xsd AuditType alignment', () => {
 
 // ────────────────────────── QSourceGroup (gap-fill) ──────────────────────────
 
-describe('QSourceGroup — covers all 5 SourceType attributes', () => {
-  it('exposes channel + ack + dedupKey + type + dataClass entries', () => {
+describe('QSourceGroup — covers every SourceType attribute', () => {
+  it('exposes an entry for each attribute the XSD declares', () => {
     const start = findById('start1');
     const group = QSourceGroup({ businessObject: start }, translate);
     const ids = group.entries.map((e) => e.id);
@@ -274,11 +276,14 @@ describe('QSourceGroup — covers all 5 SourceType attributes', () => {
       'q-source-ack',
       'q-source-dedupKey',
       'q-source-type',
-      'q-source-dataClass'
+      'q-source-dataClass',
+      'q-source-messageTypeValue',
+      'q-source-messageTypePattern',
+      'q-source-filterExpression'
     ]);
   });
 
-  it('reads all 5 attributes off the imported StartEvent', () => {
+  it('reads every attribute off the imported StartEvent', () => {
     const start = findById('start1');
     const group = QSourceGroup({ businessObject: start }, translate);
     const get = (id) => group.entries.find((e) => e.id === id).get().value;
@@ -287,6 +292,25 @@ describe('QSourceGroup — covers all 5 SourceType attributes', () => {
     expect(get('q-source-dedupKey')).toBe('header.X-Request-Id');
     expect(get('q-source-type')).toBe('order.created.v1');
     expect(get('q-source-dataClass')).toBe('financial');
+    expect(get('q-source-messageTypeValue')).toBe('OrderCreated');
+    expect(get('q-source-filterExpression')).toBe('attr.direction = "incoming"');
+  });
+
+  it('reports an absent attribute as empty rather than undefined', () => {
+    // messageTypePattern is unset on the fixture: the panel must render blank, not crash.
+    const start = findById('start1');
+    const group = QSourceGroup({ businessObject: start }, translate);
+    const entry = group.entries.find((e) => e.id === 'q-source-messageTypePattern');
+    expect(entry.get().value).toBe('');
+  });
+
+  it('writes the predicate back through its setter', () => {
+    const start = findById('start1');
+    const group = QSourceGroup({ businessObject: start }, translate);
+    const entry = group.entries.find((e) => e.id === 'q-source-filterExpression');
+    expect(entry.set({}, 'attr.direction = "outgoing"')).toEqual({
+      filterExpression: 'attr.direction = "outgoing"'
+    });
   });
 });
 

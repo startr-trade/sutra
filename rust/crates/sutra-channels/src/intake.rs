@@ -14,6 +14,7 @@ use sutra_codec_spi::{
     ValidationIssue,
 };
 use sutra_executor::telemetry;
+use sutra_executor::DeploymentId;
 use sutra_executor::Variables;
 use sutra_feel::FeelValue;
 
@@ -206,6 +207,123 @@ impl InboundChain {
         reply: &CodecValue,
         content_type: Option<&str>,
     ) -> Result<Vec<u8>, Diagnostic> {
+        let codec = self.outbound_codec(binding, content_type)?;
+        codec.encode(reply, content_type).map_err(|e| {
+            Diagnostic::error(
+                codes::OUTBOUND_ENCODE_FAILED,
+                format!(
+                    "Channel '{}' codec '{}' could not encode the reply object: {e}",
+                    binding.channel_name, binding.codec
+                ),
+            )
+        })
+    }
+
+    /// Validate bytes the flow produced against the contract of the channel they are leaving
+    /// by — the outbound counterpart of [`Self::decode`] + the validator chain.
+    ///
+    /// The codec's own decode step is the validator: it is the only direction in the SPI that
+    /// validates, and for a schema-bound codec it is what checks the message body against the
+    /// schema. So the question asked here is literally "read back what we are about to send" —
+    /// which needs no new SPI surface, no second contract, and no knowledge of any format or
+    /// standard. It covers both ways a flow produces bytes: a codec-encoded object and a
+    /// template render, which reaches the wire without touching a codec at all.
+    ///
+    /// Returns `Ok(())` when the egress is schema-less (a bare format or no codec: fail-open by
+    /// construction — it never rejects, so there is no contract to fail) or when the read-back
+    /// is clean. Otherwise the fail-closed [`codes::OUTBOUND_VALIDATION_REJECT`], carrying the
+    /// issue count and the first few issues so the operator sees the offending field rather than
+    /// a bare refusal.
+    #[allow(clippy::too_many_arguments)]
+    pub fn validate_outbound(
+        &self,
+        deployment: &DeploymentId,
+        channel_label: &str,
+        declared_codec: Option<&str>,
+        channel_codec: &str,
+        body: &[u8],
+        content_type: Option<&str>,
+        site: &str,
+    ) -> Result<(), Diagnostic> {
+        let declared = declared_codec.map(str::trim).filter(|c| !c.is_empty());
+        let name = declared.unwrap_or_else(|| channel_codec.trim());
+        // Schema-less egress: no contract to fail. Mirrors the inbound R5 carve-out exactly.
+        if name.is_empty() || self.formats.contract(name).is_some() {
+            return Ok(());
+        }
+        let codec = match declared {
+            // An author who NAMED the governing codec gets a hard answer: a name that resolves
+            // to nothing is a wiring fault, and silently skipping the check would turn the one
+            // declaration that asked for validation into the one case that gets none. Lint
+            // catches it at package time; this is the runtime backstop.
+            Some(name) => self
+                .codecs
+                .resolve(name, deployment)
+                .or_else(|| {
+                    sutra_codec_spi::builtin_codecs()
+                        .into_iter()
+                        .find(|c| c.name() == name)
+                })
+                .ok_or_else(|| codec_not_found(channel_label, name, &self.codecs.names()))?,
+            // Inferred from the channel: an unresolvable codec here is reported by the send
+            // path itself, with the name and the known set, so a second differently-worded
+            // refusal from this check would only misdirect.
+            None => match self.codecs.resolve(name, deployment) {
+                Some(codec) => codec,
+                None => return Ok(()),
+            },
+        };
+        let decoded = codec.decode(body, content_type);
+        let errors: Vec<&ValidationIssue> = decoded
+            .issues
+            .iter()
+            .filter(|i| i.severity == IssueSeverity::Error)
+            .collect();
+        if errors.is_empty() {
+            return Ok(());
+        }
+        let shown = errors
+            .iter()
+            .take(5)
+            .map(|i| format!("{} at {}: {}", i.code, i.path, i.message))
+            .collect::<Vec<_>>()
+            .join("; ");
+        // Name the codec, and say WHERE it came from: a stated codec is the author's own
+        // declaration, while an inferred one is the channel's, and an operator reading this needs
+        // to know which of the two to go and change.
+        let provenance = match declared {
+            Some(_) => "declared on the output".to_string(),
+            None => format!("bound to channel '{channel_label}'"),
+        };
+        Err(Diagnostic::error(
+            codes::OUTBOUND_VALIDATION_REJECT,
+            format!(
+                "{site} produced a message that codec '{name}' ({provenance}) rejects: {} \
+                 validation error(s) — {shown}. The message was NOT sent.",
+                errors.len()
+            ),
+        )
+        .with_attribute("channel", channel_label)
+        .with_attribute("codec", name)
+        .with_attribute(
+            "codecSource",
+            if declared.is_some() {
+                "declared"
+            } else {
+                "channel"
+            },
+        )
+        .with_attribute("issueCount", errors.len().to_string()))
+    }
+
+    /// The codec that carries bytes OUT over `binding` — the one resolution shared by the
+    /// encode step and the outbound validation step, so a message is validated by exactly the
+    /// codec that will put it on the wire.
+    fn outbound_codec(
+        &self,
+        binding: &ChannelBinding,
+        content_type: Option<&str>,
+    ) -> Result<Arc<dyn PayloadCodec>, Diagnostic> {
         let codec: Arc<dyn PayloadCodec> = if binding.codec.is_empty() {
             // No codec: mirror the inbound format (fail-open to raw) — same choice as open_decode.
             self.formats.open_select(content_type).ok_or_else(|| {
@@ -240,15 +358,7 @@ impl InboundChain {
                     codec_not_found(&binding.channel_name, &binding.codec, &self.codecs.names())
                 })?
         };
-        codec.encode(reply, content_type).map_err(|e| {
-            Diagnostic::error(
-                codes::OUTBOUND_ENCODE_FAILED,
-                format!(
-                    "Channel '{}' codec '{}' could not encode the reply object: {e}",
-                    binding.channel_name, binding.codec
-                ),
-            )
-        })
+        Ok(codec)
     }
 
     /// Process-scoped post-decode — pipeline steps 3-7: project the decoded payload under
@@ -284,6 +394,16 @@ impl InboundChain {
             .map(payload_view)
             .unwrap_or(FeelValue::Null);
         variables.insert(source.name.clone(), typed_payload.clone());
+
+        // Project the codec's reported message attributes under the SAME root an intake
+        // predicate reads them under, so `attr.direction` means one thing in a
+        // `<q:source filterExpression>` and inside the process. Without this, a flow that needs
+        // the value a start event was selected on would have to make the codec duplicate it into
+        // the payload.
+        variables.insert(
+            SELECTOR_ATTRIBUTE_ROOT.to_string(),
+            attribute_map(Some(decoded)),
+        );
 
         // Redaction (DLP): run the `<q:redactors>` chain over the raw payload to LOCATE
         // sensitive spans, then store the masked projection under `<source.name>.redacted` —
@@ -599,4 +719,49 @@ fn build_validation_summary(
     );
     out.insert("issues".to_string(), issues_as_feel(issues));
     FeelValue::Map(out)
+}
+
+// These three live in this ALWAYS-COMPILED module rather than beside the dispatcher: the
+// dispatcher is behind the `transport` feature, while the selector table in `registry` and the
+// projection below are not — and `sutra-loader` (hence the wasm lint core) depends on this
+// crate with default features off.
+
+/// The root a message's codec-reported attributes are read under, in an intake predicate and
+/// inside the process alike — so `attr.direction` means the same thing in both places. Fixed
+/// deliberately: a per-codec root could not be analysed at package time.
+pub(crate) const SELECTOR_ATTRIBUTE_ROOT: &str = "attr";
+
+/// The attributes a codec reported for this message, as a FEEL map.
+///
+/// One source for both the intake predicate and the in-process projection, so the value a filter
+/// matched on is exactly the value the process reads.
+pub(crate) fn attribute_map(
+    decoded: Option<&sutra_codec_spi::DecodeResult>,
+) -> sutra_feel::FeelValue {
+    sutra_feel::FeelValue::Map(decoded.map(|d| d.attributes.clone()).unwrap_or_default())
+}
+
+/// The context a `<q:source filterExpression>` is evaluated against: `attr.*` plus `messageType`.
+///
+/// Deliberately NOT headers and NOT the payload. Headers are an open map and a payload an
+/// arbitrary tree, so admitting either would make the deploy-time proof that two subscribers
+/// cannot both match impossible, and would let one business message route differently depending
+/// on the transport it arrived over. Both stay readable inside the process once a start event has
+/// been chosen.
+// Only the dispatch path builds a selector context, and `dispatch` is transport-gated — the
+// WASM lint core compiles this crate without it.
+#[cfg(feature = "transport")]
+pub(crate) fn selector_context(
+    decoded: Option<&sutra_codec_spi::DecodeResult>,
+    message_type: Option<&str>,
+) -> sutra_feel::FeelContext {
+    let mut ctx = sutra_feel::FeelContext::new();
+    ctx.insert(SELECTOR_ATTRIBUTE_ROOT.to_string(), attribute_map(decoded));
+    ctx.insert(
+        "messageType".to_string(),
+        message_type
+            .map(|mt| sutra_feel::FeelValue::String(mt.to_string()))
+            .unwrap_or(sutra_feel::FeelValue::Null),
+    );
+    ctx
 }

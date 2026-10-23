@@ -53,6 +53,31 @@ pub fn parse_with_known_names(
     FeelParser::new(tokens, &positions).parse()
 }
 
+/// Parse an expression that will later be evaluated against a context whose names are known by
+/// SHAPE rather than by value — a PRECOMPILED site, where the AST is built once at build or
+/// activation time and evaluated per message.
+///
+/// Neither existing entry point serves that case. [`parse`] performs no name resolution at all,
+/// so `starts with(x, "a")` never merges into a single call-name token and fails to parse;
+/// [`eval`] and [`eval_boolean`] resolve against the runtime context's own keys, which a
+/// precompiling caller does not have yet. This resolves against `names` PLUS every FEEL builtin
+/// and property whose canonical spelling contains a space, so a precompiled AST parses exactly as
+/// the same text would have at eval time — which is the property that keeps a compiled site from
+/// quietly diverging from every interpreted one.
+pub fn parse_with_context_names(
+    expression: &str,
+    names: &std::collections::HashSet<String>,
+) -> Result<FeelExpr, FeelError> {
+    let mut known = names.clone();
+    for (spaced, _) in evaluator::SPACED_BUILTIN_ALIASES {
+        known.insert((*spaced).to_string());
+    }
+    for name in evaluator::SPACED_PROPERTY_NAMES {
+        known.insert((*name).to_string());
+    }
+    parse_with_known_names(expression, &known)
+}
+
 /// Evaluate with a caller-supplied source URI so diagnostics pin to a real file.
 pub fn eval_with_uri(
     expression: &str,

@@ -19,12 +19,16 @@ mod dispatcher_policy_test;
 mod http_it_test;
 #[path = "all/intake_test.rs"]
 mod intake_test;
+#[path = "all/outbound_validation_test.rs"]
+mod outbound_validation_test;
 #[path = "all/relay_resume_test.rs"]
 mod relay_resume_test;
 #[path = "all/reply_encode_test.rs"]
 mod reply_encode_test;
 #[path = "all/retry_redrive_test.rs"]
 mod retry_redrive_test;
+#[path = "all/select_predicate_test.rs"]
+mod select_predicate_test;
 #[path = "all/shard_router_pin_test.rs"]
 mod shard_router_pin_test;
 #[path = "all/shard_scale_out_test.rs"]

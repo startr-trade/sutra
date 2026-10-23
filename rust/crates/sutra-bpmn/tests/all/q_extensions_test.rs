@@ -283,6 +283,59 @@ fn message_type_value_and_pattern_are_mutually_exclusive() {
     );
 }
 
+fn source_of(attrs: &str) -> sutra_bpmn::qbindings::SourceBinding {
+    load(&source_with(attrs))
+        .unwrap()
+        .process("p1")
+        .unwrap()
+        .bindings_for("Start")
+        .source()
+        .unwrap()
+        .clone()
+}
+
+#[test]
+fn parses_the_filter_expression_predicate() {
+    let src = source_of(r#"filterExpression="attr.direction = &quot;incoming&quot;""#);
+    assert_eq!(
+        src.filter_expression.as_deref(),
+        Some(r#"attr.direction = "incoming""#)
+    );
+}
+
+#[test]
+fn an_absent_or_blank_filter_expression_is_none() {
+    assert!(source_of(r#"messageTypeValue="a""#)
+        .filter_expression
+        .is_none());
+    assert!(source_of(r#"filterExpression="   ""#)
+        .filter_expression
+        .is_none());
+}
+
+#[test]
+fn the_filter_expression_composes_with_a_message_type_pin() {
+    // The inverse of `message_type_value_and_pattern_are_mutually_exclusive`: the predicate
+    // NARROWS a type pin rather than competing with it, so declaring both is legal and is the
+    // whole point — two start events can pin one type and differ only by attribute.
+    let src = source_of(
+        r#"messageTypeValue="Transfer" filterExpression="attr.direction = &quot;outgoing&quot;""#,
+    );
+    assert_eq!(src.message_type_value.as_deref(), Some("Transfer"));
+    assert_eq!(
+        src.filter_expression.as_deref(),
+        Some(r#"attr.direction = "outgoing""#)
+    );
+}
+
+#[test]
+fn an_unparseable_filter_expression_still_loads() {
+    // The loader carries the text; FEEL parsing, determinism and analysability are deploy-time
+    // lint's job, exactly as for `<q:case when>`. Loading must not be where that is decided.
+    let src = source_of(r#"filterExpression="attr.direction = &quot;unclosed""#);
+    assert!(src.filter_expression.is_some());
+}
+
 #[test]
 fn codec_on_source_is_rejected() {
     // The codec is YAML-authoritative — declaring it on q:source is a parse error.

@@ -32,6 +32,7 @@ pub mod lint;
 pub mod overlay;
 pub mod package;
 pub mod scanner;
+pub mod selector;
 
 pub use archive::{
     deployment_from_entries, deployment_id_of_manifest, read_archive, read_archive_expecting,
@@ -48,4 +49,7 @@ pub use package::{
     PackageOutcome, PackagedArchive, PACKAGE_FILE_NAME,
 };
 pub use scanner::{LoadedArtifact, LoadedDeployment, LoadedProcessFile};
+pub use selector::{
+    analyse, cubes_disjoint, meet, pred_disjoint, Analysis, Constraint, Cube, Disjointness, Lit,
+};
 pub use sutra_executor::deployment::DeploymentId;

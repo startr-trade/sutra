@@ -22,6 +22,10 @@ sutra-executor = { path = "../sutra-executor" }
 sutra-feel = { path = "../sutra-feel" }
 sutra-templates = { path = "../sutra-templates" }
 sutra-xsd = { path = "../sutra-xsd" }
+# The selector lattice orders declared numeric domains NUMERICALLY (an `AttributeLiteral::Decimal`
+# carries a canonical string, whose `Ord` is lexicographic) and reads FEEL numeric literals, which
+# are `BigDecimal` already.
+bigdecimal = { workspace = true }
 regex = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"

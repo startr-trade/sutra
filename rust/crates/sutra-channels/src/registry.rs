@@ -374,6 +374,116 @@ pub struct RelayTarget {
 #[derive(Default, Clone)]
 pub struct ProcessModuleRegistry {
     modules: HashMap<String, Vec<Arc<ProcessDefinition>>>,
+    /// deployment → (process id, node id, channel) → that `<q:source>`'s compiled selector.
+    ///
+    /// Keyed by channel as well as node because a channel-call task may carry several
+    /// `<q:source>` elements, one per response channel, each with its own predicate.
+    ///
+    /// Compiled ONCE per activation, in [`Self::register`], because both halves of a selector are
+    /// expensive to build and were previously built per candidate per message: the anchored regex
+    /// was `Regex::new`-ed on the hot inbound path, and a FEEL predicate would re-parse the same
+    /// way. A deployment whose selectors do not compile never activates (see
+    /// [`Self::selector_faults`]), so dispatch can treat a missing entry as fail-closed rather
+    /// than as a reason to parse anything.
+    selectors: HashMap<String, HashMap<SelectorKey, CompiledSource>>,
+}
+
+/// One start event's compiled selector: its predicate AST, and the fault that stopped the
+/// selector from compiling at all.
+///
+/// The message-type clause is NOT cached here. `ProcessDefinition::select_start_events` still
+/// owns tier precedence and still compiles `messageTypePattern` per message, as it always has —
+/// moving that here would mean moving exact/anchored-pattern matching out of the BPMN model
+/// (which cannot hold a `Regex`: it derives `PartialEq`) and relocating the tests that pin those
+/// semantics, which is a larger change than this feature needs. What the activation pass DOES
+/// take from the pattern is its validity: a malformed regex becomes a [`SelectorFault`] and the
+/// deployment never activates, where before it was silently skipped at dispatch and matched
+/// nothing — indistinguishable from "no traffic".
+#[derive(Clone)]
+struct CompiledSource {
+    predicate: Option<sutra_feel::ast::FeelExpr>,
+    fault: Option<(String, String)>,
+}
+
+/// A selector that could not be compiled at activation: `(process id, node id, code, message)`.
+pub type SelectorFault = (String, String, String, String);
+
+/// How a compiled selector is keyed: `(process id, node id, channel)`.
+type SelectorKey = (String, String, String);
+
+/// One start event's predicate failing to EVALUATE for a particular message —
+/// `(process id, node id, code, message)`. Distinct from a [`SelectorFault`], which is a
+/// compile-time failure caught at activation.
+pub type PredicateFault = (String, String, String, String);
+
+/// What [`ProcessModuleRegistry::resolve_handlers`] found: the handlers, plus any predicate that
+/// errored while deciding. The faults travel with the result because a predicate failure is
+/// per-message and must reach the operator, while never aborting the dispatch — another
+/// subscriber may legitimately match, and one broken process must not deny a shared channel.
+pub struct HandlerResolution {
+    pub handlers: Vec<HandlerMatch>,
+    pub predicate_faults: Vec<PredicateFault>,
+}
+
+/// Evaluates the compiled predicates of ONE process against one message's attribute context.
+///
+/// Fail-closed, as [`sutra_bpmn::SourcePredicate`] requires: an evaluation error, a non-boolean
+/// result or a missing compiled entry all answer `false` and record a fault.
+struct CompiledPredicates<'a> {
+    selectors: Option<&'a HashMap<SelectorKey, CompiledSource>>,
+    process_id: &'a str,
+    channel: &'a str,
+    context: &'a sutra_feel::FeelContext,
+    faults: RefCell<Vec<PredicateFault>>,
+}
+
+impl<'a> sutra_bpmn::SourcePredicate for CompiledPredicates<'a> {
+    fn holds(&self, node_id: &str) -> bool {
+        let key = (
+            self.process_id.to_string(),
+            node_id.to_string(),
+            self.channel.to_string(),
+        );
+        let Some(compiled) = self.selectors.and_then(|t| t.get(&key)) else {
+            // Activation refuses a deployment with selector faults, so this is unreachable in a
+            // live engine; answering false keeps it fail-closed if it ever is reached.
+            self.faults.borrow_mut().push((
+                self.process_id.to_string(),
+                node_id.to_string(),
+                codes::INBOUND_SELECT_PREDICATE_FAILED.to_string(),
+                "no compiled selector for this start event".to_string(),
+            ));
+            return false;
+        };
+        // A selector that did not COMPILE must never be treated as "declares no predicate",
+        // which would make a start event whose filter is broken match everything — fail-open, the
+        // exact inverse of the contract. Activation warns about these loudly and `sutra lint`
+        // refuses them at package time; if one is reached anyway, it matches nothing.
+        if let Some((code, detail)) = compiled.fault.as_ref() {
+            self.faults.borrow_mut().push((
+                self.process_id.to_string(),
+                node_id.to_string(),
+                code.clone(),
+                detail.clone(),
+            ));
+            return false;
+        }
+        let Some(expr) = compiled.predicate.as_ref() else {
+            return true;
+        };
+        match sutra_feel::evaluator::eval_boolean(expr, self.context) {
+            Ok(holds) => holds,
+            Err(e) => {
+                self.faults.borrow_mut().push((
+                    self.process_id.to_string(),
+                    node_id.to_string(),
+                    codes::INBOUND_SELECT_PREDICATE_FAILED.to_string(),
+                    format!("{e}"),
+                ));
+                false
+            }
+        }
+    }
 }
 
 impl ProcessModuleRegistry {
@@ -381,15 +491,56 @@ impl ProcessModuleRegistry {
         ProcessModuleRegistry::default()
     }
 
-    /// Register every process of a loaded BPMN file under the deployment.
+    /// Register every process of a loaded BPMN file under the deployment, compiling each start
+    /// event's selector as it goes.
     pub fn register(&mut self, deployment: &DeploymentId, module: &ProcessModule) {
         let entry = self
             .modules
             .entry(deployment.value().to_string())
             .or_default();
+        let compiled = self
+            .selectors
+            .entry(deployment.value().to_string())
+            .or_default();
         for p in module.processes() {
+            // EVERY node carrying a `<q:source>`, not only start events: the same element is
+            // legal on a user task, a message catch event and a channel-call task, where it
+            // names the channel a correlated RESPONSE arrives on. Compiling only start events
+            // would leave a predicate on a wait node silently doing nothing — which is the one
+            // outcome worse than refusing it.
+            for node in p.nodes() {
+                let node_id = node.id().to_string();
+                for source in &p.bindings_for(&node_id).sources {
+                    compiled.insert(
+                        (p.id.clone(), node_id.clone(), source.channel.clone()),
+                        compile_source(&p.id, &node_id, source),
+                    );
+                }
+            }
             entry.push(Arc::new(p.clone()));
         }
+    }
+
+    /// Every selector that failed to compile. Activation refuses a deployment with any, so a
+    /// malformed `messageTypePattern` or an unparseable / non-deterministic `filterExpression`
+    /// can never reach the inbound path — where the old code silently skipped a bad regex and
+    /// routed nothing, indistinguishably from "no traffic".
+    pub fn selector_faults(&self) -> Vec<SelectorFault> {
+        let mut out: Vec<SelectorFault> = Vec::new();
+        for table in self.selectors.values() {
+            for ((process_id, node_id, _channel), compiled) in table {
+                if let Some((code, message)) = compiled.fault.as_ref() {
+                    out.push((
+                        process_id.clone(),
+                        node_id.clone(),
+                        code.clone(),
+                        message.clone(),
+                    ));
+                }
+            }
+        }
+        out.sort();
+        out
     }
 
     /// True when anything is deployed under this id (the module presence check).
@@ -416,10 +567,16 @@ impl ProcessModuleRegistry {
     /// re-activation counterpart to [`Self::resolve_handlers`]. Empty when the deployment
     /// is unknown or nothing waits on the channel, so the dispatcher falls through to its
     /// normal no-start-event handling. Sorted (process id, node id).
+    /// `attributes` is the same selector context [`Self::resolve_handlers`] takes: a wait node's
+    /// `<q:source filterExpression>` is honoured here too, because the element is legal on a wait
+    /// node and a predicate that silently did nothing on half its legal hosts would be worse than
+    /// one that was refused outright. A target whose predicate does not hold is skipped, exactly
+    /// as a start event would be.
     pub fn resolve_relay_targets(
         &self,
         deployment: &DeploymentId,
         channel: &str,
+        attributes: &sutra_feel::FeelContext,
     ) -> Vec<RelayTarget> {
         let Some(processes) = self.modules.get(deployment.value()) else {
             return Vec::new();
@@ -427,6 +584,7 @@ impl ProcessModuleRegistry {
         if channel.trim().is_empty() {
             return Vec::new();
         }
+        let table = self.selectors.get(deployment.value());
         let mut out: Vec<RelayTarget> = Vec::new();
         for process in processes {
             for node in process.nodes() {
@@ -449,6 +607,25 @@ impl ProcessModuleRegistry {
                     _ => false,
                 };
                 if subscribed {
+                    let predicates = CompiledPredicates {
+                        selectors: table,
+                        process_id: &process.id,
+                        channel,
+                        context: attributes,
+                        faults: RefCell::new(Vec::new()),
+                    };
+                    // Only consult the predicate when the node's source declares one, matching
+                    // the start-event rule: no predicate means no opinion.
+                    let declares_predicate = process
+                        .bindings_for(node.id())
+                        .sources
+                        .iter()
+                        .any(|s| s.channel == channel && s.filter_expression.is_some());
+                    if declares_predicate
+                        && !sutra_bpmn::SourcePredicate::holds(&predicates, node.id())
+                    {
+                        continue;
+                    }
                     out.push(RelayTarget {
                         process: Arc::clone(process),
                         wait_node_id: node.id().to_string(),
@@ -465,30 +642,132 @@ impl ProcessModuleRegistry {
         out
     }
 
-    /// Every process in the channel's deployment whose `<q:source>` subscribes to
-    /// `(channel, messageType)` — exact `messageTypeValue` → regex `messageTypePattern` →
-    /// unfiltered catch-all — sorted by process id for determinism.
+    /// Every start event in the channel's deployment that subscribes to
+    /// `(channel, messageType)` and whose `<q:source filterExpression>` holds for `attributes` —
+    /// exact `messageTypeValue` → regex `messageTypePattern` → unfiltered catch-all, sorted by
+    /// (process id, start-event id) for determinism.
+    ///
+    /// `attributes` is the FEEL context the predicate is evaluated against: the codec's reported
+    /// message attributes under `attr`, plus `messageType`. Pass an EMPTY context for a message
+    /// whose decode was fatal — a codec that could not parse cannot classify, so the caller
+    /// should select on message type alone rather than let every predicate answer false.
+    ///
+    /// ONE match per start event, not per process: a single process declaring two start events
+    /// that both match is a configuration predicates make ordinary, and it used to resolve
+    /// silently by document order. Surfacing both lets the caller's ambiguity check see it.
     pub fn resolve_handlers(
         &self,
         deployment: &DeploymentId,
         channel: &str,
         message_type: Option<&str>,
-    ) -> Vec<HandlerMatch> {
+        attributes: &sutra_feel::FeelContext,
+    ) -> HandlerResolution {
         let Some(processes) = self.modules.get(deployment.value()) else {
-            return Vec::new();
+            return HandlerResolution {
+                handlers: Vec::new(),
+                predicate_faults: Vec::new(),
+            };
         };
-        let mut out: Vec<HandlerMatch> = Vec::new();
+        let table = self.selectors.get(deployment.value());
+        let mut handlers: Vec<HandlerMatch> = Vec::new();
+        let mut predicate_faults: Vec<PredicateFault> = Vec::new();
         for process in processes {
-            if let Some(start) = process.select_start_event(channel, message_type) {
-                out.push(HandlerMatch {
+            let predicates = CompiledPredicates {
+                selectors: table,
+                process_id: &process.id,
+                channel,
+                context: attributes,
+                faults: RefCell::new(Vec::new()),
+            };
+            for start in process.select_start_events(channel, message_type, &predicates) {
+                handlers.push(HandlerMatch {
                     process: Arc::clone(process),
                     start_event_id: start.id().to_string(),
                 });
             }
+            predicate_faults.extend(predicates.faults.into_inner());
         }
-        out.sort_by(|a, b| a.process.id.cmp(&b.process.id));
-        out
+        handlers.sort_by(|a, b| {
+            a.process
+                .id
+                .cmp(&b.process.id)
+                .then_with(|| a.start_event_id.cmp(&b.start_event_id))
+        });
+        predicate_faults.sort();
+        HandlerResolution {
+            handlers,
+            predicate_faults,
+        }
     }
+}
+
+/// Compile one `<q:source>`'s selector, turning every failure into a fault that keeps the
+/// deployment from activating rather than a surprise at dispatch time.
+fn compile_source(
+    process_id: &str,
+    node_id: &str,
+    source: &sutra_bpmn::qbindings::SourceBinding,
+) -> CompiledSource {
+    let mut fault = None;
+
+    // Compiled here only to VALIDATE it — anchored exactly as the matcher anchors it, so a
+    // pattern that compiles here cannot fail to compile there.
+    if let Some(p) = source.message_type_pattern.as_deref() {
+        if let Err(e) = regex::Regex::new(&format!("^(?:{p})$")) {
+            fault = Some((
+                codes::SELECTOR_COMPILE_FAILED.to_string(),
+                format!(
+                    "process {process_id} start event {node_id}: messageTypePattern {p:?} is not \
+                     a valid regular expression: {e}"
+                ),
+            ));
+        }
+    }
+
+    let mut predicate = None;
+    if let Some(text) = source.filter_expression.as_deref() {
+        // Parsed against the names that WILL be in scope, not with resolution switched off:
+        // `expressions::parse` would fail on any multi-word FEEL builtin (`starts with`,
+        // `ends with`, `string length`, …), which is exactly how an author would write a prefix
+        // filter. The two roots carry no spaces, so they are listed for intent rather than need.
+        let names: std::collections::HashSet<String> = [
+            crate::intake::SELECTOR_ATTRIBUTE_ROOT.to_string(),
+            "messageType".to_string(),
+        ]
+        .into_iter()
+        .collect();
+        match sutra_feel::expressions::parse_with_context_names(text, &names) {
+            Ok(expr) => {
+                // A routing decision that consults the clock cannot be replayed, so a
+                // non-deterministic builtin is refused here rather than producing a deployment
+                // whose routing drifts.
+                match sutra_feel::expressions::require_pure_expr(&expr, "q:source filterExpression")
+                {
+                    Ok(()) => predicate = Some(expr),
+                    Err(e) => {
+                        fault = Some((
+                            e.code.to_string(),
+                            format!(
+                                "process {process_id} start event {node_id}: filterExpression is \
+                                 not deterministic: {e}"
+                            ),
+                        ))
+                    }
+                }
+            }
+            Err(e) => {
+                fault = Some((
+                    e.code.to_string(),
+                    format!(
+                        "process {process_id} start event {node_id}: filterExpression does not \
+                         parse: {e}"
+                    ),
+                ))
+            }
+        }
+    }
+
+    CompiledSource { predicate, fault }
 }
 
 // ---- emissions -------------------------------------------------------------------------

@@ -120,10 +120,53 @@ pub mod codes {
     /// A process navigates its payload but its codec declares many message types and the
     /// `<q:source>` pins none — no concrete schema can be selected, so its paths are a WARNING.
     pub const CONFIG_BPMN_MESSAGE_TYPE_UNPINNED: &str = "SUTRA.CONFIG.BPMN.MESSAGE_TYPE_UNPINNED";
+    // ---- `<q:source filterExpression>` vocabulary — the intake predicate checked against the
+    // attributes the bound codec DECLARES it can report. The posture split is the same one the
+    // navigation family uses: fail closed on *provably impossible*, warn on *unverifiable*.
+    /// The predicate reads `attr.<key>` for a key the codec's declared attribute vocabulary does
+    /// not contain. The key set is CLOSED (the codec declared at least one attribute), so the
+    /// comparison can never be true and the start event is dead — deploy-blocking, with a
+    /// did-you-mean against the declared keys.
+    pub const CONFIG_BPMN_SELECT_ATTRIBUTE_UNKNOWN: &str =
+        "SUTRA.CONFIG.BPMN.SELECT_ATTRIBUTE_UNKNOWN";
+    /// The predicate compares a declared attribute against a value outside its CLOSED declared
+    /// domain — the codec can never emit it, so the comparison can never be true.
+    /// Deploy-blocking.
+    pub const CONFIG_BPMN_SELECT_VALUE_UNKNOWN: &str = "SUTRA.CONFIG.BPMN.SELECT_VALUE_UNKNOWN";
+    /// The predicate compares a declared attribute against a literal of another FEEL type, or
+    /// applies a relational operator to an attribute the codec declares non-numeric. A FEEL
+    /// comparison across types yields `null`, which is not eligible — deploy-blocking.
+    pub const CONFIG_BPMN_SELECT_TYPE_MISMATCH: &str = "SUTRA.CONFIG.BPMN.SELECT_TYPE_MISMATCH";
+    /// WARNING — the channel's codec declares NO attributes, so its vocabulary is open and the
+    /// predicate cannot be checked against anything. Advise-don't-gatekeep, matching
+    /// [`CHANNEL_NO_SCHEMA`]: erroring here would make every schema-less channel unusable, and
+    /// an open vocabulary is unverifiable, not provably wrong.
+    pub const CONFIG_BPMN_SELECT_UNVERIFIABLE: &str = "SUTRA.CONFIG.BPMN.SELECT_UNVERIFIABLE";
     pub const CONFIG_TEMPLATE_OUTPUT_TYPE_UNKNOWN: &str =
         "SUTRA.CONFIG.TEMPLATE.OUTPUT_TYPE_UNKNOWN";
     pub const CONFIG_TEMPLATE_OUTPUT_UNVERIFIABLE: &str =
         "SUTRA.CONFIG.TEMPLATE.OUTPUT_UNVERIFIABLE";
+    /// A `template-manifest.yaml` entry declares an `outputAttributes` key the destination
+    /// codec never reports. The engine does not know what the key MEANS — it asks the codec
+    /// through [`sutra_codec_spi::PayloadCodec::declared_attributes`] and compares.
+    pub const CONFIG_TEMPLATE_OUTPUT_ATTRIBUTE_UNKNOWN: &str =
+        "SUTRA.CONFIG.TEMPLATE.OUTPUT_ATTRIBUTE_UNKNOWN";
+    /// A declared `outputAttributes` VALUE is outside the closed domain the destination codec
+    /// declares for that key — so no render could ever carry it.
+    pub const CONFIG_TEMPLATE_OUTPUT_ATTRIBUTE_VALUE_UNKNOWN: &str =
+        "SUTRA.CONFIG.TEMPLATE.OUTPUT_ATTRIBUTE_VALUE_UNKNOWN";
+    /// The destination codec, asked to classify the TEMPLATE'S OWN TEXT, reports a different
+    /// message type or attribute than the manifest declares. This is what catches a template
+    /// that renders the wrong envelope for its declared output: the engine learns nothing about
+    /// envelopes, it just compares the codec's answer against the author's claim.
+    pub const CONFIG_TEMPLATE_OUTPUT_MISMATCH: &str = "SUTRA.CONFIG.TEMPLATE.OUTPUT_MISMATCH";
+    /// A `<q:send codec>` / `<q:reply codec>` names a codec this deployment does not carry.
+    ///
+    /// Fail-closed, and deliberately harsher than the inferred case: stating the codec is how an
+    /// author asks for the output to be validated, so a typo there would otherwise turn the one
+    /// declaration requesting a contract check into the one output that gets none. The runtime
+    /// refuses it too; this is the package-time catch so it never reaches the runtime.
+    pub const CONFIG_OUTPUT_CODEC_UNKNOWN: &str = "SUTRA.CONFIG.OUTPUT.CODEC_UNKNOWN";
     /// A `<q:variable transient="true">` is read by a node reachable *after* a wait
     /// state. A transient variable is never persisted, so it is gone on resume; a post-wait read
     /// would yield null. Fail-closed, deploy-blocking (the CLI can see the wait-state graph).
@@ -153,6 +196,24 @@ pub mod codes {
         "SUTRA.CONFIG.VALIDATION.POSTURE_UNDECLARED";
     pub const CHANNEL_AMBIGUOUS_HANDLER: &str = "SUTRA.CHANNEL.AMBIGUOUS_HANDLER";
     pub const CHANNEL_AMBIGUOUS_PATTERN: &str = "SUTRA.CHANNEL.AMBIGUOUS_PATTERN";
+    // ---- intake-selector disjointness — the `MT ∧ P` gate over a non-broadcast channel's
+    // subscribers, decided by `crate::selector`. `AMBIGUOUS_HANDLER` stays the code for the
+    // message-type-only overlap it has always reported; these three cover the predicate tier.
+    /// Two subscribers on one non-broadcast channel are provably both eligible for one message:
+    /// the message-type clauses overlap AND the predicates do too. The diagnostic prints the
+    /// witnessing attribute assignment. Deploy-blocking — routing would resolve on process-id
+    /// order, which is not a routing rule.
+    pub const CHANNEL_SELECTOR_OVERLAP: &str = "SUTRA.CHANNEL.SELECTOR_OVERLAP";
+    /// Two subscribers on one non-broadcast channel share a message type and at least one of
+    /// their predicates left the Recognised Predicate Normal Form, so disjointness can be
+    /// neither proven nor disproven. Deploy-blocking by design: the gate is a proof obligation,
+    /// not advice, and the message names the construct, its offset, and the four escapes.
+    pub const CHANNEL_SELECTOR_NOT_ANALYSABLE: &str = "SUTRA.CHANNEL.SELECTOR_NOT_ANALYSABLE";
+    /// A `filterExpression` no message can satisfy (contradictory conjuncts, or an exclusion of
+    /// every member of a closed declared domain) — a dead start event, the same posture as the
+    /// `messageTypeValue` pin-can-never-match error. Reported whether or not the channel has
+    /// other subscribers.
+    pub const CHANNEL_SELECTOR_UNSATISFIABLE: &str = "SUTRA.CHANNEL.SELECTOR_UNSATISFIABLE";
     pub const CHANNEL_NO_IDEMPOTENCY_KEY: &str = "SUTRA.CHANNEL.NO_IDEMPOTENCY_KEY";
     pub const CHANNEL_NO_SCHEMA: &str = "SUTRA.CHANNEL.NO_SCHEMA";
     pub const CHANNEL_REPLY_NOT_EMITTABLE: &str = "SUTRA.CHANNEL.REPLY_NOT_EMITTABLE";

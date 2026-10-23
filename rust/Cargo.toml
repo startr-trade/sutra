@@ -103,7 +103,7 @@ tracing = "0.1"
 # Deflate via the pure-Rust zlib-rs backend only; every other default feature (aes, bzip2,
 # zstd, xz, time, …) stays off. The deterministic-output discipline (byte-sorted entries,
 # epoch timestamps, no extra fields) is enforced by sutra-loader's archive writer, not here.
-zip = { version = "8", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 # The RabbitMQ AMQP 0.9.1 client — mature, tokio-compatible.
 lapin = "2"
 # Kafka transport: the Kafka client is rdkafka (librdkafka binding). Chosen over the

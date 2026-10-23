@@ -506,6 +506,45 @@ pub struct ProcessDefinition {
     pub idempotent: bool,
 }
 
+/// Decides one start event's `<q:source filterExpression>` predicate for the message being
+/// routed.
+///
+/// This crate stores the predicate as TEXT and owns the precedence rule; the expression language
+/// belongs to `sutra-channels`, which compiles each predicate once per activation and implements
+/// this trait over that table. The seam is what keeps an expression evaluator out of the BPMN
+/// model, exactly as `<q:case when>` and `<q:alias expression>` are stored unparsed here.
+///
+/// **Fail-closed is the implementor's duty.** An evaluation error, a non-boolean result, or a
+/// missing compiled predicate must answer `false` and raise the diagnostic at that layer. The
+/// model never evaluates FEEL and never learns that a predicate failed — it only learns that the
+/// start event is not eligible.
+pub trait SourcePredicate {
+    /// Does the predicate on start event `node_id` hold? Called ONLY for a source that declares
+    /// one, so an implementor may treat an unknown node id as a bug in its own table.
+    fn holds(&self, node_id: &str) -> bool;
+}
+
+/// Answers `false` for every predicate: the fail-closed stand-in for a caller with no evaluator.
+/// A predicated start event is then simply not selected, rather than selected without its filter
+/// having been checked.
+pub struct PredicateUnavailable;
+
+impl SourcePredicate for PredicateUnavailable {
+    fn holds(&self, _node_id: &str) -> bool {
+        false
+    }
+}
+
+/// Answers a constant. `PredicateAlways(true)` ignores predicates altogether — the behaviour
+/// before this feature existed, and what a test that is not about filtering wants.
+pub struct PredicateAlways(pub bool);
+
+impl SourcePredicate for PredicateAlways {
+    fn holds(&self, _node_id: &str) -> bool {
+        self.0
+    }
+}
+
 impl ProcessDefinition {
     /// Build a `ProcessDefinition` from node + flow lists, including the duplicate-node-id
     /// check.
@@ -689,10 +728,25 @@ impl ProcessDefinition {
             .collect()
     }
 
-    /// Select the start event that handles an inbound arriving on `channel` carrying codec
-    /// `message_type`. Preference (highest first): exact `messageTypeValue` → matching
-    /// `messageTypePattern` (full regex match) → the unfiltered catch-all.
-    pub fn select_start_event(&self, channel: &str, message_type: Option<&str>) -> Option<&Node> {
+    /// EVERY start event that handles an inbound arriving on `channel` carrying codec
+    /// `message_type` — all the matches at the winning tier, in document order.
+    ///
+    /// Tiers, highest first: exact `messageTypeValue` → matching `messageTypePattern` (full regex
+    /// match) → the unfiltered catch-all. A `<q:source filterExpression>` predicate is a
+    /// CONJUNCT on its own tier, never a tier of its own: a start event whose predicate is false
+    /// does not occupy its tier, so selection falls through to the next one. That is what keeps
+    /// "more specific wins" true while letting two start events pin the same message type and
+    /// differ only by attribute.
+    ///
+    /// Returning every match rather than the first is deliberate. The caller owns the ambiguity
+    /// policy, and a single process declaring two start events that both match is a configuration
+    /// the predicate feature makes ordinary — it used to resolve silently by document order.
+    pub fn select_start_events(
+        &self,
+        channel: &str,
+        message_type: Option<&str>,
+        predicate: &dyn SourcePredicate,
+    ) -> Vec<&Node> {
         let candidates: Vec<&Node> = self
             .start_events()
             .into_iter()
@@ -702,42 +756,85 @@ impl ProcessDefinition {
             })
             .collect();
         if candidates.is_empty() {
-            return None;
+            return Vec::new();
         }
+        // A source with no predicate passes trivially; one with a predicate asks the caller.
+        let holds = |s: &&Node| -> bool {
+            match self
+                .bindings_for(s.id())
+                .source()
+                .and_then(|b| b.filter_expression.as_deref())
+            {
+                Some(_) => predicate.holds(s.id()),
+                None => true,
+            }
+        };
+
         if let Some(mt) = message_type {
-            for s in &candidates {
-                if let Some(v) = self
-                    .bindings_for(s.id())
-                    .source()
-                    .and_then(|b| b.message_type_value.as_deref())
-                {
-                    if v == mt {
-                        return Some(s);
-                    }
-                }
+            let exact: Vec<&Node> = candidates
+                .iter()
+                .copied()
+                .filter(|s| {
+                    self.bindings_for(s.id())
+                        .source()
+                        .and_then(|b| b.message_type_value.as_deref())
+                        == Some(mt)
+                })
+                .filter(holds)
+                .collect();
+            if !exact.is_empty() {
+                return exact;
             }
-            for s in &candidates {
-                if let Some(p) = self
-                    .bindings_for(s.id())
-                    .source()
-                    .and_then(|b| b.message_type_pattern.as_deref())
-                {
-                    // Full-match semantics: anchor the pattern end to end.
-                    if let Ok(re) = regex::Regex::new(&format!("^(?:{p})$")) {
-                        if re.is_match(mt) {
-                            return Some(s);
-                        }
-                    }
-                }
+
+            let matched: Vec<&Node> = candidates
+                .iter()
+                .copied()
+                .filter(|s| {
+                    self.bindings_for(s.id())
+                        .source()
+                        .and_then(|b| b.message_type_pattern.as_deref())
+                        .is_some_and(|p| {
+                            // Full-match semantics: anchor the pattern end to end. A malformed
+                            // pattern matches nothing here; it cannot reach a live engine at all,
+                            // because activation refuses a deployment whose patterns do not
+                            // compile. Skipping rather than panicking keeps the model total.
+                            regex::Regex::new(&format!("^(?:{p})$"))
+                                .map(|re| re.is_match(mt))
+                                .unwrap_or(false)
+                        })
+                })
+                .filter(holds)
+                .collect();
+            if !matched.is_empty() {
+                return matched;
             }
         }
-        candidates.into_iter().find(|s| {
-            let src = self.bindings_for(s.id()).source();
-            let filtered = src
-                .map(|b| b.message_type_value.is_some() || b.message_type_pattern.is_some())
-                .unwrap_or(false);
-            !filtered
-        })
+
+        candidates
+            .iter()
+            .copied()
+            .filter(|s| {
+                !self
+                    .bindings_for(s.id())
+                    .source()
+                    .map(|b| b.message_type_value.is_some() || b.message_type_pattern.is_some())
+                    .unwrap_or(false)
+            })
+            .filter(holds)
+            .collect()
+    }
+
+    /// The first of [`Self::select_start_events`] — for callers that want one start event and
+    /// have no ambiguity policy of their own.
+    pub fn select_start_event(
+        &self,
+        channel: &str,
+        message_type: Option<&str>,
+        predicate: &dyn SourcePredicate,
+    ) -> Option<&Node> {
+        self.select_start_events(channel, message_type, predicate)
+            .into_iter()
+            .next()
     }
 
     /// True if the process runs to completion with no quiescent point — eligible for the

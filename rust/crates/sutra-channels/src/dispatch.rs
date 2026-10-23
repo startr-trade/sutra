@@ -555,8 +555,27 @@ impl ChannelEngine {
                 .decode(&binding, &message.body, message.content_type.as_deref())?;
         let message_type = decoded.as_ref().and_then(|d| d.message_type.clone());
 
+        // The context a `<q:source filterExpression>` is evaluated against: the codec's reported
+        // attributes under `attr`, plus `messageType`. Headers and the payload are deliberately
+        // absent — see `selector_context`.
+        //
+        // A FATAL decode gets an EMPTY context, which keeps selection on message type alone. A
+        // codec that could not parse cannot classify, so consulting predicates would make every
+        // predicated subscriber answer false, resolve to zero handlers, and turn a clean
+        // validation rejection into "no start event matched" — discarding the decode issues and
+        // skipping `<q:onValidation>` entirely.
+        let fatal_decode = decoded
+            .as_ref()
+            .map(|d| d.outcome == sutra_codec_spi::DecodeOutcome::Fatal)
+            .unwrap_or(false);
+        let selector_ctx = if fatal_decode {
+            sutra_feel::FeelContext::new()
+        } else {
+            crate::intake::selector_context(decoded.as_ref(), message_type.as_deref())
+        };
+
         // ---- start-event routing (multi-start <q:source> match) --------------------------
-        let handlers = {
+        let resolution = {
             // `sutra.resolve` (handler resolution).
             let _resolve = tracing::info_span!(
                 telemetry::SPAN_RESOLVE,
@@ -564,9 +583,28 @@ impl ChannelEngine {
                 deployment.id = %deployment.value(),
             )
             .entered();
-            self.processes
-                .resolve_handlers(&deployment, &message.channel, message_type.as_deref())
+            let resolution = self.processes.resolve_handlers(
+                &deployment,
+                &message.channel,
+                message_type.as_deref(),
+                &selector_ctx,
+            );
+            // A predicate that could not be decided is recorded and the dispatch continues: the
+            // start event is simply not eligible. Aborting here would let one broken process deny
+            // a channel every other subscriber shares.
+            for (process_id, node_id, code, detail) in &resolution.predicate_faults {
+                tracing::warn!(
+                    code = %code,
+                    process.id = %process_id,
+                    node.id = %node_id,
+                    channel = %message.channel,
+                    "{detail}"
+                );
+            }
+            resolution
         };
+        let predicate_faults = resolution.predicate_faults;
+        let handlers = resolution.handlers;
         if handlers.is_empty() {
             // Before failing "no start event", check whether this is a
             // channel-delivered RELAY: a wait node (userTask / message catch) subscribes to
@@ -600,16 +638,33 @@ impl ChannelEngine {
                 ),
             )
             .with_attribute("channel", &message.channel)
-            .with_attribute("messageType", message_type.as_deref().unwrap_or("")));
+            .with_attribute("messageType", message_type.as_deref().unwrap_or(""))
+            // Without this, a message dropped because every predicate answered false looks
+            // exactly like one whose type nothing subscribes to.
+            .with_attribute(
+                "selectPredicateFaults",
+                predicate_faults
+                    .iter()
+                    .map(|(p, n, _, detail)| format!("{p}/{n}: {detail}"))
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            ));
         }
         if !binding.broadcast && handlers.len() > 1 {
-            let processes: Vec<&str> = handlers.iter().map(|h| h.process.id.as_str()).collect();
+            // Start events, not processes: two matching start events in ONE process is a
+            // configuration predicates make ordinary, and naming only the process would print
+            // the same id twice.
+            let starts: Vec<String> = handlers
+                .iter()
+                .map(|h| format!("{}/{}", h.process.id, h.start_event_id))
+                .collect();
             return Err(Diagnostic::error(
                 codes::INBOUND_AMBIGUOUS_HANDLER,
                 format!(
                     "Inbound on non-broadcast channel '{}' (message type '{}') resolved to {} \
-                     processes {processes:?}; a non-broadcast channel must resolve to exactly \
-                     one.",
+                     start events {starts:?}; a non-broadcast channel must resolve to exactly \
+                     one. Narrow them with <q:source filterExpression>, split the channel, or \
+                     set broadcast on the channel if fan-out is intended.",
                     message.channel,
                     message_type.as_deref().unwrap_or("(none)"),
                     handlers.len()
@@ -763,7 +818,7 @@ impl ChannelEngine {
         // in-memory hook serves persistence-less hosts and tests.
         match result {
             Ok(exec) => {
-                self.commit_sync_emissions(binding, deployment, message)
+                self.commit_sync_emissions(binding, deployment, message, process)
                     .await?;
                 let reply = self.build_reply(binding, process, message, &exec)?;
                 Ok(DispatchOutcome::Completed {
@@ -973,8 +1028,20 @@ impl ChannelEngine {
         binding: &ChannelBinding,
         deployment: &DeploymentId,
         message: &InboundMessage,
+        process: &ProcessDefinition,
     ) -> Result<(), Diagnostic> {
         let drained = self.emissions.drain();
+        // Held to the destination's contract BEFORE the transactional commit: a rejection here
+        // fails the step, so nothing is enqueued and nothing reaches the wire. Validating at the
+        // sink instead would be after the commit, which turns a contract breach into a delivery
+        // incident and leaves the flow believing it sent a valid message.
+        self.validate_emissions(
+            &binding.namespace.module_key(),
+            deployment,
+            &binding.channel_name,
+            process,
+            &drained,
+        )?;
         if let Some(bridge) = &self.bridge {
             let rows = to_outbox_emissions(drained, binding.labels(), inbound_traceparent(message));
             if !rows.is_empty() {
@@ -984,6 +1051,98 @@ impl ChannelEngine {
         }
         for emission in drained {
             self.outbox.enqueue(emission);
+        }
+        Ok(())
+    }
+
+    /// Resolve the contract one emission must satisfy and validate its body against it.
+    ///
+    /// See [`NO_INFERRED_REPLY_CODEC`] for why a reply infers nothing.
+    ///
+    /// `<q:send>` and `<q:reply>` share the validation model — the same
+    /// [`InboundChain::validate_outbound`], the same fail-closed posture, the same precedence of
+    /// a stated codec over an inferred one. What differs is only WHERE the inferred one comes
+    /// from, and this is the awkward case: a `<q:reply destination=…>` is delivered out of band
+    /// and so arrives here as an emission rather than as the synchronous reply, while only a
+    /// DESTINATION-LESS reply rides the inbound connection and is checked in `build_reply`.
+    ///
+    /// Reading only the `send` binding therefore skipped every destination-bearing reply,
+    /// including one that stated its codec — which is the precise failure this check exists to
+    /// prevent, the single declaration asking to be validated being the one exempt from it. So
+    /// the binding consulted follows the emission's own kind.
+    ///
+    /// `host_channel` names the inbound channel for the diagnostic only — a reply does not
+    /// inherit that channel's contract.
+    #[allow(clippy::too_many_arguments)]
+    fn validate_emission(
+        &self,
+        module_key: &str,
+        deployment: &DeploymentId,
+        host_channel: &str,
+        process: &ProcessDefinition,
+        emission: &sutra_executor::Emission,
+    ) -> Result<(), Diagnostic> {
+        let bindings = process.bindings_for(&emission.node_id);
+        let (declared, channel, fallback) = match emission.kind {
+            // A reply names no channel — it answers over the one the request arrived on.
+            sutra_executor::EmissionKind::Reply => (
+                bindings.reply.as_ref().and_then(|r| r.codec.clone()),
+                None,
+                NO_INFERRED_REPLY_CODEC.to_string(),
+            ),
+            // A send names its own: that channel's binding supplies the codec the author did
+            // not state, and names the channel the diagnostic reports either way.
+            _ => {
+                let send = bindings.send.as_ref();
+                let channel = send.and_then(|s| s.channel.clone());
+                let fallback = channel
+                    .as_deref()
+                    .and_then(|c| self.channels.find(module_key, c.trim()))
+                    .map(|b| b.codec.clone())
+                    .unwrap_or_default();
+                (send.and_then(|s| s.codec.clone()), channel, fallback)
+            }
+        };
+        // A stated codec governs even where no channel of this deployment does — which is the
+        // point of stating it, since a `<q:send destination>` addresses an endpoint and carries
+        // nothing to infer from. With neither, there is no contract to hold the message to.
+        if declared.is_none() && fallback.trim().is_empty() {
+            return Ok(());
+        }
+        let label = channel
+            .as_deref()
+            .or(Some(host_channel).filter(|h| !h.is_empty()))
+            .unwrap_or(&emission.destination);
+        self.chain.validate_outbound(
+            deployment,
+            label,
+            declared.as_deref(),
+            &fallback,
+            &emission.body,
+            emission.content_type.as_deref(),
+            &format!("Node '{}' of process '{}'", emission.node_id, process.id),
+        )
+    }
+
+    /// Hold every emission of one quiescent step to its destination's contract, BEFORE the
+    /// commit that would make it real.
+    ///
+    /// Called from each of the four places a step's emissions drain — the sync terminal and park
+    /// steps and the resumed terminal and re-park steps. All four needed it: a parked flow is
+    /// the normal shape for broker ingress, so wiring only the synchronous path would have left
+    /// the common case silently unvalidated, which is the same class of gap this check exists
+    /// to close.
+    #[allow(clippy::too_many_arguments)]
+    fn validate_emissions(
+        &self,
+        module_key: &str,
+        deployment: &DeploymentId,
+        host_channel: &str,
+        process: &ProcessDefinition,
+        emissions: &[sutra_executor::Emission],
+    ) -> Result<(), Diagnostic> {
+        for emission in emissions {
+            self.validate_emission(module_key, deployment, host_channel, process, emission)?;
         }
         Ok(())
     }
@@ -1231,7 +1390,7 @@ impl ChannelEngine {
             } => {
                 // Ran straight through to COMPLETED (no wait node was actually reached) —
                 // behave exactly like a sync-eligible flow, reply included.
-                self.commit_sync_emissions(binding, deployment, message)
+                self.commit_sync_emissions(binding, deployment, message, process)
                     .await?;
                 let exec = ExecResult {
                     instance_id: instance_id.clone(),
@@ -1276,11 +1435,16 @@ impl ChannelEngine {
                 // step collected (channel-call requests, `<q:send>`s before the park)
                 // ride the park step and commit ATOMICALLY with the snapshot — or not at
                 // all (the strict transactional outbox).
-                let emissions = to_outbox_emissions(
-                    self.emissions.drain(),
-                    binding.labels(),
-                    inbound_traceparent(message),
-                );
+                let drained = self.emissions.drain();
+                self.validate_emissions(
+                    &binding.namespace.module_key(),
+                    deployment,
+                    &binding.channel_name,
+                    process,
+                    &drained,
+                )?;
+                let emissions =
+                    to_outbox_emissions(drained, binding.labels(), inbound_traceparent(message));
                 let pv = persisted_variables(
                     &process.declared_variables,
                     persisted_variable_values(&variables),
@@ -1477,9 +1641,24 @@ impl ChannelEngine {
         decoded: &Option<DecodeResult>,
         message: &InboundMessage,
     ) -> Result<RelayResolution, Diagnostic> {
-        let targets = self
-            .processes
-            .resolve_relay_targets(deployment, &message.channel);
+        // Same selector context the start-event path builds, and the same fatal-decode posture:
+        // a codec that could not parse cannot classify, so an unparseable message selects on
+        // channel alone rather than having every predicated wait node answer false.
+        let relay_selector_ctx = if decoded
+            .as_ref()
+            .map(|d| d.outcome == sutra_codec_spi::DecodeOutcome::Fatal)
+            .unwrap_or(false)
+        {
+            sutra_feel::FeelContext::new()
+        } else {
+            crate::intake::selector_context(
+                decoded.as_ref(),
+                decoded.as_ref().and_then(|d| d.message_type.as_deref()),
+            )
+        };
+        let targets =
+            self.processes
+                .resolve_relay_targets(deployment, &message.channel, &relay_selector_ctx);
         let Some(target) = targets.first() else {
             return Ok(RelayResolution::NoTargets);
         };
@@ -1886,7 +2065,15 @@ impl ChannelEngine {
     ) -> Result<DispatchOutcome, Diagnostic> {
         match result {
             StatefulExecResult::Completed { instance_id, .. } => {
-                let emissions = to_outbox_emissions(self.emissions.drain(), labels, traceparent);
+                let drained = self.emissions.drain();
+                self.validate_emissions(
+                    &module_key_of_labels(&labels),
+                    pinned,
+                    "",
+                    process,
+                    &drained,
+                )?;
+                let emissions = to_outbox_emissions(drained, labels, traceparent);
                 // Terminal step: no longer in-flight — drop the row, resolve every wait
                 // point, retire the aliases, enqueue the step's emissions (a completed
                 // instance never lingers; its sends never miss the commit).
@@ -1924,7 +2111,15 @@ impl ChannelEngine {
             } => {
                 // The re-park step carries the emissions collected up to this
                 // quiescent point.
-                let emissions = to_outbox_emissions(self.emissions.drain(), labels, traceparent);
+                let drained = self.emissions.drain();
+                self.validate_emissions(
+                    &module_key_of_labels(&labels),
+                    pinned,
+                    "",
+                    process,
+                    &drained,
+                )?;
+                let emissions = to_outbox_emissions(drained, labels, traceparent);
                 let pv = persisted_variables(
                     &process.declared_variables,
                     persisted_variable_values(&variables),
@@ -2677,6 +2872,19 @@ impl ChannelEngine {
         message: &InboundMessage,
         exec: &sutra_executor::ExecResult,
     ) -> Result<Option<SyncReply>, Diagnostic> {
+        // A reply is something the flow DECLARED, not a by-product of having rendered
+        // something. `responseBody` is the only slot the executor has for a template / script /
+        // decision render, so a flow whose terminal task renders bytes for a `<q:send>` fills it
+        // without ever asking to answer the caller — and reading intent into that mechanism made
+        // an asynchronous channel deliver the same message twice, once out of band through its
+        // send and once back in the ack's body.
+        //
+        // So: no visited `<q:reply>`, no synchronous reply. `<q:reply continue="true">`, whose
+        // receipt an on-persist ack deliberately carries, is unaffected — it is a declaration,
+        // and this only requires that the declaration exist.
+        if !visited_reply_declared(process, exec) {
+            return Ok(None);
+        }
         let declared_ct = visited_reply_content_type(process, exec);
         let symmetric = message
             .content_type
@@ -2689,8 +2897,20 @@ impl ChannelEngine {
         };
 
         if let Some(FeelValue::String(body)) = exec.output("responseBody") {
+            // A template render reaches the wire without passing through a codec, so this is
+            // the ONLY point at which the channel's contract can still see it.
+            let bytes = body.clone().into_bytes();
+            self.chain.validate_outbound(
+                &binding.deployment_id(),
+                &binding.channel_name,
+                declared_reply_codec(process, exec).as_deref(),
+                NO_INFERRED_REPLY_CODEC,
+                &bytes,
+                Some(content_type.as_str()),
+                &format!("The reply of process '{}'", process.id),
+            )?;
             return Ok(Some(SyncReply {
-                body: body.clone().into_bytes().into(),
+                body: bytes.into(),
                 content_type,
             }));
         }
@@ -2700,6 +2920,18 @@ impl ChannelEngine {
                 let bytes = self
                     .chain
                     .encode(binding, &value, message.content_type.as_deref())?;
+                // Encoding projects; it does not validate (`project_to_tree` is the
+                // non-validating half of the schema pair), so the contract check is this call,
+                // not the one above.
+                self.chain.validate_outbound(
+                    &binding.deployment_id(),
+                    &binding.channel_name,
+                    declared_reply_codec(process, exec).as_deref(),
+                    NO_INFERRED_REPLY_CODEC,
+                    &bytes,
+                    message.content_type.as_deref(),
+                    &format!("The reply of process '{}'", process.id),
+                )?;
                 // Native reply: the wire content-type mirrors the inbound.
                 return Ok(Some(SyncReply {
                     body: bytes.into(),
@@ -2880,6 +3112,18 @@ impl ChannelEngineBuilder {
     pub fn build(self) -> ChannelEngine {
         self.engine
     }
+}
+
+/// Rebuild the `"<tenant>/<module>/<version>"` module key from a step's authoring labels.
+///
+/// The resume path carries labels rather than the originating [`ChannelBinding`] — it is
+/// answering a relay, not an intake — but the channel registry is keyed by module. The labels
+/// are built from the namespace by `ChannelBinding::labels`, so this is that function read
+/// backwards; a label the binding omitted (an empty module or version) comes back empty, which
+/// is exactly what the key held in the first place.
+fn module_key_of_labels(labels: &BTreeMap<String, String>) -> String {
+    let get = |k: &str| labels.get(k).cloned().unwrap_or_default();
+    format!("{}/{}/{}", get("tenant"), get("module"), get("version"))
 }
 
 /// Split a `"<tenant>/<module>/<version>"` module key back into its [`Namespace`].
@@ -3534,6 +3778,57 @@ fn visited_reply_content_type(
                 if let Some(ct) = &reply.content_type {
                     return Some(ct.clone());
                 }
+            }
+        }
+    }
+    None
+}
+
+/// A reply infers no codec: it is validated only against one stated on the `<q:reply>` itself.
+///
+/// The tempting fallback is the inbound channel's codec, since a destination-less reply rides
+/// that channel back out. It is wrong, and wrong in the common case rather than an edge: a
+/// channel's codec is the contract its REQUESTS satisfy, and a reply is by definition a
+/// different message. A schema codec bound to validate a transfer request has no declaration
+/// for the acceptance that answers it, so inferring it rejects correct replies — which is how
+/// this was found, with three conformance examples refusing to answer at all.
+///
+/// For a bare format (json in, json out — the native-reply continuity) the inference would have
+/// been a no-op anyway, because a format asserts no schema and so carries no contract to fail.
+/// So inference here was never useful and sometimes harmful, and the honest surface is the
+/// declaration: state `<q:reply codec>` when the answer has a contract to keep.
+///
+/// A `<q:send>` is the asymmetric case and keeps its inference, because it is not guessing: the
+/// bytes are addressed to a named channel, and that channel's codec is exactly what its
+/// consumers will decode them with.
+const NO_INFERRED_REPLY_CODEC: &str = "";
+
+/// Did the flow actually visit a node carrying a `<q:reply>`?
+///
+/// The gate on producing a synchronous reply at all. Kept separate from
+/// [`visited_reply_content_type`], which answers a narrower question (the declared content type
+/// of a reply with no explicit destination) and so cannot stand in for this one.
+fn visited_reply_declared(process: &ProcessDefinition, exec: &sutra_executor::ExecResult) -> bool {
+    process.nodes().iter().any(|node| {
+        exec.visited_nodes.contains(node.id()) && process.bindings_for(node.id()).reply.is_some()
+    })
+}
+
+/// The `<q:reply codec>` of the visited reply node — the codec the author declared this reply
+/// must satisfy, which need not be the one that decoded the request. Resolved the same way as
+/// the reply content type, off the same visited node, so the two never disagree about which
+/// `<q:reply>` is speaking.
+fn declared_reply_codec(
+    process: &ProcessDefinition,
+    exec: &sutra_executor::ExecResult,
+) -> Option<String> {
+    for node in process.nodes() {
+        if !exec.visited_nodes.contains(node.id()) {
+            continue;
+        }
+        if let Some(reply) = &process.bindings_for(node.id()).reply {
+            if let Some(codec) = &reply.codec {
+                return Some(codec.clone());
             }
         }
     }

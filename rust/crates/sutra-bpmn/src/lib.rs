@@ -34,8 +34,8 @@ pub const REDACTION_COMPANION_SUFFIX: &str = ".redacted";
 pub use error::SutraError;
 pub use loader::BpmnModelLoader;
 pub use model::{
-    BpmnImport, CoveragePath, DataMapping, DeclaredVariable, FieldType, Node, ProcessAudit,
-    ProcessDefinition, ProcessModule, SequenceFlow, DEFAULT_LOOP_ITEM_VARIABLE,
-    LOOP_COUNTER_VARIABLE,
+    BpmnImport, CoveragePath, DataMapping, DeclaredVariable, FieldType, Node, PredicateAlways,
+    PredicateUnavailable, ProcessAudit, ProcessDefinition, ProcessModule, SequenceFlow,
+    SourcePredicate, DEFAULT_LOOP_ITEM_VARIABLE, LOOP_COUNTER_VARIABLE,
 };
 pub use timer::{TimerCycleSpec, TimerDefinition, TimerSpecRejection};

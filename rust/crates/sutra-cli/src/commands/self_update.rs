@@ -599,7 +599,13 @@ fn unpack(archive: &[u8], binary: &str, target: &str, dest: &PathBuf) -> Result<
             .map_err(|e| format!("opening the release zip: {e}"))?;
         for i in 0..zip.len() {
             let mut entry = zip.by_index(i).map_err(|e| format!("zip entry {i}: {e}"))?;
-            if entry.name().ends_with(&format!("{binary}.exe")) {
+            // zip 9 returns the entry name as a Result: a name that is not valid UTF-8 is an
+            // error rather than a lossy string. Such an entry cannot be the binary we are
+            // looking for, so skip it instead of failing the whole update.
+            let Ok(name) = entry.name() else {
+                continue;
+            };
+            if name.ends_with(&format!("{binary}.exe")) {
                 let mut out = std::fs::File::create(dest)
                     .map_err(|e| format!("creating {}: {e}", dest.display()))?;
                 std::io::copy(&mut entry, &mut out).map_err(|e| format!("extracting: {e}"))?;

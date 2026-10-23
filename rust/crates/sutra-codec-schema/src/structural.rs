@@ -380,6 +380,9 @@ impl StructuralCodec {
             issues,
             content_type: ct.to_string(),
             message_type: (!root.is_empty()).then_some(root),
+            // A user-schema codec classifies by root element alone and reports no attributes of
+            // its own; a codec that recognises more about a message fills this in.
+            attributes: Default::default(),
         }
     }
 
@@ -505,6 +508,7 @@ impl StructuralCodec {
             issues,
             content_type: ct.to_string(),
             message_type: Some(root),
+            attributes: Default::default(),
         }
     }
 

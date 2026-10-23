@@ -79,6 +79,39 @@ payload lands in:
 - `dedupKey` — an expression identifying a redelivered duplicate (e.g. `header.X-Request-Id`),
   distinct from the process-level retry-safety assertion below.
 - `dataClass` (default `none`) — `pii` / `pci` / `phi` / `financial`; drives redaction policy.
+- `filterExpression` — a FEEL predicate over the message *attributes* the codec reported. It
+  narrows whichever of the message-type selectors above applies rather than replacing one, so
+  "exact beats pattern beats accept-anything" is unchanged.
+
+### Selecting on attributes, not just a message type
+
+One string cannot always say which process should handle a message. A message standard may use the
+same message type in more than one flavour — the same type arriving one way is a request to act
+on, and arriving the other way is an acknowledgement of something you sent — and the flavour, not
+the type, decides the handler.
+
+A codec reports those facts as **attributes** alongside the message type, and a start event
+selects on the pair:
+
+```xml
+<q:source channel="rail" messageTypeValue="CreditTransfer"
+          filterExpression="attr.direction = &quot;incoming&quot;"/>
+```
+
+Two start events may now pin the same message type and be told apart by an attribute, where before
+that was an ambiguous handler. The predicate sees the attributes and `messageType` — not headers,
+not the payload: admitting either would make the package-time checks below impossible and would
+let one business message route differently depending on the transport it arrived over.
+
+A codec declares the attribute keys it can report, and optionally their closed value domains.
+`sutra lint` then refuses a predicate reading a key the bound channel's codec can never emit, or
+comparing against a value outside its domain — so `"Incoming"` for `"incoming"` fails at package
+time instead of producing a start event that silently never fires. It also refuses two subscribers
+on one non-broadcast channel whose predicates it cannot *prove* disjoint; the recognised form is
+`and` / `or` / `not` over equality, inequality, `in`, and relational comparisons on numeric
+attributes. That limit is permanent rather than provisional: the gate is a proof obligation, and
+arbitrary FEEL cannot be proven disjoint. A codec declaring no attributes is *open* — the
+predicate still works and lint warns that it cannot verify it rather than blocking.
 
 The codec itself is **not** declared on `q:source` — it comes from the channel (YAML is
 authoritative for transport/codec binding; BPMN is authoritative for process flow). Declaring a
@@ -142,6 +175,62 @@ sequenceDiagram
 
 The caller's answer is bounded by the task that produces it rather than by the tail of the process
 — the remaining nodes run on a resume nobody is waiting on.
+
+### The contract an outgoing message must satisfy
+
+A message a flow produces is held to a codec's contract before it leaves, the same way an inbound
+message is held to one on the way in. The codec's own decode step *is* the validator, so the check
+is literally "read back what we are about to send" — there is no second contract to keep in step
+with the first.
+
+This matters most for output a template, script or decision produces. Those renders reach the wire
+without passing through an encode step at all, so without this check an engine that validates every
+byte it accepts would validate none of the bytes it emits — and a flow could answer a
+strictly-validated request with a structurally invalid message.
+
+| Attribute on `q:send` / `q:reply` | Means |
+|---|---|
+| `codec="urn:…"` | the codec whose contract this output must satisfy, stated rather than inferred |
+| `messageType="…"` | the message type this output emits — checked against what that codec can produce |
+
+```xml
+<bpmn:serviceTask id="Answer" implementation="ack.hbs">
+  <bpmn:extensionElements>
+    <q:reply codec="urn:acknowledgements" messageType="Acknowledgement"/>
+  </bpmn:extensionElements>
+</bpmn:serviceTask>
+```
+
+State the codec when the output's contract is not the one the bytes happen to leave by. A flow is
+a translator: it may accept one wire format and answer or forward in another, so the codec that
+decoded the request need not govern the answer.
+
+The two forms differ in what happens when you say nothing, and the asymmetry is deliberate:
+
+- **A `<q:send>` infers** the codec of the `@channel` it names. That is not a guess — the bytes
+  are addressed to that channel, and its codec is exactly what the consumers there will decode
+  them with. A `<q:send destination="…">` names an endpoint rather than a channel and so has
+  nothing to infer from, which makes stating the codec the only way to hold it to a contract.
+- **A `<q:reply>` infers nothing**, and is unvalidated unless you state one. The tempting
+  fallback is the channel the reply rides back out on, but a channel's codec is the contract its
+  *requests* satisfy, and a reply is by definition a different message — a codec bound to
+  validate a transfer request has no declaration for the acceptance that answers it, so
+  inferring it would reject correct replies.
+
+A failure is refused rather than sent (`SUTRA.OUTBOUND.VALIDATION_REJECT`), and the diagnostic
+names the offending field. The default is fail-closed for the same reason
+[`q:onValidation`](#qonvalidation--the-structural-failure-policy)'s is: a flow that declared no
+posture toward a validation failure has said nothing about handling one, so the invalid message
+must not leave. Egress bound to a bare format, or to no codec, asserts no schema and is
+unaffected — there is nothing there to fail.
+
+`sutra lint` moves what it can to package time. It reads a template's own *unrendered* text with
+the governing codec and compares the answer against `template-manifest.yaml` — `outputMessageType`,
+and `outputAttributes` for the codec-reported attributes. That works because a template is text
+with holes and the holes are leaf content: the element structure deciding classification is already
+there. It catches a template that renders the wrong message while declaring the right one. A
+template the codec cannot classify unrendered is reported unverifiable rather than wrong; a
+*stated* codec that does not resolve is an error, because stating it is how you ask for the check.
 
 ## `q:alias` — correlation by your business key
 

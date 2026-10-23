@@ -2003,6 +2003,10 @@ fn parse_sources(ext: &XmlElement, host_id: &str) -> Result<Vec<SourceBinding>, 
             redactors,
             message_type_value: mt_value,
             message_type_pattern: mt_pattern,
+            // Carried as text. Parsing, determinism and analysability are the deploy-time lint's
+            // job and compilation is `sutra-channels`' — the same division this crate already
+            // applies to `<q:case when>` and `<q:alias expression>`.
+            filter_expression: attr_trimmed(s, "filterExpression"),
         });
     }
     if out.len() > 1 {
@@ -2211,6 +2215,7 @@ fn parse_reply(ext: &XmlElement, host_id: &str) -> Result<Option<ReplyBinding>, 
     Ok(Some(ReplyBinding {
         mode,
         destination: opt_attr(r, "destination"),
+        codec: opt_attr(r, "codec"),
         content_type: opt_attr(r, "contentType"),
         required: r.attr_or_empty("required") == "true",
         ce_type: opt_attr(r, "type"),
@@ -2253,6 +2258,7 @@ fn parse_send(ext: &XmlElement, host_id: &str) -> Result<Option<SendBinding>, Su
         mode,
         destination: if has_dest { Some(destination) } else { None },
         channel: if has_channel { Some(channel) } else { None },
+        codec: opt_attr(s, "codec"),
         content_type: opt_attr(s, "contentType"),
         ce_type: opt_attr(s, "type"),
         ce_source: opt_attr(s, "source"),

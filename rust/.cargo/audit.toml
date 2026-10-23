@@ -12,4 +12,7 @@ ignore = [
     "RUSTSEC-2026-0099",  # rustls-webpki 0.101.7 name-constraint (MSSQL/tiberius TLS; upstream-blocked)
     "RUSTSEC-2026-0098",  # rustls-webpki 0.101.7 URI name-constraint (MSSQL/tiberius TLS; upstream-blocked)
     "RUSTSEC-2026-0104",  # rustls-webpki 0.101.7 CRL-parse panic (MSSQL/tiberius TLS; upstream-blocked)
+    "RUSTSEC-2026-0346",  # rustls 0.21.12 (MSSQL/tiberius TLS; 0.23 line already on 0.23.46)
+    "RUSTSEC-2026-0349",  # rustls 0.21.12 (MSSQL/tiberius TLS; 0.23 line already on 0.23.46)
+    "RUSTSEC-2026-0382",  # rustls-webpki 0.101.7 (MSSQL/tiberius TLS; 0.103 line already on 0.103.16)
 ]

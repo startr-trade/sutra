@@ -28,6 +28,9 @@ sutra-redactor-spi = { path = "../sutra-redactor-spi" }
 sutra-srl = { path = "../sutra-srl" }
 serde_json = { workspace = true }
 serde_yaml_ng = "0.10"
+# `messageTypePattern` is compiled once per activation here rather than per message, which is
+# where the regex moved to from the hot inbound path.
+regex = { workspace = true }
 sha2 = { workspace = true }
 getrandom = { workspace = true }
 # CloudEvents structured `data_base64` decode.

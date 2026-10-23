@@ -122,8 +122,8 @@ pub use policy::{
     SystemClock, TenantConfig, TenantConfigSource, TenantQuotaEnforcer, TenantQuotas,
 };
 pub use registry::{
-    ChannelRegistry, CodecRegistry, DrainingSink, FormatRegistry, ProcessModuleRegistry,
-    RelayTarget, CODEC_BUILTIN_URN_PREFIX,
+    ChannelRegistry, CodecRegistry, DrainingSink, FormatRegistry, HandlerMatch, HandlerResolution,
+    PredicateFault, ProcessModuleRegistry, RelayTarget, SelectorFault, CODEC_BUILTIN_URN_PREFIX,
 };
 pub use shard_metrics::{ShardLaneMetrics, ShardRouterMetrics};
 pub use sink::{

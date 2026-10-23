@@ -9,3 +9,8 @@ publish.workspace = true
 [dependencies]
 inventory = "0.3.24"
 serde_json = { workspace = true }
+# Message attributes are carried as FEEL values, so a start event's intake predicate evaluates
+# them with no conversion step and a process reads the same values the filter matched on. Both
+# crates are domain-neutral core, and sutra-feel has no workspace dependencies of its own, so
+# this edge adds no cycle and no layering inversion.
+sutra-feel = { path = "../sutra-feel" }
