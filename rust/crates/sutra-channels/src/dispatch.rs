@@ -33,6 +33,10 @@ use crate::bridge::{
 use crate::codes;
 use crate::config::{ChannelBinding, ChannelDefinition, Namespace};
 use crate::diag::Diagnostic;
+use crate::inline::{InlineCaller, InlineCallerRegistry, InlineFailure, InlineResponse};
+use crate::inline_chain::{
+    InlineCall, InlineCallResult, InlineContinuation, InlineHandoff, InlineRetry, InlineStep,
+};
 use crate::intake::{InboundChain, IntakeOutcome};
 use crate::policy::{
     ConcurrencyStore, FeatureProvider, PayloadCapPolicy, QuotaCheckResult, TenantQuotaEnforcer,
@@ -124,6 +128,13 @@ pub enum DispatchOutcome {
         shard: u32,
         resolved: Box<ResolvedResume>,
     },
+    /// A start parked ONLY at calls on synchronous outbound channels (`ack-mode:
+    /// on-complete`): nothing was committed, and the in-memory instance waits on the calls the
+    /// handoff carries. Like [`Self::Handoff`], never observed by a transport — the router side
+    /// of [`crate::http::EngineHandle`] makes the calls, resumes the instance with each answer
+    /// and returns the chain's final outcome instead. Only an engine with inline callers wired
+    /// and a synchronous outbound channel declared ever answers this.
+    InlineCalls(InlineHandoff),
 }
 
 /// The already-resolved resume a relay HANDOFF carries between shards (execution
@@ -155,6 +166,17 @@ pub struct ResolvedResume {
     /// The inbound `traceparent`, when one rode the delivery (coverage correlation +
     /// emission stamping).
     pub traceparent: Option<String>,
+    /// The relay delivery itself, so the turn's `<q:reply>` can answer it (rendered against
+    /// the relay's own binding and message, exactly like a start's reply).
+    pub reply_to: Option<Box<RelayReplyContext>>,
+}
+
+/// The delivery a relayed resume answers: its channel binding and message, against which the
+/// turn's `<q:reply>` is rendered (codec, content type, contract) like a start's reply.
+#[derive(Debug, Clone)]
+pub struct RelayReplyContext {
+    pub binding: ChannelBinding,
+    pub message: InboundMessage,
 }
 
 // The handoff payload crosses shard queues: `Send` data only. `FeelValue` (inside
@@ -286,6 +308,27 @@ pub struct ChannelEngine {
     /// pipeline. A bare builder gets a fresh, unobserved handle; the router-built engine
     /// receives its lane's shared handle so the exporter sees one registry per router.
     shard_metrics: std::sync::Arc<crate::shard_metrics::ShardLaneMetrics>,
+    /// Scheme → inline caller for SYNCHRONOUS outbound channels. Empty (the default) means no
+    /// channel-call is ever made inline.
+    inline_callers: InlineCallerRegistry,
+    /// Secret resolution for an inline call's outbound auth reference — the same resolver the
+    /// outbox dispatcher uses for the async path (default: `env:` only).
+    inline_secret_env: crate::outbox_dispatch::SecretEnv,
+    /// Whether THIS pass has a driver waiting on it (a transport caller, the timer or schedule
+    /// poller), so its synchronous calls may be made inline. Set by every entry point (false
+    /// for a poison wake and a broadcast fan-out); actor-local scratch, like `pending_settle`.
+    inline_capable: std::cell::Cell<bool>,
+    /// The inbox dedup keys THIS dispatch recorded (`(channel, key)`), handed to a synchronous
+    /// chain so a chain that fails can release them. Cleared at every dispatch entry.
+    dispatch_dedup: std::cell::RefCell<Vec<(String, String)>>,
+    /// Stored instances a synchronous chain on THIS lane is driving. The chain holds the
+    /// instance's claim, and claims are re-entrant per owner (one owner per lane), so a second
+    /// relay or timer for the same instance would be granted the claim and resume a stale
+    /// frontier — every resume path refuses an instance listed here instead.
+    inline_held: std::cell::RefCell<std::collections::HashSet<String>>,
+    /// `(module_key, channel)` of every inbound channel declaring `reply-stream: sse`: a chain
+    /// answering a delivery on one streams its `q:stream` calls to the caller.
+    sse_channels: BTreeSet<(String, String)>,
 }
 
 pub struct ChannelEngineBuilder {
@@ -329,6 +372,16 @@ impl ChannelEngine {
                 shard_metrics: std::sync::Arc::new(
                     crate::shard_metrics::ShardLaneMetrics::default(),
                 ),
+                inline_callers: InlineCallerRegistry::new(),
+                inline_secret_env: Arc::new(|full_ref| {
+                    full_ref
+                        .strip_prefix("env:")
+                        .and_then(|name| std::env::var(name).ok())
+                }),
+                inline_capable: std::cell::Cell::new(false),
+                dispatch_dedup: std::cell::RefCell::new(Vec::new()),
+                inline_held: std::cell::RefCell::new(std::collections::HashSet::new()),
+                sse_channels: BTreeSet::new(),
             },
         }
     }
@@ -370,7 +423,15 @@ impl ChannelEngine {
         // left behind (the actor catches the unwind) — a plain dispatch must never adopt
         // another delivery's callbacks.
         self.pending_settle.borrow_mut().take();
+        self.begin_dispatch(true);
         self.dispatch_inner(message).await
+    }
+
+    /// Reset the per-dispatch scratch at an entry point; `inline` says whether a caller waits on
+    /// this pass (see `inline_capable`).
+    fn begin_dispatch(&self, inline: bool) {
+        self.inline_capable.set(inline);
+        self.dispatch_dedup.borrow_mut().clear();
     }
 
     /// `ack-mode: on-complete` (broker) dispatch: the SAME pipeline, but when the
@@ -389,9 +450,15 @@ impl ChannelEngine {
         settle: DeferredSettle,
     ) -> Result<DeferredDispatch, Diagnostic> {
         *self.pending_settle.borrow_mut() = Some(settle);
+        self.begin_dispatch(true);
         let result = self.dispatch_inner(message).await;
         let leftover = self.pending_settle.borrow_mut().take();
         let outcome = result?;
+        // A synchronous chain carries the callbacks itself (when it took them) and settles at
+        // its end; the router side maps its final outcome.
+        if matches!(outcome, DispatchOutcome::InlineCalls(_)) {
+            return Ok(DeferredDispatch::Settled(outcome));
+        }
         Ok(match leftover {
             // The park arm consumed the callbacks — the ack is now deferred.
             None => DeferredDispatch::Deferred {
@@ -546,6 +613,9 @@ impl ChannelEngine {
                 if !first {
                     return Ok(DispatchOutcome::Duplicate);
                 }
+                self.dispatch_dedup
+                    .borrow_mut()
+                    .push((message.channel.clone(), message.idempotency_key.clone()));
             }
         }
 
@@ -676,6 +746,11 @@ impl ChannelEngine {
         } else {
             vec![&handlers[0]]
         };
+        // A fan-out answers with its LAST handler's outcome, so an earlier handler's in-memory
+        // chain would have nowhere to go: broadcast deliveries take the async path.
+        if selected.len() > 1 {
+            self.inline_capable.set(false);
+        }
 
         // ---- per-handler: validate → aliases → execute → ack ------------------------------
         let mut last = None;
@@ -730,6 +805,9 @@ impl ChannelEngine {
                 {
                     return Ok(DispatchOutcome::Duplicate);
                 }
+                self.dispatch_dedup
+                    .borrow_mut()
+                    .push((message.channel.clone(), body_key.clone()));
             }
         }
 
@@ -1339,6 +1417,22 @@ impl ChannelEngine {
                     ),
                 ));
             }
+            // A synchronous chain in flight holds its unique aliases in memory only (nothing is
+            // committed until the chain ends), so the durable index cannot see it.
+            if let Some(owner) = self
+                .aliases
+                .as_ref()
+                .and_then(|store| store.find_live(deployment, &row.record.name, &row.record.value))
+            {
+                return Err(Diagnostic::error(
+                    codes::INBOUND_ALIAS_CONFLICT_REJECT,
+                    format!(
+                        "<q:alias {}> = '{}' already bound to in-flight instance {owner} \
+                         (a synchronous call chain); the second arrival is rejected",
+                        row.record.name, row.record.value
+                    ),
+                ));
+            }
         }
 
         // C6 phase 4 — the spawn's coverage correlation dims for any cross-process fragment this
@@ -1421,15 +1515,15 @@ impl ChannelEngine {
                 // commit so "reply returned ⇒ park committed" holds — a failed `commit_park`
                 // propagates via `?` and the reply is never returned. A due-now timer wait (armed by
                 // the executor on the continue-reply node) self-resumes the remaining nodes at once.
-                let reply = if detached_reply {
+                // A plain park answers with the last destination-less `<q:reply>` the pass
+                // rendered, if it reached one.
+                let reply = {
                     let exec = ExecResult {
                         instance_id: instance_id.clone(),
                         outputs: variables.clone(),
                         visited_nodes: completed_nodes.iter().cloned().collect(),
                     };
-                    self.build_reply(binding, process, message, &exec)?
-                } else {
-                    None
+                    self.reply_at(binding, process, message, &exec, !detached_reply)?
                 };
                 // Quiescent-point rule: the destination-bearing emissions this
                 // step collected (channel-call requests, `<q:send>`s before the park)
@@ -1443,6 +1537,67 @@ impl ChannelEngine {
                     process,
                     &drained,
                 )?;
+                // Synchronous outbound calls: when a caller waits on this pass, nothing parks —
+                // the in-memory instance goes to the router side with its requests and is
+                // persisted only if (and when) the chain reaches a durable park. A respond-and-
+                // continue detach keeps its own early-reply path.
+                let sync_sites = if detached_reply {
+                    Vec::new()
+                } else {
+                    self.sync_call_sites(process, deployment, &waiting_nodes, &[])
+                };
+                if !sync_sites.is_empty() {
+                    let pinned = self.processes.find_in_module(deployment, &process.id);
+                    match pinned {
+                        Some(pinned)
+                            if self.inline_capable.get()
+                                && sync_sites.iter().all(|site| site.caller.is_some()) =>
+                        {
+                            let chain = Box::new(InlineChain {
+                                lane: self.shard.index,
+                                instance_id: instance_id.clone(),
+                                process: pinned,
+                                deployment: deployment.clone(),
+                                binding: binding.clone(),
+                                message: message.clone(),
+                                completed_nodes: completed_nodes.clone(),
+                                waiting_nodes: waiting_nodes.clone(),
+                                variables: variables.clone(),
+                                start_node: start_node.clone(),
+                                coverage: coverage_progress.clone(),
+                                retry_attempts: retry_attempts.clone(),
+                                retry_backoff: retry_backoff.clone(),
+                                pending_timers: timer_waits.clone(),
+                                emissions: Vec::new(),
+                                alias_rows: alias_rows.iter().map(|r| r.record.clone()).collect(),
+                                held_aliases: false,
+                                counted: false,
+                                marked: false,
+                                stored: None,
+                                settle: if self.deferred_acks.is_some() {
+                                    self.pending_settle.borrow_mut().take()
+                                } else {
+                                    None
+                                },
+                                dedup_keys: self.dispatch_dedup.borrow_mut().drain(..).collect(),
+                                in_flight: BTreeSet::new(),
+                                visited: completed_nodes.iter().cloned().collect(),
+                                audit_seq: self.audit_seq_for(&instance_id),
+                                early_reply: None,
+                            });
+                            return self.launch_inline_chain(chain, drained, sync_sites).await;
+                        }
+                        _ => self.warn_sync_degraded(
+                            process,
+                            &sync_sites,
+                            if self.inline_capable.get() {
+                                "no inline caller serves the channel's scheme"
+                            } else {
+                                "this pass cannot carry a chain (a broadcast fan-out or a poison wake)"
+                            },
+                        ),
+                    }
+                }
                 let emissions =
                     to_outbox_emissions(drained, binding.labels(), inbound_traceparent(message));
                 let pv = persisted_variables(
@@ -1666,20 +1821,8 @@ impl ChannelEngine {
 
         // Two-tier intake validation of the relayed payload against the wait node's
         // <q:source> (uniform with a start event). FATAL ⇒ reject; nothing advances.
-        let mut relay_vars = project_variables(message);
-        if let Some(decoded) = decoded {
-            match self.chain.apply_decoded(
-                process,
-                &target.wait_node_id,
-                binding,
-                decoded,
-                &mut relay_vars,
-            )? {
-                IntakeOutcome::Proceed { .. } => {}
-                IntakeOutcome::Reject(d) => return Err(d),
-                IntakeOutcome::Error { diagnostic, .. } => return Err(diagnostic),
-            }
-        }
+        let relay_vars =
+            self.relay_intake_variables(process, &target.wait_node_id, binding, decoded, message)?;
 
         // The correlation the relay carries — the WAIT NODE's own declared <q:alias>
         // first (the channel-call park key), then the process-level
@@ -1732,6 +1875,10 @@ impl ChannelEngine {
                 channel: message.channel.clone(),
                 labels: binding.labels(),
                 traceparent: inbound_traceparent(message),
+                reply_to: Some(Box::new(RelayReplyContext {
+                    binding: binding.clone(),
+                    message: message.clone(),
+                })),
             })));
         }
         let outcome = self
@@ -1745,6 +1892,10 @@ impl ChannelEngine {
                 &message.channel,
                 binding.labels(),
                 inbound_traceparent(message),
+                Some(RelayReplyContext {
+                    binding: binding.clone(),
+                    message: message.clone(),
+                }),
             )
             .await?;
         Ok(RelayResolution::Resumed(outcome))
@@ -1769,6 +1920,7 @@ impl ChannelEngine {
         channel: &str,
         labels: BTreeMap<String, String>,
         traceparent: Option<String>,
+        reply_to: Option<RelayReplyContext>,
     ) -> Result<DispatchOutcome, Diagnostic> {
         // ---- instance ownership: claim BEFORE rehydrating ------------------------------
         // Correlation named a live instance; take ownership of it before a single byte of
@@ -1785,6 +1937,9 @@ impl ChannelEngine {
         // task that holds the instance across a network call) is what would make a
         // mid-step heartbeat load-bearing; until such a step exists, the timeout margin IS
         // the liveness signal.
+        if let Some(held) = self.inline_held_guard(instance_id, channel) {
+            return Err(held);
+        }
         match bridge.claim_instance(deployment, instance_id).await? {
             InstanceClaimOutcome::Granted => {}
             InstanceClaimOutcome::HeldByOther => {
@@ -1988,14 +2143,17 @@ impl ChannelEngine {
                     &resume_process,
                     &snapshot,
                     &pinned,
+                    deployment,
                     wait_node_id,
                     result,
+                    reply_to,
                 )
                 .await?;
             // The step committed under `pinned`; when that is the key we claimed under (the
             // ordinary case — a DRAINING-scope resume is the exception), the release already rode
-            // that transaction and there is nothing left to hand back.
-            if pinned == *deployment {
+            // that transaction and there is nothing left to hand back. A synchronous chain took
+            // the claim with it: the chain's final commit (or its failure) hands it back.
+            if pinned == *deployment || matches!(outcome, DispatchOutcome::InlineCalls(_)) {
                 released_in_tx.set(true);
             }
             Ok(outcome)
@@ -2032,6 +2190,8 @@ impl ChannelEngine {
                 "a resolved-resume handoff requires the persistence bridge — none is configured",
             ));
         };
+        // The router side awaits the handoff, so the resume may run a chain.
+        self.begin_dispatch(true);
         self.resume_correlated_claimed(
             &bridge,
             &resolved.deployment,
@@ -2042,6 +2202,7 @@ impl ChannelEngine {
             &resolved.channel,
             resolved.labels.clone(),
             resolved.traceparent.clone(),
+            resolved.reply_to.as_deref().cloned(),
         )
         .await
     }
@@ -2060,11 +2221,17 @@ impl ChannelEngine {
         process: &ProcessDefinition,
         prior_snapshot: &SuspendedInstance,
         pinned: &DeploymentId,
+        claim_scope: &DeploymentId,
         satisfied_node: &str,
         result: StatefulExecResult,
+        reply_to: Option<RelayReplyContext>,
     ) -> Result<DispatchOutcome, Diagnostic> {
         match result {
-            StatefulExecResult::Completed { instance_id, .. } => {
+            StatefulExecResult::Completed {
+                instance_id,
+                outputs,
+                visited_nodes,
+            } => {
                 let drained = self.emissions.drain();
                 self.validate_emissions(
                     &module_key_of_labels(&labels),
@@ -2086,12 +2253,25 @@ impl ChannelEngine {
                 if let Some(store) = &self.concurrency {
                     store.record_terminal(pinned, &instance_id).await;
                 }
-                // A relay has no synchronous reply body of its own — empty outputs, never
-                // the resumed instance's raw variable map (the drive-relay contract).
+                // A relay answers with the `<q:reply>` THIS pass reached, rendered against its
+                // own delivery; outputs stay empty, never the resumed instance's raw variable
+                // map (the drive-relay contract).
+                let reply = match &reply_to {
+                    Some(to) => self.relay_reply(
+                        to,
+                        process,
+                        prior_snapshot,
+                        &instance_id,
+                        outputs,
+                        visited_nodes,
+                        false,
+                    )?,
+                    None => None,
+                };
                 Ok(DispatchOutcome::Completed {
                     instance_id,
                     outputs: serde_json::json!({}),
-                    reply: None,
+                    reply,
                 })
             }
             StatefulExecResult::Suspended {
@@ -2101,10 +2281,9 @@ impl ChannelEngine {
                 variables,
                 start_node,
                 timer_waits,
-                // A continue-reply reached during a RESUMED tail has no sync caller to flush to; it
-                // still parks + self-resumes (the executor armed the due-now timer), so the tail
-                // runs to completion — only the (callerless) reply body is not sent. v1 limitation.
-                detached_reply: _,
+                // A continue-reply reached during a resumed tail: a relay's caller gets it as the
+                // response (below); a timer fire has no caller, so only the reply body is lost.
+                detached_reply,
                 coverage_progress,
                 retry_attempts,
                 retry_backoff,
@@ -2119,6 +2298,75 @@ impl ChannelEngine {
                     process,
                     &drained,
                 )?;
+                // Synchronous calls reached by a resume a caller drives (a relay, a timer fire):
+                // the chain keeps the claim, makes the calls inline and ends with the one
+                // commit that fits the stored row.
+                let sync_sites = if detached_reply {
+                    Vec::new()
+                } else {
+                    self.sync_call_sites(
+                        process,
+                        pinned,
+                        &waiting_nodes,
+                        &prior_snapshot.waiting_nodes,
+                    )
+                };
+                if !sync_sites.is_empty() {
+                    let pinned_process = self.processes.find_in_module(pinned, &process.id);
+                    match pinned_process {
+                        Some(pinned_process)
+                            if self.inline_capable.get()
+                                && sync_sites.iter().all(|site| site.caller.is_some()) =>
+                        {
+                            let chain = self.stored_chain(
+                                pinned_process,
+                                prior_snapshot,
+                                pinned,
+                                claim_scope,
+                                satisfied_node,
+                                labels,
+                                traceparent,
+                                reply_to,
+                                StoredPass {
+                                    instance_id,
+                                    waiting_nodes,
+                                    completed_nodes,
+                                    variables,
+                                    start_node,
+                                    timer_waits,
+                                    coverage_progress,
+                                    retry_attempts,
+                                    retry_backoff,
+                                },
+                            );
+                            return self.launch_inline_chain(chain, drained, sync_sites).await;
+                        }
+                        _ => self.warn_sync_degraded(
+                            process,
+                            &sync_sites,
+                            if self.inline_capable.get() {
+                                "no inline caller serves the channel's scheme"
+                            } else {
+                                "this pass cannot carry a chain (a broadcast fan-out or a poison wake)"
+                            },
+                        ),
+                    }
+                }
+                // A relayed turn that parks answers with the reply it reached: a
+                // respond-and-continue receipt (the tail then runs on its due-now timer), or the
+                // last destination-less `<q:reply>` the turn rendered.
+                let early_reply = match &reply_to {
+                    Some(to) => self.relay_reply(
+                        to,
+                        process,
+                        prior_snapshot,
+                        &instance_id,
+                        variables.clone(),
+                        completed_nodes.iter().cloned().collect(),
+                        !detached_reply,
+                    )?,
+                    None => None,
+                };
                 let emissions = to_outbox_emissions(drained, labels, traceparent);
                 let pv = persisted_variables(
                     &process.declared_variables,
@@ -2180,7 +2428,7 @@ impl ChannelEngine {
                 Ok(DispatchOutcome::Completed {
                     instance_id,
                     outputs: serde_json::json!({}),
-                    reply: None,
+                    reply: early_reply,
                 })
             }
         }
@@ -2211,6 +2459,9 @@ impl ChannelEngine {
         &self,
         fire: &ScheduledStartFire,
     ) -> Result<ScheduledStartOutcome, Diagnostic> {
+        // The schedule poller's task awaits the fire, so it drives a synchronous chain the way
+        // an inbound caller does.
+        self.begin_dispatch(true);
         let span = tracing::info_span!(
             telemetry::SPAN_DISPATCH,
             channel = SCHEDULE_CHANNEL,
@@ -2282,6 +2533,18 @@ impl ChannelEngine {
                 Some(fire.node_id.clone()),
             )
             .await?;
+        if let DispatchOutcome::InlineCalls(handoff) = outcome {
+            return Ok(ScheduledStartOutcome::InlineCalls(handoff));
+        }
+        Self::scheduled_outcome_of(outcome, &fire.node_id)
+    }
+
+    /// A scheduled start's dispatch outcome → the poller's answer (also applied to the final
+    /// outcome of a synchronous chain the start began).
+    pub(crate) fn scheduled_outcome_of(
+        outcome: DispatchOutcome,
+        node_id: &str,
+    ) -> Result<ScheduledStartOutcome, Diagnostic> {
         Ok(match outcome {
             DispatchOutcome::Completed { instance_id, .. } => ScheduledStartOutcome::Started {
                 // A parked instance reports through the same `Completed` shape as a finished
@@ -2307,14 +2570,15 @@ impl ChannelEngine {
                     code,
                     process = %process_id,
                     cause_code,
-                    node_id = %fire.node_id,
+                    node_id = %node_id,
                     "scheduled start dead-lettered: the non-idempotent process failed"
                 );
                 return Err(Diagnostic::error(&cause_code, detail));
             }
             // Unreachable: a schedule MINTS an instance (the spawn path) — no relay
-            // correlation runs, so a shard handoff cannot be produced.
-            DispatchOutcome::Handoff { .. } => {
+            // correlation runs, so a shard handoff cannot be produced; a synchronous chain is
+            // taken out before this mapping and its final outcome is never another chain.
+            DispatchOutcome::Handoff { .. } | DispatchOutcome::InlineCalls(_) => {
                 return Err(Diagnostic::error(
                     codes::RUNTIME_UNEXPECTED,
                     "internal: a scheduled start answered a shard handoff",
@@ -2339,6 +2603,12 @@ impl ChannelEngine {
                 "a timer fire requires the persistence bridge — none is configured",
             ));
         };
+        // A timer fire has a driver waiting on it (the poller's task), so it may run a chain.
+        self.begin_dispatch(true);
+        // A synchronous chain on this lane is driving the instance: defer, like a held claim.
+        if let Some(held) = self.inline_held_guard(&fire.instance_id, &fire.node_id) {
+            return Err(held);
+        }
         // Ownership first, exactly as the relay path does (see the claim/heartbeat rationale
         // there): a fired timer and a correlated relay are the two ways one instance gets
         // resumed, and they can land on different replicas at the same instant.
@@ -2577,17 +2847,25 @@ impl ChannelEngine {
             // Timer fires run outside any channel binding; labels ride empty on the step's
             // emissions (authoring labels are observability payload, never identity), and no
             // inbound traceparent exists to bridge.
-            self.commit_resume_outcome(
-                &bridge,
-                BTreeMap::new(),
-                None,
-                &process,
-                &snapshot,
-                &pinned,
-                &fire.node_id,
-                result,
-            )
-            .await?;
+            let outcome = self
+                .commit_resume_outcome(
+                    &bridge,
+                    BTreeMap::new(),
+                    None,
+                    &process,
+                    &snapshot,
+                    &pinned,
+                    &fire.deployment,
+                    &fire.node_id,
+                    result,
+                    None,
+                )
+                .await?;
+            // A synchronous chain carries the claim on; the poller's task drives it to its end.
+            if let DispatchOutcome::InlineCalls(handoff) = outcome {
+                released_in_tx.set(true);
+                return Ok(TimerFireOutcome::InlineCalls(handoff));
+            }
             // Released inside the step transaction when the step's key is the one we claimed
             // under (see the relay path's note on the pinned-vs-scope exception).
             if pinned == fire.deployment {
@@ -2644,6 +2922,11 @@ impl ChannelEngine {
             // a no-op is the only honest answer.
             return Ok(ChannelCallPoisonOutcome::NotApplicable);
         };
+        // The wake's outcome type has no room for a chain: its synchronous calls degrade.
+        self.begin_dispatch(false);
+        if self.inline_held.borrow().contains(&fire.instance_id) {
+            return Ok(ChannelCallPoisonOutcome::NotApplicable);
+        }
         // Ownership first, exactly as the relay and timer paths do: a poison wake and a
         // correlated relay can land on different replicas at the same instant, and claims
         // are what arbitrate every §2.1-style window.
@@ -2772,8 +3055,10 @@ impl ChannelEngine {
                 &process,
                 &snapshot,
                 &pinned,
+                &fire.deployment,
                 &fire.node_id,
                 result,
+                None,
             )
             .await?;
             if pinned == fire.deployment {
@@ -2953,6 +3238,1130 @@ impl ChannelEngine {
         *counter += 1;
         format!("intake-s{}-{:016x}", self.shard.index, *counter)
     }
+
+    // ---- synchronous outbound calls (the in-memory chain) ---------------------------------
+
+    /// The channel-call nodes FRESHLY waiting in `waiting` (absent from `prior`) whose outbound
+    /// channel is synchronous, each with the inline caller its destination resolves to (`None`
+    /// when this engine has none for the scheme).
+    fn sync_call_sites(
+        &self,
+        process: &ProcessDefinition,
+        deployment: &DeploymentId,
+        waiting: &[String],
+        prior: &[String],
+    ) -> Vec<SyncCallSite> {
+        let mut sites = Vec::new();
+        for node_id in waiting {
+            if prior.contains(node_id) {
+                continue;
+            }
+            let Some(channel) = channel_call_name(process, node_id) else {
+                continue;
+            };
+            let Some(resolved) = self.executor.outbound_channels().find(deployment, &channel)
+            else {
+                continue;
+            };
+            if !resolved.sync {
+                continue;
+            }
+            sites.push(SyncCallSite {
+                node_id: node_id.clone(),
+                caller: self.inline_callers.resolve(&resolved.destination),
+            });
+        }
+        sites
+    }
+
+    /// The runtime half of `SUTRA.CHANNEL.SYNC_CALL_DEGRADED`: these synchronous calls are going
+    /// out through the outbox, and their answers must come back by correlation.
+    fn warn_sync_degraded(&self, process: &ProcessDefinition, sites: &[SyncCallSite], why: &str) {
+        for site in sites {
+            tracing::warn!(
+                code = codes::CHANNEL_SYNC_CALL_DEGRADED,
+                process = %process.id,
+                node = %site.node_id,
+                "synchronous channel-call takes the async path ({why}): the request goes \
+                 through the outbox and the instance parks until a correlated response or \
+                 its timeout"
+            );
+        }
+    }
+
+    /// Start a chain: hold the start's unique aliases in memory, split this pass's emissions
+    /// into the inline requests and the carried rest, and hand the instance to the router.
+    async fn launch_inline_chain(
+        &self,
+        mut chain: Box<InlineChain>,
+        drained: Vec<sutra_executor::Emission>,
+        sites: Vec<SyncCallSite>,
+    ) -> Result<DispatchOutcome, Diagnostic> {
+        if let Some(store) = &self.aliases {
+            for row in chain.alias_rows.iter().filter(|r| r.unique) {
+                chain.held_aliases = true;
+                if !store.record(
+                    &chain.deployment,
+                    &chain.instance_id,
+                    &row.name,
+                    &row.value,
+                    true,
+                ) {
+                    let owner = store
+                        .find_live(&chain.deployment, &row.name, &row.value)
+                        .unwrap_or_default();
+                    let d = Diagnostic::error(
+                        codes::INBOUND_ALIAS_CONFLICT_REJECT,
+                        format!(
+                            "<q:alias {}> = '{}' already bound to in-flight instance {owner} \
+                             (a synchronous call chain); the second arrival is rejected",
+                            row.name, row.value
+                        ),
+                    );
+                    self.release_chain(&chain, ChainEnd::Aborted).await;
+                    return Err(d);
+                }
+            }
+        }
+        // An instance inside a chain holds its channel's admission slot like a RUNNING one:
+        // counted now, freed when the chain completes or fails (a durable park keeps it). Only
+        // a capped channel is counted, so an uncapped fully synchronous chain still writes
+        // nothing durable.
+        if let (Some(store), Some(_)) = (&self.concurrency, chain.binding.max_concurrent_instances)
+        {
+            store
+                .record_started(
+                    &chain.deployment,
+                    &chain.instance_id,
+                    &chain.message.channel,
+                )
+                .await;
+            chain.counted = true;
+        }
+        if chain.stored.is_some() {
+            self.inline_held
+                .borrow_mut()
+                .insert(chain.instance_id.clone());
+        }
+        // The durable in-flight marker: what a crash mid-chain leaves behind for the sweep to
+        // release (the delivery's dedup rows, an admission slot). Only written when there is
+        // something to release.
+        if let Some(bridge) = &self.bridge {
+            if !chain.dedup_keys.is_empty() || chain.counted {
+                if let Err(d) = bridge
+                    .begin_inline_chain(&chain.deployment, &chain.instance_id, &chain.dedup_keys)
+                    .await
+                {
+                    self.release_chain(&chain, ChainEnd::Aborted).await;
+                    return Err(d);
+                }
+                chain.marked = true;
+            }
+        }
+        let calls = self.issue_inline_calls(&mut chain, drained, &sites);
+        if calls.is_empty() {
+            // Unreachable: a fresh synchronous call always emits its request.
+            self.release_chain(&chain, ChainEnd::Aborted).await;
+            return Err(Diagnostic::error(
+                codes::RUNTIME_UNEXPECTED,
+                "internal: a synchronous call chain started with no request to make",
+            ));
+        }
+        let heartbeat = chain
+            .stored
+            .as_ref()
+            .map(|stored| (stored.claim_scope.clone(), chain.instance_id.clone()));
+        Ok(DispatchOutcome::InlineCalls(InlineHandoff::new(
+            InlineContinuation {
+                chain,
+                calls,
+                heartbeat,
+            },
+        )))
+    }
+
+    /// Turn the requests of `sites` among `drained` into calls (marking their nodes in flight);
+    /// every other emission is carried to the chain's final commit.
+    fn issue_inline_calls(
+        &self,
+        chain: &mut InlineChain,
+        drained: Vec<sutra_executor::Emission>,
+        sites: &[SyncCallSite],
+    ) -> Vec<InlineCall> {
+        let mut calls = Vec::new();
+        for emission in drained {
+            let caller = (emission.kind == sutra_executor::EmissionKind::Send)
+                .then(|| {
+                    sites
+                        .iter()
+                        .find(|s| s.node_id == emission.node_id)
+                        .and_then(|s| s.caller.clone())
+                })
+                .flatten();
+            let Some(caller) = caller else {
+                chain.emissions.push(emission);
+                continue;
+            };
+            let node_id = emission.node_id.clone();
+            let request = self.inline_request(chain, emission);
+            // Streamed only when the task asks AND the delivery the chain answers asked for a
+            // streamed reply; anywhere else `q:stream` changes nothing.
+            let stream = matches!(
+                chain.process.node(&node_id),
+                Ok(Node::ServiceTask { stream: true, .. })
+            ) && self.sse_channels.contains(&(
+                chain.binding.namespace.module_key(),
+                chain.message.channel.clone(),
+            ));
+            calls.push(InlineCall {
+                node_id: node_id.clone(),
+                request,
+                caller,
+                budget: inline_call_budget(&chain.process, &node_id),
+                retry: inline_retry(&chain.process, &node_id),
+                stream,
+            });
+            chain.in_flight.insert(node_id);
+        }
+        calls
+    }
+
+    /// Render one request exactly as the outbox would put it on the wire (reply mode,
+    /// CloudEvents rendering, auth headers), so a synchronous call carries the same bytes and
+    /// headers as its async form.
+    fn inline_request(
+        &self,
+        chain: &InlineChain,
+        emission: sutra_executor::Emission,
+    ) -> crate::sink::OutboundMessage {
+        let row = to_outbox_emissions(
+            vec![emission],
+            chain.labels(),
+            inbound_traceparent(&chain.message),
+        )
+        .pop()
+        .expect("one emission in, one row out");
+        let claimed = crate::outbox_dispatch::ClaimedOutboxRow {
+            entry_id: String::new(),
+            attempt_count: 0,
+            destination: row.destination,
+            headers: row.headers,
+            body: row.body.into_inner(),
+            content_type: row.content_type,
+            outbox_key: row.outbox_key,
+            mode: row.mode,
+            cloud_event_json: row.cloud_event_json,
+            auth_ref_json: row.auth_ref_json,
+            labels: row.labels,
+            traceparent: row.traceparent,
+            instance_id: row.instance_id,
+            node_id: Some(row.node_id),
+            required: row.required,
+            last_diagnostic_json: None,
+        };
+        crate::outbox_dispatch::encode_wire_message(
+            &claimed,
+            &now_rfc3339(),
+            &*self.inline_secret_env,
+        )
+    }
+
+    /// Apply one call's answer to the in-memory instance — the actor half of the chain. Runs
+    /// one resume pass and ends the chain, or hands it back with any calls the pass issued.
+    pub(crate) async fn resume_in_memory(
+        &self,
+        mut chain: Box<InlineChain>,
+        node_id: String,
+        result: InlineCallResult,
+    ) -> InlineStep {
+        chain.in_flight.remove(&node_id);
+        let process = Arc::clone(&chain.process);
+        let policy = process.retry_policy(&node_id).cloned();
+        let failure = match result {
+            InlineCallResult::Answered(response) => {
+                match self.inline_response_variables(&chain, &node_id, response) {
+                    Ok(answer) => {
+                        return self
+                            .resume_chain_pass(chain, &node_id, ChainPass::Answer(answer))
+                            .await
+                    }
+                    // An answer the call's own contract rejects is a failed call.
+                    Err(d) => d,
+                }
+            }
+            InlineCallResult::TimedOut => {
+                let boundary = inline_timeout_boundary(&process, &node_id);
+                match boundary {
+                    // No policy: the timeout boundary fires, exactly as a durable timer would
+                    // — its modelled route, or the catchable timeout error.
+                    Some(boundary) if policy.is_none() => {
+                        return self
+                            .resume_chain_pass(chain, &node_id, ChainPass::Timeout(boundary))
+                            .await
+                    }
+                    _ => Diagnostic::error(
+                        sutra_executor::codes::DISPATCH_CHANNEL_CALL_TIMEOUT,
+                        format!(
+                            "synchronous channel-call task '{node_id}' got no answer within \
+                             its <q:timeout>"
+                        ),
+                    ),
+                }
+            }
+            InlineCallResult::Failed(InlineFailure::Permanent(d))
+            | InlineCallResult::Failed(InlineFailure::Retryable(d)) => d,
+        };
+        if policy.is_some() {
+            // The policy already ran inline; the failure path of the task rules on what is left.
+            return self
+                .resume_chain_pass(chain, &node_id, ChainPass::Failure(failure))
+                .await;
+        }
+        // No policy: an uncaught task failure fails the flow, as a registered task's does.
+        self.fail_chain(chain, failure).await
+    }
+
+    /// One in-memory resume pass and its quiescent point.
+    async fn resume_chain_pass(
+        &self,
+        mut chain: Box<InlineChain>,
+        node_id: &str,
+        pass: ChainPass,
+    ) -> InlineStep {
+        let process = Arc::clone(&chain.process);
+        let labels = chain.labels();
+        self.seed_audit(&chain.instance_id, chain.audit_seq);
+        let (satisfied, result) = match pass {
+            ChainPass::Answer(answer) => {
+                let correlation = CoverageCorrelation {
+                    trace_id: inbound_traceparent(&chain.message),
+                    business_key: chain
+                        .alias_rows
+                        .iter()
+                        .find(|r| r.unique)
+                        .or_else(|| chain.alias_rows.first())
+                        .map(|r| r.value.clone()),
+                };
+                let result = self
+                    .executor
+                    .resume_correlated(
+                        &process,
+                        &chain.instance_id,
+                        &chain.completed_nodes,
+                        chain.variables.clone(),
+                        node_id,
+                        &answer,
+                        chain.deployment.clone(),
+                        labels,
+                        chain.start_node.as_deref(),
+                        &chain.waiting_nodes,
+                        &chain.coverage,
+                        &chain.retry_attempts,
+                        &chain.retry_backoff,
+                        correlation,
+                    )
+                    .await;
+                (node_id.to_string(), result)
+            }
+            ChainPass::Timeout(boundary) => {
+                let due_at = chain
+                    .pending_timers
+                    .iter()
+                    .find(|t| t.node_id == boundary)
+                    .map(|t| t.due_at.clone())
+                    .unwrap_or_else(now_rfc3339);
+                let fire = TimerFire {
+                    deployment: chain.deployment.clone(),
+                    instance_id: chain.instance_id.clone(),
+                    node_id: boundary.clone(),
+                    due_at,
+                    fired_at: now_rfc3339(),
+                };
+                let result = self
+                    .executor
+                    .resume_timer(
+                        &process,
+                        &fire,
+                        &chain.completed_nodes,
+                        chain.variables.clone(),
+                        labels,
+                        chain.start_node.as_deref(),
+                        &chain.waiting_nodes,
+                        &chain.coverage,
+                        &chain.retry_attempts,
+                        &chain.retry_backoff,
+                    )
+                    .await;
+                (boundary, result)
+            }
+            ChainPass::Failure(failure) => {
+                // The inline attempts spent the budget, so the policy must not park a durable
+                // backoff: offer the failure as the LAST attempt.
+                let mut attempts = chain.retry_attempts.clone();
+                if let Some(policy) = process.retry_policy(node_id) {
+                    attempts.insert(node_id.to_string(), policy.max_attempts.saturating_sub(1));
+                }
+                let result = self
+                    .executor
+                    .resume_channel_call_failure(
+                        &process,
+                        &chain.instance_id,
+                        node_id,
+                        &failure.code,
+                        &failure.message,
+                        &chain.completed_nodes,
+                        chain.variables.clone(),
+                        chain.deployment.clone(),
+                        labels,
+                        chain.start_node.as_deref(),
+                        &chain.waiting_nodes,
+                        &chain.coverage,
+                        &attempts,
+                        &chain.retry_backoff,
+                    )
+                    .await;
+                (node_id.to_string(), result)
+            }
+        };
+        let result = match result {
+            Ok(result) => result,
+            Err(e) => {
+                let d = e.to_diagnostic();
+                return self
+                    .fail_chain(chain, Diagnostic::error(&d.code, d.message.clone()))
+                    .await;
+            }
+        };
+        // The satisfied wait consumed its own timer rows (and, for a fired boundary, its host's).
+        let resolved = resolved_waits_for(&process, &satisfied);
+        chain
+            .pending_timers
+            .retain(|t| !resolved.contains(&t.node_id));
+        if let Some(stored) = &mut chain.stored {
+            for node in resolved {
+                if !stored.satisfied.contains(&node) {
+                    stored.satisfied.push(node);
+                }
+            }
+        }
+        let drained = self.emissions.drain();
+        if let Err(d) = self.validate_emissions(
+            &chain.binding.namespace.module_key(),
+            &chain.deployment,
+            &chain.binding.channel_name,
+            &process,
+            &drained,
+        ) {
+            return self.abort_chain(chain, d).await;
+        }
+        match result {
+            StatefulExecResult::Completed {
+                outputs,
+                visited_nodes,
+                ..
+            } => {
+                self.complete_chain(chain, drained, outputs, visited_nodes)
+                    .await
+            }
+            StatefulExecResult::Suspended {
+                waiting_nodes,
+                completed_nodes,
+                variables,
+                timer_waits,
+                detached_reply,
+                coverage_progress,
+                retry_attempts,
+                retry_backoff,
+                ..
+            } => {
+                let prior_waiting = std::mem::replace(&mut chain.waiting_nodes, waiting_nodes);
+                chain.visited.extend(completed_nodes.iter().cloned());
+                chain.completed_nodes = completed_nodes;
+                chain.variables = variables;
+                chain.coverage = coverage_progress;
+                chain.retry_attempts = retry_attempts;
+                chain.retry_backoff = retry_backoff;
+                chain.pending_timers.extend(timer_waits);
+                chain.audit_seq = self.audit_seq_for(&chain.instance_id);
+                // Respond-and-continue reached mid-chain: the caller is still waiting on the
+                // chain, so the reply is held and returned when the chain ends.
+                if detached_reply && chain.early_reply.is_none() {
+                    let reply = match &chain.stored {
+                        Some(_) => self.stored_chain_reply(
+                            &chain,
+                            chain.variables.clone(),
+                            chain.visited.clone(),
+                            false,
+                        ),
+                        None => {
+                            let exec = ExecResult {
+                                instance_id: chain.instance_id.clone(),
+                                outputs: chain.variables.clone(),
+                                visited_nodes: chain.visited.clone(),
+                            };
+                            self.build_reply(&chain.binding, &process, &chain.message, &exec)
+                        }
+                    };
+                    match reply {
+                        Ok(reply) => chain.early_reply = reply,
+                        Err(d) => return self.abort_chain(chain, d).await,
+                    }
+                }
+                let sites = self.sync_call_sites(
+                    &process,
+                    &chain.deployment,
+                    &chain.waiting_nodes,
+                    &prior_waiting,
+                );
+                let (inline, degraded): (Vec<SyncCallSite>, Vec<SyncCallSite>) =
+                    sites.into_iter().partition(|s| s.caller.is_some());
+                if !degraded.is_empty() {
+                    self.warn_sync_degraded(
+                        &process,
+                        &degraded,
+                        "no inline caller serves the channel's scheme",
+                    );
+                }
+                let calls = self.issue_inline_calls(&mut chain, drained, &inline);
+                if chain.in_flight.is_empty() {
+                    return self.park_chain(chain).await;
+                }
+                InlineStep::More { chain, calls }
+            }
+        }
+    }
+
+    /// The chain completed: commit every carried emission in one step. A start answers the
+    /// caller with the flow's reply, built against the ORIGINAL binding and message; a stored
+    /// instance takes its terminal step (and, like any resume, has no reply of its own).
+    async fn complete_chain(
+        &self,
+        mut chain: Box<InlineChain>,
+        mut drained: Vec<sutra_executor::Emission>,
+        outputs: Variables,
+        visited_nodes: std::collections::HashSet<String>,
+    ) -> InlineStep {
+        let mut emissions = std::mem::take(&mut chain.emissions);
+        emissions.append(&mut drained);
+        if self.bridge.is_none() {
+            // Persistence-less host: the collect-only hook, as on the run-to-end path.
+            for emission in std::mem::take(&mut emissions) {
+                self.outbox.enqueue(emission);
+            }
+        }
+        let rows = to_outbox_emissions(
+            emissions,
+            chain.labels(),
+            inbound_traceparent(&chain.message),
+        );
+        if chain.stored.is_some() {
+            let Some(bridge) = self.bridge.clone() else {
+                return self.abort_chain(chain, no_bridge()).await;
+            };
+            if let Err(d) = bridge
+                .commit_complete(&chain.deployment, &chain.instance_id, &rows)
+                .await
+            {
+                return self.abort_chain(chain, d).await;
+            }
+            self.shard_metrics.resumed();
+            if let Some(store) = &self.concurrency {
+                store
+                    .record_terminal(&chain.deployment, &chain.instance_id)
+                    .await;
+            }
+            self.release_chain(&chain, ChainEnd::Completed).await;
+            chain.visited.extend(visited_nodes);
+            let reply = self.stored_chain_reply(&chain, outputs, chain.visited.clone(), false);
+            let early = chain.early_reply.take();
+            return InlineStep::Done {
+                outcome: reply.map(|reply| DispatchOutcome::Completed {
+                    instance_id: chain.instance_id.clone(),
+                    outputs: serde_json::json!({}),
+                    reply: reply.or(early),
+                }),
+                settle_consumed: false,
+                completed: true,
+            };
+        }
+        let committed = match &self.bridge {
+            Some(bridge) if !rows.is_empty() => {
+                bridge.commit_emissions(&chain.deployment, &rows).await
+            }
+            _ => Ok(()),
+        };
+        if let Err(d) = committed {
+            return self.abort_chain(chain, d).await;
+        }
+        chain.visited.extend(visited_nodes);
+        let exec = ExecResult {
+            instance_id: chain.instance_id.clone(),
+            outputs,
+            visited_nodes: chain.visited.clone(),
+        };
+        let reply = self.build_reply(&chain.binding, &chain.process, &chain.message, &exec);
+        // The step is committed either way: the dedup row stays, as on the run-to-end path.
+        self.release_chain(&chain, ChainEnd::Completed).await;
+        let outcome = reply.map(|reply| DispatchOutcome::Completed {
+            instance_id: exec.instance_id.clone(),
+            outputs: exec.outputs.to_json(),
+            reply: reply.or_else(|| chain.early_reply.take()),
+        });
+        InlineStep::Done {
+            outcome,
+            settle_consumed: false,
+            completed: true,
+        }
+    }
+
+    /// The chain reached a wait no synchronous call answers: the one durable commit of the
+    /// whole chain, carrying every alias, emission and timer row it accumulated — the first
+    /// park of a start, or the re-park (claim handed back in the same transaction) of a stored
+    /// instance.
+    async fn park_chain(&self, mut chain: Box<InlineChain>) -> InlineStep {
+        let Some(bridge) = self.bridge.clone() else {
+            return self.abort_chain(chain, no_bridge()).await;
+        };
+        let process = Arc::clone(&chain.process);
+        // The request the chain answers gets the last destination-less `<q:reply>` its passes
+        // rendered — else a respond-and-continue receipt produced on the way.
+        let park_reply = match &chain.stored {
+            Some(_) => self.stored_chain_reply(
+                &chain,
+                chain.variables.clone(),
+                chain.visited.clone(),
+                true,
+            ),
+            None => self.reply_at(
+                &chain.binding,
+                &process,
+                &chain.message,
+                &ExecResult {
+                    instance_id: chain.instance_id.clone(),
+                    outputs: chain.variables.clone(),
+                    visited_nodes: chain.visited.clone(),
+                },
+                true,
+            ),
+        };
+        let park_reply = match park_reply {
+            Ok(reply) => reply.or_else(|| chain.early_reply.take()),
+            Err(d) => return self.abort_chain(chain, d).await,
+        };
+        let indexed: &[String] = chain
+            .stored
+            .as_ref()
+            .map(|s| s.prior.waiting_nodes.as_slice())
+            .unwrap_or(&[]);
+        let mut records = chain.alias_rows.clone();
+        match channel_call_alias_rows(&process, &chain.waiting_nodes, indexed, &chain.variables) {
+            Ok(rows) => records.extend(rows),
+            Err(d) => return self.abort_chain(chain, d).await,
+        }
+        let emissions = to_outbox_emissions(
+            std::mem::take(&mut chain.emissions),
+            chain.labels(),
+            inbound_traceparent(&chain.message),
+        );
+        let pv = persisted_variables(
+            &process.declared_variables,
+            persisted_variable_values(&chain.variables),
+        );
+        let snapshot = SuspendedInstance {
+            process_id: process.id.clone(),
+            deployment_id: chain.deployment.value().to_string(),
+            status: "SUSPENDED".to_string(),
+            suspended: true,
+            completed_nodes: chain.completed_nodes.clone(),
+            variables: pv.kept,
+            sensitive: pv.sensitive,
+            waiting_nodes: chain.waiting_nodes.clone(),
+            start_node: chain.start_node.clone().unwrap_or_default(),
+            coverage: chain.coverage.clone(),
+            retry_attempts: chain.retry_attempts.clone(),
+            retry_backoff: chain.retry_backoff.clone(),
+            audit_seq: self.audit_seq_for(&chain.instance_id),
+            // A stored instance keeps the key id it was first parked under.
+            key_id: match &chain.stored {
+                Some(stored) => stored.prior.key_id.clone(),
+                None => chain.binding.tenant().to_string(),
+            },
+            encrypt_names: pv.encrypt_names,
+            subjects: pv.subjects,
+        };
+        if let Some(stored) = &chain.stored {
+            if let Err(d) = bridge
+                .commit_repark(
+                    &chain.deployment,
+                    &chain.instance_id,
+                    &snapshot,
+                    &stored.satisfied,
+                    &records,
+                    &timer_records(&chain.pending_timers),
+                    &emissions,
+                )
+                .await
+            {
+                return self.abort_chain(chain, d).await;
+            }
+            self.shard_metrics.resumed();
+            self.release_chain(&chain, ChainEnd::Parked).await;
+            return InlineStep::Done {
+                outcome: Ok(DispatchOutcome::Completed {
+                    instance_id: chain.instance_id.clone(),
+                    outputs: serde_json::json!({}),
+                    reply: park_reply,
+                }),
+                settle_consumed: false,
+                completed: false,
+            };
+        }
+        // Registered BEFORE the commit and withdrawn if it fails — the park arm's ordering.
+        let registered = match (&self.deferred_acks, chain.settle.take()) {
+            (Some(registry), Some(settle)) => {
+                if !registry.register(
+                    &chain.instance_id,
+                    &chain.message.channel,
+                    settle.ack,
+                    settle.nack,
+                ) {
+                    tracing::error!(
+                        channel = %chain.message.channel,
+                        instance = %chain.instance_id,
+                        "deferred-ack registration rejected as duplicate — the delivery's \
+                         settle callbacks were dropped (broker redelivery recovers via inbox \
+                         dedup)"
+                    );
+                }
+                true
+            }
+            _ => false,
+        };
+        if let Err(commit_error) = bridge
+            .commit_park(
+                &chain.deployment,
+                &chain.instance_id,
+                &snapshot,
+                &records,
+                &timer_records(&chain.pending_timers),
+                &emissions,
+            )
+            .await
+        {
+            if let (true, Some(registry)) = (registered, &self.deferred_acks) {
+                registry.withdraw(&chain.instance_id);
+            }
+            return self.abort_chain(chain, commit_error).await;
+        }
+        self.shard_metrics.parked();
+        // The slot was taken when the chain began; the parked instance keeps it (WAITING).
+        if let Some(store) = &self.concurrency {
+            if !chain.counted {
+                store
+                    .record_started(
+                        &chain.deployment,
+                        &chain.instance_id,
+                        &chain.message.channel,
+                    )
+                    .await;
+            }
+            store
+                .record_suspended(&chain.deployment, &chain.instance_id)
+                .await;
+        }
+        self.release_chain(&chain, ChainEnd::Parked).await;
+        InlineStep::Done {
+            outcome: Ok(DispatchOutcome::Completed {
+                instance_id: chain.instance_id.clone(),
+                outputs: serde_json::json!({}),
+                reply: park_reply,
+            }),
+            settle_consumed: registered,
+            completed: false,
+        }
+    }
+
+    /// The flow failed inside the chain. A start has no row to stamp, so the ack disposition
+    /// is gated on the process's idempotency exactly as on the run-to-end path; a stored
+    /// instance is persisted FAILED, exactly as a failed resume.
+    async fn fail_chain(&self, chain: Box<InlineChain>, cause: Diagnostic) -> InlineStep {
+        let _ = self.emissions.drain();
+        if let (Some(stored), Some(bridge)) = (&chain.stored, self.bridge.clone()) {
+            self.mark_instance_failed(
+                &bridge,
+                &chain.deployment,
+                &chain.instance_id,
+                &stored.prior,
+                &cause,
+            )
+            .await;
+            self.release_chain(&chain, ChainEnd::Failed).await;
+            return InlineStep::Done {
+                outcome: Err(cause),
+                settle_consumed: false,
+                completed: false,
+            };
+        }
+        self.release_chain(&chain, ChainEnd::Failed).await;
+        let outcome = self
+            .gate_execution_failure(&chain.process, &chain.deployment, &chain.message, cause)
+            .await;
+        InlineStep::Done {
+            outcome,
+            settle_consumed: false,
+            completed: false,
+        }
+    }
+
+    /// The chain could not reach a quiescent commit (a rejected emission, a failed commit):
+    /// surfaced as-is, like the same failure on the park path. A stored instance stays at the
+    /// frontier it had before the chain.
+    async fn abort_chain(&self, chain: Box<InlineChain>, d: Diagnostic) -> InlineStep {
+        let _ = self.emissions.drain();
+        self.release_chain(&chain, ChainEnd::Aborted).await;
+        InlineStep::Done {
+            outcome: Err(d),
+            settle_consumed: false,
+            completed: false,
+        }
+    }
+
+    /// Release what the chain held while it ran: its unique aliases; its admission slot unless
+    /// it parked; a stored instance's claim (unless the final step released it in its own
+    /// transaction); its in-flight marker; and — when nothing of it was persisted — the inbox
+    /// dedup rows of its delivery, so the client's retry runs again instead of being swallowed
+    /// as a duplicate.
+    async fn release_chain(&self, chain: &InlineChain, end: ChainEnd) {
+        if chain.held_aliases {
+            self.retire_aliases(&chain.deployment, &chain.instance_id);
+        }
+        if chain.counted && end != ChainEnd::Parked {
+            if let Some(store) = &self.concurrency {
+                store
+                    .record_terminal(&chain.deployment, &chain.instance_id)
+                    .await;
+            }
+        }
+        // A FAILED stored instance was persisted; everything else that did not commit leaves
+        // its delivery free to be redelivered.
+        let unpersisted = match end {
+            ChainEnd::Aborted => true,
+            ChainEnd::Failed => chain.stored.is_none(),
+            ChainEnd::Parked | ChainEnd::Completed => false,
+        };
+        if unpersisted {
+            if let Some(inbox) = &self.inbox {
+                for (channel, key) in &chain.dedup_keys {
+                    inbox.forget(&chain.deployment, channel, key).await;
+                }
+            }
+        }
+        if let Some(bridge) = &self.bridge {
+            if chain.marked {
+                // Idempotent: the final step already cleared it inside its own transaction.
+                bridge
+                    .end_inline_chain(&chain.deployment, &chain.instance_id)
+                    .await;
+            }
+            if let Some(stored) = &chain.stored {
+                let released_in_tx = stored.claim_scope == chain.deployment
+                    && matches!(end, ChainEnd::Parked | ChainEnd::Completed);
+                if !released_in_tx {
+                    release_claim_best_effort(bridge, &stored.claim_scope, &chain.instance_id)
+                        .await;
+                }
+            }
+        }
+        if chain.stored.is_some() {
+            self.inline_held.borrow_mut().remove(&chain.instance_id);
+        }
+    }
+
+    /// A stored chain's reply: only a relay's chain answers (a timer fire has no caller), with
+    /// the `<q:reply>` its turn reached.
+    fn stored_chain_reply(
+        &self,
+        chain: &InlineChain,
+        outputs: Variables,
+        visited: std::collections::HashSet<String>,
+        at_park: bool,
+    ) -> Result<Option<SyncReply>, Diagnostic> {
+        match &chain.stored {
+            Some(stored) if stored.replies => self.relay_reply(
+                &RelayReplyContext {
+                    binding: chain.binding.clone(),
+                    message: chain.message.clone(),
+                },
+                &chain.process,
+                &stored.prior,
+                &chain.instance_id,
+                outputs,
+                visited,
+                at_park,
+            ),
+            _ => Ok(None),
+        }
+    }
+
+    /// The resume paths' refusal of an instance a synchronous chain on this lane is driving:
+    /// retry-safe, like a claim held by another replica (nothing was loaded or executed).
+    fn inline_held_guard(&self, instance_id: &str, origin: &str) -> Option<Diagnostic> {
+        self.inline_held.borrow().contains(instance_id).then(|| {
+            Diagnostic::error(
+                codes::RUNTIME_RESUME_CLAIM_HELD,
+                format!(
+                    "Instance {instance_id} is inside a synchronous call chain on this replica; \
+                     '{origin}' refuses to resume it concurrently. Nothing was executed — retry \
+                     once the chain has ended."
+                ),
+            )
+            .with_attribute("instanceId", instance_id)
+            .with_attribute(ACK_DISPOSITION_ATTR, ACK_DISPOSITION_REQUEUE)
+        })
+    }
+
+    /// Keep a stored chain's claim alive while its calls run: a re-claim by the same owner
+    /// restamps the heartbeat the stuck-instance sweep reads.
+    pub(crate) async fn refresh_inline_claim(&self, deployment: &DeploymentId, instance_id: &str) {
+        let Some(bridge) = &self.bridge else {
+            return;
+        };
+        match bridge.claim_instance(deployment, instance_id).await {
+            Ok(InstanceClaimOutcome::Granted) => {}
+            Ok(InstanceClaimOutcome::HeldByOther) => tracing::error!(
+                instance = instance_id,
+                deployment = deployment.value(),
+                "a synchronous call chain lost its instance claim — another replica may resume \
+                 the instance; the chain's final commit will not apply to a moved frontier"
+            ),
+            Err(d) => tracing::warn!(
+                instance = instance_id,
+                code = %d.code,
+                "synchronous call chain claim refresh failed: {}",
+                d.message
+            ),
+        }
+    }
+
+    /// A relayed turn's reply: the `<q:reply>` THIS turn reached, rendered against the relay's
+    /// own delivery exactly like a start's reply. Only nodes the turn actually ran count — the
+    /// replay walks past every node of earlier turns, and a reply declared on one of those must
+    /// not answer again.
+    #[allow(clippy::too_many_arguments)]
+    fn relay_reply(
+        &self,
+        to: &RelayReplyContext,
+        process: &ProcessDefinition,
+        prior: &SuspendedInstance,
+        instance_id: &str,
+        outputs: Variables,
+        mut visited_nodes: std::collections::HashSet<String>,
+        at_park: bool,
+    ) -> Result<Option<SyncReply>, Diagnostic> {
+        for done in &prior.completed_nodes {
+            visited_nodes.remove(done);
+        }
+        let exec = ExecResult {
+            instance_id: instance_id.to_string(),
+            outputs,
+            visited_nodes,
+        };
+        self.reply_at(&to.binding, process, &to.message, &exec, at_park)
+    }
+
+    /// The reply a pass answers its request with. At a PARK, only a destination-less
+    /// `<q:reply>` the pass reached answers (a reply with a destination is delivered out of
+    /// band); its body is the last one rendered, since each render overwrites the reply
+    /// variables. At the end of a flow, or a respond-and-continue detach, the reply rules of
+    /// [`Self::build_reply`] apply unchanged.
+    fn reply_at(
+        &self,
+        binding: &ChannelBinding,
+        process: &ProcessDefinition,
+        message: &InboundMessage,
+        exec: &ExecResult,
+        at_park: bool,
+    ) -> Result<Option<SyncReply>, Diagnostic> {
+        if at_park && !visited_sync_reply(process, exec) {
+            return Ok(None);
+        }
+        self.build_reply(binding, process, message, exec)
+    }
+
+    /// The in-memory chain of a RESUMED instance: its stored snapshot, the claim it keeps, and
+    /// the resume pass that reached the synchronous calls.
+    #[allow(clippy::too_many_arguments)]
+    fn stored_chain(
+        &self,
+        process: Arc<ProcessDefinition>,
+        prior: &SuspendedInstance,
+        pinned: &DeploymentId,
+        claim_scope: &DeploymentId,
+        satisfied_node: &str,
+        labels: BTreeMap<String, String>,
+        traceparent: Option<String>,
+        reply_to: Option<RelayReplyContext>,
+        pass: StoredPass,
+    ) -> Box<InlineChain> {
+        // A resume carries labels, not a binding: rebuild the namespace the labels came from
+        // (the tenant falls back to the instance's key id, which is its tenant anchor).
+        let module_key = module_key_of_labels(&labels);
+        let tenant = labels
+            .get("tenant")
+            .filter(|t| !t.is_empty())
+            .cloned()
+            .unwrap_or_else(|| prior.key_id.clone());
+        let binding = ChannelBinding::new(
+            "",
+            namespace_of_module_key(&module_key, &tenant),
+            pinned.clone(),
+            "",
+        );
+        let mut headers = BTreeMap::new();
+        if let Some(traceparent) = traceparent {
+            headers.insert(
+                sutra_executor::telemetry::TRACEPARENT_HEADER.to_string(),
+                traceparent,
+            );
+        }
+        let message = InboundMessage {
+            tenant,
+            module_key,
+            channel: String::new(),
+            headers,
+            body: sutra_executor::Sensitive::new(Vec::new()),
+            content_type: None,
+            idempotency_key: String::new(),
+            explicit_event_id: false,
+            received_at: now_rfc3339(),
+            cloud_event: None,
+        };
+        // A relay's chain renders its reply against the relay's own delivery.
+        let replies = reply_to.is_some();
+        let (binding, message) = match reply_to {
+            Some(to) => (to.binding, to.message),
+            None => (binding, message),
+        };
+        Box::new(InlineChain {
+            lane: self.shard.index,
+            instance_id: pass.instance_id.clone(),
+            process: Arc::clone(&process),
+            deployment: pinned.clone(),
+            binding,
+            message,
+            visited: pass.completed_nodes.iter().cloned().collect(),
+            completed_nodes: pass.completed_nodes,
+            waiting_nodes: pass.waiting_nodes,
+            variables: pass.variables,
+            start_node: pass.start_node,
+            coverage: pass.coverage_progress,
+            retry_attempts: pass.retry_attempts,
+            retry_backoff: pass.retry_backoff,
+            pending_timers: pass.timer_waits,
+            emissions: Vec::new(),
+            alias_rows: Vec::new(),
+            held_aliases: false,
+            counted: false,
+            marked: false,
+            settle: None,
+            dedup_keys: self.dispatch_dedup.borrow_mut().drain(..).collect(),
+            in_flight: BTreeSet::new(),
+            audit_seq: self.audit_seq_for(&pass.instance_id),
+            early_reply: None,
+            stored: Some(StoredChain {
+                claim_scope: claim_scope.clone(),
+                prior: prior.clone(),
+                satisfied: resolved_waits_for(&process, satisfied_node),
+                labels,
+                replies,
+            }),
+        })
+    }
+
+    /// One call's answer → the variables it resumes with: the same decode, `<q:source>` intake
+    /// and channel-call output mapping a correlated reply gets, decoded with the OUTBOUND
+    /// channel's codec (the answer arrives on the call's own connection, not on a reply
+    /// channel).
+    fn inline_response_variables(
+        &self,
+        chain: &InlineChain,
+        node_id: &str,
+        response: InlineResponse,
+    ) -> Result<Variables, Diagnostic> {
+        let channel = channel_call_name(&chain.process, node_id).unwrap_or_default();
+        let module_key = chain.binding.namespace.module_key();
+        let binding = self
+            .channels
+            .find(&module_key, &channel)
+            .cloned()
+            .unwrap_or_else(|| {
+                ChannelBinding::new(
+                    &channel,
+                    chain.binding.namespace.clone(),
+                    chain.deployment.clone(),
+                    "",
+                )
+            });
+        let message = InboundMessage {
+            tenant: chain.message.tenant.clone(),
+            module_key,
+            channel: channel.clone(),
+            headers: response.headers,
+            body: sutra_executor::Sensitive::new(response.body),
+            content_type: response.content_type,
+            idempotency_key: String::new(),
+            explicit_event_id: false,
+            received_at: now_rfc3339(),
+            cloud_event: None,
+        };
+        let decoded =
+            self.chain
+                .decode(&binding, &message.body, message.content_type.as_deref())?;
+        let answer =
+            self.relay_intake_variables(&chain.process, node_id, &binding, &decoded, &message)?;
+        // A sync call's task rarely declares a `<q:source>` (the answer is bound to it by
+        // construction), so its output mapping sees the decoded answer under `payload`, as the
+        // `<q:source>` default name would. Only the mapping sees it: an unmapped answer merges as
+        // before and never shadows the instance's own `payload`.
+        let mut mapping_view = answer.clone();
+        if mapping_view.get("payload").is_none() {
+            if let Some(view) = decoded
+                .as_ref()
+                .and_then(|d| d.payload.as_ref())
+                .map(crate::intake::payload_view)
+            {
+                mapping_view.insert("payload".to_string(), view);
+            }
+        }
+        Ok(channel_call_output_mapping(&chain.process, node_id, &mapping_view)?.unwrap_or(answer))
+    }
+
+    /// A relayed message's variables: the projected `event` view plus the two-tier intake of
+    /// the payload against the wait node's `<q:source>`. A rejection is the error.
+    fn relay_intake_variables(
+        &self,
+        process: &ProcessDefinition,
+        wait_node_id: &str,
+        binding: &ChannelBinding,
+        decoded: &Option<DecodeResult>,
+        message: &InboundMessage,
+    ) -> Result<Variables, Diagnostic> {
+        let mut variables = project_variables(message);
+        if let Some(decoded) = decoded {
+            match self.chain.apply_decoded(
+                process,
+                wait_node_id,
+                binding,
+                decoded,
+                &mut variables,
+            )? {
+                IntakeOutcome::Proceed { .. } => {}
+                IntakeOutcome::Reject(d) => return Err(d),
+                IntakeOutcome::Error { diagnostic, .. } => return Err(diagnostic),
+            }
+        }
+        Ok(variables)
+    }
 }
 
 impl ChannelEngineBuilder {
@@ -2962,6 +4371,12 @@ impl ChannelEngineBuilder {
     /// collision here is a genuine boot-time fail-closed condition.
     pub fn with_channel_definitions(mut self, definitions: &[ChannelDefinition]) -> Self {
         for def in definitions {
+            if def.wants_reply_stream_sse() {
+                self.engine.sse_channels.insert((
+                    def.binding.namespace.module_key(),
+                    def.binding.channel_name.clone(),
+                ));
+            }
             if let Some(cap) = def.payload_cap_bytes {
                 self.engine
                     .payload_cap_policy
@@ -3109,6 +4524,23 @@ impl ChannelEngineBuilder {
         self
     }
 
+    /// Wire the inline callers that make SYNCHRONOUS outbound calls (`ack-mode: on-complete`
+    /// outbound channels). Without them (the default) every channel-call takes the async path.
+    pub fn with_inline_callers(mut self, callers: InlineCallerRegistry) -> Self {
+        self.engine.inline_callers = callers;
+        self
+    }
+
+    /// Wire the secret resolver an inline call's outbound auth reference resolves through —
+    /// the same one the outbox dispatcher is given (default: `env:` only).
+    pub fn with_inline_secret_env(
+        mut self,
+        secret_env: impl Fn(&str) -> Option<String> + Send + Sync + 'static,
+    ) -> Self {
+        self.engine.inline_secret_env = Arc::new(secret_env);
+        self
+    }
+
     pub fn build(self) -> ChannelEngine {
         self.engine
     }
@@ -3184,6 +4616,10 @@ pub enum ScheduledStartOutcome {
     /// process was removed, the start event stopped being timer-triggered) — the poller RESOLVES
     /// the row so it stops firing.
     Stale,
+    /// The minted instance waits on synchronous calls — see [`DispatchOutcome::InlineCalls`].
+    /// Consumed by the router side of [`crate::http::EngineHandle`], which answers the chain's
+    /// final outcome instead; the poller never sees it.
+    InlineCalls(InlineHandoff),
 }
 
 /// Outcome of a [`ChannelEngine::fire_timer`].
@@ -3198,6 +4634,9 @@ pub enum TimerFireOutcome {
     /// The row no longer matches a live parked instance (already resumed / completed /
     /// model changed) — the poller resolves the row so it stops firing.
     Stale,
+    /// The resumed instance waits on synchronous calls — consumed by the router side exactly
+    /// like [`ScheduledStartOutcome::InlineCalls`].
+    InlineCalls(InlineHandoff),
 }
 
 /// One evaluated `<q:alias>` row awaiting its step-commit, with the conflict policy kept
@@ -3247,6 +4686,220 @@ enum RelayResolution {
     /// executed; the resolved resume surfaces as [`DispatchOutcome::Handoff`] for the
     /// router to re-enqueue. Dead at the default `shard-count = 1`.
     Handoff(Box<ResolvedResume>),
+}
+
+// ---- the synchronous-call chain ------------------------------------------------------------
+
+/// An instance in flight inside a synchronous-call chain — never persisted, so this IS the
+/// instance until the chain parks or completes. It carries everything the chain's single
+/// final commit needs (the emissions, alias rows, timer rows and settle callbacks accumulated
+/// across passes) and the original delivery, whose binding and message the final reply is
+/// built against. `Send`: it travels between the actor lane and the router-side task.
+pub struct InlineChain {
+    /// The lane that started the chain: every resume returns there, because the lane's
+    /// in-memory alias index holds the chain's unique aliases.
+    pub(crate) lane: u32,
+    pub(crate) instance_id: String,
+    process: Arc<ProcessDefinition>,
+    deployment: DeploymentId,
+    binding: ChannelBinding,
+    message: InboundMessage,
+    completed_nodes: Vec<String>,
+    waiting_nodes: Vec<String>,
+    variables: Variables,
+    start_node: Option<String>,
+    coverage: BTreeMap<String, u64>,
+    retry_attempts: BTreeMap<String, u32>,
+    retry_backoff: BTreeMap<String, String>,
+    /// Every timer row still pending (fresh rows of each pass, minus those a resume resolved).
+    pending_timers: Vec<TimerWait>,
+    /// Emissions that are not synchronous requests — committed with the chain's last step.
+    emissions: Vec<sutra_executor::Emission>,
+    /// The start event's alias rows, recorded with the durable park.
+    alias_rows: Vec<AliasRecord>,
+    /// Whether the start's unique aliases are held in the lane's in-memory index.
+    held_aliases: bool,
+    /// Whether the chain holds an admission slot in the concurrency store.
+    counted: bool,
+    /// Whether the durable in-flight marker was written.
+    marked: bool,
+    settle: Option<DeferredSettle>,
+    /// The delivery's inbox dedup keys, released if the chain fails.
+    dedup_keys: Vec<(String, String)>,
+    /// Synchronous calls issued and not yet answered.
+    in_flight: BTreeSet<String>,
+    /// Every node visited so far — the reply is gated on a visited `<q:reply>`, which a later
+    /// pass replays rather than visits.
+    visited: std::collections::HashSet<String>,
+    audit_seq: u32,
+    /// A respond-and-continue reply produced mid-chain, returned when the chain ends.
+    early_reply: Option<SyncReply>,
+    /// Set when the chain drives a STORED instance (a relay or timer resume): the chain ends
+    /// with the commits that fit a stored row instead of a first park.
+    stored: Option<StoredChain>,
+}
+
+impl InlineChain {
+    /// The labels the chain's emissions carry: a resume's own, else the start binding's.
+    fn labels(&self) -> BTreeMap<String, String> {
+        match &self.stored {
+            Some(stored) => stored.labels.clone(),
+            None => self.binding.labels(),
+        }
+    }
+}
+
+/// What a chain over a stored instance keeps besides the in-memory state.
+struct StoredChain {
+    /// The deployment the instance's claim was taken under (a DRAINING-scope resume claims
+    /// under the scope, not the pin).
+    claim_scope: DeploymentId,
+    /// The snapshot as loaded: the frontier the instance returns to if the chain aborts, and
+    /// the key id and indexed waits the final re-park keeps.
+    prior: SuspendedInstance,
+    /// Every wait the chain's passes satisfied — resolved by the final re-park.
+    satisfied: Vec<String>,
+    labels: BTreeMap<String, String>,
+    /// The chain answers a relay delivery (its binding and message are the chain's).
+    replies: bool,
+}
+
+/// The fields of the resume pass that reached a chain's first synchronous calls.
+struct StoredPass {
+    instance_id: String,
+    waiting_nodes: Vec<String>,
+    completed_nodes: Vec<String>,
+    variables: Variables,
+    start_node: Option<String>,
+    timer_waits: Vec<TimerWait>,
+    coverage_progress: BTreeMap<String, u64>,
+    retry_attempts: BTreeMap<String, u32>,
+    retry_backoff: BTreeMap<String, String>,
+}
+
+fn no_bridge() -> Diagnostic {
+    Diagnostic::error(
+        codes::INBOUND_PERSISTENCE_REQUIRED,
+        "a synchronous call chain reached a durable commit with no bridge wired",
+    )
+}
+
+const _: () = {
+    const fn assert_send<T: Send>() {}
+    assert_send::<InlineChain>();
+};
+
+/// A freshly waiting channel-call on a synchronous outbound channel.
+struct SyncCallSite {
+    node_id: String,
+    caller: Option<Arc<dyn InlineCaller>>,
+}
+
+/// What one in-memory resume pass applies.
+enum ChainPass {
+    /// The call's answer, already through intake and output mapping.
+    Answer(Variables),
+    /// The call's timeout: fire this timer boundary.
+    Timeout(String),
+    /// The call failed (its inline retries, if any, spent): the task's failure path.
+    Failure(Diagnostic),
+}
+
+/// How a chain ended, for what it releases.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ChainEnd {
+    Parked,
+    Completed,
+    /// The flow failed (a start is dead-lettered or requeued; a stored instance is FAILED).
+    Failed,
+    /// No quiescent commit was reached — nothing changed durably.
+    Aborted,
+}
+
+/// The outbound channel a `channel:<name>` service task calls.
+fn channel_call_name(process: &ProcessDefinition, node_id: &str) -> Option<String> {
+    match process.node(node_id) {
+        Ok(Node::ServiceTask { implementation, .. }) => implementation
+            .strip_prefix(CHANNEL_CALL_PREFIX)
+            .map(|c| c.trim().to_string()),
+        _ => None,
+    }
+}
+
+/// The interrupting timer boundaries on a call, with how long each allows from now.
+fn call_timeouts(process: &ProcessDefinition, node_id: &str) -> Vec<(String, std::time::Duration)> {
+    let mut out = Vec::new();
+    for n in process.nodes() {
+        let Node::BoundaryEvent {
+            id,
+            kind: sutra_bpmn::model::BoundaryKind::Timer,
+            attached_to_ref,
+            interrupting: true,
+            timer: Some(timer),
+            ..
+        } = n
+        else {
+            continue;
+        };
+        if attached_to_ref != node_id {
+            continue;
+        }
+        let allowed = match timer {
+            sutra_bpmn::timer::TimerDefinition::Duration(spec) => {
+                sutra_bpmn::duration::parse_iso8601_duration(spec).ok()
+            }
+            sutra_bpmn::timer::TimerDefinition::Date(at) => {
+                time::OffsetDateTime::parse(at, &time::format_description::well_known::Rfc3339)
+                    .ok()
+                    .map(|due| {
+                        let left = due - time::OffsetDateTime::now_utc();
+                        std::time::Duration::try_from(left).unwrap_or_default()
+                    })
+            }
+            sutra_bpmn::timer::TimerDefinition::Cycle(_) => None,
+        };
+        if let Some(allowed) = allowed {
+            out.push((id.clone(), allowed));
+        }
+    }
+    out
+}
+
+/// A synchronous call's whole budget: its earliest interrupting timer boundary (the loader
+/// guarantees every channel-call has one).
+fn inline_call_budget(process: &ProcessDefinition, node_id: &str) -> std::time::Duration {
+    call_timeouts(process, node_id)
+        .into_iter()
+        .map(|(_, d)| d)
+        .min()
+        .unwrap_or(std::time::Duration::from_secs(30))
+}
+
+/// The boundary a synchronous call's timeout fires — the one that set its budget.
+fn inline_timeout_boundary(process: &ProcessDefinition, node_id: &str) -> Option<String> {
+    call_timeouts(process, node_id)
+        .into_iter()
+        .min_by_key(|(_, d)| *d)
+        .map(|(id, _)| id)
+}
+
+/// A call task's `<q:retry>` resolved to durations (validated parseable at load).
+fn inline_retry(process: &ProcessDefinition, node_id: &str) -> Option<InlineRetry> {
+    let policy = process.retry_policy(node_id)?;
+    let parse = |raw: &str| sutra_bpmn::duration::parse_iso8601_duration(raw).unwrap_or_default();
+    Some(InlineRetry {
+        max_attempts: policy.max_attempts,
+        initial_delay: parse(&policy.initial_delay),
+        backoff_coefficient: policy.backoff_coefficient,
+        max_delay: parse(&policy.max_delay),
+        non_retryable_codes: policy.non_retryable_codes.clone(),
+    })
+}
+
+fn now_rfc3339() -> String {
+    time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_default()
 }
 
 // ---- channel-call / timer helpers ----------------------------------------------------------
@@ -3826,6 +5479,19 @@ fn visited_reply_content_type(
 /// bytes are addressed to a named channel, and that channel's codec is exactly what its
 /// consumers will decode them with.
 const NO_INFERRED_REPLY_CODEC: &str = "";
+
+/// Did the pass visit a node carrying a DESTINATION-LESS `<q:reply>` — one that answers the
+/// request on its own connection?
+fn visited_sync_reply(process: &ProcessDefinition, exec: &sutra_executor::ExecResult) -> bool {
+    process.nodes().iter().any(|node| {
+        exec.visited_nodes.contains(node.id())
+            && process
+                .bindings_for(node.id())
+                .reply
+                .as_ref()
+                .is_some_and(|reply| reply.destination.is_none())
+    })
+}
 
 /// Did the flow actually visit a node carrying a `<q:reply>`?
 ///

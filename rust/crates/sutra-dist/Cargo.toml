@@ -51,6 +51,11 @@ sutra-transport-amqp = { path = "../sutra-transport-amqp", optional = true }
 sutra-transport-file = { path = "../sutra-transport-file", optional = true }
 sutra-transport-dapr = { path = "../sutra-transport-dapr", optional = true }
 sutra-transport-knative = { path = "../sutra-transport-knative", optional = true }
+# The `llm` transport + its model-provider adapters (each self-registers an LlmProviderFactory).
+sutra-transport-llm = { path = "../sutra-transport-llm", optional = true }
+sutra-llm-openai = { path = "../sutra-llm-openai", optional = true }
+sutra-llm-anthropic = { path = "../sutra-llm-anthropic", optional = true }
+sutra-llm-bedrock = { path = "../sutra-llm-bedrock", optional = true }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time"] }
 tracing = { workspace = true }
 
@@ -58,7 +63,7 @@ tracing = { workspace = true }
 # bundles HTTP + the five network brokers + file + dapr + knative (the general image). A
 # hardened / air-gapped build uses `--no-default-features` + only the transports it needs.
 [features]
-default = ["http", "kafka", "rabbitmq", "aws-sqs", "gcp-pubsub", "amqp", "file", "dapr", "knative"]
+default = ["http", "kafka", "rabbitmq", "aws-sqs", "gcp-pubsub", "amqp", "file", "dapr", "knative", "llm-openai", "llm-anthropic", "llm-bedrock"]
 http = ["dep:sutra-transport-http"]
 kafka = ["dep:sutra-transport-kafka"]
 rabbitmq = ["dep:sutra-transport-rabbitmq"]
@@ -68,11 +73,19 @@ amqp = ["dep:sutra-transport-amqp"]
 file = ["dep:sutra-transport-file"]
 dapr = ["dep:sutra-transport-dapr"]
 knative = ["dep:sutra-transport-knative"]
+# A provider adapter implies the `llm` transport it plugs into. `llm-openai` also covers every
+# hosted service speaking the same wire format (mistral, deepseek, xai, kimi, meta-llama,
+# google-gemini), each registered under its own `provider:` id.
+llm = ["dep:sutra-transport-llm"]
+llm-openai = ["llm", "dep:sutra-llm-openai"]
+llm-anthropic = ["llm", "dep:sutra-llm-anthropic"]
+llm-bedrock = ["llm", "dep:sutra-llm-bedrock"]
 
 [dev-dependencies]
 # The bundle-completeness tests (moved here — the distribution layer) resolve the assembled set.
 sutra-channels = { path = "../sutra-channels" }
 sutra-codec-spi = { path = "../sutra-codec-spi" }
+sutra-llm-spi = { path = "../sutra-llm-spi" }
 sutra-transport-spi = { path = "../sutra-transport-spi" }
 # The envref bundle test resolves the assembled scheme set via `ResolverRegistry::with_builtins()`.
 sutra-envref-spi = { path = "../sutra-envref-spi" }

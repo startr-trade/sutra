@@ -24,6 +24,15 @@ pub trait InboxStore {
         channel: &str,
         event_id: &str,
     ) -> Result<bool>;
+    /// Deletes the `(deployment, channel, event_id)` row, so a redelivery of that event is a
+    /// first observation again. Returns whether a row was removed. Used when the work the row
+    /// guarded failed without persisting anything.
+    async fn forget(
+        &self,
+        deployment: &DeploymentId,
+        channel: &str,
+        event_id: &str,
+    ) -> Result<bool>;
     /// Deletes rows older than `age` across ALL deployments (maintenance bypass posture).
     /// Returns rows pruned.
     async fn prune_older_than(&self, age: std::time::Duration) -> Result<u64>;
@@ -40,6 +49,9 @@ const SQL_INSERT: &str = "INSERT INTO inbox_seen (deployment_id, channel, event_
      ON CONFLICT (deployment_id, channel, event_id) DO NOTHING";
 
 const SQL_PRUNE: &str = "DELETE FROM inbox_seen WHERE seen_at < $1";
+
+const SQL_FORGET: &str =
+    "DELETE FROM inbox_seen WHERE deployment_id = $1 AND channel = $2 AND event_id = $3";
 
 impl PgInboxStore {
     /// Wraps a connection pool.
@@ -81,6 +93,27 @@ impl InboxStore for PgInboxStore {
             .await
             .map_err(PersistenceError::db("inbox recordSeen commit"))?;
         Ok(first)
+    }
+
+    async fn forget(
+        &self,
+        deployment: &DeploymentId,
+        channel: &str,
+        event_id: &str,
+    ) -> Result<bool> {
+        let mut tx = begin_deployment_tx(&self.pool, deployment).await?;
+        let removed = sqlx::query(SQL_FORGET)
+            .bind(deployment.as_str())
+            .bind(channel)
+            .bind(event_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(PersistenceError::db("inbox forget"))?
+            .rows_affected();
+        tx.commit()
+            .await
+            .map_err(PersistenceError::db("inbox forget commit"))?;
+        Ok(removed == 1)
     }
 
     async fn prune_older_than(&self, age: std::time::Duration) -> Result<u64> {

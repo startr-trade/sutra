@@ -7,7 +7,7 @@ may send to it.
 
 ## Transports
 
-One neutral transport SPI, nine implementations, all self-registering behind the same lifecycle
+One neutral transport SPI, ten implementations, all self-registering behind the same lifecycle
 trait — the engine binds, activates, and drains every one of them through a single generic path
 with no `if transport == "..."` branching anywhere:
 
@@ -21,6 +21,7 @@ with no `if transport == "..."` branching anywhere:
 | `amqp` | `fe2o3-amqp` (AMQP 1.0). |
 | `dapr` | Dapr pub/sub: the sidecar pushes to the engine's own HTTP listener. No vendor client — see [Dapr and Knative](channels.md#dapr-and-knative). |
 | `knative` | Knative Eventing: a Trigger or Subscription pushes to the engine's own HTTP listener. No vendor client. |
+| `llm` | A language model as an outbound request/reply channel, with ordered fallback candidates — see [Calling a language model](llm-channels.md). Provider adapters are cargo features `llm-openai`, `llm-anthropic`, `llm-bedrock`, all in the default build. |
 | `file` | Air-gapped: file-spool inbound + `file://` outbound sink, no network dependency. |
 
 Two further `transport:` values are engine-internal rather than vendor clients — they have no wire
@@ -248,5 +249,6 @@ validation rejects a literal secret outright.
 ## Next
 
 - **[The q: namespace](q-namespace.md)** — how a BPMN process subscribes to a channel.
+- **[Calling a language model](llm-channels.md)** — the `llm` transport, sync and async.
 - **[External tasks: the pull worker surface](external-tasks.md)** — the `pull` transport in full.
 - **[Acknowledgement modes](../operating/ack-modes.md)** — the operator-facing deep dive.

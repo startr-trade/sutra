@@ -97,6 +97,21 @@ enum EngineRequest {
         resolved: Box<crate::dispatch::ResolvedResume>,
         respond: tokio::sync::oneshot::Sender<Result<DispatchOutcome, Diagnostic>>,
     },
+    /// One answer of a synchronous-call chain, posted by the router-side task that made the
+    /// call back to the lane that started the chain. Answers are posted one at a time, so a
+    /// chain's resumes are serial however many of its calls are in flight.
+    ResumeInMemory {
+        chain: Box<crate::dispatch::InlineChain>,
+        node_id: String,
+        result: crate::inline_chain::InlineCallResult,
+        respond: tokio::sync::oneshot::Sender<crate::inline_chain::InlineStep>,
+    },
+    /// Keep a synchronous chain's instance claim alive (fire-and-forget): the chain's router
+    /// task sends it while calls are in flight, so a slow call outlives no claim timeout.
+    RefreshClaim {
+        deployment: crate::DeploymentId,
+        instance_id: String,
+    },
 }
 
 /// A shard's identity inside the engine's shard router, handed to the per-shard engine
@@ -293,6 +308,36 @@ impl EngineHandle {
             .await?;
         match rx.await.map_err(|_| engine_gone())?? {
             DispatchOutcome::Handoff { resolved, .. } => self.resume_resolved(*resolved).await,
+            DispatchOutcome::InlineCalls(handoff) => {
+                self.drive_inline_chain(handoff, None).await.outcome
+            }
+            outcome => Ok(outcome),
+        }
+    }
+
+    /// [`Self::dispatch`] for a delivery whose caller accepts a streamed reply (`reply-stream:
+    /// sse`): a synchronous chain's `q:stream` calls forward their answer to `frames` as they
+    /// run. The first frame is [`crate::inline_chain::StreamFrame::Started`] when — and only
+    /// when — something streams; the chain's end then follows as a `Reply` or `Error` frame and
+    /// the sender is dropped. When nothing streams, no frame is sent and the outcome is
+    /// answered exactly as by [`Self::dispatch`].
+    pub async fn dispatch_streaming(
+        &self,
+        message: InboundMessage,
+        frames: tokio::sync::mpsc::UnboundedSender<crate::inline_chain::StreamFrame>,
+    ) -> Result<DispatchOutcome, Diagnostic> {
+        let (respond, rx) = tokio::sync::oneshot::channel();
+        self.arrival_shard()
+            .send(EngineRequest::Dispatch { message, respond })
+            .await?;
+        let tap = std::sync::Arc::new(crate::inline_chain::StreamTap::new(frames));
+        match rx.await.map_err(|_| engine_gone())?? {
+            DispatchOutcome::Handoff { resolved, .. } => {
+                self.resume_resolved_streaming(*resolved, Some(tap)).await
+            }
+            DispatchOutcome::InlineCalls(handoff) => {
+                self.drive_inline_chain(handoff, Some(tap)).await.outcome
+            }
             outcome => Ok(outcome),
         }
     }
@@ -323,7 +368,159 @@ impl EngineHandle {
             }) => Ok(crate::dispatch::DeferredDispatch::Settled(
                 self.resume_resolved(*resolved).await?,
             )),
+            // A synchronous chain: the callbacks are deferred only if its final durable park
+            // registered them; any other ending settles now.
+            crate::dispatch::DeferredDispatch::Settled(DispatchOutcome::InlineCalls(handoff)) => {
+                let ended = self.drive_inline_chain(handoff, None).await;
+                let outcome = ended.outcome?;
+                Ok(match (ended.settle_consumed, outcome) {
+                    (true, DispatchOutcome::Completed { instance_id, .. }) => {
+                        crate::dispatch::DeferredDispatch::Deferred { instance_id }
+                    }
+                    (_, outcome) => crate::dispatch::DeferredDispatch::Settled(outcome),
+                })
+            }
             outcome => Ok(outcome),
+        }
+    }
+
+    /// Drive a synchronous-call chain to its end on the ROUTER side: make the calls
+    /// concurrently and post each answer back to the chain's lane, one at a time, until the
+    /// lane reports the chain ended. Runs as its own task so a caller that goes away (a closed
+    /// connection drops the transport's future) cannot abandon a chain half-way — the lane's
+    /// in-memory state it holds is always released. Answers `(outcome, settle_consumed)`.
+    async fn drive_inline_chain(
+        &self,
+        handoff: crate::inline_chain::InlineHandoff,
+        tap: Option<std::sync::Arc<crate::inline_chain::StreamTap>>,
+    ) -> ChainEnded {
+        let Some(continuation) = handoff.take() else {
+            return ChainEnded::failed(Diagnostic::error(
+                codes::RUNTIME_UNEXPECTED,
+                "internal: a synchronous call chain was driven twice",
+            ));
+        };
+        let handle = self.clone();
+        match tokio::spawn(async move { handle.run_inline_chain(continuation, tap).await }).await {
+            Ok(ended) => ended,
+            Err(e) => ChainEnded::failed(Diagnostic::error(
+                codes::RUNTIME_UNEXPECTED,
+                format!("synchronous call chain task failed: {e}"),
+            )),
+        }
+    }
+
+    async fn run_inline_chain(
+        &self,
+        continuation: crate::inline_chain::InlineContinuation,
+        tap: Option<std::sync::Arc<crate::inline_chain::StreamTap>>,
+    ) -> ChainEnded {
+        let ended = self.run_inline_chain_calls(continuation, tap.clone()).await;
+        // A streamed response ends with the flow's reply, or the failure's code.
+        if let Some(tap) = tap.filter(|tap| tap.started()) {
+            use crate::inline_chain::StreamFrame;
+            match &ended.outcome {
+                Ok(DispatchOutcome::Completed {
+                    reply: Some(reply), ..
+                }) => tap.send(StreamFrame::Reply(reply.clone())),
+                Ok(DispatchOutcome::DeadLettered { cause_code, .. }) => {
+                    tap.send(StreamFrame::Error(cause_code.clone()))
+                }
+                Err(d) => tap.send(StreamFrame::Error(d.code.clone())),
+                Ok(_) => {}
+            }
+        }
+        ended
+    }
+
+    async fn run_inline_chain_calls(
+        &self,
+        continuation: crate::inline_chain::InlineContinuation,
+        tap: Option<std::sync::Arc<crate::inline_chain::StreamTap>>,
+    ) -> ChainEnded {
+        use crate::inline_chain::{run_inline_call, InlineStep};
+        let crate::inline_chain::InlineContinuation {
+            mut chain,
+            calls,
+            heartbeat,
+        } = continuation;
+        let lane = self
+            .shards
+            .get(chain.lane as usize)
+            .unwrap_or_else(|| &self.shards[0])
+            .clone();
+        // Dropping the set when the chain ends aborts any call still in flight: its answer
+        // could no longer be applied to anything.
+        let mut in_flight = tokio::task::JoinSet::new();
+        for call in calls {
+            in_flight.spawn(run_inline_call(call, tap.clone()));
+        }
+        // Well inside the default claim timeout (PT5M), so a slow call never lets the stuck-
+        // instance sweep take a stored instance from under its chain.
+        let mut refresh = tokio::time::interval(INLINE_CLAIM_REFRESH);
+        refresh.tick().await;
+        loop {
+            let joined = tokio::select! {
+                joined = in_flight.join_next() => joined,
+                _ = refresh.tick(), if heartbeat.is_some() => {
+                    if let Some((deployment, instance_id)) = &heartbeat {
+                        let _ = lane
+                            .send(EngineRequest::RefreshClaim {
+                                deployment: deployment.clone(),
+                                instance_id: instance_id.clone(),
+                            })
+                            .await;
+                    }
+                    continue;
+                }
+            };
+            let (node_id, result) = match joined {
+                Some(Ok(answered)) => answered,
+                Some(Err(e)) => {
+                    return ChainEnded::failed(Diagnostic::error(
+                        codes::RUNTIME_UNEXPECTED,
+                        format!("synchronous call task failed: {e}"),
+                    ))
+                }
+                None => {
+                    return ChainEnded::failed(Diagnostic::error(
+                        codes::RUNTIME_UNEXPECTED,
+                        "internal: a synchronous call chain has no call in flight",
+                    ))
+                }
+            };
+            let (respond, rx) = tokio::sync::oneshot::channel();
+            if let Err(d) = lane
+                .send(EngineRequest::ResumeInMemory {
+                    chain,
+                    node_id,
+                    result,
+                    respond,
+                })
+                .await
+            {
+                return ChainEnded::failed(d);
+            }
+            match rx.await {
+                Ok(InlineStep::More { chain: next, calls }) => {
+                    chain = next;
+                    for call in calls {
+                        in_flight.spawn(run_inline_call(call, tap.clone()));
+                    }
+                }
+                Ok(InlineStep::Done {
+                    outcome,
+                    settle_consumed,
+                    completed,
+                }) => {
+                    return ChainEnded {
+                        outcome,
+                        settle_consumed,
+                        completed,
+                    }
+                }
+                Err(_) => return ChainEnded::failed(engine_gone()),
+            }
         }
     }
 
@@ -338,7 +535,25 @@ impl EngineHandle {
         self.shard_for_instance(&fire.instance_id)
             .send(EngineRequest::FireTimer { fire, respond })
             .await?;
-        rx.await.map_err(|_| engine_gone())?
+        match rx.await.map_err(|_| engine_gone())?? {
+            // The poller's task drives the chain the fire began, then reports its end.
+            TimerFireOutcome::InlineCalls(handoff) => {
+                let ended = self.drive_inline_chain(handoff, None).await;
+                match ended.outcome? {
+                    DispatchOutcome::Completed { instance_id, .. } => {
+                        Ok(TimerFireOutcome::Resumed {
+                            instance_id,
+                            completed: ended.completed,
+                        })
+                    }
+                    other => Err(Diagnostic::error(
+                        codes::RUNTIME_UNEXPECTED,
+                        format!("internal: a timer-driven chain ended as {other:?}"),
+                    )),
+                }
+            }
+            outcome => Ok(outcome),
+        }
     }
 
     /// Offer a terminally-poisoned channel-call delivery to the parked task's `<q:retry>`
@@ -363,10 +578,17 @@ impl EngineHandle {
         fire: crate::dispatch::ScheduledStartFire,
     ) -> Result<crate::dispatch::ScheduledStartOutcome, Diagnostic> {
         let (respond, rx) = tokio::sync::oneshot::channel();
+        let node_id = fire.node_id.clone();
         self.arrival_shard()
             .send(EngineRequest::StartScheduled { fire, respond })
             .await?;
-        rx.await.map_err(|_| engine_gone())?
+        match rx.await.map_err(|_| engine_gone())?? {
+            crate::dispatch::ScheduledStartOutcome::InlineCalls(handoff) => {
+                let ended = self.drive_inline_chain(handoff, None).await;
+                ChannelEngine::scheduled_outcome_of(ended.outcome?, &node_id)
+            }
+            outcome => Ok(outcome),
+        }
     }
 
     /// Execute a relay handoff's resolved resume on the instance's owner shard and await
@@ -377,6 +599,14 @@ impl EngineHandle {
         &self,
         resolved: crate::dispatch::ResolvedResume,
     ) -> Result<DispatchOutcome, Diagnostic> {
+        self.resume_resolved_streaming(resolved, None).await
+    }
+
+    async fn resume_resolved_streaming(
+        &self,
+        resolved: crate::dispatch::ResolvedResume,
+        tap: Option<std::sync::Arc<crate::inline_chain::StreamTap>>,
+    ) -> Result<DispatchOutcome, Diagnostic> {
         let (respond, rx) = tokio::sync::oneshot::channel();
         self.shard_for_instance(&resolved.instance_id)
             .send(EngineRequest::ResumeResolved {
@@ -384,7 +614,12 @@ impl EngineHandle {
                 respond,
             })
             .await?;
-        rx.await.map_err(|_| engine_gone())?
+        match rx.await.map_err(|_| engine_gone())?? {
+            DispatchOutcome::InlineCalls(handoff) => {
+                self.drive_inline_chain(handoff, tap).await.outcome
+            }
+            outcome => Ok(outcome),
+        }
     }
 
     /// Apply a prepared mutation on EVERY shard's actor thread — the control-plane
@@ -440,6 +675,28 @@ impl EngineHandle {
         match first_error {
             None => Ok(()),
             Some(d) => Err(d),
+        }
+    }
+}
+
+/// How often a chain over a stored instance refreshes the instance's claim.
+const INLINE_CLAIM_REFRESH: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How a synchronous chain ended, as the router side reports it.
+struct ChainEnded {
+    outcome: Result<DispatchOutcome, Diagnostic>,
+    /// The deferred settle callbacks were registered with the final durable park.
+    settle_consumed: bool,
+    /// The instance finished rather than parked.
+    completed: bool,
+}
+
+impl ChainEnded {
+    fn failed(d: Diagnostic) -> ChainEnded {
+        ChainEnded {
+            outcome: Err(d),
+            settle_consumed: false,
+            completed: false,
         }
     }
 }
@@ -619,6 +876,36 @@ where
                                     catch_actor_panic(engine.resume_resolved(&resolved)).await;
                                 let _ = respond.send(outcome);
                             }
+                            EngineRequest::ResumeInMemory {
+                                chain,
+                                node_id,
+                                result,
+                                respond,
+                            } => {
+                                lane_metrics.dispatched();
+                                let step = catch_actor_panic(async {
+                                    Ok(engine.resume_in_memory(chain, node_id, result).await)
+                                })
+                                .await
+                                .unwrap_or_else(|d| {
+                                    crate::inline_chain::InlineStep::Done {
+                                        outcome: Err(d),
+                                        settle_consumed: false,
+                                        completed: false,
+                                    }
+                                });
+                                let _ = respond.send(step);
+                            }
+                            EngineRequest::RefreshClaim {
+                                deployment,
+                                instance_id,
+                            } => {
+                                let _ = catch_actor_panic(async {
+                                    engine.refresh_inline_claim(&deployment, &instance_id).await;
+                                    Ok(())
+                                })
+                                .await;
+                            }
                         }
                     }
                 }));
@@ -664,6 +951,8 @@ struct HttpChannel {
     ce_source_default: Option<String>,
     /// Wrap-mode `type` default (`ce.type` property).
     ce_type_default: Option<String>,
+    /// `reply-stream: sse` — a streamed synchronous call answers as server-sent events.
+    reply_stream_sse: bool,
 }
 
 /// The swappable `(METHOD, path)` → channel table the HTTP transport serves from — the
@@ -779,6 +1068,7 @@ pub fn http_routes_of_resolved(
             ce_mode: crate::cloudevents::CeMode::parse(def.cloud_events_mode.as_deref()),
             ce_source_default: def.properties.get("ce.source").cloned(),
             ce_type_default: def.properties.get("ce.type").cloned(),
+            reply_stream_sse: def.wants_reply_stream_sse(),
         };
         if by_route
             .insert((method.clone(), path.clone()), channel)
@@ -911,7 +1201,26 @@ async fn serve_route(
 
     // 5. Dispatch + 6. ack per ack-mode.
     let async_ack = channel.ack_mode.eq_ignore_ascii_case("on-persist");
-    match state.handle.dispatch(message).await {
+    let dispatched = if channel.reply_stream_sse && !async_ack {
+        // A streamed reply: the dispatch runs on its own task, and the response becomes an
+        // event stream the moment a streamed call starts. When nothing streams, the frame
+        // sender is simply dropped and the outcome is answered as usual.
+        let (frames, mut frames_rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = state.handle.clone();
+        let job = tokio::spawn(async move { handle.dispatch_streaming(message, frames).await });
+        match frames_rx.recv().await {
+            Some(_started) => return sse_response(frames_rx),
+            None => job.await.unwrap_or_else(|e| {
+                Err(Diagnostic::error(
+                    codes::RUNTIME_UNEXPECTED,
+                    format!("dispatch task failed: {e}"),
+                ))
+            }),
+        }
+    } else {
+        state.handle.dispatch(message).await
+    };
+    match dispatched {
         Ok(DispatchOutcome::Duplicate) => StatusCode::ACCEPTED.into_response(),
         Ok(DispatchOutcome::Completed { reply, outputs, .. }) => {
             if async_ack {
@@ -944,7 +1253,7 @@ async fn serve_route(
             problem_response(status_for_code(&diagnostic.code), &diagnostic, problem_ct)
         }
         // Unreachable: `EngineHandle::dispatch` consumes every handoff on the router side.
-        Ok(DispatchOutcome::Handoff { .. }) => problem_response(
+        Ok(DispatchOutcome::Handoff { .. } | DispatchOutcome::InlineCalls(_)) => problem_response(
             500,
             &Diagnostic::error(
                 codes::RUNTIME_UNEXPECTED,
@@ -980,6 +1289,69 @@ fn render_ok(
         }
         _ => response_with(StatusCode::OK, &symmetric, Vec::new()),
     }
+}
+
+/// A `text/event-stream` response over the remaining frames of a streamed chain: `chunk`
+/// events while the call runs (with a `reset` when the call starts its answer over), then
+/// `reply` (the flow's reply body) or `error` (the code only); the stream closes when the
+/// chain ends.
+fn sse_response(
+    frames: tokio::sync::mpsc::UnboundedReceiver<crate::inline_chain::StreamFrame>,
+) -> Response {
+    (
+        StatusCode::OK,
+        [
+            (axum::http::header::CONTENT_TYPE, "text/event-stream"),
+            (axum::http::header::CACHE_CONTROL, "no-cache"),
+        ],
+        axum::body::Body::from_stream(SseFrames(frames)),
+    )
+        .into_response()
+}
+
+/// The frame receiver as a byte stream of server-sent events.
+struct SseFrames(tokio::sync::mpsc::UnboundedReceiver<crate::inline_chain::StreamFrame>);
+
+impl futures_core::Stream for SseFrames {
+    type Item = Result<Bytes, std::convert::Infallible>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        use crate::inline_chain::StreamFrame;
+        loop {
+            let frame = match self.0.poll_recv(cx) {
+                std::task::Poll::Ready(Some(frame)) => frame,
+                std::task::Poll::Ready(None) => return std::task::Poll::Ready(None),
+                std::task::Poll::Pending => return std::task::Poll::Pending,
+            };
+            let event = match frame {
+                StreamFrame::Started => continue,
+                StreamFrame::Chunk(text) => sse_event("chunk", &text),
+                // The client discards what it has; the next chunks start the answer over.
+                StreamFrame::Reset => sse_event("reset", ""),
+                StreamFrame::Reply(reply) => {
+                    sse_event("reply", &String::from_utf8_lossy(reply.body.get()))
+                }
+                StreamFrame::Error(code) => sse_event("error", &code),
+            };
+            return std::task::Poll::Ready(Some(Ok(Bytes::from(event))));
+        }
+    }
+}
+
+/// One server-sent event: every line of `data` gets its own `data:` field, so a multi-line
+/// payload survives the framing.
+fn sse_event(event: &str, data: &str) -> String {
+    let mut out = format!("event: {event}\n");
+    for line in data.split('\n') {
+        out.push_str("data: ");
+        out.push_str(line.strip_suffix('\r').unwrap_or(line));
+        out.push('\n');
+    }
+    out.push('\n');
+    out
 }
 
 fn response_with(status: StatusCode, content_type: &str, body: Vec<u8>) -> Response {

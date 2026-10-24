@@ -1,0 +1,115 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  ASYNC model call. The caller gets `202 Accepted` at once; the model is called through the outbox,
+  the instance parks, and the answer is delivered as a message on `summarize-reply`.
+
+    startEvent (JSON ticket on `ticket-async`)
+      then BuildPrompt : data task (FEEL) — requestBody := { prompt, ticketId }, and `body` seeded
+                         with the same ticketId (see CORRELATION)
+      then Summarize   : channel-call task on `summarize-async` — parks until the reply arrives
+      then BuildNote   : data task (FEEL) — responseBody := { ticketId, summary }
+      then Deliver     : send task — posts that note to the `summary-sink` channel
+      then End
+
+  CORRELATION. The model echoes the request under `request` in its reply, so the task's <q:alias>
+  can match on a field the process put there: `body.request.ticketId`. The reply is projected under
+  the name given on <q:source name="body">, so on the reply `body.request.ticketId` is the echoed id.
+  The alias is also evaluated once at PARK time, against the instance's variables — so BuildPrompt
+  seeds a `body` of the same shape ({request: {ticketId}}), and one expression resolves on both
+  sides. `unique="true"` makes the id single-flight: a second ticket with the same id while the
+  first is in flight is refused rather than cross-correlated.
+-->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI"
+                  xmlns:dc="http://www.omg.org/spec/DD/20100524/DC"
+                  xmlns:di="http://www.omg.org/spec/DD/20100524/DI"
+                  xmlns:q="urn:sutra:q:1.0"
+                  id="Definitions_summarize_async"
+                  targetNamespace="urn:sutra:module:ai-summarize:1.0.0">
+
+  <bpmn:process id="summarize-async" name="Summarize a ticket (async)" isExecutable="true">
+
+    <bpmn:extensionElements>
+      <q:variables>
+        <q:variable name="requestBody" type="object"/>
+        <q:variable name="body" type="object"/>          <!-- park-time shape of the reply; replaced by the reply -->
+        <q:variable name="summary" type="string"/>
+        <q:variable name="responseBody" type="object"/>  <!-- the note handed to summary-sink -->
+      </q:variables>
+    </bpmn:extensionElements>
+
+    <bpmn:startEvent id="Start" name="Ticket received">
+      <bpmn:extensionElements>
+        <q:source channel="ticket-async"/>
+      </bpmn:extensionElements>
+      <bpmn:outgoing>F1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="F1" sourceRef="Start" targetRef="BuildPrompt"/>
+
+    <bpmn:serviceTask id="BuildPrompt" name="Build the prompt (FEEL)">
+      <bpmn:incoming>F1</bpmn:incoming><bpmn:outgoing>F2</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment>
+          <bpmn:from>{prompt: "Summarize this support ticket. Subject: " + payload.subject + ". Details: " + payload.description, ticketId: payload.ticketId}</bpmn:from>
+          <bpmn:to>requestBody</bpmn:to>
+        </bpmn:assignment>
+        <bpmn:assignment>
+          <bpmn:from>{request: {ticketId: payload.ticketId}}</bpmn:from>
+          <bpmn:to>body</bpmn:to>
+        </bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F2" sourceRef="BuildPrompt" targetRef="Summarize"/>
+
+    <bpmn:serviceTask id="Summarize" name="Ask the model (async)" implementation="channel:summarize-async">
+      <bpmn:extensionElements>
+        <!-- The answer arrives on this channel and resumes the parked instance. -->
+        <q:source channel="summarize-reply" name="body"/>
+        <q:alias name="ticket" expression="body.request.ticketId" unique="true"/>
+        <q:timeout duration="PT2M"/>
+      </bpmn:extensionElements>
+      <bpmn:incoming>F2</bpmn:incoming><bpmn:outgoing>F3</bpmn:outgoing>
+      <bpmn:dataOutputAssociation>
+        <bpmn:assignment><bpmn:from>body.text</bpmn:from><bpmn:to>summary</bpmn:to></bpmn:assignment>
+      </bpmn:dataOutputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F3" sourceRef="Summarize" targetRef="BuildNote"/>
+
+    <bpmn:serviceTask id="BuildNote" name="Build the note (FEEL)">
+      <bpmn:incoming>F3</bpmn:incoming><bpmn:outgoing>F4</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment>
+          <bpmn:from>{ticketId: payload.ticketId, summary: summary}</bpmn:from>
+          <bpmn:to>responseBody</bpmn:to>
+        </bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F4" sourceRef="BuildNote" targetRef="Deliver"/>
+
+    <bpmn:sendTask id="Deliver" name="Hand the summary to the sink">
+      <bpmn:extensionElements>
+        <q:send channel="summary-sink"/>
+      </bpmn:extensionElements>
+      <bpmn:incoming>F4</bpmn:incoming><bpmn:outgoing>F5</bpmn:outgoing>
+    </bpmn:sendTask>
+    <bpmn:sequenceFlow id="F5" sourceRef="Deliver" targetRef="End"/>
+
+    <bpmn:endEvent id="End" name="Summary delivered"><bpmn:incoming>F5</bpmn:incoming></bpmn:endEvent>
+  </bpmn:process>
+
+  <bpmndi:BPMNDiagram id="Diagram_summarize_async">
+    <bpmndi:BPMNPlane id="Plane_summarize_async" bpmnElement="summarize-async">
+      <bpmndi:BPMNShape id="S_Start" bpmnElement="Start"><dc:Bounds x="100" y="100" width="36" height="36"/></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="S_BuildPrompt" bpmnElement="BuildPrompt"><dc:Bounds x="190" y="78" width="110" height="80"/></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="S_Summarize" bpmnElement="Summarize"><dc:Bounds x="350" y="78" width="110" height="80"/></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="S_BuildNote" bpmnElement="BuildNote"><dc:Bounds x="510" y="78" width="110" height="80"/></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="S_Deliver" bpmnElement="Deliver"><dc:Bounds x="670" y="78" width="110" height="80"/></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="S_End" bpmnElement="End"><dc:Bounds x="830" y="100" width="36" height="36"/></bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="E_F1" bpmnElement="F1"><di:waypoint x="136" y="118"/><di:waypoint x="190" y="118"/></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="E_F2" bpmnElement="F2"><di:waypoint x="300" y="118"/><di:waypoint x="350" y="118"/></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="E_F3" bpmnElement="F3"><di:waypoint x="460" y="118"/><di:waypoint x="510" y="118"/></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="E_F4" bpmnElement="F4"><di:waypoint x="620" y="118"/><di:waypoint x="670" y="118"/></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="E_F5" bpmnElement="F5"><di:waypoint x="780" y="118"/><di:waypoint x="830" y="118"/></bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</bpmn:definitions>

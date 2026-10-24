@@ -259,7 +259,7 @@ async fn handle_post(
             | Ok(DispatchOutcome::DeadLettered { .. }) => StatusCode::ACCEPTED.into_response(),
             // Unreachable: `EngineHandle::dispatch` consumes every shard handoff on the
             // router side. Non-2xx so the subscription's retry policy re-delivers.
-            Ok(DispatchOutcome::Handoff { .. }) => {
+            Ok(DispatchOutcome::Handoff { .. } | DispatchOutcome::InlineCalls(_)) => {
                 StatusCode::INTERNAL_SERVER_ERROR.into_response()
             }
             Err(diagnostic) => problem_status(&diagnostic).into_response(),
@@ -365,7 +365,9 @@ fn settled_response(outcome: &DispatchOutcome) -> Response {
         DispatchOutcome::DeadLettered { .. } => decision_response(AckDecision::NackDrop),
         // Unreachable: `EngineHandle::dispatch_deferred` consumes every shard handoff on
         // the router side. Non-2xx so the subscription's retry policy re-delivers.
-        DispatchOutcome::Handoff { .. } => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        DispatchOutcome::Handoff { .. } | DispatchOutcome::InlineCalls(_) => {
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
     }
 }
 

@@ -374,6 +374,11 @@ pub struct ResolvedOutboundChannel {
     pub destination: String,
     pub mode: ReplyMode,
     pub auth_ref: Option<AuthRef>,
+    /// The channel declared `ack-mode: on-complete`: a channel-call on it is answered
+    /// SYNCHRONOUSLY (the dispatcher makes the call inline and resumes in memory) rather than
+    /// through the outbox and a correlated reply. Data only — the executor emits and parks a
+    /// sync call exactly like an async one.
+    pub sync: bool,
 }
 
 impl ResolvedOutboundChannel {
@@ -406,7 +411,14 @@ impl ResolvedOutboundChannel {
             destination: destination.to_string(),
             mode,
             auth_ref,
+            sync: false,
         }
+    }
+
+    /// Mark the channel synchronous (see [`Self::sync`]).
+    pub fn with_sync(mut self, sync: bool) -> ResolvedOutboundChannel {
+        self.sync = sync;
+        self
     }
 }
 

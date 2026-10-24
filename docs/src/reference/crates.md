@@ -9,8 +9,8 @@ nothing to do with workflow engines at all.
 
 ```toml
 [dependencies]
-sutra-feel = "0.4.0"
-sutra-dmn  = "0.4.0"   # depends on sutra-feel directly; use it alone if you only need DMN
+sutra-feel = "0.5.0"
+sutra-dmn  = "0.5.0"   # depends on sutra-feel directly; use it alone if you only need DMN
 ```
 
 ## `sutra-feel` — the FEEL expression language
@@ -87,6 +87,22 @@ persistence layer, the CLI — is Sutra-engine-internal: coupled to the engine's
 general-purpose crate. FEEL and DMN evaluation, by contrast, are useful on their own to anyone
 building rules or decision logic in Rust, independent of whether BPMN or Sutra is anywhere in the
 picture — so those two are published, versioned, and supported as standalone libraries.
+
+## The model-call crates
+
+Unpublished, and listed because they are the extension points behind the `llm` transport (see
+[Calling a language model](../building/llm-channels.md)):
+
+| Crate | What it is |
+|---|---|
+| `sutra-llm-spi` | The provider-neutral SPI: request, response and failure types, the `LlmProvider` trait, the registration each provider crate submits, and a shared JSON/SSE HTTP client. Names no provider. |
+| `sutra-llm-openai` | The Chat Completions adapter, serving `openai` and the compatible services (`google-gemini`, `mistral`, `deepseek`, `xai`, `kimi`, `meta-llama`) or any compatible server via `base-url`. Streaming and background jobs with webhooks. |
+| `sutra-llm-anthropic` | The Anthropic Messages API adapter. Streaming; jobs through Message Batches, polled. |
+| `sutra-llm-bedrock` | The Amazon Bedrock Converse API adapter (`aws-bedrock`), authenticated with a Bedrock API key. |
+| `sutra-transport-llm` | The `llm` transport: ordered candidates with fallback, capability filtering, sync and async calls, jobs, signed webhooks and SSE streaming. Names no provider. |
+
+`sutra-dist` links the three adapters behind the `llm-openai`, `llm-anthropic` and `llm-bedrock`
+features, all on by default.
 
 ## Next
 

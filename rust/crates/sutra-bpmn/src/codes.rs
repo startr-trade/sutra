@@ -68,6 +68,14 @@ pub const CONFIG_BPMN_RETRY_POLICY_INVALID: &str = "SUTRA.CONFIG.BPMN.RETRY_POLI
 /// not a task-level re-invocation), or a service task wrapped in loop characteristics / nested in
 /// a sub-process (neither can park the durable timer the retry wait needs).
 pub const CONFIG_BPMN_RETRY_NOT_APPLICABLE: &str = "SUTRA.CONFIG.BPMN.RETRY_NOT_APPLICABLE";
+
+// ---- q:stream (streamed channel-call answer) --------------------------------------------------
+
+/// `q:stream="true"` sits on a `<serviceTask>` whose implementation is not a `channel:` call.
+/// Only a channel-call task has a model answer to stream to the original caller.
+pub const CONFIG_BPMN_STREAM_NOT_CHANNEL_CALL: &str = "SUTRA.CONFIG.BPMN.STREAM.NOT_CHANNEL_CALL";
+/// `q:stream` is present but is not a boolean (`true` / `false`).
+pub const CONFIG_BPMN_STREAM_INVALID: &str = "SUTRA.CONFIG.BPMN.STREAM.INVALID";
 pub const CONFIG_COVERAGE_UNKNOWN_FLOW: &str = "SUTRA.CONFIG.COVERAGE.UNKNOWN_FLOW";
 pub const CONFIG_COVERAGE_INVALID_ROUTE: &str = "SUTRA.CONFIG.COVERAGE.INVALID_ROUTE";
 pub const CONFIG_COVERAGE_DUPLICATE_PATH: &str = "SUTRA.CONFIG.COVERAGE.DUPLICATE_PATH";

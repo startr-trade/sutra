@@ -417,3 +417,33 @@ fn a_thousand_register_then_complete_operations_settle_cleanly() {
     assert_eq!(acks.load(Ordering::SeqCst), 1000);
     assert_eq!(registry.pending_count(), 0);
 }
+
+#[test]
+fn only_an_explicit_on_complete_makes_an_outbound_channel_synchronous() {
+    let yaml = b"channels:
+  - name: plain-out
+    transport: http
+    direction: outbound
+    bind: https://svc.example/op
+  - name: sync-out
+    transport: http
+    direction: outbound
+    ack-mode: on-complete
+    bind: https://svc.example/op
+  - name: async-out
+    transport: http
+    direction: outbound
+    ack-mode: on-persist
+    bind: https://svc.example/op
+  - name: http-in
+    transport: http
+    auth-scheme: apikey
+";
+    let defs = load_channel_definitions(yaml, "t", "m", "1.0.0", "test.yaml").expect("loads");
+    let sync: Vec<bool> = defs.iter().map(|d| d.is_sync_outbound()).collect();
+    // The http per-transport default (on-complete) never turns an outbound channel synchronous.
+    assert_eq!(sync, vec![false, true, false, false]);
+    // …and the inbound default is untouched.
+    assert_eq!(defs[3].effective_ack_mode(), "on-complete");
+    assert_eq!(defs[0].effective_ack_mode(), "on-complete");
+}

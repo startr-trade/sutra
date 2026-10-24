@@ -6,3 +6,46 @@ channels:
     direction: outbound
     transport: http
     bind: "http://localhost:8080/callback"
+  - name: summarize
+    direction: outbound
+    transport: llm
+    bind: "llm://summarize"
+    ack-mode: on-complete
+    llm:
+      reply-channel: summarize-reply
+      system: "Summarize the ticket."
+      max-output-tokens: 512
+      temperature: 0
+      timeout-seconds: 60
+      concurrency: 4
+      fallback-on: [rate-limited, timeout]
+      require: [json-output]
+      candidates:
+        - provider: anthropic
+          model: model-a
+          api-key: secret:llm/very-private-path
+        - provider: openai
+          model: model-b
+          base-url: https://models.example.test/v1
+          api-key: env:LLM_PRIVATE_VAR
+  - name: summarize-async
+    direction: outbound
+    transport: llm
+    bind: "llm://summarize-async"
+    ack-mode: on-persist
+    llm:
+      mode: job
+      reply-channel: summarize-reply
+      candidates:
+        - provider: openai
+          model: model-c
+          completion: batch
+          callback-channel: summarize-callback
+          poll-interval-seconds: 30
+          job-timeout-seconds: 3600
+          callback-secret: vault:kv/hook-secret-path
+          api-key: literal-key-value-123
+  - name: summarize-callback
+    transport: http
+    callback-for: summarize-async
+    callback-secret: secret:hooks/cb-private

@@ -79,7 +79,7 @@ The engine, tooling, and libraries are a single Cargo workspace under `rust/`.
 curl -fsSL https://raw.githubusercontent.com/startr-trade/sutra/main/scripts/install.sh | sh
 
 # The engine — one generic image; behaviour comes from the packages you deploy into it
-docker pull ghcr.io/startr-trade/sutra:0.4.0
+docker pull ghcr.io/startr-trade/sutra:0.5.0
 ```
 
 **Runtimes:** the CLI is published for **linux x86_64/arm64**, **macOS x86_64/arm64** and

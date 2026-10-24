@@ -13,6 +13,91 @@ This is the changelog for the **Rust-native** engine (`rust/` workspace). It beg
 
 Nothing yet.
 
+## [0.5.0] — 2026-10-24
+
+A **minor** release: a process can call a language model, synchronously or asynchronously, and
+stream the answer to its caller. Model calls are ordinary channel calls, so they get `<q:timeout>`,
+`<q:retry>`, boundary events and correlation with no new BPMN element. One additive `q:` attribute
+(`q:stream`).
+
+### Added
+
+- **Sync and async outbound calls, chosen by the outbound channel's declared `ack-mode`.**
+  `on-complete` = **sync**: the call is made inline, its response is merged into the variables and the
+  flow continues — no park, no outbox row, no database write for the hop. Parallel branches' sync
+  calls are in flight together; responses are applied one at a time. Works on a start, on a relayed
+  turn, on a timer-driven pass and on a scheduled start. `on-persist` (the outbound default) =
+  **async**: outbox, durable park, the callback arrives on a declared inbound channel and resumes by
+  correlation. Only an explicitly declared `ack-mode` counts on an outbound channel, so no existing
+  channel changes behaviour.
+- **`InlineCaller`** SPI (`sutra-channels`, registered through `sutra-transport-spi`'s
+  `InlineCallerFactory`), implemented by the `llm` transport and by the `http` transport (sync REST).
+  A sync channel on a transport without one fails at load (`SUTRA.CHANNEL.SYNC_CALLER_MISSING`).
+- **The `llm` transport** (`sutra-transport-llm`): ordered model candidates with fallback on
+  rate-limit / outage / timeout, `require` capability filtering, `system`, `max-output-tokens`,
+  `temperature`, `timeout-seconds`, `concurrency`. Sync channels need no reply channel; async ones
+  deliver to `reply-channel` with the request echoed so `<q:alias>` can correlate on it.
+- **Provider-native async jobs** (`llm.mode: job`): submit and return at once; completion by
+  polling or by **signed webhooks** (served under `/llm/…`); a durable, row-claimed `llm_job` table.
+- **Streaming to the caller**: an inbound HTTP channel declaring `reply-stream: sse` streams a
+  `q:stream="true"` model call as `event: chunk` frames, then `event: reply` (or `event: error`, code
+  only); `event: reset` if a fallback candidate takes over mid-stream. Chunks are never logged.
+- **`q:stream`** attribute on `<bpmn:serviceTask>` (additive to the frozen `q:` namespace).
+- **A provider SPI** (`sutra-llm-spi`) — neutral request/response/failure types, optional
+  streaming, job and callback methods, a shared JSON/SSE HTTP client — held to the domain-neutrality
+  gate. **Providers:** `openai`, `anthropic`, `aws-bedrock` (Converse API, Bedrock API-key auth),
+  and through the Chat Completions adapter `google-gemini`, `mistral`, `deepseek`, `xai`, `kimi`,
+  `meta-llama`. Jobs: `openai` (background responses + webhooks), `anthropic` (Message Batches,
+  polled). Streaming: all except `aws-bedrock`. `sutra-dist` features `llm-openai`,
+  `llm-anthropic`, `llm-bedrock`, all in the default build.
+- **A relayed turn on an `on-complete` HTTP channel answers with that turn's reply**, so a
+  multi-turn conversation over HTTP gets each answer on its own request.
+- **`ReplySinkFactory`** hook in `sutra-transport-spi` for a sink that answers by re-entering the
+  engine; bare `<scheme>://<channel>` binds are qualified for it as for `local://`.
+- **Crash recovery for in-memory chains**: an `inflight_sync_chain` marker and a sweep release a
+  crashed chain's inbox-dedup rows and admission slot (`sutra.instance.inflight-chain-max-age`,
+  default PT15M). A failed chain releases its dedup row at once, so a client retry re-runs.
+- `sutra-docgen` documents `llm:` channels (secret references shown only by scheme).
+- Example package `examples/ai-summarize` (sync and async summaries against a stub model).
+
+### Changed
+
+- **A destination-less `<q:reply>` reached before a park now answers the request**, for a start
+  and for a relayed turn; previously only `continue="true"` did, and a start that replied then
+  parked returned `200` with an empty body.
+- `<q:alias>` is no longer required on a channel-call task by the BPMN loader; the deploy-time lint
+  requires it only when the target channel is async (same `ALIAS_REQUIRED` code).
+- An instance inside an in-memory sync chain holds its `max-concurrent-instances` slot from the
+  first call until the chain ends.
+- **A structured request or send body is sent as JSON.** A channel-call `requestBody`, and a
+  `<q:send>` / destination-bearing `<q:reply>` body, that is a FEEL context or list is now serialised as
+  JSON instead of FEEL's canonical text (`{a=1}`), which no counterpart could parse. String bodies
+  are unchanged.
+
+### Known limitations
+
+- Async held calls (`mode: call` on an `on-persist` channel) still hold the outbox's serial
+  delivery for the call's duration; use `mode: job` or a sync channel to avoid it.
+- A crash after a model answered but before the result was recorded can call the model again.
+- No token budget or rate limiter beyond `concurrency`; no IAM request signing for Bedrock;
+  broker-routed job callbacks and Bedrock/Gemini jobs are not implemented; broadcast fan-out keeps
+  sync calls on the async path. The `llm_job` and in-flight-marker stores are PostgreSQL-only.
+- A failed sync call without `<q:retry>` fails the instance rather than routing to a boundary.
+
+### Fixed
+
+- **Anthropic: a rejected `temperature` is retried once without it.** Newer Claude models reject
+  sampling parameters with HTTP 400 ("`temperature` is deprecated for this model"); a channel's
+  `temperature` is a preference, so the adapter drops it rather than failing the call.
+
+### Verified against real providers
+
+- `examples/ai-summarize` (sync, streamed, async) passed end to end against OpenAI
+  (`gpt-4o-mini`), Anthropic (`claude-haiku-5-5`) and Google Gemini (`gemini-2.5-flash`) on
+  2026-10-24; against OpenAI also cross-candidate fallback, JSON mode, tool calls, and an OpenAI
+  background job completed both by polling and by a signed webhook; and an Anthropic Message
+  Batches job (`mode: job`, polled) end to end.
+
 ## [0.4.0] — 2026-10-23
 
 A **minor** release: BPMN standard convergence. Where BPMN 2.0 already spells something the

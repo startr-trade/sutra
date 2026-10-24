@@ -207,6 +207,7 @@ async fn boot_n4(package_dir: PathBuf, datasource_url: &str) -> RunningEngine {
         instance_sweep: sutra_engine::StuckInstanceScannerConfig {
             interval: std::time::Duration::from_secs(1),
             claim_timeout: std::time::Duration::from_secs(2),
+            ..Default::default()
         },
         engine_shards: sutra_engine::EngineShardConfig {
             shards: 4,

@@ -11,6 +11,8 @@ use sutra_formats as _;
 
 #[path = "all/archive_negative.rs"]
 mod archive_negative;
+#[path = "all/lint_channel_call_alias_test.rs"]
+mod lint_channel_call_alias_test;
 #[path = "all/lint_navigation_test.rs"]
 mod lint_navigation_test;
 #[path = "all/lint_never_init_test.rs"]
@@ -21,6 +23,8 @@ mod lint_output_conformance_test;
 mod lint_selector_test;
 #[path = "all/lint_store_structure_test.rs"]
 mod lint_store_structure_test;
+#[path = "all/lint_stream_test.rs"]
+mod lint_stream_test;
 #[path = "all/lint_template_fields_test.rs"]
 mod lint_template_fields_test;
 #[path = "all/lint_transient_test.rs"]

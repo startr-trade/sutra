@@ -1,0 +1,100 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  SYNC model call. One HTTP request in, one HTTP response out, the model called in between.
+
+    startEvent (JSON ticket on `ticket`)
+      then BuildPrompt : data task (FEEL) — requestBody := { prompt, ticketId }
+      then Summarize   : channel-call task on `summarize-sync` (outbound ack-mode: on-complete)
+                         — the call is made inline; the model's `text` lands in `summary`
+      then BuildReply  : data task (FEEL) — responseObject := { ticketId, summary }
+      then End         : the HTTP caller receives responseObject (rendered by the json codec)
+
+  No park, no outbox row, no reply channel. If the model is slow the HTTP request is slow:
+  <q:timeout> bounds it.
+
+  THE REQUEST BODY. A channel-call task sends its `requestBody` variable. The llm transport reads
+  it as { prompt | messages, system, json, maxOutputTokens, temperature, tools }, so the prompt is
+  built here, in the diagram, versioned with the flow that uses it.
+-->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI"
+                  xmlns:dc="http://www.omg.org/spec/DD/20100524/DC"
+                  xmlns:di="http://www.omg.org/spec/DD/20100524/DI"
+                  xmlns:q="urn:sutra:q:1.0"
+                  id="Definitions_summarize_sync"
+                  targetNamespace="urn:sutra:module:ai-summarize:1.0.0">
+
+  <bpmn:process id="summarize-sync" name="Summarize a ticket (sync)" isExecutable="true">
+
+    <bpmn:extensionElements>
+      <q:variables>
+        <q:variable name="requestBody" type="object"/>   <!-- what the model channel is sent -->
+        <q:variable name="summary" type="string"/>       <!-- the model's text -->
+        <q:variable name="responseObject" type="object"/>  <!-- what the HTTP caller gets back -->
+      </q:variables>
+    </bpmn:extensionElements>
+
+    <bpmn:startEvent id="Start" name="Ticket received">
+      <bpmn:extensionElements>
+        <q:source channel="ticket"/>
+      </bpmn:extensionElements>
+      <bpmn:outgoing>F1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="F1" sourceRef="Start" targetRef="BuildPrompt"/>
+
+    <bpmn:serviceTask id="BuildPrompt" name="Build the prompt (FEEL)">
+      <bpmn:incoming>F1</bpmn:incoming><bpmn:outgoing>F2</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment>
+          <bpmn:from>{prompt: "Summarize this support ticket. Subject: " + payload.subject + ". Details: " + payload.description, ticketId: payload.ticketId}</bpmn:from>
+          <bpmn:to>requestBody</bpmn:to>
+        </bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F2" sourceRef="BuildPrompt" targetRef="Summarize"/>
+
+    <!-- The model call. The channel is sync (ack-mode: on-complete), so the answer is bound to
+         this task by construction and no <q:alias> is needed. -->
+    <bpmn:serviceTask id="Summarize" name="Ask the model (sync)" implementation="channel:summarize-sync">
+      <bpmn:extensionElements>
+        <q:timeout duration="PT45S"/>
+      </bpmn:extensionElements>
+      <bpmn:incoming>F2</bpmn:incoming><bpmn:outgoing>F3</bpmn:outgoing>
+      <!-- Only mapped variables land. The reply message carries text, finish, usage, model, ... -->
+      <bpmn:dataOutputAssociation>
+        <bpmn:assignment><bpmn:from>payload.text</bpmn:from><bpmn:to>summary</bpmn:to></bpmn:assignment>
+      </bpmn:dataOutputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F3" sourceRef="Summarize" targetRef="BuildReply"/>
+
+    <bpmn:serviceTask id="BuildReply" name="Build the reply (FEEL)">
+      <bpmn:extensionElements>
+        <q:reply mode="native" contentType="application/json"/>
+      </bpmn:extensionElements>
+      <bpmn:incoming>F3</bpmn:incoming><bpmn:outgoing>F4</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment>
+          <bpmn:from>{ticketId: payload.ticketId, summary: summary}</bpmn:from>
+          <bpmn:to>responseObject</bpmn:to>
+        </bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F4" sourceRef="BuildReply" targetRef="End"/>
+
+    <bpmn:endEvent id="End" name="Summary returned"><bpmn:incoming>F4</bpmn:incoming></bpmn:endEvent>
+  </bpmn:process>
+
+  <bpmndi:BPMNDiagram id="Diagram_summarize_sync">
+    <bpmndi:BPMNPlane id="Plane_summarize_sync" bpmnElement="summarize-sync">
+      <bpmndi:BPMNShape id="S_Start" bpmnElement="Start"><dc:Bounds x="100" y="100" width="36" height="36"/></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="S_BuildPrompt" bpmnElement="BuildPrompt"><dc:Bounds x="190" y="78" width="110" height="80"/></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="S_Summarize" bpmnElement="Summarize"><dc:Bounds x="350" y="78" width="110" height="80"/></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="S_BuildReply" bpmnElement="BuildReply"><dc:Bounds x="510" y="78" width="110" height="80"/></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="S_End" bpmnElement="End"><dc:Bounds x="670" y="100" width="36" height="36"/></bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="E_F1" bpmnElement="F1"><di:waypoint x="136" y="118"/><di:waypoint x="190" y="118"/></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="E_F2" bpmnElement="F2"><di:waypoint x="300" y="118"/><di:waypoint x="350" y="118"/></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="E_F3" bpmnElement="F3"><di:waypoint x="460" y="118"/><di:waypoint x="510" y="118"/></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="E_F4" bpmnElement="F4"><di:waypoint x="620" y="118"/><di:waypoint x="670" y="118"/></bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</bpmn:definitions>

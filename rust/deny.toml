@@ -34,6 +34,13 @@ unmaintained = "workspace"
 # ID is either dev/test-only (not in the shipped engine binary), has no fix available, or is
 # a tracked upgrade blocked upstream.
 ignore = [
+    # crypto-bigint 0.5.5 — SHIPPED via jsonwebtoken (rust_crypto) -> p256/p384 -> elliptic-curve
+    # 0.13. Timing variability in constant-time ops (published 2026-10-23; fix is 0.7.6). NO FIX
+    # reachable: jsonwebtoken 11.1.0 (latest) still pins elliptic-curve 0.13. Reachability: the EC
+    # curves are used only to VERIFY admin bearer JWTs (public-key operations over public data —
+    # no secret-dependent timing); the one production signer (sutra-envref-gcp) signs RS256 with
+    # RSA, not EC. Re-check when jsonwebtoken moves to elliptic-curve 0.14 / crypto-bigint 0.7.
+    "RUSTSEC-2026-0387",
     # (quick-xml RUSTSEC-2026-0194/-0195 removed — upgraded to 0.41.0, which fixes both.)
     # rsa 0.9.10 — SHIPPED via sqlx-mysql. Marvin timing side-channel (5.9 med). NO FIX
     # published upstream. Reachable only on the MySQL auth handshake over the (trusted) DB

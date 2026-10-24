@@ -353,6 +353,10 @@ pub enum Node {
         implementation: String,
         data_mapping: DataMapping,
         params: Vec<ParamBinding>,
+        /// `q:stream="true"` — marks a channel-call task whose synchronous model answer is
+        /// streamed to the original caller. Defaults to `false`; only ever `true` on a
+        /// `channel:`-prefixed implementation (the loader rejects it elsewhere).
+        stream: bool,
     },
     /// Declarative data task: a serviceTask with data associations and NO
     /// `@implementation` — its store reads / FEEL assignments / store writes ARE its behaviour.

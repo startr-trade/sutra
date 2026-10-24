@@ -2898,6 +2898,10 @@ fn dispatch_outcome_label(outcome: &sutra_channels::DispatchOutcome) -> serde_js
         sutra_channels::DispatchOutcome::Handoff { .. } => {
             serde_json::json!({ "kind": "Handoff" })
         }
+        // Unreachable for the same reason: the router drives a synchronous chain to its end.
+        sutra_channels::DispatchOutcome::InlineCalls(_) => {
+            serde_json::json!({ "kind": "InlineCalls" })
+        }
     }
 }
 

@@ -8,6 +8,7 @@
 
 [advisories]
 ignore = [
+    "RUSTSEC-2026-0387",  # crypto-bigint 0.5.5 timing (via jsonwebtoken EC verify only; no fix upstream)
     "RUSTSEC-2023-0071",  # rsa 0.9.10 Marvin timing (SHIPPED via sqlx-mysql; no fix; trusted DB link)
     "RUSTSEC-2026-0099",  # rustls-webpki 0.101.7 name-constraint (MSSQL/tiberius TLS; upstream-blocked)
     "RUSTSEC-2026-0098",  # rustls-webpki 0.101.7 URI name-constraint (MSSQL/tiberius TLS; upstream-blocked)

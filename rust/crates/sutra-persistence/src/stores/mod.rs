@@ -15,6 +15,7 @@ mod dead_letter;
 mod deployment_archive;
 mod external_task;
 mod inbox;
+mod inflight;
 mod instance;
 mod lease;
 mod outbox;
@@ -39,6 +40,7 @@ pub use deployment_archive::{
 };
 pub use external_task::{ExternalTaskRow, ExternalTaskStore, PgExternalTaskStore};
 pub use inbox::{InboxStore, PgInboxStore};
+pub use inflight::PgInflightChainStore;
 pub use instance::{
     InstanceFilter, InstanceState, InstanceStore, InstanceSummary, OwnedInstanceState,
     PgInstanceStore,

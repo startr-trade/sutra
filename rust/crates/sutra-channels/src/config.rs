@@ -152,6 +152,29 @@ impl ChannelDefinition {
             .is_some_and(|v| v.trim().eq_ignore_ascii_case("outbound"))
     }
 
+    /// A SYNCHRONOUS outbound channel: `direction: outbound` with an EXPLICITLY declared
+    /// `ack-mode: on-complete`. A channel-call on it is made inline and its response merged
+    /// without a durable park. Deliberately not [`Self::effective_ack_mode`]: that applies the
+    /// inbound per-transport default (`http` → `on-complete`), which must never turn an existing
+    /// outbound channel synchronous.
+    pub fn is_sync_outbound(&self) -> bool {
+        self.is_outbound()
+            && self
+                .properties
+                .get("ack-mode")
+                .is_some_and(|v| v.trim().eq_ignore_ascii_case("on-complete"))
+    }
+
+    /// The channel declares `reply-stream: sse`: a synchronous call marked `q:stream="true"`
+    /// in a flow answering this channel's request streams to the caller as server-sent
+    /// events. Meaningful only on an `http` channel with an `on-complete` ack (the lint
+    /// refuses it anywhere else).
+    pub fn wants_reply_stream_sse(&self) -> bool {
+        self.properties
+            .get("reply-stream")
+            .is_some_and(|v| v.trim().eq_ignore_ascii_case("sse"))
+    }
+
     /// Effective ack-mode, per the startup-orchestrator resolution — the per-transport
     /// default rule: the HTTP transport defaults `on-complete` (the synchronous
     /// request/reply contract); broker transports default `on-persist` (ack after

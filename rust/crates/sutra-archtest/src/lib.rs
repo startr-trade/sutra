@@ -54,6 +54,9 @@ pub const NEUTRAL_CORE_CRATES: &[&str] = &[
     // types carry no business standard. The concrete parsers live ABOVE it (sutra-formats,
     // sutra-codec-schema, sutra-codec-<standard>) and are excluded.
     "sutra-codec-spi",
+    // The model-provider SPI behind the `llm` transport — neutral types + trait; the provider
+    // adapters (`sutra-llm-<provider>`) live above it and are excluded like the transports.
+    "sutra-llm-spi",
 ];
 
 /// The assembly / binding-layer crates — domain-literal-free since the codec/format + transport

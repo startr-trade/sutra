@@ -276,6 +276,9 @@ pub async fn commit_step_with_timers_releasing(
     }
     let mut tx = begin_deployment_tx(pool, &step.deployment).await?;
     write_step_with_timers_in(&mut tx, step, timer_waits).await?;
+    // A synchronous-call chain's in-flight marker ends with the step that ends the chain.
+    crate::stores::PgInflightChainStore::clear_in(&mut tx, &step.deployment, step.instance_id)
+        .await?;
     if let Some(owner) = claim_owner {
         PgInstanceStore::release_in(&mut tx, &step.deployment, step.instance_id, owner).await?;
     }

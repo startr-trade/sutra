@@ -442,6 +442,28 @@ pub trait InstanceBridge {
     /// fails a parked call on the in-process notification alone — a wake without a poisoned
     /// row (a stale or misrouted prompt) must be a no-op. Default `false`: a bridge with no
     /// outbox knowledge can never validate a poison, so the wake safely does nothing.
+    /// Record that a synchronous-call chain is IN FLIGHT for `instance_id`, holding the
+    /// delivery's inbox dedup keys `(channel, key)`. Nothing else of the chain is persisted
+    /// until it ends, so this marker is what lets a recovery sweep release those keys (and an
+    /// admission slot) when the replica dies mid-chain. The durable implementation deletes it
+    /// inside every final step of the instance; [`Self::end_inline_chain`] covers the endings
+    /// that commit nothing. Default: a no-op (bridges with nothing to recover).
+    async fn begin_inline_chain(
+        &self,
+        deployment: &DeploymentId,
+        instance_id: &str,
+        dedup_keys: &[(String, String)],
+    ) -> Result<(), Diagnostic> {
+        let _ = (deployment, instance_id, dedup_keys);
+        Ok(())
+    }
+
+    /// Delete the in-flight marker of [`Self::begin_inline_chain`]. Idempotent and
+    /// best-effort: a marker left behind is released by the sweep. Default: a no-op.
+    async fn end_inline_chain(&self, deployment: &DeploymentId, instance_id: &str) {
+        let _ = (deployment, instance_id);
+    }
+
     async fn poisoned_call_emission_exists(
         &self,
         deployment: &DeploymentId,

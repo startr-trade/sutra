@@ -3308,6 +3308,24 @@ fn check_node_references(
         .iter()
         .map(|d| d.binding.channel_name.as_str())
         .collect();
+    // `reply-stream: sse` needs a connection held open for the answer: an http channel that
+    // answers on-complete.
+    for def in definitions {
+        if def.wants_reply_stream_sse()
+            && (def.transport.as_deref() != Some("http")
+                || !def.effective_ack_mode().eq_ignore_ascii_case("on-complete")
+                || def.is_outbound())
+        {
+            out.push(LintDiagnostic::error(
+                codes::CONFIG_STREAM_REPLY_STREAM_UNSUPPORTED,
+                format!(
+                    "deployment {dep_label}: channel '{}' declares reply-stream: sse, which only \
+                     an inbound http channel with ack-mode: on-complete can serve",
+                    def.binding.channel_name
+                ),
+            ));
+        }
+    }
     let mut seen = BTreeSet::new();
     for module in deployment.processes.values() {
         for process in module.processes() {
@@ -3317,9 +3335,42 @@ fn check_node_references(
             visit_nodes(process, &mut |owner, node| {
                 match node {
                     Node::ServiceTask {
-                        id, implementation, ..
+                        id,
+                        implementation,
+                        stream,
+                        ..
                     } => {
                         let implementation = implementation.trim();
+                        // `q:stream` streams a model answer made INLINE to the waiting caller:
+                        // only a synchronous `llm` channel-call can do that.
+                        if *stream {
+                            let target = implementation
+                                .strip_prefix(sutra_bpmn::model::CHANNEL_CALL_PREFIX)
+                                .and_then(|channel| {
+                                    definitions
+                                        .iter()
+                                        .find(|d| d.binding.channel_name == channel)
+                                });
+                            let sync_llm = target.is_some_and(|d| {
+                                d.is_sync_outbound() && d.transport.as_deref() == Some("llm")
+                            });
+                            if !sync_llm {
+                                out.push(
+                                    LintDiagnostic::error(
+                                        codes::CONFIG_STREAM_TARGET_NOT_SYNC_LLM,
+                                        format!(
+                                            "deployment {dep_label}: process '{}' task '{id}' \
+                                             declares q:stream=\"true\" but '{implementation}' \
+                                             is not a channel-call to a synchronous \
+                                             (ack-mode: on-complete) llm channel; only such a \
+                                             call's answer can stream to the caller",
+                                            process.id
+                                        ),
+                                    )
+                                    .at_node(&process.id, id),
+                                );
+                            }
+                        }
                         if is_template_implementation(implementation)
                             && !deployment.templates.contains_key(implementation)
                         {
@@ -3347,6 +3398,33 @@ fn check_node_references(
                                             "deployment {dep_label}: process '{}' channel-call \
                                              task '{id}' targets channel '{channel}', which \
                                              channels.yaml does not declare",
+                                            process.id
+                                        ),
+                                    )
+                                    .at_node(&process.id, id),
+                                );
+                            }
+                            // An ASYNC call's response resumes the instance by correlation, so
+                            // its park needs a declared `<q:alias>`; a synchronous call
+                            // (`ack-mode: on-complete`) is answered on its own connection.
+                            let sync = definitions
+                                .iter()
+                                .any(|d| d.binding.channel_name == channel && d.is_sync_outbound());
+                            if channel_names.contains(channel)
+                                && !sync
+                                && owner.bindings_for(id).aliases.is_empty()
+                            {
+                                out.push(
+                                    LintDiagnostic::error(
+                                        sutra_bpmn::codes::DISPATCH_CHANNEL_CALL_ALIAS_REQUIRED,
+                                        format!(
+                                            "deployment {dep_label}: process '{}' channel-call \
+                                             task '{id}' targets the asynchronous channel \
+                                             '{channel}' but declares no <q:alias>; the park is \
+                                             keyed by a DECLARED correlation alias — without \
+                                             one the correlated response could never resume the \
+                                             instance (declare ack-mode: on-complete on the \
+                                             channel to make the call synchronous instead)",
                                             process.id
                                         ),
                                     )

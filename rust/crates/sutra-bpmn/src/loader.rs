@@ -1417,6 +1417,26 @@ fn build_service_task(
         .and_then(|s| s.strip_suffix('}'))
         .unwrap_or(implementation)
         .to_string();
+    let stream = match st.attr(Some(Q_NS), "stream").map(str::trim) {
+        None | Some("false" | "0") => false,
+        Some("true" | "1") => true,
+        Some(other) => {
+            return Err(err(
+                codes::CONFIG_BPMN_STREAM_INVALID,
+                format!("serviceTask {id} q:stream '{other}' must be a boolean (true or false)"),
+            ));
+        }
+    };
+    if stream && !implementation.starts_with(CHANNEL_CALL_PREFIX) {
+        return Err(err(
+            codes::CONFIG_BPMN_STREAM_NOT_CHANNEL_CALL,
+            format!(
+                "serviceTask {id} declares q:stream=\"true\" but its implementation \
+                 '{implementation}' is not a channel call (channel:<name>); only a channel-call \
+                 task can stream its answer to the caller"
+            ),
+        ));
+    }
     Ok(Node::ServiceTask {
         id: id.clone(),
         name: non_blank(st.attr_or_empty("name")),
@@ -1427,6 +1447,7 @@ fn build_service_task(
             .get(&id)
             .cloned()
             .unwrap_or_default(),
+        stream,
     })
 }
 
@@ -3023,7 +3044,6 @@ fn synthesize_timeout_boundaries(
 
 /// Fail closed at load time on:
 /// - a channel-call task without a timer boundary (BPMN or `<q:timeout>`-synthesized),
-/// - a channel-call task without a declared `<q:alias>` (the park key),
 /// - a channel-call task wrapped in loop characteristics (cannot park mid-iteration),
 /// - a timer boundary attached to a host that can never be parked when it fires,
 /// - a `<q:timeout>` on anything but a channel-call service task,
@@ -3104,21 +3124,10 @@ fn validate_channel_calls_and_timers(
                         ),
                     ));
                 }
-                let has_alias = process_bindings
-                    .get(id)
-                    .map(|b| !b.aliases.is_empty())
-                    .unwrap_or(false);
-                if !has_alias {
-                    return Err(err(
-                        codes::DISPATCH_CHANNEL_CALL_ALIAS_REQUIRED,
-                        format!(
-                            "<serviceTask> '{id}' in process '{process_id}' is a channel-call \
-                             task but declares no <q:alias>; the park is keyed by a DECLARED \
-                             correlation alias — without one the \
-                             correlated response could never resume the instance."
-                        ),
-                    ));
-                }
+                // No `<q:alias>` requirement here: whether the call needs one depends on its
+                // channel (a synchronous call is answered on its own connection, an async one
+                // by correlation), which this loader cannot see — the deploy-time lint rules
+                // on it with the channels in hand.
             }
             Node::MultiInstance { id, inner, .. } | Node::StandardLoop { id, inner, .. } => {
                 if let Node::ServiceTask {

@@ -643,7 +643,25 @@ impl EngineConfig {
                     ConfigError(format!("sutra.instance.claim-timeout: '{raw}' — {e}"))
                 })?,
             },
+            inflight_chain_max_age: match value(
+                "sutra.instance.inflight-chain-max-age",
+                "SUTRA_INSTANCE_INFLIGHT_CHAIN_MAX_AGE",
+            )? {
+                None => instance_sweep_defaults.inflight_chain_max_age,
+                Some(raw) => parse_duration(&raw).map_err(|e| {
+                    ConfigError(format!(
+                        "sutra.instance.inflight-chain-max-age: '{raw}' — {e}"
+                    ))
+                })?,
+            },
         };
+        if instance_sweep.inflight_chain_max_age.is_zero() {
+            return Err(ConfigError(
+                "sutra.instance.inflight-chain-max-age must be positive (a zero age would \
+                 release the dedup rows of every chain while it is still in flight)"
+                    .to_string(),
+            ));
+        }
         if instance_sweep.interval.is_zero() {
             return Err(ConfigError(
                 "sutra.instance.sweep-interval must be positive (a zero interval would \

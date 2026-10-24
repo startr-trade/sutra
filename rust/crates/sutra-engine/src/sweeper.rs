@@ -36,7 +36,7 @@ use std::sync::Arc;
 
 use sqlx::PgPool;
 use sutra_channels::LeaderGate;
-use sutra_persistence::stores::{InstanceStore, PgInstanceStore};
+use sutra_persistence::stores::{InstanceStore, PgInflightChainStore, PgInstanceStore};
 use sutra_persistence::DeploymentId as PersistDeploymentId;
 use tracing::{debug, info, warn};
 
@@ -60,6 +60,11 @@ pub struct StuckInstanceScannerConfig {
     /// How long a claim survives without a heartbeat before the sweep clears it
     /// (`sutra.instance.claim-timeout`). Default `PT5M`.
     pub claim_timeout: std::time::Duration,
+    /// How old a synchronous-call chain's in-flight marker may grow before the sweep treats
+    /// its holder as gone and releases what it held (`sutra.instance.inflight-chain-max-age`).
+    /// Default `PT15M` — longer than any sensible `<q:timeout>` of a synchronous call, so a
+    /// live chain is never swept from under its holder.
+    pub inflight_chain_max_age: std::time::Duration,
 }
 
 impl Default for StuckInstanceScannerConfig {
@@ -67,6 +72,7 @@ impl Default for StuckInstanceScannerConfig {
         StuckInstanceScannerConfig {
             interval: std::time::Duration::from_secs(60),
             claim_timeout: std::time::Duration::from_secs(300),
+            inflight_chain_max_age: std::time::Duration::from_secs(900),
         }
     }
 }
@@ -75,6 +81,7 @@ impl Default for StuckInstanceScannerConfig {
 /// deployment activation flip is picked up without a restart), the leader gate and the knobs.
 pub struct StuckInstanceScanner {
     store: PgInstanceStore,
+    inflight: PgInflightChainStore,
     deployments: sutra_channels::LiveDeploymentSet,
     gate: Arc<dyn LeaderGate>,
     config: StuckInstanceScannerConfig,
@@ -89,6 +96,7 @@ impl StuckInstanceScanner {
         config: StuckInstanceScannerConfig,
     ) -> StuckInstanceScanner {
         StuckInstanceScanner {
+            inflight: PgInflightChainStore::new(pool.clone()),
             store: PgInstanceStore::new(pool),
             deployments,
             gate,
@@ -136,13 +144,57 @@ impl StuckInstanceScanner {
         swept
     }
 
-    /// Spawn the interval loop. Runs until aborted (`RunningEngine::shutdown` / `drain`).
+    /// Release the in-flight markers synchronous-call chains left behind: those held by an
+    /// earlier process on this host (it restarted, so they can never end), and those older than
+    /// `inflight_chain_max_age` whoever held them. Each releases its delivery's inbox dedup
+    /// rows — the client's retry then runs again — and the admission row of an instance that
+    /// never reached a stored row. Runs on EVERY replica, ungated, over every live deployment (each
+    /// pass is deployment-scoped, so row security holds): only this replica can tell its own
+    /// host's dead processes apart, and the release is idempotent.
+    pub async fn sweep_inflight_chains(&self) -> u64 {
+        let holder = sutra_channels::replica_id();
+        // `replica_id` is `<host>-<pid>-<rand>`; the host part is everything before the last
+        // two segments.
+        let host = holder.rsplitn(3, '-').nth(2).unwrap_or(holder).to_string();
+        let mut released = 0;
+        for deployment in self.deployments.snapshot() {
+            let Ok(dep) = PersistDeploymentId::new(deployment.value()) else {
+                continue;
+            };
+            match self
+                .inflight
+                .sweep(&dep, &host, holder, self.config.inflight_chain_max_age)
+                .await
+            {
+                Ok(0) => {}
+                Ok(count) => {
+                    info!(
+                        deployment = deployment.value(),
+                        released = count,
+                        max_age_s = self.config.inflight_chain_max_age.as_secs(),
+                        "released the in-flight markers of synchronous call chains whose \
+                         holder is gone (their deliveries can be retried)"
+                    );
+                    released += count;
+                }
+                Err(e) => {
+                    warn!(deployment = deployment.value(), error = %e,
+                          "in-flight chain sweep failed for deployment");
+                }
+            }
+        }
+        released
+    }
+
+    /// Spawn the interval loop. Runs until aborted (`RunningEngine::shutdown` / `drain`). The
+    /// first tick is immediate, so the in-flight chain sweep also runs at startup.
     pub fn spawn(self) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(self.config.interval);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 interval.tick().await;
+                self.sweep_inflight_chains().await;
                 if !self.gate.is_leading() {
                     continue;
                 }

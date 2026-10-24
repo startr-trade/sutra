@@ -1,0 +1,61 @@
+# Run the ai-summarize example locally: engine + PostgreSQL + a stub model server. Nothing to edit.
+#
+#   docker compose -f examples/ai-summarize/deploy/compose.yaml up -d
+#   sutra package examples/ai-summarize/deployments-src/default--ai-summarize--1.0.0 \
+#        --out examples/ai-summarize/deploy/deployments
+#
+# The engine watches ./deployments and activates the archive without a restart. The project name
+# is explicit so this stack can never collide with another one that would default to `deploy`.
+
+name: sutra-ai-summarize
+
+services:
+  engine:
+    image: ${SUTRA_ENGINE_IMAGE:-ghcr.io/startr-trade/sutra:0.5.0}
+    environment:
+      SUTRA_DEPLOYMENTS_DIR: /deployments
+      SUTRA_HTTP_PORT: "8080"
+      SUTRA_DATASOURCE_URL: postgres://engine-db:5432/sutra
+      # A plain login role, not the postgres superuser — see engine-db-init.sh.
+      SUTRA_DATASOURCE_USERNAME: ${ENGINE_DB_USER:-sutra_engine}
+      SUTRA_DATASOURCE_PASSWORD: ${ENGINE_DB_PASSWORD:-sutra-dev-only}
+
+      # What channels.yaml names by reference. Resolved by the ENGINE, in ITS environment.
+      SUMMARIZE_API_KEY: ${SUMMARIZE_API_KEY:-dev-only-summarize-key}
+      # Any non-empty value satisfies the stub. For a real provider, export a real key before
+      # `up` (and see the README for the two channel keys to change).
+      LLM_API_KEY: ${LLM_API_KEY:-stub-not-a-real-key}
+    volumes:
+      - ./deployments:/deployments:ro
+    ports:
+      # Dynamic host port, loopback only. `docker compose -f … port engine 8080` shows it.
+      - "127.0.0.1::8080"
+    depends_on:
+      engine-db:
+        condition: service_healthy
+      model-stub:
+        condition: service_started
+
+  # Answers /v1/chat/completions with a fixed completion; /sink logs what the async flow sends.
+  # Resolvable from the engine as http://model-stub:8000 (the base-url in channels.yaml).
+  model-stub:
+    image: python:3.12-alpine
+    command: ["python3", "/stub/model-stub.py", "8000"]
+    volumes:
+      - ../stub:/stub:ro
+
+  engine-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: sutra
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_BOOTSTRAP_PASSWORD:-bootstrap-dev-only}
+      ENGINE_DB_USER: ${ENGINE_DB_USER:-sutra_engine}
+      ENGINE_DB_PASSWORD: ${ENGINE_DB_PASSWORD:-sutra-dev-only}
+    volumes:
+      - ./engine-db-init.sh:/docker-entrypoint-initdb.d/10-engine-role.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d sutra"]
+      interval: 2s
+      timeout: 3s
+      retries: 30

@@ -867,3 +867,63 @@ fn multiple_q_elements_on_one_start_event_coexist() {
     assert_eq!(b.aliases.len(), 1);
     assert!(b.audit.is_some());
 }
+
+// ---- q:stream (streamed channel-call answer) ----------------------------------------------
+
+fn stream_process(implementation: &str, attr: &str) -> String {
+    // A channel call must declare a timeout and an alias; a registered task may not.
+    let timeout = if implementation.starts_with("channel:") {
+        r#"<bpmn:extensionElements><q:timeout duration="PT30S"/><q:alias name="k" expression="event.k"/></bpmn:extensionElements>"#
+    } else {
+        ""
+    };
+    format!(
+        r#"<?xml version="1.0"?>
+        <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                          xmlns:q="urn:sutra:q:1.0">
+          <bpmn:process id="p1">
+            <bpmn:startEvent id="S"/>
+            <bpmn:serviceTask id="T" implementation="{implementation}" {attr}>
+              {timeout}
+            </bpmn:serviceTask>
+            <bpmn:endEvent id="E"/>
+            <bpmn:sequenceFlow id="f1" sourceRef="S" targetRef="T"/>
+            <bpmn:sequenceFlow id="f2" sourceRef="T" targetRef="E"/>
+          </bpmn:process>
+        </bpmn:definitions>"#
+    )
+}
+
+fn stream_flag(implementation: &str, attr: &str) -> Result<bool, sutra_bpmn::SutraError> {
+    let m =
+        sutra_bpmn::BpmnModelLoader::new().load(stream_process(implementation, attr).as_bytes())?;
+    match m.process("p1").unwrap().node("T").unwrap() {
+        sutra_bpmn::Node::ServiceTask { stream, .. } => Ok(*stream),
+        other => panic!("expected ServiceTask, got {other:?}"),
+    }
+}
+
+#[test]
+fn q_stream_true_false_and_absent_parse_on_a_channel_call() {
+    assert!(stream_flag("channel:llm", r#"q:stream="true""#).unwrap());
+    assert!(!stream_flag("channel:llm", r#"q:stream="false""#).unwrap());
+    assert!(!stream_flag("channel:llm", "").unwrap());
+}
+
+#[test]
+fn q_stream_false_or_absent_is_fine_on_a_registered_task() {
+    assert!(!stream_flag("chargeCard", "").unwrap());
+    assert!(!stream_flag("chargeCard", r#"q:stream="false""#).unwrap());
+}
+
+#[test]
+fn q_stream_true_on_a_non_channel_call_is_rejected() {
+    let e = stream_flag("chargeCard", r#"q:stream="true""#).unwrap_err();
+    assert_eq!(e.code, "SUTRA.CONFIG.BPMN.STREAM.NOT_CHANNEL_CALL");
+}
+
+#[test]
+fn q_stream_non_boolean_is_rejected() {
+    let e = stream_flag("channel:llm", r#"q:stream="maybe""#).unwrap_err();
+    assert_eq!(e.code, "SUTRA.CONFIG.BPMN.STREAM.INVALID");
+}

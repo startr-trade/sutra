@@ -30,7 +30,9 @@ use sutra_channels::{
     StaticTenantConfigSource, ValidatorRegistry,
 };
 use sutra_persistence::stores::{PgChannelConcurrencyStore, PgInstanceStore};
-use sutra_transport_spi::{transport_factories, TransportChannels};
+use sutra_transport_spi::{
+    inline_caller_factories, reply_sink_factories, transport_factories, TransportChannels,
+};
 
 use crate::concurrency::{PersistedActiveInstanceCount, PersistedChannelConcurrency};
 use sutra_codec_schema::StructuralCodec;
@@ -605,6 +607,12 @@ pub(crate) fn build_engine_runtime(
         // scheme among the transports (uniform `send → channel`), registered DIRECTLY because
         // it holds the `EngineHandle` and re-enters `dispatch` off the actor thread.
         sinks.register(Arc::new(LocalDeliverySink::new(local_sink_handle.clone())));
+        // Request/reply transports whose sink answers by re-entering the engine — collected
+        // through the neutral `ReplySinkFactory` hook for the same reason `local` is registered
+        // here: they hold the `EngineHandle`.
+        for factory in reply_sink_factories() {
+            sinks.register((factory.build)(local_sink_handle.clone()));
+        }
         // The `pull` scheme: the delivery PARKS as a fetchable external task instead of being
         // dialed anywhere. Registered directly for the same reason `local` is — it holds engine
         // state (the row store + the long-poll notifier) the bare fn-ptr hook cannot carry.
@@ -838,9 +846,14 @@ pub(crate) fn allowed_transports() -> std::collections::BTreeSet<String> {
 ///
 /// Both schemes take the same grammar because they name the same thing: the inbound channel the
 /// hop is delivered to. `local://` delivers there immediately; `pull://` parks the delivery for
-/// a worker first and delivers its RESULT there instead.
+/// a worker first and delivers its RESULT there instead. A registered `ReplySinkFactory`
+/// scheme is qualified the same way, so its sink can address the reply to this deployment.
 pub(crate) fn expand_local_destination(destination: &str, module_key: &str) -> String {
-    for scheme in [LOCAL_TRANSPORT, PULL_TRANSPORT] {
+    let reply_schemes = reply_sink_factories().into_iter().map(|f| f.transport);
+    for scheme in [LOCAL_TRANSPORT, PULL_TRANSPORT]
+        .into_iter()
+        .chain(reply_schemes)
+    {
         let prefix = format!("{scheme}://");
         if let Some(target) = destination.strip_prefix(&prefix) {
             return if !target.is_empty() && !target.contains('/') {
@@ -928,6 +941,71 @@ fn rule_local_id(subpath: &str) -> String {
 /// runtime identity: the manifest-hash id for archive-sourced deployments, the
 /// legacy triple-derived shim id for tree-scanned ones — every binding, registry key and
 /// persistence row downstream keys on it opaquely.
+/// Every collected inline caller, by scheme — the registry the dispatcher makes synchronous
+/// outbound calls through.
+pub(crate) fn inline_callers() -> sutra_channels::InlineCallerRegistry {
+    let mut registry = sutra_channels::InlineCallerRegistry::new();
+    for factory in inline_caller_factories() {
+        registry.register((factory.build)());
+    }
+    registry
+}
+
+/// The load-time half of `SUTRA.CHANNEL.SYNC_CALL_DEGRADED`. A synchronous call is made inline
+/// on every pass something waits on — an inbound start or relay, a timer fire, a scheduled start
+/// — except a BROADCAST fan-out, which answers with its last handler's outcome and so cannot
+/// carry a chain per handler. A process with sync calls that starts from a broadcast channel
+/// will make them through the outbox and must then take the answers by correlation.
+fn warn_degraded_sync_calls(
+    dep: &DeploymentId,
+    modules: &[Arc<ProcessModule>],
+    outbound: &[ResolvedOutboundChannel],
+    definitions: &[ChannelDefinition],
+) {
+    let is_sync_call = |node: &sutra_bpmn::Node| match node {
+        sutra_bpmn::Node::ServiceTask { implementation, .. } => implementation
+            .strip_prefix(sutra_bpmn::model::CHANNEL_CALL_PREFIX)
+            .is_some_and(|c| outbound.iter().any(|o| o.sync && o.name == c.trim())),
+        _ => false,
+    };
+    let broadcast = |channel: &str| {
+        definitions
+            .iter()
+            .any(|d| d.binding.broadcast && d.binding.channel_name == channel)
+    };
+    for module in modules {
+        for process in module.processes() {
+            let sync_calls: Vec<&str> = process
+                .nodes()
+                .iter()
+                .filter(|n| is_sync_call(n))
+                .map(|n| n.id())
+                .collect();
+            if sync_calls.is_empty() {
+                continue;
+            }
+            let fanned_out = process.start_events().iter().any(|start| {
+                process
+                    .bindings_for(start.id())
+                    .source()
+                    .map(|source| source.channel.as_str())
+                    .is_some_and(broadcast)
+            });
+            if fanned_out {
+                warn!(
+                    code = sutra_channels::codes::CHANNEL_SYNC_CALL_DEGRADED,
+                    deployment = dep.value(),
+                    process = %process.id,
+                    calls = ?sync_calls,
+                    "process starts from a broadcast channel: a fan-out cannot carry a \
+                     synchronous call chain, so these calls go through the outbox and park for a \
+                     correlated response"
+                );
+            }
+        }
+    }
+}
+
 pub(crate) fn plan_deployment(
     d: &LoadedDeployment,
 ) -> Result<DeploymentPlan, Box<dyn std::error::Error>> {
@@ -1169,16 +1247,35 @@ pub(crate) fn plan_deployment(
         // already-qualified path is left as authored.
         let destination =
             expand_local_destination(&destination, &def.binding.namespace.module_key());
-        outbound.push(ResolvedOutboundChannel::resolve(
-            &name,
-            &transport,
-            &destination,
-            def.auth_scheme.as_deref(),
-            def.properties.get("secret-ref").map(|s| s.as_str()),
-            def.properties.get("header").map(|s| s.as_str()),
-            def.cloud_events_mode.as_deref().unwrap_or("none"),
-        ));
+        // A synchronous channel (`ack-mode: on-complete`) is made inline, so something must be
+        // able to make it: no inline caller for the scheme is a load error, never a silent
+        // fallback to the async path.
+        let sync = def.is_sync_outbound();
+        if sync && inline_callers().resolve(&destination).is_none() {
+            return Err(format!(
+                "[{}] Outbound channel '{name}' of deployment {dep} declares ack-mode: \
+                 on-complete (a synchronous call), but no transport in this engine can make \
+                 an inline call to its destination scheme ({raw_bind}); inline-capable \
+                 schemes: {:?}",
+                sutra_channels::codes::CHANNEL_SYNC_CALLER_MISSING,
+                inline_callers().schemes()
+            )
+            .into());
+        }
+        outbound.push(
+            ResolvedOutboundChannel::resolve(
+                &name,
+                &transport,
+                &destination,
+                def.auth_scheme.as_deref(),
+                def.properties.get("secret-ref").map(|s| s.as_str()),
+                def.properties.get("header").map(|s| s.as_str()),
+                def.cloud_events_mode.as_deref().unwrap_or("none"),
+            )
+            .with_sync(sync),
+        );
     }
+    warn_degraded_sync_calls(&dep, &modules, &outbound, &definitions);
 
     // Data stores — each store OWNS its connection (datastores.yaml, env-indirected).
     // Pre-cutover compat: INSERTs stamp the legacy namespace triple (see sutra-datastore).
@@ -1996,6 +2093,10 @@ pub(crate) fn build_engine(
     .with_concurrency_store(concurrency_store)
     // DRAINING scopes for relay correlation — pinned instances resume.
     .with_prior_deployments(prior_deployments)
+    // Synchronous outbound calls: every transport's inline caller, and the same secret
+    // resolution the outbox uses for the async path.
+    .with_inline_callers(inline_callers())
+    .with_inline_secret_env(|full_ref| crate::envref::resolve_value(full_ref).ok())
     // This engine's lane in the shard router (relay handoff decision + intake-id salt).
     .with_shard(shard)
     // …and its lane's §6.1 counters (park/resume/handoff/claim-bounce sites).

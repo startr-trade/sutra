@@ -240,6 +240,14 @@ pub mod codes {
     pub const INBOUND_CODEC_NOT_FOUND: &str = "SUTRA.INBOUND.CODEC_NOT_FOUND";
     pub const RESOLVE_TEMPLATE_UNKNOWN: &str = "SUTRA.RESOLVE.TEMPLATE.UNKNOWN";
     pub const CONFIG_CHANNEL_OUTBOUND_UNKNOWN: &str = "SUTRA.CONFIG.CHANNEL.OUTBOUND_UNKNOWN";
+    /// A `q:stream="true"` channel-call task whose target is not a synchronous
+    /// (`ack-mode: on-complete`) `transport: llm` channel — only a model answer made inline can
+    /// stream to the waiting caller.
+    pub const CONFIG_STREAM_TARGET_NOT_SYNC_LLM: &str = "SUTRA.CONFIG.STREAM.TARGET_NOT_SYNC_LLM";
+    /// `reply-stream: sse` on a channel that is not an `http` channel answering `on-complete`
+    /// — no other channel holds a connection a stream could be written to.
+    pub const CONFIG_STREAM_REPLY_STREAM_UNSUPPORTED: &str =
+        "SUTRA.CONFIG.STREAM.REPLY_STREAM_UNSUPPORTED";
     /// An outbound channel binds `local://<target>` (in-process routing), but `<target>` does
     /// not name a `transport: local` inbound channel of the SAME deployment — the in-process
     /// hop would dispatch to a channel that cannot receive it. Fail-closed at load.

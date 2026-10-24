@@ -14,6 +14,7 @@
 - [Concepts](building/concepts.md)
 - [Deployment packages](building/deployment-packages.md)
 - [Channels and transports](building/channels.md)
+- [Calling a language model](building/llm-channels.md)
 - [The q: namespace](building/q-namespace.md)
 - [Rules: DMN, FEEL, and .srl](building/rules.md)
 - [Data stores](building/data-stores.md)

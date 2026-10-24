@@ -18,6 +18,12 @@ use sutra_executor::{DeploymentId, Emission};
 pub trait InboxStore {
     /// Records the triple; `true` on first sight, `false` on a duplicate.
     async fn record_seen(&self, deployment: &DeploymentId, channel: &str, event_id: &str) -> bool;
+
+    /// Release a triple recorded by [`Self::record_seen`], so a redelivery of the same event runs
+    /// again. Called when an in-memory (synchronous-call) chain fails: nothing of it was
+    /// persisted, so keeping the dedup row would turn the client's retry into a silent
+    /// duplicate. Best-effort; the default is a no-op for stores that cannot release.
+    async fn forget(&self, _deployment: &DeploymentId, _channel: &str, _event_id: &str) {}
 }
 
 /// In-memory [`InboxStore`] (unbounded; tests / persistence-less hosts).
@@ -40,6 +46,14 @@ impl InboxStore for InMemoryInboxStore {
             channel.to_string(),
             event_id.to_string(),
         ))
+    }
+
+    async fn forget(&self, deployment: &DeploymentId, channel: &str, event_id: &str) {
+        self.seen.borrow_mut().remove(&(
+            deployment.value().to_string(),
+            channel.to_string(),
+            event_id.to_string(),
+        ));
     }
 }
 

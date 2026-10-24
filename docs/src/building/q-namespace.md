@@ -25,6 +25,7 @@ and the same XSD drives the `sutra-modeler-plugin` property panels.
 | `q:param` | `bpmn:serviceTask` | A scoped, per-invocation input to a registered task or template. |
 | `q:retry` | registered-task **and** channel-call `bpmn:serviceTask` | Per-task retry policy — attempts, backoff, non-retryable codes. |
 | `q:timeout` | channel-call `bpmn:serviceTask` | Synthesizes a timer boundary on the call. |
+| `q:stream` (attribute) | channel-call `bpmn:serviceTask` | `q:stream="true"` streams a synchronous model answer to the original caller. Default `false`. |
 | `q:store` | `bpmn:dataStoreReference` | Binds the reference to a durable key in a declared data store. |
 | `q:dispatch` / `q:case` | `bpmn:process` | Content-based dispatch to called elements. |
 | `q:variables` / `q:variable` | `bpmn:process` | Declared process variables — type or schema, `transient` / `sensitive` / `source`. |
@@ -289,6 +290,17 @@ Full treatment, including the re-drive's fresh-idempotency-key contract and what
 Synthesizes a timer boundary on the call, so a counterpart that never answers cannot park the
 instance forever. Without a `<q:retry>` alongside it, a fired route-less timeout is a catchable
 BPMN error; with one, it is a retryable task failure first.
+
+## `q:stream` — stream a channel-call answer
+
+`q:stream` is an optional boolean **attribute** (not an element) on a `bpmn:serviceTask`. Writing
+`q:stream="true"` on a channel-call task (`implementation="channel:<name>"`) marks it as one whose
+synchronous model answer should be streamed to the original caller, while the complete answer is
+still accumulated and resumes the flow as an ordinary response. It defaults to `false`, and omitting
+it changes nothing. Declaring it `true` on a task whose implementation is not a channel call fails
+the load with `SUTRA.CONFIG.BPMN.STREAM.NOT_CHANNEL_CALL`; a value that is not `true`/`false` fails
+with `SUTRA.CONFIG.BPMN.STREAM.INVALID`. The attribute is a backwards-compatible addition to the
+frozen `urn:sutra:q:1.0` namespace. See [Calling a language model](llm-channels.md#streaming-to-the-caller).
 
 ## `q:store` — durable, cross-instance data
 

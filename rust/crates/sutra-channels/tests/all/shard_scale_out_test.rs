@@ -507,6 +507,7 @@ fn resolved_resume(instance_id: &str) -> ResolvedResume {
         channel: "relay-in".to_string(),
         labels: BTreeMap::new(),
         traceparent: None,
+        reply_to: None,
     }
 }
 

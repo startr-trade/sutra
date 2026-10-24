@@ -479,3 +479,29 @@ async fn external_task_claims_and_counts_are_deployment_scoped_under_enforcing_r
         "the other deployment's parked task is untouched"
     );
 }
+
+/// The `llm` transport's `llm_job` rows (the V1401 addendum) are deployment-isolated like
+/// every other tenant table.
+#[ignore = "docker"]
+#[tokio::test]
+async fn llm_job_rows_are_deployment_scoped_under_enforcing_rls() {
+    let (pool, _) = fresh_pool_named().await;
+    let role = create_app_role(&pool, &["llm_job"]).await;
+    for (dep, job) in [(dep_a(), "job-a"), (dep_b(), "job-b")] {
+        sqlx::query(
+            "INSERT INTO llm_job (deployment_id, provider, provider_job_id, channel, \
+             candidate_index, tenant, module_key, reply_channel, request_body, outbox_key, \
+             poll_interval_seconds, next_poll_at, deadline_at) \
+             VALUES ($1, 'p', $2, 'ask', 0, 'acme', 'acme/m/1.0.0', 'answers', '\\x7b7d', $2, \
+             30, now(), now() + interval '1 day')",
+        )
+        .bind(dep.as_str())
+        .bind(job)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    assert_eq!(count_as(&pool, &role, Some(&dep_a()), "llm_job").await, 1);
+    assert_eq!(count_as(&pool, &role, Some(&dep_b()), "llm_job").await, 1);
+    assert_eq!(count_as(&pool, &role, None, "llm_job").await, 0);
+}

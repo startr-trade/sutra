@@ -11,6 +11,7 @@ mod deployment_archive;
 mod external_task;
 mod fixture;
 mod inbox;
+mod inflight;
 mod instance;
 mod instance_migration;
 mod lease;

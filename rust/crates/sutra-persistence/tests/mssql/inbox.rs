@@ -134,3 +134,14 @@ async fn concurrent_first_sight_exactly_one_winner() {
     }
     assert_eq!(winners, 1, "first-observer-wins admits exactly one");
 }
+
+#[ignore = "docker"]
+#[tokio::test]
+async fn forget_releases_one_dedup_row() {
+    let pool = fresh_pool().await;
+    let store = MssqlInboxStore::new(pool);
+    assert!(store.record_seen(&dep_a(), "in", "evt-1").await.unwrap());
+    assert!(store.forget(&dep_a(), "in", "evt-1").await.unwrap());
+    assert!(!store.forget(&dep_a(), "in", "evt-1").await.unwrap());
+    assert!(store.record_seen(&dep_a(), "in", "evt-1").await.unwrap());
+}

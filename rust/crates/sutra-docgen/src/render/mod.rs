@@ -3,6 +3,7 @@
 //! them (preserving hand-written manual notes below the sentinel), or diff them for `--check`.
 
 pub mod bpmn;
+pub mod channels;
 pub mod coverage;
 pub mod diagram;
 pub mod dmn;
@@ -466,7 +467,14 @@ fn render_yaml_page(input_root: &Path, rel: &str, kind: &str) -> Page {
     let title = format!("{kind} — `{}`", basename(rel));
     let content = match std::fs::read_to_string(input_root.join(rel)) {
         Ok(text) => match serde_yaml::from_str::<serde_yaml::Value>(&text) {
-            Ok(value) => wrap_page(&title, rel, &yaml_table::render_yaml_body(&value)),
+            Ok(value) => {
+                let body = if basename(rel) == "channels.yaml" {
+                    channels::render_channels_body(&value)
+                } else {
+                    yaml_table::render_yaml_body(&value)
+                };
+                wrap_page(&title, rel, &body)
+            }
             Err(e) => wrap_error_page(kind, rel, &anyhow::anyhow!(e)),
         },
         Err(e) => wrap_error_page(kind, rel, &anyhow::anyhow!(e)),

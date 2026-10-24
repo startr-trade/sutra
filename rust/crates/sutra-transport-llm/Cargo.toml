@@ -1,0 +1,37 @@
+[package]
+name = "sutra-transport-llm"
+description = "The `llm` request/reply transport: an outbound `llm://<channel>` call runs the channel's ordered candidate list (provider + model) through the provider SPI with capability filtering, class-based fallback, a per-channel concurrency cap and a whole-call deadline, then delivers the answer back into the engine as an inbound message on the channel's reply channel. Names no provider."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+sutra-channels = { path = "../sutra-channels" }
+sutra-transport-spi = { path = "../sutra-transport-spi" }
+sutra-llm-spi = { path = "../sutra-llm-spi" }
+inventory = "0.3.24"
+async-trait = { workspace = true }
+tracing = { workspace = true }
+serde_json = { workspace = true }
+# The channel property bag carries a YAML list as its YAML text; parsed back here.
+serde_yaml_ng = "0.10"
+time = { workspace = true }
+# The `llm_job` rows behind `llm.mode: job`. Same sqlx build as the rest of the tree so the
+# SPI's `PgPool` matches.
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "uuid"] }
+# `sync`: the per-channel concurrency semaphore + the poller stop signal; `time`: the call
+# deadline + the poller tick; `macros`: the poller's select.
+tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
+# The job-callback endpoint on the shared listener.
+axum = { version = "0.8", default-features = false }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "test-util"] }
+tower = { version = "0.5", features = ["util"] }
+# The docker-gated job-table tests: a postgres container migrated with the engine SQL.
+sutra-persistence = { path = "../sutra-persistence" }
+sutra-testkit = { path = "../sutra-testkit" }
+testcontainers = { version = "0.27", features = ["blocking"] }
+testcontainers-modules = { version = "0.15", features = ["postgres"] }
+tracing-subscriber = { version = "0.3", features = ["fmt"] }

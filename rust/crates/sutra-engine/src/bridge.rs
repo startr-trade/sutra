@@ -64,7 +64,7 @@ use sutra_persistence::step::{
 };
 use sutra_persistence::stores::{
     DeadLetterRow, InboxStore, InstanceStore, OutboxEntry, PgDeadLetterStore, PgInboxStore,
-    PgInstanceStore, PgOutboxStore, ReplyMode as PersistReplyMode,
+    PgInflightChainStore, PgInstanceStore, PgOutboxStore, ReplyMode as PersistReplyMode,
 };
 use sutra_persistence::{DeploymentId as PersistDeploymentId, PersistenceError};
 
@@ -597,6 +597,7 @@ impl InstanceBridge for PersistenceBridge {
             for entry in &entries {
                 PgOutboxStore::enqueue_in(&mut tx, entry).await?;
             }
+            PgInflightChainStore::clear_in(&mut tx, &dep, instance).await?;
             tx.commit()
                 .await
                 .map_err(PersistenceError::db("terminal step commit"))?;
@@ -760,6 +761,7 @@ impl InstanceBridge for PersistenceBridge {
             .execute(&mut *tx)
             .await
             .map_err(PersistenceError::db("failed-step wait resolveAll"))?;
+            PgInflightChainStore::clear_in(&mut tx, &dep, instance).await?;
             tx.commit()
                 .await
                 .map_err(PersistenceError::db("failed step commit"))?;
@@ -785,6 +787,33 @@ impl InstanceBridge for PersistenceBridge {
             );
         }
         Ok(())
+    }
+
+    async fn begin_inline_chain(
+        &self,
+        deployment: &sutra_executor::DeploymentId,
+        instance_id: &str,
+        dedup_keys: &[(String, String)],
+    ) -> Result<(), Diagnostic> {
+        let dep = persist_dep(deployment)?;
+        let instance = parse_instance(instance_id)?;
+        PgInflightChainStore::new(self.pool.clone())
+            .begin(&dep, instance, dedup_keys, sutra_channels::replica_id())
+            .await
+            .map_err(|e| persistence_diag("in-flight chain marker write failed", &e))
+    }
+
+    async fn end_inline_chain(&self, deployment: &sutra_executor::DeploymentId, instance_id: &str) {
+        let (Ok(dep), Ok(instance)) = (persist_dep(deployment), parse_instance(instance_id)) else {
+            return;
+        };
+        if let Err(e) = PgInflightChainStore::new(self.pool.clone())
+            .clear(&dep, instance)
+            .await
+        {
+            // The sweep releases it once its holder is gone or it ages out.
+            warn!(instance_id, error = %e, "in-flight chain marker delete failed");
+        }
     }
 
     async fn poisoned_call_emission_exists(
@@ -816,8 +845,16 @@ impl InstanceBridge for PersistenceBridge {
         // ONE deployment-scoped transaction — all rows, or none.
         async {
             let mut tx = begin_deployment_tx(&self.pool, &dep).await?;
+            let mut instances = Vec::new();
             for entry in &entries {
                 PgOutboxStore::enqueue_in(&mut tx, entry).await?;
+                if !instances.contains(&entry.instance_id) {
+                    instances.push(entry.instance_id);
+                }
+            }
+            // A synchronous-call chain that completes ends its in-flight marker here.
+            for instance in instances {
+                PgInflightChainStore::clear_in(&mut tx, &dep, instance).await?;
             }
             tx.commit()
                 .await
@@ -851,6 +888,21 @@ impl ChannelInboxStore for PersistenceBridge {
                 warn!(channel, event_id, error = %e, "inbox dedup failed — proceeding (fail-open)");
                 true
             }
+        }
+    }
+    async fn forget(
+        &self,
+        deployment: &sutra_executor::DeploymentId,
+        channel: &str,
+        event_id: &str,
+    ) {
+        let Ok(dep) = PersistDeploymentId::new(deployment.value()) else {
+            return;
+        };
+        if let Err(e) = self.inbox.forget(&dep, channel, event_id).await {
+            // The row then keeps suppressing a redelivery until it is pruned — the same
+            // outcome as a crash mid-chain; logged so the stuck key is findable.
+            warn!(channel, event_id, error = %e, "inbox dedup release failed");
         }
     }
 }

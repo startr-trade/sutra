@@ -23,6 +23,9 @@ const SQL_INSERT: &str = "INSERT INTO inbox_seen (deployment_id, channel, event_
 
 const SQL_PRUNE: &str = "DELETE FROM inbox_seen WHERE seen_at < ?";
 
+const SQL_FORGET: &str =
+    "DELETE FROM inbox_seen WHERE deployment_id = ? AND channel = ? AND event_id = ?";
+
 impl MySqlInboxStore {
     /// Wraps a connection pool.
     pub fn new(pool: MySqlPool) -> Self {
@@ -66,6 +69,23 @@ impl InboxStore for MySqlInboxStore {
             .await
             .map_err(PersistenceError::db("inbox recordSeen acquire"))?;
         Self::record_seen_in(&mut conn, deployment, channel, event_id).await
+    }
+
+    async fn forget(
+        &self,
+        deployment: &DeploymentId,
+        channel: &str,
+        event_id: &str,
+    ) -> Result<bool> {
+        let removed = sqlx::query(SQL_FORGET)
+            .bind(deployment.as_str())
+            .bind(channel)
+            .bind(event_id)
+            .execute(&self.pool)
+            .await
+            .map_err(PersistenceError::db("inbox forget"))?
+            .rows_affected();
+        Ok(removed == 1)
     }
 
     async fn prune_older_than(&self, age: std::time::Duration) -> Result<u64> {

@@ -17,6 +17,8 @@ mod deferred_ack_test;
 mod dispatcher_policy_test;
 #[path = "all/http_it_test.rs"]
 mod http_it_test;
+#[path = "all/inline_call_test.rs"]
+mod inline_call_test;
 #[path = "all/intake_test.rs"]
 mod intake_test;
 #[path = "all/outbound_validation_test.rs"]

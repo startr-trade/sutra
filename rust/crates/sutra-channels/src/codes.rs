@@ -12,6 +12,15 @@ pub const CHANNEL_AUTH_MISSING_SCHEME: &str = "SUTRA.CHANNEL.AUTH.MISSING_SCHEME
 pub const CHANNEL_AUTH_SCHEME_INVALID: &str = "SUTRA.CHANNEL.AUTH.SCHEME_INVALID";
 pub const CHANNEL_NAME_COLLISION: &str = "SUTRA.CHANNEL.NAME.COLLISION";
 pub const CHANNEL_TRANSPORT_UNKNOWN: &str = "SUTRA.CHANNEL.TRANSPORT.UNKNOWN";
+/// A call on a synchronous outbound channel (`ack-mode: on-complete`) was reached by a pass that
+/// cannot carry an in-memory chain — a broadcast fan-out, or a resume driven by an outbox poison
+/// wake — so it takes the async path instead: outbox delivery, durable park, correlated
+/// response. Warned at load for a process that starts from a broadcast channel, and logged again
+/// each time it happens.
+pub const CHANNEL_SYNC_CALL_DEGRADED: &str = "SUTRA.CHANNEL.SYNC_CALL_DEGRADED";
+/// A synchronous outbound channel's destination scheme has no inline caller in this engine build
+/// — a load-time error, never a silent fallback to the async path.
+pub const CHANNEL_SYNC_CALLER_MISSING: &str = "SUTRA.CHANNEL.SYNC_CALLER_MISSING";
 
 pub const INBOUND_REJECTED_AUTH: &str = "SUTRA.INBOUND.REJECTED.AUTH";
 pub const INBOUND_REJECTED_TENANT_CHANNEL_NOT_ALLOWED: &str =

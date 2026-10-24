@@ -16,6 +16,8 @@
 //! so it stays neutral and is always force-linked into the binary (never an optional bundle).
 #![forbid(unsafe_code)]
 
+pub mod inline;
+
 use std::sync::Arc;
 
 use axum::Router;
@@ -24,7 +26,9 @@ use sutra_channels::{
     http_routes_of_resolved, ChannelDefinition, ChannelRouteTable, Diagnostic, HttpSink,
     SinkRegistry,
 };
-use sutra_transport_spi::{EnvRefResolver, TransportChannels, TransportFactory};
+use sutra_transport_spi::{
+    EnvRefResolver, InlineCallerFactory, TransportChannels, TransportFactory,
+};
 use tracing::warn;
 
 /// The `transport:` discriminator this transport binds (the HTTP channel default scheme).
@@ -150,5 +154,16 @@ inventory::submit! {
         // IS the ack (its per-transport DEFAULT, no deferred-ack registry involved) — so
         // the neutral ON_COMPLETE_UNSUPPORTED assembly scan never flags an HTTP channel.
         handles_on_complete: true,
+    }
+}
+
+fn build_inline() -> Arc<dyn sutra_channels::InlineCaller> {
+    Arc::new(inline::HttpInlineCaller::new())
+}
+
+inventory::submit! {
+    InlineCallerFactory {
+        transport: TRANSPORT,
+        build: build_inline,
     }
 }

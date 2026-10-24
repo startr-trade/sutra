@@ -411,10 +411,10 @@ fn channel_call_without_timer_or_timeout_is_a_load_time_error() {
 }
 
 #[test]
-fn channel_call_without_declared_alias_is_a_load_time_error() {
-    // The park key is a DECLARED <q:alias>.
-    let e = load(&call_process(r#"<q:timeout duration="PT30S"/>"#, "")).unwrap_err();
-    assert_eq!(e.code, "SUTRA.DISPATCH.CHANNEL_CALL.ALIAS_REQUIRED", "{e}");
+fn channel_call_without_declared_alias_loads() {
+    // Whether a call needs a correlation alias depends on its channel (a synchronous call
+    // needs none), which the loader cannot see; the deploy-time lint enforces it per channel.
+    load(&call_process(r#"<q:timeout duration="PT30S"/>"#, "")).expect("loads without an alias");
 }
 
 #[test]

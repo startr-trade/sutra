@@ -1,0 +1,15 @@
+[package]
+name = "sutra-llm-bedrock"
+description = "The Amazon Bedrock Converse API adapter for the `llm` transport: an LlmProvider registered through the model-provider SPI."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+sutra-llm-spi = { path = "../sutra-llm-spi" }
+inventory = "0.3.24"
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util"] }

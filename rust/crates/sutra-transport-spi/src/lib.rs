@@ -102,3 +102,50 @@ pub fn transport_factories() -> Vec<&'static TransportFactory> {
     factories.sort_by_key(|f| f.transport);
     factories
 }
+
+/// A transport whose outbound sink ANSWERS by re-entering the engine — a request/reply
+/// exchange whose reply is delivered back as an inbound message, the way the in-process
+/// `local` sink does. The bare [`TransportFactory::register_sink`] fn-ptr has no engine
+/// access, so such a transport additionally `inventory::submit!`s one of these; the engine
+/// assembly registers every collected sink with the engine handle, naming none.
+///
+/// The `transport` value doubles as the sink's URI scheme: a bare `<transport>://<channel>`
+/// outbound bind is qualified to `<transport>://<module_key>/<channel>` at load, exactly
+/// as `local://` is, so the sink can address the reply to the owning deployment.
+pub struct ReplySinkFactory {
+    /// The `transport:` value (and URI scheme) this sink serves.
+    pub transport: &'static str,
+    /// Build the sink around the engine handle it re-enters through.
+    pub build: fn(EngineHandle) -> Arc<dyn sutra_channels::MessageSink>,
+}
+
+inventory::collect!(ReplySinkFactory);
+
+/// Every registered [`ReplySinkFactory`], sorted by `transport` for deterministic wiring.
+pub fn reply_sink_factories() -> Vec<&'static ReplySinkFactory> {
+    let mut factories: Vec<&'static ReplySinkFactory> =
+        inventory::iter::<ReplySinkFactory>.into_iter().collect();
+    factories.sort_by_key(|f| f.transport);
+    factories
+}
+
+/// A transport that can answer an outbound call SYNCHRONOUSLY (an outbound channel declaring
+/// `ack-mode: on-complete`): the response is merged into the flow without a durable park. The
+/// engine assembly registers every collected caller into the dispatcher's
+/// [`sutra_channels::InlineCallerRegistry`], naming none; a sync outbound channel whose scheme
+/// has no caller is a load-time error.
+pub struct InlineCallerFactory {
+    /// The `transport:` value this caller serves.
+    pub transport: &'static str,
+    pub build: fn() -> Arc<dyn sutra_channels::InlineCaller>,
+}
+
+inventory::collect!(InlineCallerFactory);
+
+/// Every registered [`InlineCallerFactory`], sorted by `transport`.
+pub fn inline_caller_factories() -> Vec<&'static InlineCallerFactory> {
+    let mut factories: Vec<&'static InlineCallerFactory> =
+        inventory::iter::<InlineCallerFactory>.into_iter().collect();
+    factories.sort_by_key(|f| f.transport);
+    factories
+}

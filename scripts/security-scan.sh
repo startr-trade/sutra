@@ -31,11 +31,11 @@ cache=${XDG_CACHE_HOME:-$HOME/.cache}
 scratch=()
 cleanup() { [ ${#scratch[@]} -eq 0 ] || rm -rf "${scratch[@]}"; }
 trap cleanup EXIT
+# Sets $scratch_dir. Called directly, never as `$(new_scratch)`: a command substitution runs in
+# a subshell, so the registration would be lost and the EXIT trap would never remove the dir.
 new_scratch() {
-    local dir
-    dir=$(mktemp -d)
-    scratch+=("$dir")
-    echo "$dir"
+    scratch_dir=$(mktemp -d)
+    scratch+=("$scratch_dir")
 }
 
 # What a fresh checkout would contain (tracked files, plus untracked ones git does not ignore),
@@ -54,7 +54,7 @@ trivy() {
 
 scan_deps() {
     local tree
-    tree=$(new_scratch)
+    new_scratch; tree=$scratch_dir
     checkout_copy "$tree"
     trivy -v "$tree:/src:ro" -w /src "aquasec/trivy:$TRIVY_VERSION" fs \
         --severity "$SEVERITY" --ignorefile .trivyignore.yaml --exit-code 1 .
@@ -85,7 +85,7 @@ codeql_cli() {
 scan_codeql() {
     local codeql work sarif count
     codeql=$(codeql_cli)
-    work=$(new_scratch)
+    new_scratch; work=$scratch_dir
     mkdir -p "$work/src" "$root/rust/target/codeql"
     sarif="$root/rust/target/codeql/rust.sarif"
     checkout_copy "$work/src"

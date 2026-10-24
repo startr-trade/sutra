@@ -17,4 +17,12 @@ tracing = { workspace = true }
 # uses neither a datasource nor a spawn runtime. Same sqlx build as the rest of the tree so
 # the `PgPool` type matches the SPI's `TransportSpawn` fn-pointer type.
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "uuid"] }
-tokio = { version = "1", features = ["rt"] }
+tokio = { version = "1", features = ["rt", "time"] }
+# The inline (request/response) caller — same hyper stack as the outbound sink in sutra-channels.
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "native-tokio", "ring", "tls12"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }

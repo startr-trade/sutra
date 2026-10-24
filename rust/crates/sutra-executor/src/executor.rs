@@ -215,6 +215,12 @@ pub struct Builder {
 }
 
 impl TokenExecutor {
+    /// The declared outbound channels a channel-call resolves against — read by the dispatcher
+    /// to tell a synchronous call ([`crate::ResolvedOutboundChannel::sync`]) from an async one.
+    pub fn outbound_channels(&self) -> &crate::registry::OutboundChannelRegistry {
+        &self.outbound_channels
+    }
+
     pub fn builder(tasks: TaskRegistry) -> Builder {
         Builder {
             executor: TokenExecutor {
@@ -4829,6 +4835,9 @@ fn apply_task_outputs(
 /// `requestBody` → `responseBody` → `responseObject` → `payload.body`. Mirrors the reply
 /// extraction precedence with `requestBody` in front (the natural channel-call name; a
 /// template task upstream typically produced it via `<q:output variable>`).
+/// A channel-call request body. A string is sent as written; a structured value (context, list,
+/// number, …) is sent as JSON — the wire form every structured counterpart parses — rather than
+/// FEEL's canonical text.
 fn channel_call_body(vars: &Variables) -> Vec<u8> {
     let body = vars
         .get("requestBody")
@@ -4843,12 +4852,14 @@ fn channel_call_body(vars: &Variables) -> Vec<u8> {
     match body {
         None | Some(FeelValue::Null) => Vec::new(),
         Some(FeelValue::String(s)) => s.into_bytes(),
-        Some(other) => sutra_feel::value::canonical_string_of(&other).into_bytes(),
+        Some(other) => crate::variables::feel_to_json(&other)
+            .to_string()
+            .into_bytes(),
     }
 }
 
 /// The reply body: prefer the flow's PRODUCED reply (`responseBody`/`responseObject`) over
-/// the INBOUND `payload.body`.
+/// the INBOUND `payload.body`. A structured value is sent as JSON, like a channel-call body.
 fn extract_reply_body(state: &ExecutionState<'_>) -> Vec<u8> {
     let ctx = state.ctx.borrow();
     let vars = &ctx.variables;
@@ -4864,7 +4875,9 @@ fn extract_reply_body(state: &ExecutionState<'_>) -> Vec<u8> {
     match body {
         None | Some(FeelValue::Null) => Vec::new(),
         Some(FeelValue::String(s)) => s.into_bytes(),
-        Some(other) => sutra_feel::value::canonical_string_of(&other).into_bytes(),
+        Some(other) => crate::variables::feel_to_json(&other)
+            .to_string()
+            .into_bytes(),
     }
 }
 

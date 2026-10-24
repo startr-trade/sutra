@@ -259,6 +259,38 @@ fn channels_and_package_yaml_render_as_tables() {
 }
 
 #[test]
+fn llm_channels_render_tables_and_never_leak_secrets() {
+    let tree = discover::discover(&fixture_root()).unwrap();
+    let pages = render::generate_pages(&tree);
+    let c = &find(&pages, "acme--mini-package--1.0.0/channels.md").content;
+
+    assert!(c.contains("### LLM — `summarize`"));
+    assert!(c.contains("| `reply-channel` | summarize-reply |"));
+    assert!(c.contains("| `fallback-on` | rate-limited, timeout |"));
+    assert!(c.contains("| # | Provider | Model | Endpoint override | Completion | API key |"));
+    assert!(c.contains("| 1 | anthropic | model-a |  |  | `secret:…` |"));
+    assert!(c.contains("| 2 | openai | model-b | https://models.example.test/v1 |  | `env:…` |"));
+    assert!(c.contains("### LLM — `summarize-async`"));
+    assert!(c.contains("| `mode` | job |"));
+    assert!(c.contains("batch"));
+    assert!(c.contains("`vault:…`"));
+    assert!(c.contains("`(literal — hidden)`"));
+    assert!(c.contains("| `summarize` | sync (on-complete) |"));
+    assert!(c.contains("| `summarize-async` | async (on-persist) |"));
+    assert!(c.contains("| `callback-for` | summarize-async |"));
+
+    for secret in [
+        "very-private-path",
+        "LLM_PRIVATE_VAR",
+        "hook-secret-path",
+        "literal-key-value-123",
+        "cb-private",
+    ] {
+        assert!(!c.contains(secret), "secret text leaked: {secret}");
+    }
+}
+
+#[test]
 fn coverage_file_renders_as_first_class_page_with_correlations_and_routes() {
     let tree = discover::discover(&fixture_root()).unwrap();
     let pages = render::generate_pages(&tree);

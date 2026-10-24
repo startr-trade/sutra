@@ -221,6 +221,8 @@ async fn fire_schedule(
                 "timer start fired"
             );
         }
+        // Unreachable: `EngineHandle::start_scheduled` drives a synchronous chain to its end.
+        Ok(ScheduledStartOutcome::InlineCalls(_)) => {}
         Ok(ScheduledStartOutcome::Stale) => {
             // The row outlived its model (process or start node gone, or no longer
             // timer-triggered). Resolve it so it stops claiming a slot every tick.
@@ -366,6 +368,8 @@ async fn fire_one(
             );
             // The resume step resolved the TIMER row atomically — nothing else to do.
         }
+        // Unreachable: `EngineHandle::fire_timer` drives a synchronous chain to its end.
+        Ok(TimerFireOutcome::InlineCalls(_)) => {}
         Ok(TimerFireOutcome::Stale) => {
             // The row outlived its instance/frontier — resolve it so it stops firing.
             if let Err(e) = store

@@ -42,6 +42,7 @@ pub mod cloudevents;
 pub mod codes;
 pub mod config;
 pub mod diag;
+pub mod inline;
 pub mod intake;
 pub mod policy;
 pub mod redaction;
@@ -62,6 +63,8 @@ pub mod external_task;
 pub mod http;
 #[cfg(feature = "transport")]
 pub mod http_sink;
+#[cfg(feature = "transport")]
+pub mod inline_chain;
 #[cfg(feature = "transport")]
 pub mod outbox_dispatch;
 #[cfg(feature = "transport")]
@@ -92,8 +95,9 @@ pub use diag::Diagnostic;
 #[cfg(feature = "transport")]
 pub use dispatch::{
     ChannelCallPoisonFire, ChannelCallPoisonOutcome, ChannelEngine, DeferredDispatch,
-    DispatchOutcome, InboundMessage, ResolvedResume, ScheduledStartFire, ScheduledStartOutcome,
-    SyncReply, TimerFireOutcome, ACK_DISPOSITION_ATTR, ACK_DISPOSITION_REQUEUE, SCHEDULE_CHANNEL,
+    DispatchOutcome, InboundMessage, InlineChain, RelayReplyContext, ResolvedResume,
+    ScheduledStartFire, ScheduledStartOutcome, SyncReply, TimerFireOutcome, ACK_DISPOSITION_ATTR,
+    ACK_DISPOSITION_REQUEUE, SCHEDULE_CHANNEL,
 };
 #[cfg(feature = "transport")]
 pub use external_task::{
@@ -109,6 +113,11 @@ pub use http::{
 };
 #[cfg(feature = "transport")]
 pub use http_sink::HttpSink;
+pub use inline::{
+    InlineCaller, InlineCallerRegistry, InlineChunk, InlineChunkSink, InlineFailure, InlineResponse,
+};
+#[cfg(feature = "transport")]
+pub use inline_chain::{InlineHandoff, StreamFrame};
 pub use intake::{InboundChain, IntakeOutcome};
 #[cfg(feature = "transport")]
 pub use outbox_dispatch::{

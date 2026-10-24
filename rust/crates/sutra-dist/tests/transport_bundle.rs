@@ -11,6 +11,12 @@
 
 // Force-link every ENABLED transport so its `inventory::submit! TransportFactory` is present in
 // THIS test binary (a test binary links only the engine lib; the binary force-links in main.rs).
+#[cfg(feature = "llm-anthropic")]
+use sutra_llm_anthropic as _;
+#[cfg(feature = "llm-bedrock")]
+use sutra_llm_bedrock as _;
+#[cfg(feature = "llm-openai")]
+use sutra_llm_openai as _;
 #[cfg(feature = "amqp")]
 use sutra_transport_amqp as _;
 #[cfg(feature = "dapr")]
@@ -25,6 +31,8 @@ use sutra_transport_http as _;
 use sutra_transport_kafka as _;
 #[cfg(feature = "knative")]
 use sutra_transport_knative as _;
+#[cfg(feature = "llm")]
+use sutra_transport_llm as _;
 #[cfg(feature = "rabbitmq")]
 use sutra_transport_rabbitmq as _;
 #[cfg(feature = "aws-sqs")]
@@ -55,6 +63,8 @@ fn transport_factories_bundles_every_enabled_transport() {
     expected.push("kafka");
     #[cfg(feature = "knative")]
     expected.push("knative");
+    #[cfg(feature = "llm")]
+    expected.push("llm");
     #[cfg(feature = "rabbitmq")]
     expected.push("rabbitmq");
     expected.sort_unstable();
@@ -95,4 +105,40 @@ fn broker_sinks_share_the_outbox_key_carrier_string() {
         sutra_transport_amqp::PROPERTY_OUTBOX_KEY,
         sutra_transport_kafka::HEADER_OUTBOX_KEY
     );
+}
+
+/// The `llm` transport answers through the engine-handle-holding `ReplySinkFactory` hook, and
+/// each enabled provider adapter registers its `LlmProviderFactory` — a dropped force-link would
+/// leave every channel naming that provider failing at load.
+#[cfg(feature = "llm")]
+#[test]
+#[allow(clippy::vec_init_then_push)] // the pushes are cfg-gated
+fn llm_bundle_registers_its_reply_sink_and_every_enabled_provider() {
+    let reply: Vec<&str> = sutra_transport_spi::reply_sink_factories()
+        .iter()
+        .map(|f| f.transport)
+        .collect();
+    assert_eq!(reply, vec!["llm"]);
+
+    let mut expected: Vec<&str> = Vec::new();
+    #[cfg(feature = "llm-anthropic")]
+    expected.push("anthropic");
+    #[cfg(feature = "llm-bedrock")]
+    expected.push("aws-bedrock");
+    #[cfg(feature = "llm-openai")]
+    expected.extend([
+        "deepseek",
+        "google-gemini",
+        "kimi",
+        "meta-llama",
+        "mistral",
+        "openai",
+        "xai",
+    ]);
+    expected.sort_unstable();
+    let providers: Vec<&str> = sutra_llm_spi::provider_factories()
+        .iter()
+        .map(|f| f.provider)
+        .collect();
+    assert_eq!(providers, expected);
 }

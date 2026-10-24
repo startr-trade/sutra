@@ -625,6 +625,7 @@ fn wait_state_column_matches_engine() {
             implementation: id("channel:acquirer"),
             data_mapping: DataMapping::default(),
             params: vec![],
+            stream: false,
         },
         Node::ServiceTask {
             id: id("n"),
@@ -632,6 +633,7 @@ fn wait_state_column_matches_engine() {
             implementation: id("some-registered-task"),
             data_mapping: DataMapping::default(),
             params: vec![],
+            stream: false,
         },
         Node::ExclusiveGateway {
             id: id("n"),

@@ -745,4 +745,19 @@
     <xsd:attribute name="flows" type="xsd:string" use="required"/>
   </xsd:complexType>
 
+  <!-- ===================== Attributes on BPMN elements ===================== -->
+
+  <xsd:attribute name="stream" type="xsd:boolean" default="false">
+    <xsd:annotation>
+      <xsd:documentation>
+        Optional attribute on &lt;bpmn:serviceTask&gt; (written q:stream="true"). Marks a channel-call task
+        (implementation="channel:&lt;name&gt;") whose synchronous model answer is streamed to the original caller
+        while the full answer is still accumulated and resumes the flow as a normal response. Default false.
+        Declaring q:stream="true" on a serviceTask whose implementation is not a channel call is a load error
+        (SUTRA.CONFIG.BPMN.STREAM.NOT_CHANNEL_CALL). Added in 1.0 as a backwards-compatible addition
+        (semver-minor): a package that omits it is unaffected.
+      </xsd:documentation>
+    </xsd:annotation>
+  </xsd:attribute>
+
 </xsd:schema>

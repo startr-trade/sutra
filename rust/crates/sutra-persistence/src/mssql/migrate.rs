@@ -139,7 +139,10 @@ mod tests {
         // and is applied to the `coverage` store the deployment declares.
         assert_eq!(
             versions,
-            vec![101, 201, 301, 401, 402, 501, 601, 603, 604, 605, 606, 701, 801, 803, 804, 1001]
+            vec![
+                101, 201, 301, 302, 401, 402, 501, 601, 603, 604, 605, 606, 701, 801, 803, 804,
+                1001
+            ]
         );
     }
 }

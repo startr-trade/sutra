@@ -221,7 +221,9 @@ async fn handle_post(
         | Ok(DispatchOutcome::DeadLettered { .. }) => StatusCode::OK.into_response(),
         // Unreachable: `EngineHandle::dispatch` consumes every shard handoff on the router
         // side. Non-2xx so the sidecar retries per its at-least-once contract.
-        Ok(DispatchOutcome::Handoff { .. }) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        Ok(DispatchOutcome::Handoff { .. } | DispatchOutcome::InlineCalls(_)) => {
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
         // A reject/runtime diagnostic maps to a non-2xx so the sidecar retries per its
         // at-least-once contract (a rejected CloudEvent is a 400, anything else a 500).
         Err(diagnostic) => problem_status(&diagnostic).into_response(),

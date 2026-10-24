@@ -22,6 +22,9 @@ const SQL_INSERT: &str = "INSERT INTO inbox_seen (deployment_id, channel, event_
 
 const SQL_PRUNE: &str = "DELETE FROM inbox_seen WHERE seen_at < @P1";
 
+const SQL_FORGET: &str =
+    "DELETE FROM inbox_seen WHERE deployment_id = @P1 AND channel = @P2 AND event_id = @P3";
+
 impl MssqlInboxStore {
     /// Wraps a connection pool.
     pub fn new(pool: MssqlPool) -> Self {
@@ -61,6 +64,22 @@ impl InboxStore for MssqlInboxStore {
     ) -> Result<bool> {
         let mut conn = self.pool.acquire().await?;
         Self::record_seen_in(conn.client(), deployment, channel, event_id).await
+    }
+
+    async fn forget(
+        &self,
+        deployment: &DeploymentId,
+        channel: &str,
+        event_id: &str,
+    ) -> Result<bool> {
+        let mut conn = self.pool.acquire().await?;
+        let removed = conn
+            .client()
+            .execute(SQL_FORGET, &[&deployment.as_str(), &channel, &event_id])
+            .await
+            .map_err(PersistenceError::mssql("inbox forget"))?
+            .total();
+        Ok(removed == 1)
     }
 
     async fn prune_older_than(&self, age: std::time::Duration) -> Result<u64> {

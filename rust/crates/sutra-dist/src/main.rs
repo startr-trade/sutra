@@ -43,6 +43,12 @@ use sutra_envref_vault as _;
 // Each force-link is behind its cargo feature (see Cargo.toml [features]), so the BINARY
 // selects the bundled set — a hardened / air-gapped build links only what it enables and none
 // of the other vendor client crates are compiled.
+#[cfg(feature = "llm-anthropic")]
+use sutra_llm_anthropic as _;
+#[cfg(feature = "llm-bedrock")]
+use sutra_llm_bedrock as _;
+#[cfg(feature = "llm-openai")]
+use sutra_llm_openai as _;
 #[cfg(feature = "amqp")]
 use sutra_transport_amqp as _;
 #[cfg(feature = "dapr")]
@@ -57,6 +63,8 @@ use sutra_transport_http as _;
 use sutra_transport_kafka as _;
 #[cfg(feature = "knative")]
 use sutra_transport_knative as _;
+#[cfg(feature = "llm")]
+use sutra_transport_llm as _;
 #[cfg(feature = "rabbitmq")]
 use sutra_transport_rabbitmq as _;
 #[cfg(feature = "aws-sqs")]
