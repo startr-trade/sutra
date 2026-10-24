@@ -27,7 +27,7 @@
 # webhook.
 #
 # Needs docker compose and the `sutra` CLI, 0.5.0 or later (SUTRA_BIN, else a build in rust/target,
-# else `sutra` on PATH). The engine image is SUTRA_ENGINE_IMAGE, default ghcr.io/startr-trade/sutra:0.5.0.
+# else `sutra` on PATH). The engine image is SUTRA_ENGINE_IMAGE, default ghcr.io/startr-trade/sutra:0.5.1.
 set -uo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -47,8 +47,8 @@ if [ "$(printf '%s\n' 0.5.0 "$cli_version" | sort -V | head -1)" != 0.5.0 ]; the
     echo "and point SUTRA_BIN at it, e.g. SUTRA_BIN=\$PWD/rust/target/debug/sutra" >&2
     exit 2
 fi
-echo "using $("$sutra_bin" --version) ($sutra_bin); engine image ${SUTRA_ENGINE_IMAGE:-ghcr.io/startr-trade/sutra:0.5.0}"
-image=${SUTRA_ENGINE_IMAGE:-ghcr.io/startr-trade/sutra:0.5.0}
+echo "using $("$sutra_bin" --version) ($sutra_bin); engine image ${SUTRA_ENGINE_IMAGE:-ghcr.io/startr-trade/sutra:0.5.1}"
+image=${SUTRA_ENGINE_IMAGE:-ghcr.io/startr-trade/sutra:0.5.1}
 if ! docker image inspect "$image" >/dev/null 2>&1 && ! docker pull -q "$image" >/dev/null 2>&1; then
     echo "engine image $image is not available locally and cannot be pulled; build one (make image)" >&2
     echo "and set SUTRA_ENGINE_IMAGE, e.g. SUTRA_ENGINE_IMAGE=sutra-rust-engine:dev" >&2

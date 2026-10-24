@@ -13,6 +13,20 @@ This is the changelog for the **Rust-native** engine (`rust/` workspace). It beg
 
 Nothing yet.
 
+## [0.5.1] — 2026-10-24
+
+A **patch** release, and the first complete release of the 0.5 line. The `v0.5.0` release run
+stopped at the engine-image scan, after `sutra-feel` and `sutra-dmn` 0.5.0 had already reached
+crates.io (a published version is immutable) and before any image tag, CLI archive or GitHub
+release was published. 0.5.1 is the `v0.5.0` tree plus the one change below; the [0.5.0] entry
+describes the release itself.
+
+### Security
+
+- DLA-4854-1 (tzdata 2026b → 2026e in the distroless base) accepted, time-boxed to 2026-11-09:
+  a timezone-data refresh, not an exploitable path; the newest `cc-debian12` digest still ships
+  2026b. This is the finding that stopped the 0.5.0 release run.
+
 ## [0.5.0] — 2026-10-24
 
 A **minor** release: a process can call a language model, synchronously or asynchronously, and
