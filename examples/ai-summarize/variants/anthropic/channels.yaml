@@ -1,0 +1,122 @@
+# Channels for the ai-summarize module, 1.0.0 — the `anthropic` variant: every model call goes to
+# Anthropic (https://api.anthropic.com, the provider's default endpoint, so there is no base-url). Reference: docs/guide/llm-channels.md
+# in the Sutra source tree.
+#
+# ONE FILE PER PROVIDER. The flows live once, in ../../shared/bpmn. A variant is this file plus
+# package.yaml; `sutra package` composes the two layers:
+#
+#   sutra package examples/ai-summarize/variants/anthropic \
+#       --overlay examples/ai-summarize/shared --out examples/ai-summarize/deploy/deployments
+#
+# The variants (stub-openai, stub-anthropic, openai, anthropic, gemini) differ only in the two
+# `candidates` blocks below.
+#
+#   SYNC   POST /channels/ticket        -> summarize-sync  (outbound, ack-mode: on-complete)
+#   STREAM POST /channels/ticket-stream -> summarize-sync, answered as server-sent events
+#   ASYNC  POST /channels/ticket-async  -> summarize-async (outbound, default ack-mode: on-persist)
+#                                          answer arrives on summarize-reply
+#
+# The outbound channel's `ack-mode` is what picks the pattern. Declared `on-complete`, the model is
+# called inline and the flow continues with the answer in hand — no outbox row, no park, no reply
+# channel — so the HTTP caller of /channels/ticket gets the summary on its own connection. Left at
+# the outbound default (`on-persist`) the request goes through the outbox, the instance parks, and
+# the answer is delivered as a message on `reply-channel`, correlated by <q:alias>.
+#
+# WHAT IS NOT PARAMETERISED. `provider`, `model` and `base-url` are plain strings here: only the
+# secret-bearing `api-key` is resolved through the reference resolver. Switching provider is
+# switching variant; the key itself always comes from the engine's environment.
+
+channels:
+  # ---- inbound: the two ways in ----------------------------------------------------------------
+
+  # Sync intake. `on-complete` holds the HTTP request open until the flow ends, so the model's
+  # summary is the 200 body. The flow's own reply (the final responseObject) is what is returned.
+  - name: ticket
+    transport: http
+    bind: "POST /channels/ticket"
+    codec: json
+    ack-mode: on-complete
+    cloudevents-mode: none
+    auth:
+      scheme: apikey
+      apikey:
+        value: env:SUMMARIZE_API_KEY
+        header: X-Api-Key
+
+  # Streamed sync intake: like `ticket`, but the answer is streamed to the caller as server-sent
+  # events while the model generates it (the flow's task carries q:stream="true").
+  - name: ticket-stream
+    transport: http
+    bind: "POST /channels/ticket-stream"
+    codec: json
+    ack-mode: on-complete
+    reply-stream: sse
+    cloudevents-mode: none
+    auth:
+      scheme: apikey
+      apikey:
+        value: env:SUMMARIZE_API_KEY
+        header: X-Api-Key
+
+  # Async intake. `on-persist` answers `202 Accepted` as soon as the inbound is durably stored;
+  # the model call, the wait and the hand-off to summary-sink all run detached behind it.
+  - name: ticket-async
+    transport: http
+    bind: "POST /channels/ticket-async"
+    codec: json
+    ack-mode: on-persist
+    cloudevents-mode: none
+    auth:
+      scheme: apikey
+      apikey:
+        value: env:SUMMARIZE_API_KEY
+        header: X-Api-Key
+
+  # ---- outbound: the model, behind a channel ------------------------------------------------
+
+  # SYNC model call. No `reply-channel` — an inline call has nobody to deliver a reply to.
+  - name: summarize-sync
+    direction: outbound
+    transport: llm
+    bind: "llm://summarize-sync"
+    ack-mode: on-complete
+    llm:
+      candidates:
+        - provider: anthropic                   # Anthropic Messages API
+          model: claude-haiku-5-5               # any model id your account can use
+          api-key: env:ANTHROPIC_API_KEY        # export ANTHROPIC_API_KEY before `docker compose up`
+      system: "You summarize support tickets in two sentences."
+      max-output-tokens: 256
+      temperature: 0
+      timeout-seconds: 30
+
+  # ASYNC model call. The answer is delivered on `summarize-reply`.
+  - name: summarize-async
+    direction: outbound
+    transport: llm
+    bind: "llm://summarize-async"
+    llm:
+      reply-channel: summarize-reply
+      candidates:
+        - provider: anthropic
+          model: claude-haiku-5-5
+          api-key: env:ANTHROPIC_API_KEY
+      system: "You summarize support tickets in two sentences."
+      max-output-tokens: 256
+      temperature: 0
+      timeout-seconds: 30
+
+  # The reply side of the async call: an inbound channel the answer arrives on. The message is
+  # { text, finish, usage, provider, model, request: <the echoed request body>, ... }.
+  - name: summarize-reply
+    transport: local
+    codec: json
+
+  # ---- outbound: where the async flow hands the finished summary -------------------------------
+
+  # A plain HTTP destination. In the demo it is the stub's /sink, which logs what it receives
+  # (`docker compose logs model-stub`); in real use it is your ticketing system's webhook.
+  - name: summary-sink
+    direction: outbound
+    transport: http
+    bind: "http://model-stub:8000/sink"

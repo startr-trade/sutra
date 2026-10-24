@@ -1,6 +1,6 @@
 # ai-summarize — a process that calls a language model, synchronously and asynchronously
 
-A worked deployment package for the v0.5.0 `llm` transport. A support ticket is POSTed as JSON; a
+A worked deployment package for the v0.5.0 `llm` transport, in five provider variants. A support ticket is POSTed as JSON; a
 FEEL data task builds a prompt from it; a **channel-call task** sends the prompt to a model behind
 an outbound `transport: llm` channel. No BPMN element is specific to models — the call is an
 ordinary channel call, so `<q:timeout>`, `<q:retry>` and boundaries all apply.
@@ -33,17 +33,35 @@ ASYNC  POST /channels/ticket-async
 
 ## Layout
 
+The flows live once; each provider is one small layer on top. `sutra package <variant> --overlay
+shared` composes the two into one package (the variant's files win; an overlay layer may not carry
+`package.yaml`, so each variant has its own copy, with the same labels).
+
 | Path | What it is |
 |---|---|
-| `deployments-src/default--ai-summarize--1.0.0/` | the package: `package.yaml`, `channels.yaml` (commented), `bpmn/summarize-sync.bpmn`, `bpmn/summarize-async.bpmn` (both with diagram interchange) |
-| `stub/model-stub.py` | a ~50-line Python 3 stdlib server: a fixed `/v1/chat/completions` answer plus a `/sink` that logs |
+| `shared/bpmn/` | `summarize-sync.bpmn`, `summarize-stream.bpmn`, `summarize-async.bpmn` (with diagram interchange) |
+| `variants/stub-openai/` | `package.yaml` + `channels.yaml` (commented): the stub, OpenAI Chat Completions wire. The default. |
+| `variants/stub-anthropic/` | the same, over the Anthropic Messages wire |
+| `variants/openai/`, `variants/anthropic/`, `variants/gemini/` | the real services (`gpt-4o-mini`, `claude-haiku-5-5`, `gemini-2.5-flash`) |
+| `stub/model-stub.py` | a Python 3 stdlib server with fixed answers: the OpenAI and Anthropic wire formats (incl. streaming, tools, JSON mode, jobs, batches, webhooks) plus a `/sink` that records. Shared with `examples/ai-advanced`. |
 | `deploy/compose.yaml` | engine + PostgreSQL + the stub, project name `sutra-ai-summarize` |
+
+The variants differ only in the two `candidates` blocks of `channels.yaml`:
+
+| Variant | `provider` | `model` | `base-url` | `api-key` |
+|---|---|---|---|---|
+| `stub-openai` | `openai` | `test-model` | `http://model-stub:8000/v1` | `env:LLM_API_KEY` |
+| `stub-anthropic` | `anthropic` | `test-model` | `http://model-stub:8000` | `env:LLM_API_KEY` |
+| `openai` | `openai` | `gpt-4o-mini` | default | `env:OPENAI_API_KEY` |
+| `anthropic` | `anthropic` | `claude-haiku-5-5` | default | `env:ANTHROPIC_API_KEY` |
+| `gemini` | `google-gemini` | `gemini-2.5-flash` | default | `env:GEMINI_API_KEY` |
 
 ## Run it against the stub
 
 ```bash
-# 1. Seal the package into the directory the engine watches.
-sutra package examples/ai-summarize/deployments-src/default--ai-summarize--1.0.0 \
+# 1. Compose the variant over the shared flows and seal it into the directory the engine watches.
+#    Package ONE variant there at a time: they all bind the same /channels/... paths.
+sutra package examples/ai-summarize/variants/stub-openai --overlay examples/ai-summarize/shared \
     --out examples/ai-summarize/deploy/deployments
 
 # 2. Start the engine, its database and the stub.
@@ -54,7 +72,7 @@ PORT=$(docker compose -f examples/ai-summarize/deploy/compose.yaml port engine 8
 curl -s -X POST "http://127.0.0.1:$PORT/channels/ticket" \
   -H 'Content-Type: application/json' -H 'X-Api-Key: dev-only-summarize-key' \
   -d '{"ticketId":"T-1001","subject":"Cannot log in","description":"Password reset email never arrives."}'
-# => {"ticketId":"T-1001","summary":"STUB SUMMARY: the customer reports a problem and asks for it to be looked at."}
+# => {"summary":"STUB SUMMARY: the customer reports a problem and asks for it to be looked at.","ticketId":"T-1001"}
 
 # 3b. Streamed: the same summary as server-sent events, one chunk per piece, then the reply.
 curl -s -N -X POST "http://127.0.0.1:$PORT/channels/ticket-stream" \
@@ -63,37 +81,50 @@ curl -s -N -X POST "http://127.0.0.1:$PORT/channels/ticket-stream" \
 # => event: chunk / data: STUB   … event: chunk / data:  at.
 #    event: reply / data: {"summary":"STUB SUMMARY: …","ticketId":"T-1003"}
 
-# 4. Async: 202 immediately; the summary reaches the sink a moment later.
+# 4. Async: 202 immediately; the summary reaches the sink a few seconds later.
 curl -s -i -X POST "http://127.0.0.1:$PORT/channels/ticket-async" \
   -H 'Content-Type: application/json' -H 'X-Api-Key: dev-only-summarize-key' \
   -d '{"ticketId":"T-1002","subject":"Invoice looks wrong","description":"Total differs from the quote."}'
 # => HTTP/1.1 202 Accepted
 docker compose -f examples/ai-summarize/deploy/compose.yaml logs model-stub | grep SINK
-# => model-stub: SINK received {"ticketId":"T-1002","summary":"STUB SUMMARY: ..."}
+# => model-stub: SINK received {"summary":"STUB SUMMARY: ...","ticketId":"T-1002"}
 
 # 5. Tear down by explicit project name.
 docker compose -p sutra-ai-summarize down -v
 ```
 
-The engine image is `ghcr.io/startr-trade/sutra:0.5.0`; set `SUTRA_ENGINE_IMAGE` to run a locally
-built tag. Validate the package without Docker: `sutra lint examples/ai-summarize/deployments-src/default--ai-summarize--1.0.0`.
+For the Anthropic wire, package `variants/stub-anthropic` instead (remove the previous archive from
+`deploy/deployments` first); the answers are the same. The engine image is
+`ghcr.io/startr-trade/sutra:0.5.0`; set `SUTRA_ENGINE_IMAGE` to run a locally built tag. Validate a
+variant without Docker:
+
+```bash
+sutra lint examples/ai-summarize/variants/stub-openai --overlay examples/ai-summarize/shared
+```
 
 ## Run it against a real provider
 
-`api-key` is resolved from the engine's environment (`env:LLM_API_KEY`), so the key never appears in
-the package. `provider`, `model` and `base-url` are **plain strings in `channels.yaml`** (placeholder
-substitution applies to the key, not to these), so switching providers is an edit to the two
-`candidates` blocks (`summarize-sync` and `summarize-async`), then re-run `sutra package`:
+Pick the variant, export its key, and run the same requests. `api-key` is an `env:` reference
+resolved from the engine's environment, so the key never appears in the package; the compose file
+passes `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` and `GEMINI_API_KEY` through (each defaults to a
+placeholder, because an `env:` reference to an unset variable fails the channel at load).
 
-1. `model: test-model` becomes a real `<model-id>` from your provider.
-2. Delete the `base-url:` line to use the provider's default endpoint (for `provider: openai`,
-   `https://api.openai.com/v1`), or point it at any OpenAI-compatible server. Other `provider:` ids
-   (`anthropic`, `mistral`, ...) are listed in `docs/guide/llm-channels.md`.
-3. `export LLM_API_KEY=<your key>` before `docker compose up` (the compose file passes it through),
-   and optionally remove the `model-stub` service. The async flow's `summary-sink` still points at
-   the stub's `/sink`; change its `bind:` to your own webhook.
+```bash
+export ANTHROPIC_API_KEY=...          # or OPENAI_API_KEY / GEMINI_API_KEY
+sutra package examples/ai-summarize/variants/anthropic --overlay examples/ai-summarize/shared \
+    --out examples/ai-summarize/deploy/deployments
+docker compose -f examples/ai-summarize/deploy/compose.yaml up -d
+```
 
-Never put a literal key in the package: a literal secret is rejected at package-validation time.
+`provider`, `model` and `base-url` are plain strings in the variant's `channels.yaml` (placeholder
+substitution applies to the key, not to these): to change the model, edit the two `candidates`
+blocks of that variant. A new provider is a new variant directory: copy one, change its candidates.
+The async flow's `summary-sink` still points at the stub's `/sink`; change its `bind:` to your own
+webhook. Never put a literal key in the package: a literal secret is rejected at package-validation
+time.
+
+`examples/ai-advanced/live-check.sh` runs all three real variants (for each key you export) plus
+the advanced flows, and prints a pass/fail line per check.
 
 ## Notes
 
@@ -102,7 +133,5 @@ Never put a literal key in the package: a literal secret is rejected at package-
   along and is echoed back as `request` on the async reply.
 - A slow model makes the sync caller wait: `<q:timeout duration="PT45S">` bounds the call, and
   `timeout-seconds: 30` bounds each candidate. For anything slower, use the async pair.
-- The sync task still carries a `<q:alias>` because the loader requires one on every channel call; the
-  engine never evaluates it for an inline call.
 - Delivery is at-least-once: a crash after the model answered but before the delivery was recorded
   calls the model again. Prompts and answers are never written to logs or spans.

@@ -7,9 +7,8 @@
 //! module is the thin alias that keeps every `crate::support::<m>` path in the suites intact;
 //! nothing suite-specific lives here.
 
-// `callback` (host recorders) and `compose` (the `shared/` + `variants/` DRY composer) are NOT
-// re-exported: no suite in THIS repo uses them any more — the multi-variant packages and the
-// outbound-leg recorders they served belong to the proprietary extension suites. They remain part
-// of `sutra_testkit::conformance` for those out-of-workspace suites; re-exporting them here would
-// only be an unused import.
-pub use sutra_testkit::conformance::{broker, engine, k8s, util};
+// `compose` (the `shared/` + `variants/` composer, the same `sutra_loader::overlay` path as
+// `sutra package --overlay`) is used by `tc_ai_examples`, whose examples keep one shared layer
+// plus one small layer per provider. `callback` (host recorders) is NOT re-exported: no suite in
+// THIS repo uses it; it remains part of `sutra_testkit::conformance` for out-of-workspace suites.
+pub use sutra_testkit::conformance::{broker, compose, engine, k8s, util};

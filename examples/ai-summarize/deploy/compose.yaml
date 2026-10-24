@@ -1,8 +1,10 @@
 # Run the ai-summarize example locally: engine + PostgreSQL + a stub model server. Nothing to edit.
 #
-#   docker compose -f examples/ai-summarize/deploy/compose.yaml up -d
-#   sutra package examples/ai-summarize/deployments-src/default--ai-summarize--1.0.0 \
+#   sutra package examples/ai-summarize/variants/stub-openai --overlay examples/ai-summarize/shared \
 #        --out examples/ai-summarize/deploy/deployments
+#   docker compose -f examples/ai-summarize/deploy/compose.yaml up -d
+#
+# Package ONE variant into ./deployments at a time: they all bind the same /channels/... paths.
 #
 # The engine watches ./deployments and activates the archive without a restart. The project name
 # is explicit so this stack can never collide with another one that would default to `deploy`.
@@ -22,22 +24,30 @@ services:
 
       # What channels.yaml names by reference. Resolved by the ENGINE, in ITS environment.
       SUMMARIZE_API_KEY: ${SUMMARIZE_API_KEY:-dev-only-summarize-key}
-      # Any non-empty value satisfies the stub. For a real provider, export a real key before
-      # `up` (and see the README for the two channel keys to change).
+      # The stub variants' key: any non-empty value satisfies the stub.
       LLM_API_KEY: ${LLM_API_KEY:-stub-not-a-real-key}
+      # The real-provider variants' keys. An `env:` reference to an unset variable fails the
+      # channel at load, so each is always defined: export the real one before `up`; the
+      # placeholder only ever reaches the provider as a key it rejects.
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-not-set}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-not-set}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-not-set}
     volumes:
-      - ./deployments:/deployments:ro
+      # DEPLOYMENTS_DIR overrides the archive directory (live-check.sh uses a temporary one).
+      - ${DEPLOYMENTS_DIR:-./deployments}:/deployments:ro
     ports:
-      # Dynamic host port, loopback only. `docker compose -f … port engine 8080` shows it.
-      - "127.0.0.1::8080"
+      # Loopback only. Dynamic by default (`docker compose -f … port engine 8080` shows it); set
+      # ENGINE_HOST_PORT for a fixed one.
+      - "127.0.0.1:${ENGINE_HOST_PORT:-}:8080"
     depends_on:
       engine-db:
         condition: service_healthy
       model-stub:
         condition: service_started
 
-  # Answers /v1/chat/completions with a fixed completion; /sink logs what the async flow sends.
-  # Resolvable from the engine as http://model-stub:8000 (the base-url in channels.yaml).
+  # Speaks the OpenAI and Anthropic wire formats with fixed answers; /sink records what the async
+  # flow sends. Resolvable from the engine as http://model-stub:8000 (the base-url in the stub
+  # variants' channels.yaml). The real-provider variants still use its /sink.
   model-stub:
     image: python:3.12-alpine
     command: ["python3", "/stub/model-stub.py", "8000"]

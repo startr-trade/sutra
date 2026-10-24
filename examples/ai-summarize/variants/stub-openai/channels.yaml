@@ -1,7 +1,18 @@
-# Channels for the `default` tenant's ai-summarize module, 1.0.0 — the v0.5.0 `llm` transport,
-# called two ways. Reference: docs/guide/llm-channels.md in the Sutra source tree.
+# Channels for the ai-summarize module, 1.0.0 — the `stub-openai` variant: every model call goes to
+# the stub in ../../stub over the OpenAI Chat Completions wire. Reference: docs/guide/llm-channels.md
+# in the Sutra source tree.
+#
+# ONE FILE PER PROVIDER. The flows live once, in ../../shared/bpmn. A variant is this file plus
+# package.yaml; `sutra package` composes the two layers:
+#
+#   sutra package examples/ai-summarize/variants/stub-openai \
+#       --overlay examples/ai-summarize/shared --out examples/ai-summarize/deploy/deployments
+#
+# The variants (stub-openai, stub-anthropic, openai, anthropic, gemini) differ only in the two
+# `candidates` blocks below.
 #
 #   SYNC   POST /channels/ticket        -> summarize-sync  (outbound, ack-mode: on-complete)
+#   STREAM POST /channels/ticket-stream -> summarize-sync, answered as server-sent events
 #   ASYNC  POST /channels/ticket-async  -> summarize-async (outbound, default ack-mode: on-persist)
 #                                          answer arrives on summarize-reply
 #
@@ -12,9 +23,8 @@
 # the answer is delivered as a message on `reply-channel`, correlated by <q:alias>.
 #
 # WHAT IS NOT PARAMETERISED. `provider`, `model` and `base-url` are plain strings here: only the
-# secret-bearing `api-key` is resolved through the reference resolver. To point the package at a
-# real provider, edit the two `candidates` blocks below (the README lists exactly what to change);
-# the key itself always comes from the engine's environment (`env:LLM_API_KEY`).
+# secret-bearing `api-key` is resolved through the reference resolver. Switching provider is
+# switching variant; the key itself always comes from the engine's environment.
 
 channels:
   # ---- inbound: the two ways in ----------------------------------------------------------------
@@ -73,8 +83,8 @@ channels:
     llm:
       candidates:
         - provider: openai                      # also any OpenAI-compatible server, via base-url
-          model: test-model                     # replace with a real <model-id> for a real provider
-          base-url: http://model-stub:8000/v1   # the stub in ../../stub; delete the line for api.openai.com
+          model: test-model                     # any id: the stub answers every model
+          base-url: http://model-stub:8000/v1   # the stub in ../../stub (the `openai` variant has none)
           api-key: env:LLM_API_KEY              # a reference, never a literal
       system: "You summarize support tickets in two sentences."
       max-output-tokens: 256

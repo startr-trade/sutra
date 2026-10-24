@@ -20,6 +20,8 @@ use sutra_formats as _;
 #[path = "all/support.rs"]
 mod support;
 
+#[path = "all/tc_ai_examples.rs"]
+mod tc_ai_examples;
 #[path = "all/tc_approval_hold.rs"]
 mod tc_approval_hold;
 #[path = "all/tc_money_transfer.rs"]

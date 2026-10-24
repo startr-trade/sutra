@@ -1,0 +1,81 @@
+# Run the ai-advanced example locally: engine + PostgreSQL + the stub model server (shared with
+# ai-summarize). With the `stub` variant nothing needs a key:
+#
+#   sutra package examples/ai-advanced/variants/stub --overlay examples/ai-advanced/shared \
+#        --out examples/ai-advanced/deploy/deployments
+#   docker compose -f examples/ai-advanced/deploy/compose.yaml up -d
+#
+# Package ONE variant into ./deployments at a time: both bind the same /channels/... paths.
+#
+# The engine watches ./deployments and activates the archive without a restart. The project name
+# is explicit so this stack can never collide with another one that would default to `deploy`.
+
+name: sutra-ai-advanced
+
+services:
+  engine:
+    image: ${SUTRA_ENGINE_IMAGE:-ghcr.io/startr-trade/sutra:0.5.0}
+    environment:
+      SUTRA_DEPLOYMENTS_DIR: /deployments
+      SUTRA_HTTP_PORT: "8080"
+      SUTRA_DATASOURCE_URL: postgres://engine-db:5432/sutra
+      # A plain login role, not the postgres superuser — see engine-db-init.sh.
+      SUTRA_DATASOURCE_USERNAME: ${ENGINE_DB_USER:-sutra_engine}
+      SUTRA_DATASOURCE_PASSWORD: ${ENGINE_DB_PASSWORD:-sutra-dev-only}
+      # Job results are found by a poller; a short outbox tick keeps the demo snappy.
+      SUTRA_OUTBOX_TICK_INTERVAL: PT1S
+
+      # Everything channels.yaml names by `env:` reference, resolved by the ENGINE in ITS
+      # environment. An unset variable fails the channel at load, so every name is always
+      # defined; the placeholders are never valid credentials.
+      AI_ADVANCED_API_KEY: ${AI_ADVANCED_API_KEY:-dev-only-advanced-key}
+      # `stub` variant: any non-empty key satisfies the stub, and the stub signs its webhooks
+      # with the same dev-only secret it is given below.
+      LLM_API_KEY: ${LLM_API_KEY:-stub-not-a-real-key}
+      STUB_WEBHOOK_SECRET: whsec_ZGV2LW9ubHktd2ViaG9vay1zZWNyZXQ=
+      # `live` variant: export the real values before `up`. Without a real OPENAI_WEBHOOK_SECRET
+      # no webhook verifies (each is refused 401) and the webhook job completes by its
+      # safety-net poll instead.
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-not-set}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-not-set}
+      OPENAI_WEBHOOK_SECRET: ${OPENAI_WEBHOOK_SECRET:-not-set}
+    volumes:
+      # DEPLOYMENTS_DIR overrides the archive directory (live-check.sh uses a temporary one).
+      - ${DEPLOYMENTS_DIR:-./deployments}:/deployments:ro
+    ports:
+      # Loopback only. Dynamic by default (`docker compose -f … port engine 8080` shows it). For
+      # a real OpenAI webhook, set ENGINE_HOST_PORT to a fixed port and point a tunnel at it.
+      - "127.0.0.1:${ENGINE_HOST_PORT:-}:8080"
+    depends_on:
+      engine-db:
+        condition: service_healthy
+      model-stub:
+        condition: service_started
+
+  # The stub model server from ai-summarize: OpenAI and Anthropic wire formats, background jobs,
+  # batches, signed webhooks, the /flaky and /relay outage gates and the /sink. Resolvable from
+  # the engine as http://model-stub:8000.
+  model-stub:
+    image: python:3.12-alpine
+    command: ["python3", "/stub/model-stub.py", "8000"]
+    environment:
+      # Signs the `-webhook` jobs' completion events (the engine verifies with the same value).
+      STUB_WEBHOOK_SECRET: whsec_ZGV2LW9ubHktd2ViaG9vay1zZWNyZXQ=
+    volumes:
+      - ../../ai-summarize/stub:/stub:ro
+
+  engine-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: sutra
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_BOOTSTRAP_PASSWORD:-bootstrap-dev-only}
+      ENGINE_DB_USER: ${ENGINE_DB_USER:-sutra_engine}
+      ENGINE_DB_PASSWORD: ${ENGINE_DB_PASSWORD:-sutra-dev-only}
+    volumes:
+      - ./engine-db-init.sh:/docker-entrypoint-initdb.d/10-engine-role.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d sutra"]
+      interval: 2s
+      timeout: 3s
+      retries: 30

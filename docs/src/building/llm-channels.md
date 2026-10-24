@@ -326,3 +326,33 @@ loop back to the model task. Bound the loop with a counter and a non-interruptin
 
 Prompts and answers are never written to spans, logs or diagnostics. Each call opens a
 `sutra.llm.call` span carrying the channel, provider, model, finish reason and token counts.
+
+## Examples
+
+Two runnable packages in the source tree, each with flows kept once under `shared/` and one
+`channels.yaml` per provider under `variants/`, composed by `sutra package --overlay`:
+
+| Example | Variants | Flows |
+|---|---|---|
+| `examples/ai-summarize` | `stub-openai`, `stub-anthropic`, `openai`, `anthropic`, `gemini` | sync, streamed (SSE), async |
+| `examples/ai-advanced` | `stub`, `live` | cross-provider fallback (Anthropic first, OpenAI second), JSON mode, a tool call, an OpenAI background job (polled), an OpenAI background job (webhook), an Anthropic Message Batch |
+
+```bash
+sutra package examples/ai-summarize/variants/anthropic --overlay examples/ai-summarize/shared \
+    --out examples/ai-summarize/deploy/deployments
+sutra package examples/ai-advanced/variants/stub --overlay examples/ai-advanced/shared \
+    --out examples/ai-advanced/deploy/deployments
+```
+
+Both share a stub model server (`examples/ai-summarize/stub/model-stub.py`) that speaks the OpenAI
+and Anthropic wire formats with fixed answers, including streaming, tools, JSON mode, background
+jobs, batches, signed webhooks and a switchable outage for fallback.
+
+- **CI (tier 2, no keys):** the `stub-openai`, `stub-anthropic` and ai-advanced `stub` variants,
+  composed through the overlay path, run against the stub on a real engine and PostgreSQL — every
+  flow above, with the replies, the SSE frames, the sink deliveries and the `instance_state` and
+  `llm_job` rows checked. Every variant, the real-provider ones included, is also linted in tier 1.
+- **Live (your keys):** `examples/ai-advanced/live-check.sh` runs the `openai`, `anthropic` and
+  `gemini` variants and the ai-advanced `live` variant against the real APIs, including a fallback
+  where both the failing Anthropic candidate and the answering OpenAI one are real, and — with a
+  tunnel and `OPENAI_WEBHOOK_SECRET` — a webhook-completed job.

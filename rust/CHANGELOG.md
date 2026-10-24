@@ -58,7 +58,20 @@ stream the answer to its caller. Model calls are ordinary channel calls, so they
   crashed chain's inbox-dedup rows and admission slot (`sutra.instance.inflight-chain-max-age`,
   default PT15M). A failed chain releases its dedup row at once, so a client retry re-runs.
 - `sutra-docgen` documents `llm:` channels (secret references shown only by scheme).
-- Example package `examples/ai-summarize` (sync and async summaries against a stub model).
+- Example packages `examples/ai-summarize` (sync, streamed and async summaries; variants
+  `stub-openai`, `stub-anthropic`, `openai`, `anthropic`, `gemini`) and `examples/ai-advanced`
+  (cross-provider fallback, JSON mode, a tool call, OpenAI background jobs polled and
+  webhook-completed, an Anthropic Message Batch; variants `stub`, `live`). Flows are kept once under
+  `shared/` and each provider is one `channels.yaml` under `variants/`, composed with
+  `sutra package <variant> --overlay <shared>`. A shared stub model server speaks the OpenAI and
+  Anthropic wire formats, and `examples/ai-advanced/live-check.sh` runs both examples against the
+  real APIs with your keys.
+- Tier-2 tests (`sutra-conformance`, `tc_ai_examples`) run both examples end to end without keys:
+  the stub variants, composed through the overlay path, on a real engine and PostgreSQL against the
+  stub — sync, SSE-streamed and async calls over both the OpenAI and Anthropic wires, cross-provider
+  fallback (Anthropic down, then up), JSON mode, a tool call, an OpenAI background job polled and
+  one completed by a signed webhook, and an Anthropic Message Batch — checking replies, SSE frames,
+  sink deliveries and the `instance_state` and `llm_job` rows. A tier-1 test lints every variant.
 
 ### Changed
 
@@ -94,9 +107,12 @@ stream the answer to its caller. Model calls are ordinary channel calls, so they
 
 - `examples/ai-summarize` (sync, streamed, async) passed end to end against OpenAI
   (`gpt-4o-mini`), Anthropic (`claude-haiku-5-5`) and Google Gemini (`gemini-2.5-flash`) on
-  2026-10-24; against OpenAI also cross-candidate fallback, JSON mode, tool calls, and an OpenAI
-  background job completed both by polling and by a signed webhook; and an Anthropic Message
-  Batches job (`mode: job`, polled) end to end.
+  2026-10-24. Against OpenAI also: candidate fallback (an unreachable first candidate, then
+  OpenAI), JSON mode, tool calls, and a background job completed both by polling and by a signed
+  webhook through a public tunnel; and an Anthropic Message Batches job (`mode: job`, polled).
+- Not yet run live: the cross-provider fallback with a real Anthropic candidate failing over to
+  OpenAI, and Anthropic JSON mode and tool calls. All three are covered in tier 2 against the stub,
+  and `live-check.sh` runs them against the real APIs.
 
 ## [0.4.0] — 2026-10-23
 

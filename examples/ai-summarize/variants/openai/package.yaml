@@ -1,0 +1,12 @@
+# Deployment package labels — one standalone authoring unit once composed with ../../shared:
+#   sutra package <this dir> --overlay examples/ai-summarize/shared
+# seals one content-addressed .sutra archive. An overlay layer may not carry package.yaml, so
+# every variant holds its own copy; the labels are the same in all of them (the variants are
+# alternative builds of one module, deploy one at a time). Labels are opaque selectors: tenant is
+# a label, not a resource scope.
+labels:
+  "module": "ai-summarize"
+  "tenant": "default"
+  "version": "1.0.0"
+engine:
+  minContract: 1

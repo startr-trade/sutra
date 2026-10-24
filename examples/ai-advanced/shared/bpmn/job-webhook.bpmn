@@ -1,0 +1,116 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  PROVIDER JOB, ANNOUNCED BY WEBHOOK. Same flow as job-poll; only the channel differs.
+  `webhook-model`'s candidate says `completion: callback` and names the callback channel
+  `openai-hooks` (an inbound `transport: llm` channel bound to POST /llm/openai-hooks). When the
+  provider finishes, it POSTs a signed event there; the engine verifies the signature with the
+  callback secret, fetches the result and delivers it on `webhook-reply`. Polling stays on as a
+  slow safety net (`poll-interval-seconds: 600`), because a webhook can be lost.
+
+  A real OpenAI webhook needs the endpoint reachable from the internet (a tunnel to the engine's
+  port) and the project's signing secret in OPENAI_WEBHOOK_SECRET; see the README. Without them
+  the job still completes, by the safety-net poll.
+
+    startEvent (JSON ticket on `summarize-webhook`; caller gets 202)
+      then BuildRequest, AskModel (on `webhook-model`), BuildNote, Deliver, End — as job-poll
+
+  CORRELATION, as in ai-summarize's async flow. The reply echoes the request under `request`, so
+  the task's <q:alias> matches on `body.request.ticketId`. The alias is also evaluated once at PARK
+  time against the instance's variables, so BuildRequest seeds a `body` of the same shape and one
+  expression resolves on both sides. `unique="true"` refuses a second ticket with the same id while
+  the first is in flight.
+-->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI"
+                  xmlns:dc="http://www.omg.org/spec/DD/20100524/DC"
+                  xmlns:di="http://www.omg.org/spec/DD/20100524/DI"
+                  xmlns:q="urn:sutra:q:1.0"
+                  id="Definitions_job_webhook"
+                  targetNamespace="urn:sutra:module:ai-advanced:1.0.0">
+
+  <bpmn:process id="job-webhook" name="Summarize as a background job (webhook)" isExecutable="true">
+
+    <bpmn:extensionElements>
+      <q:variables>
+        <q:variable name="requestBody" type="object"/>
+        <q:variable name="body" type="object"/>          <!-- park-time shape of the reply; replaced by the reply -->
+        <q:variable name="summary" type="string"/>
+        <q:variable name="responseBody" type="object"/>  <!-- the note handed to summary-sink -->
+      </q:variables>
+    </bpmn:extensionElements>
+
+    <bpmn:startEvent id="Start" name="Ticket received">
+      <bpmn:extensionElements>
+        <q:source channel="summarize-webhook"/>
+      </bpmn:extensionElements>
+      <bpmn:outgoing>F1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="F1" sourceRef="Start" targetRef="BuildRequest"/>
+
+    <bpmn:serviceTask id="BuildRequest" name="Build the prompt (FEEL)">
+      <bpmn:incoming>F1</bpmn:incoming><bpmn:outgoing>F2</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment>
+          <bpmn:from>{prompt: "Summarize this support ticket in one sentence: " + payload.description, ticketId: payload.ticketId}</bpmn:from>
+          <bpmn:to>requestBody</bpmn:to>
+        </bpmn:assignment>
+        <bpmn:assignment>
+          <bpmn:from>{request: {ticketId: payload.ticketId}}</bpmn:from>
+          <bpmn:to>body</bpmn:to>
+        </bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F2" sourceRef="BuildRequest" targetRef="AskModel"/>
+
+    <!-- Job channel with completion: callback: the webhook resumes this task, the poll is a safety net. -->
+    <bpmn:serviceTask id="AskModel" name="Submit the job and wait" implementation="channel:webhook-model">
+      <bpmn:extensionElements>
+        <q:source channel="webhook-reply" name="body"/>
+        <q:alias name="ticket" expression="body.request.ticketId" unique="true"/>
+        <q:timeout duration="PT30M"/>
+      </bpmn:extensionElements>
+      <bpmn:incoming>F2</bpmn:incoming><bpmn:outgoing>F3</bpmn:outgoing>
+      <bpmn:dataOutputAssociation>
+        <bpmn:assignment><bpmn:from>body.text</bpmn:from><bpmn:to>summary</bpmn:to></bpmn:assignment>
+      </bpmn:dataOutputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F3" sourceRef="AskModel" targetRef="BuildNote"/>
+
+    <bpmn:serviceTask id="BuildNote" name="Build the note (FEEL)">
+      <bpmn:incoming>F3</bpmn:incoming><bpmn:outgoing>F4</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment>
+          <bpmn:from>{ticketId: payload.ticketId, summary: summary, via: "job-webhook"}</bpmn:from>
+          <bpmn:to>responseBody</bpmn:to>
+        </bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F4" sourceRef="BuildNote" targetRef="Deliver"/>
+
+    <bpmn:sendTask id="Deliver" name="Hand the summary to the sink">
+      <bpmn:extensionElements>
+        <q:send channel="summary-sink"/>
+      </bpmn:extensionElements>
+      <bpmn:incoming>F4</bpmn:incoming><bpmn:outgoing>F5</bpmn:outgoing>
+    </bpmn:sendTask>
+    <bpmn:sequenceFlow id="F5" sourceRef="Deliver" targetRef="End"/>
+
+    <bpmn:endEvent id="End" name="Summary delivered"><bpmn:incoming>F5</bpmn:incoming></bpmn:endEvent>
+  </bpmn:process>
+
+  <bpmndi:BPMNDiagram id="Diagram_job_webhook">
+    <bpmndi:BPMNPlane id="Plane_job_webhook" bpmnElement="job-webhook">
+      <bpmndi:BPMNShape id="S_Start" bpmnElement="Start"><dc:Bounds x="100" y="100" width="36" height="36"/></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="S_BuildRequest" bpmnElement="BuildRequest"><dc:Bounds x="190" y="78" width="110" height="80"/></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="S_AskModel" bpmnElement="AskModel"><dc:Bounds x="350" y="78" width="110" height="80"/></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="S_BuildNote" bpmnElement="BuildNote"><dc:Bounds x="510" y="78" width="110" height="80"/></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="S_Deliver" bpmnElement="Deliver"><dc:Bounds x="670" y="78" width="110" height="80"/></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="S_End" bpmnElement="End"><dc:Bounds x="830" y="100" width="36" height="36"/></bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="E_F1" bpmnElement="F1"><di:waypoint x="136" y="118"/><di:waypoint x="190" y="118"/></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="E_F2" bpmnElement="F2"><di:waypoint x="300" y="118"/><di:waypoint x="350" y="118"/></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="E_F3" bpmnElement="F3"><di:waypoint x="460" y="118"/><di:waypoint x="510" y="118"/></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="E_F4" bpmnElement="F4"><di:waypoint x="620" y="118"/><di:waypoint x="670" y="118"/></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="E_F5" bpmnElement="F5"><di:waypoint x="780" y="118"/><di:waypoint x="830" y="118"/></bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</bpmn:definitions>

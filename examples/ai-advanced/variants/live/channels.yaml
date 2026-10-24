@@ -1,0 +1,252 @@
+# Channels for the ai-advanced module, 1.0.0 — the `live` variant: the real OpenAI and Anthropic
+# APIs. live-check.sh deploys it; keys come from the engine's environment (OPENAI_API_KEY,
+# ANTHROPIC_API_KEY). Reference: docs/guide/llm-channels.md in the Sutra source tree.
+#
+# The flows live once, in ../../shared/bpmn; this file is the only thing that differs between the
+# `stub` and `live` variants. `sutra package` composes the layers:
+#
+#   sutra package examples/ai-advanced/variants/live \
+#       --overlay examples/ai-advanced/shared --out examples/ai-advanced/deploy/deployments
+#
+#   SYNC  POST /channels/fallback           -> fallback-model   Anthropic first, OpenAI second
+#   SYNC  POST /channels/classify           -> classify-model   JSON mode (OpenAI)
+#   SYNC  POST /channels/weather            -> weather-model    a tool call (Anthropic)
+#   JOB   POST /channels/summarize-job      -> job-model        OpenAI background job, polled
+#   JOB   POST /channels/summarize-webhook  -> webhook-model    OpenAI background job, webhook
+#   JOB   POST /channels/summarize-batch    -> batch-model      Anthropic Message Batch, polled
+#
+# The three sync channels declare `ack-mode: on-complete`: the call is inline and the HTTP caller
+# gets the answer on its own connection. The three job channels are `mode: job` on the outbound
+# default (`on-persist`): the caller gets 202, the provider holds the work, and the result is
+# delivered on the channel's `reply-channel` and handed to `summary-sink`.
+#
+# SECRETS. Every key and the webhook secret are `env:` references, resolved by the ENGINE from its
+# own environment when the package loads. An unset variable fails the channel at load
+# (SUTRA.LLM.CONFIG.INVALID), so deploy/compose.yaml always defines every name this package
+# references — with a placeholder when you have not exported a real value.
+
+channels:
+  # ---- inbound: one per flow ---------------------------------------------------------------
+
+  # Sync: the answer, and which provider gave it, come back on the request.
+  - name: fallback
+    transport: http
+    bind: "POST /channels/fallback"
+    codec: json
+    ack-mode: on-complete
+    cloudevents-mode: none
+    auth:
+      scheme: apikey
+      apikey:
+        value: env:AI_ADVANCED_API_KEY
+        header: X-Api-Key
+
+  # Sync: { ticketId, description } in, the model's JSON object (as text) out.
+  - name: classify
+    transport: http
+    bind: "POST /channels/classify"
+    codec: json
+    ack-mode: on-complete
+    cloudevents-mode: none
+    auth:
+      scheme: apikey
+      apikey:
+        value: env:AI_ADVANCED_API_KEY
+        header: X-Api-Key
+
+  # Sync: the model's tool call comes back instead of text.
+  - name: weather
+    transport: http
+    bind: "POST /channels/weather"
+    codec: json
+    ack-mode: on-complete
+    cloudevents-mode: none
+    auth:
+      scheme: apikey
+      apikey:
+        value: env:AI_ADVANCED_API_KEY
+        header: X-Api-Key
+
+  # Job intake: 202 at once; the summary reaches summary-sink when the job is done.
+  - name: summarize-job
+    transport: http
+    bind: "POST /channels/summarize-job"
+    codec: json
+    ack-mode: on-persist
+    cloudevents-mode: none
+    auth:
+      scheme: apikey
+      apikey:
+        value: env:AI_ADVANCED_API_KEY
+        header: X-Api-Key
+
+  # Job intake, webhook-completed.
+  - name: summarize-webhook
+    transport: http
+    bind: "POST /channels/summarize-webhook"
+    codec: json
+    ack-mode: on-persist
+    cloudevents-mode: none
+    auth:
+      scheme: apikey
+      apikey:
+        value: env:AI_ADVANCED_API_KEY
+        header: X-Api-Key
+
+  # Job intake, Anthropic batch.
+  - name: summarize-batch
+    transport: http
+    bind: "POST /channels/summarize-batch"
+    codec: json
+    ack-mode: on-persist
+    cloudevents-mode: none
+    auth:
+      scheme: apikey
+      apikey:
+        value: env:AI_ADVANCED_API_KEY
+        header: X-Api-Key
+
+  # ---- outbound: the models -----------------------------------------------------------------
+
+  # FALLBACK. Candidates are tried in order; a transient failure of one (`fallback-on`, default
+  # [rate-limited, unavailable, timeout]) moves the call to the next. The answer's `provider`
+  # says which one answered.
+  - name: fallback-model
+    direction: outbound
+    transport: llm
+    bind: "llm://fallback-model"
+    ack-mode: on-complete
+    llm:
+      candidates:
+        - provider: anthropic
+          model: claude-haiku-5-5
+          base-url: http://model-stub:8000/relay/anthropic   # via the stub's relay to api.anthropic.com: up or down on its outage switch
+          api-key: env:ANTHROPIC_API_KEY
+        - provider: openai
+          model: gpt-4o-mini
+          api-key: env:OPENAI_API_KEY
+      fallback-on: [rate-limited, unavailable, timeout]
+      max-output-tokens: 200
+      timeout-seconds: 30
+
+  # JSON MODE. Nothing on the channel: the flow's request says `json: true`.
+  # `require: [json-output]` would skip a candidate that cannot do it.
+  - name: classify-model
+    direction: outbound
+    transport: llm
+    bind: "llm://classify-model"
+    ack-mode: on-complete
+    llm:
+      candidates:
+        - provider: openai
+          model: gpt-4o-mini
+          api-key: env:OPENAI_API_KEY
+      require: [json-output]
+      max-output-tokens: 200
+      timeout-seconds: 30
+
+  # TOOLS. The flow's request carries the tool list; the answer carries the calls.
+  - name: weather-model
+    direction: outbound
+    transport: llm
+    bind: "llm://weather-model"
+    ack-mode: on-complete
+    llm:
+      candidates:
+        - provider: anthropic
+          model: claude-haiku-5-5
+          api-key: env:ANTHROPIC_API_KEY
+      require: [tools]
+      max-output-tokens: 300
+      timeout-seconds: 30
+
+  # OPENAI BACKGROUND JOB, POLLED. `mode: job` needs the outbound default ack-mode (on-persist)
+  # and an engine with a database: the job is a row in `llm_job` until its result is delivered.
+  - name: job-model
+    direction: outbound
+    transport: llm
+    bind: "llm://job-model"
+    llm:
+      mode: job
+      reply-channel: job-reply
+      candidates:
+        - provider: openai
+          model: gpt-4o-mini
+          api-key: env:OPENAI_API_KEY
+          completion: poll
+          poll-interval-seconds: 5
+          job-timeout-seconds: 1800
+      max-output-tokens: 300
+      timeout-seconds: 60
+
+  # OPENAI BACKGROUND JOB, WEBHOOK. `completion: callback` names the inbound callback channel the
+  # provider's webhook arrives on; polling remains as a slow safety net.
+  - name: webhook-model
+    direction: outbound
+    transport: llm
+    bind: "llm://webhook-model"
+    llm:
+      mode: job
+      reply-channel: webhook-reply
+      candidates:
+        - provider: openai
+          model: gpt-4o-mini
+          api-key: env:OPENAI_API_KEY
+          completion: callback
+          callback-channel: openai-hooks
+          poll-interval-seconds: 600
+          job-timeout-seconds: 1800
+      max-output-tokens: 300
+      timeout-seconds: 60
+
+  # ANTHROPIC MESSAGE BATCHES. Anthropic has no webhooks: `completion: poll`.
+  - name: batch-model
+    direction: outbound
+    transport: llm
+    bind: "llm://batch-model"
+    llm:
+      mode: job
+      reply-channel: batch-reply
+      candidates:
+        - provider: anthropic
+          model: claude-haiku-5-5
+          api-key: env:ANTHROPIC_API_KEY
+          completion: poll
+          poll-interval-seconds: 20
+          job-timeout-seconds: 86400
+      max-output-tokens: 300
+      timeout-seconds: 60
+
+  # ---- inbound: where job results and webhooks arrive -----------------------------------------
+
+  # The job results: { text, finish, usage, provider, model, request, ... } — as an async reply.
+  - name: job-reply
+    transport: local
+    codec: json
+
+  - name: webhook-reply
+    transport: local
+    codec: json
+
+  - name: batch-reply
+    transport: local
+    codec: json
+
+  # The webhook endpoint: an inbound `llm` channel on the engine's shared HTTP listener, always
+  # POST /llm/<path>. A webhook whose signature does not verify against the secret is refused 401.
+  - name: openai-hooks
+    transport: llm
+    bind: "POST /llm/openai-hooks"
+    llm:
+      callback-for: openai
+      callback-secret: env:OPENAI_WEBHOOK_SECRET   # the project's signing secret (whsec_...) from the OpenAI dashboard
+
+  # ---- outbound: where the job flows hand the finished summary --------------------------------
+
+  # The stub's /sink, which records what it receives (GET /sink on the stub lists it). In real use,
+  # your ticketing system's webhook.
+  - name: summary-sink
+    direction: outbound
+    transport: http
+    bind: "http://model-stub:8000/sink"
+    cloudevents-mode: none
