@@ -40,7 +40,20 @@ for candidate in "$repo/rust/target/release/sutra" "$repo/rust/target/debug/sutr
     [ -n "$candidate" ] && [ -x "$candidate" ] && sutra_bin=$candidate
 done
 [ -n "$sutra_bin" ] || { echo "no sutra CLI: set SUTRA_BIN or put sutra on PATH" >&2; exit 2; }
+# The examples use 0.5.0 features (sync calls without <q:alias>, q:stream); an older CLI rejects them.
+cli_version=$("$sutra_bin" --version | awk '{print $NF}')
+if [ "$(printf '%s\n' 0.5.0 "$cli_version" | sort -V | head -1)" != 0.5.0 ]; then
+    echo "sutra CLI $cli_version at $sutra_bin is older than 0.5.0; build one (cargo build -p sutra-cli)" >&2
+    echo "and point SUTRA_BIN at it, e.g. SUTRA_BIN=\$PWD/rust/target/debug/sutra" >&2
+    exit 2
+fi
 echo "using $("$sutra_bin" --version) ($sutra_bin); engine image ${SUTRA_ENGINE_IMAGE:-ghcr.io/startr-trade/sutra:0.5.0}"
+image=${SUTRA_ENGINE_IMAGE:-ghcr.io/startr-trade/sutra:0.5.0}
+if ! docker image inspect "$image" >/dev/null 2>&1 && ! docker pull -q "$image" >/dev/null 2>&1; then
+    echo "engine image $image is not available locally and cannot be pulled; build one (make image)" >&2
+    echo "and set SUTRA_ENGINE_IMAGE, e.g. SUTRA_ENGINE_IMAGE=sutra-rust-engine:dev" >&2
+    exit 2
+fi
 
 have() { [ -n "${!1:-}" ]; }
 if ! have OPENAI_API_KEY && ! have ANTHROPIC_API_KEY && ! have GEMINI_API_KEY; then

@@ -110,9 +110,11 @@ stream the answer to its caller. Model calls are ordinary channel calls, so they
   2026-10-24. Against OpenAI also: candidate fallback (an unreachable first candidate, then
   OpenAI), JSON mode, tool calls, and a background job completed both by polling and by a signed
   webhook through a public tunnel; and an Anthropic Message Batches job (`mode: job`, polled).
-- Not yet run live: the cross-provider fallback with a real Anthropic candidate failing over to
-  OpenAI, and Anthropic JSON mode and tool calls. All three are covered in tier 2 against the stub,
-  and `live-check.sh` runs them against the real APIs.
+- `live-check.sh` ran all 16 checks green against the real APIs: both examples on OpenAI,
+  Anthropic and Gemini; cross-provider fallback (Anthropic answering, then Anthropic unavailable and
+  OpenAI answering); JSON mode on OpenAI; a tool call on Anthropic; the OpenAI background job,
+  polled and webhook-completed; an Anthropic Message Batch. Not run live: JSON mode on Anthropic
+  (covered in tier 2 against the stub).
 
 ## [0.4.0] — 2026-10-23
 
