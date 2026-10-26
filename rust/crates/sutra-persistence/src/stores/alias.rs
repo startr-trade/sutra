@@ -80,6 +80,17 @@ const SQL_FIND_LIVE: &str = "SELECT instance_id FROM alias_index \
 const SQL_RETIRE: &str = "UPDATE alias_index SET live = FALSE \
      WHERE deployment_id = $1 AND instance_id = $2 AND live = TRUE";
 
+/// Retire ONE alias row of a still-live instance — the key of a wait it has left.
+const SQL_RETIRE_ONE: &str = "UPDATE alias_index SET live = FALSE \
+     WHERE deployment_id = $1 AND instance_id = $2 AND alias_name = $3 AND alias_value = $4 \
+       AND live = TRUE";
+
+/// Bring a retired row of the SAME instance back to life — a loop whose new iteration parks on
+/// a key an earlier iteration retired.
+const SQL_REVIVE: &str = "UPDATE alias_index SET live = TRUE, unique_alias = $5 \
+     WHERE deployment_id = $1 AND instance_id = $2 AND alias_name = $3 AND alias_value = $4 \
+       AND live = FALSE";
+
 const SQL_LIST_FOR: &str = "SELECT alias_name, alias_value, unique_alias, live FROM alias_index \
      WHERE deployment_id = $1 AND instance_id = $2";
 
@@ -115,19 +126,57 @@ impl PgAliasStore {
             return Ok(true);
         }
         // Conflict path. Non-unique aliases can only have hit the row PK (same instance
-        // re-attempt) — idempotent success. Unique aliases must disambiguate idempotent
-        // retry vs a DIFFERENT live instance owning this (deployment, name, value).
-        if !unique {
-            return Ok(true);
+        // re-attempt, or this instance's own row RETIRED by an earlier step) — revive it and
+        // succeed. Unique aliases must disambiguate idempotent retry vs a DIFFERENT live
+        // instance owning this (deployment, name, value) first: only an unowned key may be
+        // revived, or the revival itself would break the unique-live guarantee.
+        if unique {
+            let owner: Option<Uuid> = sqlx::query_scalar(SQL_FIND_LIVE)
+                .bind(deployment.as_str())
+                .bind(alias_name)
+                .bind(alias_value)
+                .fetch_optional(&mut *conn)
+                .await
+                .map_err(PersistenceError::db("alias record owner check"))?;
+            if let Some(owner) = owner {
+                return Ok(owner == instance_id);
+            }
         }
-        let owner: Option<Uuid> = sqlx::query_scalar(SQL_FIND_LIVE)
+        let revived = sqlx::query(SQL_REVIVE)
             .bind(deployment.as_str())
+            .bind(instance_id)
             .bind(alias_name)
             .bind(alias_value)
-            .fetch_optional(conn)
+            .bind(unique)
+            .execute(&mut *conn)
             .await
-            .map_err(PersistenceError::db("alias record owner check"))?;
-        Ok(owner == Some(instance_id))
+            .map_err(PersistenceError::db("alias revive"))?
+            .rows_affected();
+        // A non-unique conflict with nothing to revive is the same instance's live row — an
+        // idempotent re-attempt. A unique key with no live owner and no own row to revive
+        // cannot happen (the insert conflicted with something); report it as not recorded.
+        Ok(revived == 1 || !unique)
+    }
+
+    /// Retire ONE alias row of an instance that stays live, on a caller-supplied connection
+    /// (the transactional-step building block): the correlation key of a wait the instance
+    /// has left. A missing or already-retired row is a no-op.
+    pub async fn retire_one_in(
+        conn: &mut PgConnection,
+        deployment: &DeploymentId,
+        instance_id: Uuid,
+        alias_name: &str,
+        alias_value: &str,
+    ) -> Result<()> {
+        sqlx::query(SQL_RETIRE_ONE)
+            .bind(deployment.as_str())
+            .bind(instance_id)
+            .bind(alias_name)
+            .bind(alias_value)
+            .execute(&mut *conn)
+            .await
+            .map_err(PersistenceError::db("alias retire one"))?;
+        Ok(())
     }
 }
 

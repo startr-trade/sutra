@@ -342,3 +342,183 @@ async fn list_for_instance_shows_redacted_payloads_after_an_erasure() {
     assert_eq!(rows[0].event_type, "NODE_ENTERED");
     assert_eq!(rows[0].payload_json, "{}", "the captured PII is gone");
 }
+
+/// A transport event (`<transport>.<EVENT>`) in an instance's journal takes the instance's
+/// current high-water seq over the engine's events and sits outside the replay-dedup index: it
+/// never blocks the engine event that comes next under that seq, the engine's replay dedup still
+/// holds, and a deployment-level transport event (no instance) lands with seq 0.
+#[ignore = "docker"]
+#[tokio::test]
+async fn a_transport_event_never_takes_a_number_the_engine_writes() {
+    let pool = fresh_pool().await;
+    let store = PgAuditEventStore::new(pool.clone());
+    let instance = Uuid::new_v4();
+
+    // Before any engine event the transport event is numbered 1 (seqs start there).
+    assert!(store
+        .insert(&row(&dep_a(), instance, 99, "media.SESSION_RECOVERED"))
+        .await
+        .unwrap());
+    assert!(store
+        .insert(&row(&dep_a(), instance, 1, "INSTANCE_STARTED"))
+        .await
+        .unwrap());
+    // Two transport events after seq 1 both land, numbered 1 (the caller's seq is ignored).
+    for _ in 0..2 {
+        assert!(store
+            .insert(&row(&dep_a(), instance, 1, "media.REQUEST_REFUSED"))
+            .await
+            .unwrap());
+    }
+    // The engine's next event, seq 2, is not blocked; its replay is still a no-op.
+    assert!(store
+        .insert(&row(&dep_a(), instance, 2, "NODE_ENTERED"))
+        .await
+        .unwrap());
+    assert!(!store
+        .insert(&row(&dep_a(), instance, 2, "NODE_ENTERED"))
+        .await
+        .unwrap());
+
+    let journal = store
+        .list_for_instance(&dep_a(), instance, 0, 100)
+        .await
+        .unwrap();
+    let order: Vec<(i32, &str)> = journal
+        .iter()
+        .map(|r| (r.seq, r.event_type.as_str()))
+        .collect();
+    assert_eq!(
+        order,
+        vec![
+            (1, "media.SESSION_RECOVERED"),
+            (1, "INSTANCE_STARTED"),
+            (1, "media.REQUEST_REFUSED"),
+            (1, "media.REQUEST_REFUSED"),
+            (2, "NODE_ENTERED"),
+        ]
+    );
+
+    // The deployment-level journal: no instance, seq 0, any number of rows.
+    let mut deployment_row = row(&dep_a(), instance, 7, "media.REQUEST_REFUSED");
+    deployment_row.instance_id = None;
+    assert!(store.insert(&deployment_row).await.unwrap());
+    assert!(store.insert(&deployment_row).await.unwrap());
+    let deployment_rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_event WHERE deployment_id = $1 AND instance_id IS NULL \
+         AND seq = 0 AND event_type = 'media.REQUEST_REFUSED'",
+    )
+    .bind(dep_a().as_str())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(deployment_rows, 2);
+}
+
+/// A transport event written AFTER a reader passed the seq it lands on is missed by a `seq`
+/// cursor but returned by the ordinal cursor: the ordinal is assigned in commit order, so paging
+/// by it is lossless while the instance is still writing.
+#[ignore = "docker"]
+#[tokio::test]
+async fn ordinal_paging_returns_a_transport_event_written_behind_the_seq_cursor() {
+    let pool = fresh_pool().await;
+    let store = PgAuditEventStore::new(pool);
+    let instance = Uuid::new_v4();
+    store
+        .insert(&row(&dep_a(), instance, 1, "NODE_ENTERED"))
+        .await
+        .unwrap();
+
+    let first = store
+        .list_for_instance_after_ordinal(&dep_a(), instance, 0, 10)
+        .await
+        .unwrap();
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].ordinal, Some(1));
+    let (seq_cursor, ordinal_cursor) = (first[0].seq, first[0].ordinal.unwrap());
+
+    // The transport writes now, at the engine's high-water seq — the one the reader already passed.
+    store
+        .insert(&row(&dep_a(), instance, 0, "http.REQUEST_SENT"))
+        .await
+        .unwrap();
+    store
+        .insert(&row(&dep_a(), instance, 2, "NODE_LEFT"))
+        .await
+        .unwrap();
+
+    let by_seq = store
+        .list_for_instance(&dep_a(), instance, seq_cursor, 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        by_seq
+            .iter()
+            .map(|r| r.event_type.as_str())
+            .collect::<Vec<_>>(),
+        ["NODE_LEFT"],
+        "the legacy seq cursor skips the transport row (the defect the ordinal fixes)"
+    );
+    let by_ordinal = store
+        .list_for_instance_after_ordinal(&dep_a(), instance, ordinal_cursor, 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        by_ordinal
+            .iter()
+            .map(|r| (r.event_type.as_str(), r.ordinal))
+            .collect::<Vec<_>>(),
+        [("http.REQUEST_SENT", Some(2)), ("NODE_LEFT", Some(3))]
+    );
+
+    // A replayed engine event is still dropped by the seq dedup, and takes no ordinal.
+    assert!(!store
+        .insert(&row(&dep_a(), instance, 2, "NODE_LEFT"))
+        .await
+        .unwrap());
+    let all = store
+        .list_for_instance_after_ordinal(&dep_a(), instance, 0, 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        all.iter().map(|r| r.ordinal.unwrap()).collect::<Vec<_>>(),
+        [1, 2, 3]
+    );
+}
+
+/// Concurrent writers of one instance never leave a gap a reader can pass: the ordinals form
+/// exactly 1..=N, whatever order the transactions commit in.
+#[ignore = "docker"]
+#[tokio::test]
+async fn concurrent_writers_of_one_instance_get_dense_ordinals() {
+    let pool = fresh_pool().await;
+    let store = PgAuditEventStore::new(pool);
+    let instance = Uuid::new_v4();
+    let writers: Vec<_> = (1..=20)
+        .map(|n| {
+            let store = store.clone();
+            tokio::spawn(async move {
+                let event = if n % 2 == 0 {
+                    "NODE_ENTERED"
+                } else {
+                    "http.SENT"
+                };
+                store
+                    .insert(&row(&dep_a(), instance, n, event))
+                    .await
+                    .unwrap();
+            })
+        })
+        .collect();
+    for writer in writers {
+        writer.await.unwrap();
+    }
+    let all = store
+        .list_for_instance_after_ordinal(&dep_a(), instance, 0, 100)
+        .await
+        .unwrap();
+    assert_eq!(
+        all.iter().map(|r| r.ordinal.unwrap()).collect::<Vec<_>>(),
+        (1..=20).collect::<Vec<i64>>()
+    );
+}

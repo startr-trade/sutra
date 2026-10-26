@@ -147,6 +147,23 @@ impl OutboxRowStore for PgOutboxRows {
         })
     }
 
+    fn requeue<'a>(
+        &'a self,
+        deployment: &'a sutra_executor::DeploymentId,
+        entry_id: &'a str,
+        new_due_at: OffsetDateTime,
+        diagnostic_json: &'a str,
+    ) -> BoxFuture<'a, Result<(), Diagnostic>> {
+        Box::pin(async move {
+            let dep = persist_dep(deployment)?;
+            let id = parse_entry_id(entry_id)?;
+            self.store
+                .requeue(&dep, id, new_due_at, Some(diagnostic_json))
+                .await
+                .map_err(|e| store_diag("outbox requeue failed", e))
+        })
+    }
+
     fn mark_poisoned<'a>(
         &'a self,
         deployment: &'a sutra_executor::DeploymentId,

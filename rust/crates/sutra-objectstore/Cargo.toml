@@ -1,0 +1,24 @@
+[package]
+name = "sutra-objectstore"
+description = "A neutral object-store seam for media a transport records (a call's audio): the ObjectStore trait, an S3-compatible client (AWS Signature V4, path-style for self-hosted stores, pure Rust over hyper + rustls/ring), an in-memory store for tests, and the sealed-object format that encrypts an object at rest with sutra-crypto envelope encryption (a fresh data key per object, wrapped under a key-encryption key)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+sutra-crypto = { path = "../sutra-crypto" }
+base64 = { workspace = true }
+hmac = "0.12"
+sha2 = { workspace = true }
+serde_json = { workspace = true }
+time = { workspace = true }
+tokio = { version = "1", features = ["time"] }
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "native-tokio", "ring", "tls12"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
+sutra-testkit = { path = "../sutra-testkit" }

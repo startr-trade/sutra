@@ -14,7 +14,7 @@ name: sutra-ai-advanced
 
 services:
   engine:
-    image: ${SUTRA_ENGINE_IMAGE:-ghcr.io/startr-trade/sutra:0.5.1}
+    image: ${SUTRA_ENGINE_IMAGE:-ghcr.io/startr-trade/sutra:0.6.0}
     environment:
       SUTRA_DEPLOYMENTS_DIR: /deployments
       SUTRA_HTTP_PORT: "8080"
@@ -38,6 +38,7 @@ services:
       # safety-net poll instead.
       OPENAI_API_KEY: ${OPENAI_API_KEY:-not-set}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-not-set}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-not-set}
       OPENAI_WEBHOOK_SECRET: ${OPENAI_WEBHOOK_SECRET:-not-set}
     volumes:
       # DEPLOYMENTS_DIR overrides the archive directory (live-check.sh uses a temporary one).

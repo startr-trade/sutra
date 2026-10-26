@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Sutra engine — platform / system API
-  version: 0.5.1
+  version: 0.6.0
   description: |
     The **platform (system) API** the Sutra engine serves on its own HTTP port — distinct from the
     per-deployment channel endpoints (those are generated per archive). This surface is the
@@ -481,8 +481,12 @@ paths:
         owns an instance row nor appears in any journal.
 
 
-        Paging is by CURSOR (`afterSeq`), not offset, so a page stays stable while a running
-        instance keeps appending. A full page returns `nextAfterSeq`; a short page is the end.
+        Paging is by CURSOR, not offset, so a page stays stable while a running instance keeps
+        appending. Page by `afterOrdinal`: the journal ordinal is assigned in commit order, so no
+        event written later can land behind a cursor already returned. `afterSeq` is the legacy
+        cursor and is kept for existing clients; it can miss a transport event, which shares the
+        `seq` of the engine event it followed. A full page returns `nextAfterOrdinal` and
+        `nextAfterSeq`; a short page is the end.
       operationId: adminInstanceHistory
       security: [{ bearerAuth: [] }]
       parameters:
@@ -491,7 +495,8 @@ paths:
           required: true
           description: The instance UUID.
           schema: { type: string, format: uuid }
-        - { name: afterSeq, in: query, required: false, description: Exclusive cursor — return events with `seq` greater than this. Default 0 (seqs start at 1)., schema: { type: integer, default: 0 } }
+        - { name: afterOrdinal, in: query, required: false, description: "Exclusive cursor — return events with `ordinal` greater than this. Default 0 (ordinals start at 1). Takes precedence over `afterSeq`; with neither, the page starts at the beginning of the journal by ordinal.", schema: { type: integer, default: 0 } }
+        - { name: afterSeq, in: query, required: false, description: "Legacy exclusive cursor — return events with `seq` greater than this. Can miss a transport event that shares an already-passed `seq`; use `afterOrdinal`.", schema: { type: integer } }
         - { name: limit, in: query, required: false, description: Page size, clamped to 1..1000., schema: { type: integer, default: 100, minimum: 1, maximum: 1000 } }
       responses:
         "200": { description: One page of the instance's journal (possibly empty — see `auditEnabled` / `note`)., content: { application/json: { schema: { $ref: "#/components/schemas/InstanceHistory" } } } }
@@ -988,7 +993,8 @@ components:
         instead of failing the page. It is `{}` for an instance whose process captured nothing, and
         also after a GDPR erasure redacted it (the trail row itself is retained on purpose).
       properties:
-        seq: { type: integer, description: Monotonic per-instance sequence — the ordering and the paging cursor. }
+        seq: { type: integer, description: "The engine's per-instance sequence (its replay de-duplication number). A transport event shares the seq of the engine event it followed." }
+        ordinal: { type: [integer, "null"], description: "The event's position in its instance's journal, assigned in commit order — the lossless paging cursor." }
         at: { type: string, format: date-time }
         eventType: { type: string, description: "e.g. INSTANCE_STARTED / NODE_ENTERED / NODE_LEFT / INSTANCE_COMPLETED / INSTANCE_FAILED." }
         nodeId: { type: [string, "null"] }
@@ -997,16 +1003,18 @@ components:
         payload: { description: The captured payload. }
     InstanceHistory:
       type: object
-      description: One seq-ordered page of an instance's audit journal.
+      description: One page of an instance's audit journal, in journal-ordinal order (seq order for an `afterSeq` page).
       properties:
         instanceId: { type: string, format: uuid }
         deploymentId: { type: [string, "null"], description: The deployment whose journal answered; null when the instance is known but has no journal rows. }
         events:
           type: array
           items: { $ref: "#/components/schemas/AuditEvent" }
-        afterSeq: { type: integer, description: The cursor this page was read from. }
+        afterOrdinal: { type: [integer, "null"], description: "The ordinal cursor this page was read from; null for an `afterSeq` page." }
+        afterSeq: { type: [integer, "null"], description: "The legacy seq cursor this page was read from; null unless `afterSeq` was given." }
         limit: { type: integer }
-        nextAfterSeq: { type: [integer, "null"], description: Cursor for the next page; null when this page was the last one. }
+        nextAfterOrdinal: { type: [integer, "null"], description: Ordinal cursor for the next page; null when this page was the last one. }
+        nextAfterSeq: { type: [integer, "null"], description: Legacy seq cursor for the next page; null when this page was the last one. }
         auditEnabled: { type: boolean, description: Whether the durable journal is switched on engine-wide (`sutra.audit.sql`). }
         note: { type: string, description: "Present only on an EMPTY page: why it is empty (journal disabled, no `<q:audit>`, or a cursor past the end) — so an empty journal is never mistaken for a lost one." }
     MigrationFinding:

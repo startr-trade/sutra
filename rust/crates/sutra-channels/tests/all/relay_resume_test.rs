@@ -66,6 +66,8 @@ struct FakeBridge {
     parked_aliases: RefCell<Vec<AliasRecord>>,
     /// Set when a resume step actually commits — must stay false on every negative path.
     resume_committed: RefCell<bool>,
+    /// Set when a resume step re-parked (rather than completed) the instance.
+    reparked: RefCell<bool>,
     /// `(name, value)` pairs `find_live_alias` was asked to correlate — lets a test observe the
     /// value the relay derived (e.g. from an inbound header) at the correlate site.
     alias_lookups: RefCell<Vec<(String, String)>>,
@@ -138,6 +140,7 @@ impl InstanceBridge for FakeBridge {
         _emissions: &[OutboxEmission],
     ) -> Result<(), Diagnostic> {
         *self.resume_committed.borrow_mut() = true;
+        *self.reparked.borrow_mut() = true;
         Ok(())
     }
 
@@ -188,8 +191,12 @@ impl InstanceBridge for FakeBridge {
 }
 
 fn engine_with_bridge(bridge: Rc<FakeBridge>) -> ChannelEngine {
+    engine_for(HOLD_BPMN, bridge)
+}
+
+fn engine_for(bpmn: &str, bridge: Rc<FakeBridge>) -> ChannelEngine {
     let module = BpmnModelLoader::new()
-        .load(HOLD_BPMN.as_bytes())
+        .load(bpmn.as_bytes())
         .expect("BPMN loads");
     let sink = Rc::new(DrainingSink::new());
     let executor = TokenExecutor::builder(TaskRegistry::new())
@@ -970,5 +977,133 @@ fn imec_relay_wait_alias_correlates_from_inbound_header() {
     assert_eq!(
         lookups,
         vec![("corrAlias".to_string(), "CORR-55".to_string())]
+    );
+}
+
+// ==================== one channel, several wait nodes =========================================
+
+/// twice: start → catch A (`relay-in`, as `first`) → catch B (`relay-in`, as `second`) → end.
+const TWICE_BPMN: &str = r#"<?xml version="1.0"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0">
+  <bpmn:process id="twice">
+    <bpmn:startEvent id="S">
+      <bpmn:extensionElements>
+        <q:source channel="start-in" name="payload"/>
+        <q:alias name="e2eId" expression="event.body" unique="true" onConflict="correlate"/>
+      </bpmn:extensionElements>
+    </bpmn:startEvent>
+    <bpmn:intermediateCatchEvent id="A">
+      <bpmn:extensionElements><q:source channel="relay-in" name="first"/></bpmn:extensionElements>
+      <bpmn:messageEventDefinition/>
+    </bpmn:intermediateCatchEvent>
+    <bpmn:intermediateCatchEvent id="B">
+      <bpmn:extensionElements><q:source channel="relay-in" name="second"/></bpmn:extensionElements>
+      <bpmn:messageEventDefinition/>
+    </bpmn:intermediateCatchEvent>
+    <bpmn:endEvent id="E"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="S" targetRef="A"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="A" targetRef="B"/>
+    <bpmn:sequenceFlow id="f3" sourceRef="B" targetRef="E"/>
+  </bpmn:process>
+</bpmn:definitions>"#;
+
+/// Two wait nodes of one process subscribe the same channel. An instance parked at the SECOND
+/// one gets the relay there — it completes — instead of the relay "satisfying" the first node
+/// (already behind it) and leaving the instance re-parked where it was.
+#[test]
+fn a_relay_resumes_the_wait_node_the_instance_is_parked_at() {
+    let bridge = Rc::new(FakeBridge {
+        alias_owner: Some("inst-1".to_string()),
+        loaded: Some(SuspendedInstance {
+            process_id: "twice".to_string(),
+            deployment_id: deployment().value().to_string(),
+            status: "SUSPENDED".to_string(),
+            suspended: true,
+            waiting_nodes: vec!["B".to_string()],
+            completed_nodes: vec!["S".to_string(), "A".to_string()],
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    let engine = engine_for(TWICE_BPMN, Rc::clone(&bridge));
+    drive(engine.dispatch(&inbound("relay-in", b"K-100"))).expect("the relay resumes");
+    assert!(*bridge.resume_committed.borrow(), "a resume step committed");
+    assert!(
+        !*bridge.reparked.borrow(),
+        "the instance completed at B rather than re-parking at B"
+    );
+}
+
+// ============ start-event alias correlation when the wait renames its payload ============
+
+const RENAMED_PAYLOAD_BPMN: &str = r#"<?xml version="1.0"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0">
+  <bpmn:process id="hold">
+    <bpmn:startEvent id="S">
+      <bpmn:extensionElements>
+        <q:source channel="start-in"/>
+        <q:alias name="orderId" expression="payload.id" unique="true" onConflict="correlate"/>
+      </bpmn:extensionElements>
+    </bpmn:startEvent>
+    <bpmn:userTask id="U" name="Approve">
+      <bpmn:extensionElements>
+        <q:source channel="relay-in" name="decision"/>
+      </bpmn:extensionElements>
+    </bpmn:userTask>
+    <bpmn:endEvent id="E"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="S" targetRef="U"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="U" targetRef="E"/>
+  </bpmn:process>
+</bpmn:definitions>"#;
+
+/// A wait that binds its payload under its own name (`<q:source name="decision">`) still
+/// correlates through the start event's `payload.<field>` alias: the payload name is a local
+/// choice of the wait, not part of the correlation contract.
+#[test]
+fn a_relay_correlates_through_the_start_alias_when_the_wait_renames_its_payload() {
+    let bridge = Rc::new(FakeBridge::default());
+    let module = BpmnModelLoader::new()
+        .load(RENAMED_PAYLOAD_BPMN.as_bytes())
+        .expect("BPMN loads");
+    let sink = Rc::new(DrainingSink::new());
+    let executor = TokenExecutor::builder(TaskRegistry::new())
+        .with_feel()
+        .with_emission_sink(Rc::clone(&sink) as Rc<dyn sutra_executor::EmissionSink>)
+        .build();
+    let engine = ChannelEngine::builder(
+        executor,
+        sink,
+        InboundChain::new(
+            CodecRegistry::with_builtins(),
+            sutra_channels::FormatRegistry::with_builtins(),
+            ValidatorRegistry::new(),
+        ),
+    )
+    .with_binding(ChannelBinding::new(
+        "start-in",
+        namespace(),
+        deployment(),
+        "json",
+    ))
+    .with_binding(ChannelBinding::new(
+        "relay-in",
+        namespace(),
+        deployment(),
+        "json",
+    ))
+    .with_module(&deployment(), &module)
+    .with_instance_bridge(Rc::clone(&bridge) as Rc<dyn InstanceBridge>)
+    .build();
+    let mut message = inbound("relay-in", br#"{"id":"K-7"}"#);
+    message.content_type = Some("application/json".to_string());
+    let d = expect_err(drive(engine.dispatch(&message)));
+    assert_eq!(d.code, "SUTRA.RUNTIME.RELAY.CORRELATION_NOT_FOUND");
+    assert_eq!(
+        *bridge.alias_lookups.borrow(),
+        [("orderId".to_string(), "K-7".to_string())],
+        "the relay derived the start alias from its renamed payload: {}",
+        d.message
     );
 }

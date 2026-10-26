@@ -183,7 +183,7 @@ const SQL_CLAIM_DUE: &str = "SELECT entry_id, deployment_id, instance_id, body, 
       node_id \
      FROM outbox_entry \
      WHERE deployment_id = $1 AND NOT poisoned AND next_attempt_at <= $2 \
-     ORDER BY next_attempt_at \
+     ORDER BY next_attempt_at, created_at \
      LIMIT $3 \
      FOR UPDATE SKIP LOCKED";
 
@@ -206,6 +206,11 @@ const SQL_DELETE: &str = "DELETE FROM outbox_entry WHERE deployment_id = $1 AND 
 
 const SQL_DEFER: &str = "UPDATE outbox_entry SET next_attempt_at = $1, \
       attempt_count = attempt_count + 1, last_diagnostic_json = $2 \
+     WHERE deployment_id = $3 AND entry_id = $4";
+
+/// Put an entry back WITHOUT counting an attempt (a pooled request waiting for a slot).
+const SQL_REQUEUE: &str = "UPDATE outbox_entry SET next_attempt_at = $1, \
+      last_diagnostic_json = $2 \
      WHERE deployment_id = $3 AND entry_id = $4";
 
 const SQL_POISON: &str = "UPDATE outbox_entry SET poisoned = TRUE, last_diagnostic_json = $1 \
@@ -321,6 +326,30 @@ impl PgOutboxStore {
             "outbox countPendingForInstance commit",
         ))?;
         Ok(count)
+    }
+
+    /// Put an entry back due at `new_due_at` WITHOUT incrementing `attempt_count` — nothing
+    /// was sent (a request on a pooled channel waiting for a slot). Records the diagnostic so the
+    /// wait is visible. A missing row is a no-op.
+    pub async fn requeue(
+        &self,
+        deployment: &DeploymentId,
+        entry_id: Uuid,
+        new_due_at: OffsetDateTime,
+        new_diagnostic_json: Option<&str>,
+    ) -> Result<()> {
+        let mut tx = begin_deployment_tx(&self.pool, deployment).await?;
+        sqlx::query(SQL_REQUEUE)
+            .bind(new_due_at)
+            .bind(new_diagnostic_json)
+            .bind(deployment.as_str())
+            .bind(entry_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(PersistenceError::db("outbox requeue"))?;
+        tx.commit()
+            .await
+            .map_err(PersistenceError::db("outbox requeue commit"))
     }
 
     /// SKIP LOCKED claim on a caller-supplied transaction connection. Rows stay locked until

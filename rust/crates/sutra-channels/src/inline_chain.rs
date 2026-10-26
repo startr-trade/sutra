@@ -141,6 +141,14 @@ impl InlineHandoff {
     pub(crate) fn take(&self) -> Option<InlineContinuation> {
         self.0.lock().ok().and_then(|mut slot| slot.take())
     }
+
+    /// The instance the chain drives (`None` once the continuation was taken).
+    pub(crate) fn instance_id(&self) -> Option<String> {
+        self.0.lock().ok().and_then(|slot| {
+            slot.as_ref()
+                .map(|continuation| continuation.chain.instance_id.clone())
+        })
+    }
 }
 
 // Identity, not content: two handoffs are equal only when they are the same chain.
@@ -199,6 +207,10 @@ pub(crate) async fn run_inline_call(
         retry,
         stream,
     } = call;
+    let mut request = request;
+    if !caller.records_media() {
+        request.headers.remove(crate::audit::AUDIT_CAPTURE_HEADER);
+    }
     // A streamed call forwards its pieces to the caller's response as they arrive.
     let on_chunk: Option<crate::inline::InlineChunkSink> = match (stream, tap) {
         (true, Some(tap)) => {

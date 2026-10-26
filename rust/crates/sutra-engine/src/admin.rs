@@ -587,8 +587,8 @@ async fn admin_instance_by_alias(
     crate::server::instance_by_alias_response(&state, &key, &value).await
 }
 
-/// `GET /admin/instances/{id}/history` — one seq-ordered page of the instance's `audit_event`
-/// journal (`?afterSeq=` cursor, `?limit=`). Admin-only: audit rows carry captured business
+/// `GET /admin/instances/{id}/history` — one page of the instance's `audit_event` journal
+/// (`?afterOrdinal=` cursor, or the legacy `?afterSeq=`; `?limit=`). Admin-only: audit rows carry captured business
 /// payloads. The journal is OPT-IN (`sutra.audit.sql` + `<q:audit>`); an empty page says which
 /// switch left it empty rather than implying the history was lost.
 async fn admin_instance_history(

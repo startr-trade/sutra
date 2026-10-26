@@ -124,6 +124,7 @@ impl LlmProvider for AnthropicProvider {
             streaming: true,
             async_jobs: true,
             job_callbacks: false,
+            ..LlmCapabilities::default()
         }
     }
 
@@ -337,6 +338,8 @@ impl MessageStream {
             finish: map_stop(self.stop.as_deref()),
             usage: self.usage,
             provider_request_id: self.id,
+            audio: None,
+            transcript: None,
         })
     }
 }
@@ -492,6 +495,8 @@ fn parse_response(value: &Value) -> Result<LlmResponse, LlmFailure> {
         finish,
         usage,
         provider_request_id: value.get("id").and_then(Value::as_str).map(String::from),
+        audio: None,
+        transcript: None,
     })
 }
 
@@ -520,6 +525,8 @@ mod tests {
             max_output_tokens: None,
             temperature: None,
             deadline: Duration::from_secs(5),
+            audio_output: None,
+            output_voice: None,
         }
     }
 
@@ -529,6 +536,8 @@ mod tests {
             content: content.into(),
             tool_calls: vec![],
             tool_call_id: Some(id.into()),
+            audio: None,
+            video: None,
         }
     }
 
@@ -598,6 +607,8 @@ mod tests {
                 },
             ],
             tool_call_id: None,
+            audio: None,
+            video: None,
         };
         let b = request_body(&req(vec![
             LlmMessage::user("go"),
@@ -636,6 +647,8 @@ mod tests {
                 arguments: json!({}),
             }],
             tool_call_id: None,
+            audio: None,
+            video: None,
         };
         let b = request_body(&req(vec![assistant]));
         assert_eq!(b["messages"][0]["content"].as_array().unwrap().len(), 1);

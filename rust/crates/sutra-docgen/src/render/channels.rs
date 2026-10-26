@@ -84,10 +84,33 @@ fn render_llm(name: &str, llm: &serde_yaml::Mapping) -> String {
         "concurrency",
         "fallback-on",
         "require",
+        "voice",
+        "output-voice",
         "callback-for",
     ] {
         if let Some(v) = llm.get(key) {
             let _ = writeln!(out, "| `{key}` | {} |", cell(&text(Some(v))));
+        }
+    }
+    if let Some(speech) = llm.get("speech").and_then(Value::as_mapping) {
+        for key in [
+            "provider",
+            "base-url",
+            "transcribe-model",
+            "speech-model",
+            "voice",
+            "language",
+        ] {
+            if let Some(v) = speech.get(key) {
+                let _ = writeln!(out, "| `speech.{key}` | {} |", cell(&text(Some(v))));
+            }
+        }
+        if speech.contains_key("api-key") {
+            let _ = writeln!(
+                out,
+                "| `speech.api-key` | {} |",
+                secret_ref(speech.get("api-key"))
+            );
         }
     }
     if llm.contains_key("callback-secret") {
@@ -109,6 +132,7 @@ fn render_llm(name: &str, llm: &serde_yaml::Mapping) -> String {
     }
     let has = |k: &str| cands.iter().any(|c| c.contains_key(k));
     let job = [
+        "transcription-model",
         "callback-channel",
         "poll-interval-seconds",
         "job-timeout-seconds",

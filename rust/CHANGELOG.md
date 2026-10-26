@@ -13,6 +13,261 @@ This is the changelog for the **Rust-native** engine (`rust/` workspace). It beg
 
 Nothing yet.
 
+## [0.6.0] — 2026-10-26
+
+A **minor** release: a process can work with sound, images and stored recordings, share a
+limited number of slots across deployments, end a session before its instance ends, and loop back
+to a wait as many times as it needs. The `q:` namespace gains one value, additively
+(`capture="media"` on `<q:audit>`). Four migrations run on upgrade (V202 and V203 on the audit
+journal, V703 and V704 for capacity pools); the snapshot format is unchanged, and instances
+parked by a 0.5 engine resume under the new rules. Two new crates: `sutra-objectstore` and
+`sutra-llm-gemini`.
+
+### Preview
+
+- **Live audio sessions and video understanding are preview** in this release: `AudioSession`
+  (the OpenAI Realtime and Gemini Live adapters, `require: [realtime]`, live sessions opened
+  through an `llm` channel) and video understanding (clips, frames, images). Both were run
+  against the real Gemini and OpenAI APIs on 2026-10-26, as well as against in-process stand-ins
+  of the provider APIs, and stay preview: their shapes may still change. Audio on a turn-based
+  call (`audio`, `audioOutput`, `voice: pipeline`) is not preview.
+
+### Telephony and video live in sutra-voice
+
+- **Telephony and video are not part of this engine.** They were built during the 0.6 cycle and
+  moved, before this release, into the separate open-source repository
+  [sutra-voice](https://github.com/startr-trade/sutra-voice) (MIT OR Apache-2.0), which consumes
+  this engine as a git submodule and ships its own engine image: the `voip` transport, the WebRTC
+  media worker, and the voice, IVR, meeting and video examples with their suites. The engine
+  keeps every generic piece they build on, listed below.
+
+### Added — audio in the `llm` transport and the provider SPI
+
+- **Audio stays audio.** A user turn may carry `audio` (`{data: <base64>, format: <media type>}`)
+  or `video` (a clip, or sampled frames; preview), and `audioOutput` asks for a spoken answer. The
+  reply adds `audio`, `transcript` and `audioPreserved`. A candidate that cannot take what the
+  call carries is skipped — the audio is never dropped for a text-only call.
+- **Formats are media types** (`audio/wav`, `audio/L16;rate=<hz>`, `audio/PCMU`, `audio/PCMA`,
+  and pass-through compressed formats). The transport converts between the call's formats and
+  the provider's in pure Rust: WAV wrap/unwrap, G.711 µ-law / A-law, linear resampling.
+- **`voice: pipeline`** with an `llm.speech` provider: speech-to-text, a text model, then
+  text-to-speech, for models without audio. Its replies say `audioPreserved: false`.
+- **`require:`** gains `audio-input`, `audio-output`, `audio-understanding` (the model hears the
+  voice itself), `video-understanding` and `realtime`.
+- **`openai`** (only that id, only audio chat models): `input_audio` parts and spoken answers;
+  transcription and speech for the pipeline; a live `AudioSession` over the Realtime WebSocket
+  API (preview), with G.711 at 8 kHz passed straight through, and a transcription-only session.
+  A refused Realtime session says why in OpenAI's own words: a refused handshake carries the
+  response body, and an `error` event its code (`invalid_api_key`, `model_not_found`).
+- **SPI** (`sutra-llm-spi`): `AudioFormat`, `LlmAudio`, `LlmVideo`, the `audio` conversion module,
+  capability flags `audio_input`, `audio_output`, `audio_understanding`, `video_understanding`,
+  `realtime`, `transcription`, `speech_synthesis`, and provider methods `transcribe`,
+  `synthesize` and `open_audio_session` (all defaulting to "unsupported", so existing adapters
+  are unchanged); `AudioSessionConfig.transcription_only`; session events `SpeechStarted` /
+  `SpeechStopped` (audio offsets). New diagnostic code `SUTRA.LLM.AUDIO.UNSUPPORTED`.
+
+### Added — native Gemini, structured answers
+
+- **Gemini Live turn detection** waits for the end of a sentence: with server turn detection a
+  session asks for a low end-of-speech sensitivity and 800 ms of silence, so a short pause after
+  the first word no longer ends the caller's turn (the model answered the fragment).
+- **`gemini`** provider (`sutra-llm-gemini`, bundled by default: the `llm-gemini` feature) —
+  Gemini's native API, with audio, images and video (preview) that the compatible
+  `google-gemini` route cannot carry, and a Gemini Live `AudioSession` (preview). Gemini Live has
+  no listen-only session: a transcription-only setup asks the model to stay silent.
+- **Structured answers.** A model call that asks for JSON (`json: true`) gets the parsed answer
+  under `json` in the reply, so a flow reads its fields directly. When it does not parse, the
+  reply says why under `jsonError` — cut off at `max-output-tokens` (a reasoning model's thinking
+  counts against that limit; the Gemini examples now allow 2048), or not JSON at all.
+
+### Added — model channels other transports can call
+
+- **`sutra-llm-spi`**: `LlmChannelHandle` (`complete`, `open_audio_session`, `capabilities`),
+  `LlmChannelRegistry` and the process-wide `llm_channels()`. The `llm` transport publishes every
+  live `mode: call` channel to it at spawn and on each activation flip (`RoutedChannelHandle`,
+  `channel_handles`, `publish_channels`, `LlmTransport::publishing`), so a media transport opens
+  its model sessions through a named channel of its deployment — with the channel's ordered
+  candidates and fallback, `require:` filtering, key references, `concurrency` limit and
+  `sutra.llm.call` span — instead of calling a provider directly. A live session opens on the
+  first candidate with `realtime` that satisfies `require:`, falls back on `fallback-on`, and
+  holds one of the channel's `concurrency` permits while it is open.
+- **`llm` channels**: `require:` now applies whole to every call on the channel. A candidate may
+  name a `transcription-model` for live sessions opened on it.
+
+### Added — object stores, media references and recordings
+
+- **`sutra-objectstore`** (new, neutral): the `ObjectStore` seam, an S3-compatible client
+  (Signature V4, path-style for a self-hosted store, pure Rust over hyper + rustls/ring), an
+  in-memory store, and the sealed-object format — an object encrypted at rest with a fresh data
+  key wrapped under a key-encryption key (`sutra-crypto` envelope encryption), its AAD bound to
+  the object key. `ObjectStore::delete` (S3 `DELETE`; a provided default refuses).
+- **Streamed, crash-recoverable writes.** Multipart uploads (`create_upload`, `upload_part`
+  answering the part's ETag, `complete_upload` over ordered `UploadedPart`s, `abort_upload`,
+  `list_uploads` answering `PendingUpload`s, `list_parts`), a ranged read (`get_range`), and a
+  paginated listing of the objects under a prefix (`list_objects` answering `ListedObject`s).
+  `S3ObjectStore` and `MemoryObjectStore` implement all of it; for any other implementor the new
+  methods default to a refusal, so it keeps compiling. `S3Config::list_page_size` (default 1000)
+  sets the page a listing asks for. Some S3-compatible stores (MinIO among them) list the uploads
+  in progress only for an exact key, so a caller that must find its uploads after a crash keeps
+  a marker object per upload and lists the markers by prefix; the trait documents the pattern.
+- **Named object stores** in the engine configuration: `sutra.object-stores.<name>.{uri,
+  endpoint, region, access-key, secret-key, encryption, kek, key-id}` (env
+  `SUTRA_OBJECT_STORES_<NAME>_<FIELD>`, or the name in `sutra.object-stores`). Secrets are
+  references resolved at boot; `encryption: envelope` (the default) opens sealed objects with
+  `kek`. A store that cannot be built refuses startup. The process-wide `registry` (`NamedStore`,
+  `StoreSettings`, `ObjectRef`, `install`, `register`, `named`, `for_uri`).
+- **Media references in `llm` requests.** A user turn's `audio`, `video` (clip or each frame)
+  and the new `image` part (a one-frame video) may give `{ref: <object URI>, sha256}` instead of
+  `data`. The channel names the store it reads (`llm.media-store`; `llm.media-max-bytes`,
+  default 20 MiB, caps one object); the transport reads, checks the SHA-256 and the size, opens
+  a sealed object, and sends the content as if inline. Refusals are permanent
+  `SUTRA.LLM.MEDIA.REFUSED` (no media store, a reference outside it, a missing object, over the
+  limit, a digest mismatch, a sealed object that does not open); an undeclared store is
+  `SUTRA.LLM.CONFIG.INVALID`; an unreachable store is retryable.
+- **`q:audit capture="media"`** (an additive value of `xsd/q.xsd#AuditCapture`, semver-minor):
+  metadata-level events, plus every request the process sends is marked
+  (`sutra-audit-capture: media`) so a media transport records the session, and each audit event
+  carries the media REFERENCES found among the instance's variables (objects with `kind:
+  "media"`, a `uri` and a `sha256`) under `media` — never the media. Accepted in `<q:audit>` and
+  in a package's `audit.capture`.
+- **Erasure and retention delete recordings.** Subject erasure deletes every object the erased
+  instances' `q:audit` media events reference, and terminal retention does so for the instances
+  it purges (retained rows past the window, and finished instances whose row is already gone).
+  Each media event is amended to `{"media": [{kind, uri, sha256, bytes, erased: true}],
+  "mediaErasure": {at, reason, objects}}`. A recording no declared store holds, or a refused
+  delete, is never skipped: erasure answers 500 and changes nothing for that instance (re-run
+  once resolved); retention keeps the instance and retries. `PgAuditEventStore` gains
+  `list_media_for_instance`, `list_expired_media`, `amend_payload`,
+  `redact_instance_payloads_amending`; `PgInstanceStore` gains `purge_terminal_except`.
+
+### Added — audit events from transports
+
+- **A transport can write to the audit journal.** `sutra_channels::transport_audit()` is a
+  process-wide registry the engine installs its journal into at boot; a transport appends a
+  `TransportAuditEvent` to an instance's journal (with the `TransportAuditContext` the engine
+  leaves on the requests it serves, when it answers `writes_audit_events()`) or to its
+  deployment's journal (by module key). The instance's `<q:audit>` level applies: nothing is
+  written for a process that is not audited, fields are kept only at `payload` level, and a field
+  the transport marks sensitive is recorded as the redaction placeholder. A transport's event
+  types are `<transport>.<EVENT>` and can never be an engine type. An append never blocks: the
+  queue is bounded and a drop is counted in `sutra.audit.transport.dropped`. Until a journal is
+  installed (a transport's own tests, an engine with no audit sink) an append is a no-op;
+  `CapturingTransportAuditJournal` records appends for a transport's tests.
+- **Lossless instance-history paging.** Migration V203 adds a per-instance journal `ordinal`,
+  assigned in commit order under a per-instance lock; `GET /admin/instances/{id}/history` takes
+  `?afterOrdinal=`, answers `ordinal` per event and `nextAfterOrdinal`, and pages by ordinal when
+  no cursor is given. `?afterSeq=` keeps working as before. (A transport event takes the seq of
+  the engine event it followed, so a client paging by `afterSeq` could miss one written later.)
+
+### Added — session slots and capacity pools
+
+- **`session-end:`** on an inbound channel ends an instance's session before it reaches End:
+  `on-message: <channel>` (a correlated message on another inbound channel of the file — accepted
+  for the release alone when no wait takes it) and/or `on-reply: true` (the flow's reply on the
+  channel). The instance's `max-concurrent-instances` slot and pool slot are released; the
+  instance runs on. Malformed blocks fail to load (`SUTRA.CONFIG.CHANNEL.SESSION_END_INVALID`).
+- **Capacity pools**: `sutra.capacity-pools.<name>.{slots, reserve.inbound, reserve.outbound,
+  tenants}` in the engine configuration, referenced by `pool: <name>` from channels of any
+  deployment. An inbound start takes a slot or is rejected busy (`SUTRA.INBOUND.POOL.EXHAUSTED`,
+  HTTP 503); an outbound request waits in the outbox without counting an attempt until its
+  call holds a slot (`SUTRA.OUTBOUND.POOL.WAITING`), oldest first. One slot per active call — an
+  instance bridging two legs holds two; `pool-call-key: header.<name>` names the header that
+  identifies a call (else the delivery's or the outbox entry's own identity). A
+  `session-end: on-message` carrying a call key ends that call alone; End, failure or a cancel
+  release everything the instance still holds; a park releases nothing. A request delivered (or
+  given up on) after its instance finished returns its slot at once. An outbound request queued
+  for a slot when its instance's session ends is sent without one (the session end is recorded
+  in `capacity_session_end`, migration V704; `CapacityPoolStore` gains `end_session` and
+  `session_ended`, with defaults, and `SlotAcquisition::SessionEnded`). A channel naming an
+  undeclared pool or a pool its tenant may not use fails to load
+  (`SUTRA.CONFIG.CHANNEL.POOL_UNDECLARED`, `SUTRA.CONFIG.CHANNEL.POOL_TENANT_NOT_ALLOWED`); a
+  malformed `pool-call-key`, or one on an unpooled channel, fails with
+  `SUTRA.CONFIG.CHANNEL.POOL_CALL_KEY_INVALID`.
+- **Schema**: `V703__capacity_slot.sql` (`capacity_pool`, `capacity_slot`); the instance sweep
+  also returns slots of finished or vanished holders.
+
+### Added — examples and test support
+
+- **New examples**, each with a walkthrough run against the bundled stub model server:
+  `media-recordings` (media references, audited by reference, deleted on erasure and retention),
+  `capacity-pools` (shared slots and sessions that end before their instance) and `review-loop`
+  (a process that waits at the same nodes round after round). `ai-advanced` gains `voice`,
+  `voice-pipeline` and vision flows, and its `live-check.sh` covers every native Gemini path.
+- **`sutra-testkit`**: `EngineBuilder::mount_read_only` bind-mounts a host path into the engine
+  container (prompts, CA bundles) for a conformance suite.
+
+### Changed
+
+- **A process instance can wait at the same node any number of times.** A loop that brings the
+  token back to a message catch, a receive task, a user task, a channel-call (async or
+  synchronous), a timer catch or an event-based gateway used to find that node already done: the
+  token ran past it, or the instance could not park there again. Each iteration now parks a NEW
+  wait — its own wait row, timer and `<q:timeout>` rows, `<q:retry>` budget and `<q:alias>` rows
+  — and the step that answers an iteration resolves its rows and retires its correlation keys, so
+  a late relay for a past iteration no longer resumes the instance. Behind it, a resume now
+  continues from the satisfied node itself instead of replaying the graph from the start event:
+  nothing upstream runs again, the other parked waits carry over untouched, and a converging
+  gateway regains its earlier arrivals from a side-effect-free walk over the completed nodes. That
+  walk is not reported to listeners; the satisfied wait records `NODE_LEFT`, so a loop's audit
+  history reads round by round.
+- **A failure an HTTP caller caused is answered with its cause.** A dead-lettered inbound answers
+  the cause's code and message, with the incident code under `incident`, and the status the cause
+  deserves: `422` for a code an extension registers as the caller's fault
+  (`sutra_channels::http::CallerFaultCode`; the `llm` transport registers
+  `SUTRA.LLM.MEDIA.REFUSED`), `500` otherwise. It used to answer
+  `500 SUTRA.INBOUND.NON_IDEMPOTENT_FAILURE` with the cause only in the log.
+- **`SUTRA_CRYPTO_MASTER_KEY` is resolved as a secret reference** (`env:`, `secret:`, `vault:`,
+  `${…}`, …), as its documentation said and as every other secret key is. It was used as raw
+  bytes. A literal value is still accepted as the raw key, so data already encrypted under it
+  stays readable, and a warning is logged at boot; an unresolvable reference refuses to boot.
+- **`require:` on an `llm` channel applies whole to every call on the channel.**
+- **Migration V202** narrows `audit_event`'s `(deployment_id, instance_id, seq)` uniqueness to
+  the engine's own event types, so a transport event never takes a number the engine writes next.
+  The engine's replay dedup is unchanged.
+- The outbox claims due entries in `next_attempt_at, created_at` order, and `OutboxRowStore`
+  gains `requeue` (put back without counting an attempt).
+- A channel declaring `pool:` is never a synchronous outbound channel; `ack-mode: on-complete`
+  on it takes the outbox path.
+
+### Fixed
+
+- An **event-based gateway** resumed by its winning arm continues along that arm; the resume used
+  to re-arm the losing arms and strand the token at the gateway.
+- A relay on a channel that **several wait nodes of one process** subscribe resumes the node the
+  instance is parked at, not the first subscriber in the model.
+- A wait node's own `<q:alias>` (on a message catch, receive task or user task) is indexed when
+  the node parks, so a relay correlates by it — previously only a channel-call's alias was.
+- A relay that correlates to an instance but names a wait the instance is not parked at is
+  refused before anything runs (`SUTRA.RUNTIME.RESUME.NOT_WAITING`); it used to run that node's
+  continuation again.
+- A parallel join inside a loop waits for a full set of tokens each time round instead of
+  passing on the first arrival after its first firing.
+- **A relay correlates through a start-event alias when the wait binds its payload under another
+  name.** With `<q:source name="x">` on the wait, `payload.<field>` in the start event's
+  `<q:alias>` did not resolve and the relay failed with
+  `SUTRA.RUNTIME.RELAY.CORRELATION_NOT_FOUND`.
+- A synchronous call chain over a stored instance no longer re-takes a channel admission slot
+  the instance had given up, and an aborted chain no longer frees the slot of the instance that
+  stays parked.
+- **`GET /admin/instances/{id}` and `/admin/instances/by-alias/…` inspect an instance whose
+  `sensitive` variable is encrypted at rest** (`SUTRA_CRYPTO_MASTER_KEY` set). They answered
+  `500 "snapshot decode failed"`; they now decrypt with the engine's key and redact the value as
+  for any other instance.
+- **Tenant-wide subject erasure covers every live deployment of the tenant**, including those
+  from a watched deployments directory; it scanned only the deployment archive table, which a
+  watched directory leaves empty.
+- `sutra lint` no longer reports as inert (`SUTRA.CONFIG.CHANNEL.INERT`) a channel whose messages
+  only resume a waiting instance, or one used by another channel's `session-end: on-message`.
+
+### Security
+
+- **The Gemini API key is never sent in a URL.** The Live API documents the key only as a
+  `?key=` query parameter on the WebSocket, so a live session mints a single-use ephemeral token
+  (`POST /v1beta/auth_tokens` with the key in the `x-goog-api-key` header) and opens the
+  constrained Live endpoint with `Authorization: Token <token>`. `sutra_llm_spi::redact_url`
+  blanks query values and user-info wherever the shared HTTP client or the OpenAI Realtime
+  connect prints a URL in a failure.
+
 ## [0.5.1] — 2026-10-24
 
 A **patch** release, and the first complete release of the 0.5 line. The `v0.5.0` release run

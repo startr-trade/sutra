@@ -87,11 +87,7 @@ impl ArchiveManifest {
         // B1 — the deployment audit default. Emitted only when present, so a manifest without an
         // audit default serializes to exactly its pre-B1 bytes (deploymentId unchanged).
         if let Some(audit) = &self.audit {
-            let capture = match audit.capture {
-                AuditCapture::Metadata => "metadata",
-                AuditCapture::Payload => "payload",
-                AuditCapture::None => "none",
-            };
+            let capture = audit.capture.as_str();
             out.push_str("audit:\n");
             out.push_str(&format!("  sink: {}\n", quote(&audit.sink)));
             out.push_str(&format!("  capture: {}\n", quote(capture)));
@@ -204,9 +200,10 @@ impl ArchiveManifest {
                 None | Some("") | Some("metadata") => AuditCapture::Metadata,
                 Some("payload") => AuditCapture::Payload,
                 Some("none") => AuditCapture::None,
+                Some("media") => AuditCapture::Media,
                 Some(other) => {
                     return Err(invalid(format!(
-                        "audit.capture '{other}' is not one of metadata|payload|none"
+                        "audit.capture '{other}' is not one of metadata|payload|none|media"
                     )))
                 }
             };

@@ -6,7 +6,8 @@
 //!
 //! 1. resolves the qualified `llm://<tenant>/<module>/<version>/<channel>` destination to
 //!    the channel's [`LlmChannel`] in the shared [`ChannelTable`];
-//! 2. parses the JSON request body ([`parse_request_body`]);
+//! 2. parses the JSON request body ([`parse_request_body`]) and reads any media references
+//!    from the channel's object store ([`resolve_media`]);
 //! 3. waits for one of the channel's `llm.concurrency` permits, then [`route`]s the call
 //!    across the ordered `llm.candidates`, skipping candidates that lack a needed
 //!    capability and falling back on the `llm.fallback-on` failure classes;
@@ -14,10 +15,23 @@
 //!    (same deployment), deduplicated on the outbox key, which the process correlates
 //!    like any other inbound message.
 //!
+//! AUDIO AND VIDEO. A user message may carry `audio` / `video`, and `audioOutput` asks for a
+//! spoken answer. Audio stays audio: a candidate that cannot take what the call carries is
+//! skipped, never sent a text-only version of it; the transport converts between the formats
+//! the call states and the formats the candidate takes or speaks (WAV, L16, G.711). With
+//! `llm.voice: pipeline` the `llm.speech` provider transcribes the audio, the text model
+//! answers, and the speech provider speaks the answer — the reply then says
+//! `audioPreserved: false`.
+//!
 //! With `llm.mode: job` the sink instead submits a provider job, records it in the
 //! `llm_job` table and returns; the [`jobs`] poller (and, for `completion: callback`
 //! candidates, the [`callback`] endpoint served for inbound `transport: llm` channels)
 //! completes it later and delivers the answer the same way.
+//!
+//! CHANNELS FOR OTHER TRANSPORTS. Every live `mode: call` channel is also published to the
+//! provider SPI's channel registry ([`sutra_llm_spi::llm_channels`], see [`handle`]), so a
+//! transport that needs a model for its own media plane (live transcription, per-segment video
+//! analysis) names an `llm` channel of its deployment and is served by the same routing.
 //!
 //! Providers come from the provider SPI (`sutra-llm-spi`); this crate names none. No
 //! prompt or answer text is written to spans, logs or diagnostics.
@@ -34,9 +48,11 @@ use sutra_transport_spi::{
 
 pub mod callback;
 pub mod config;
+pub mod handle;
 pub mod inline;
 pub mod job_store;
 pub mod jobs;
+pub mod media;
 pub mod request;
 pub mod sink;
 
@@ -44,17 +60,23 @@ pub use callback::callback_router;
 pub use config::{
     parse_all, parse_callback_channel, parse_channel, parse_channels, CallbackMap, CallbackTable,
     CandidateJob, ChannelMap, ChannelMode, ChannelTable, Completion, LlmCallbackChannel,
-    LlmCandidate, LlmChannel, ParsedChannels, CALLBACK_PATH_PREFIX,
+    LlmCandidate, LlmChannel, ParsedChannels, SpeechStage, VoiceMode, CALLBACK_PATH_PREFIX,
     DEFAULT_CALLBACK_POLL_INTERVAL_SECONDS, DEFAULT_CONCURRENCY, DEFAULT_FALLBACK_ON,
     DEFAULT_JOB_TIMEOUT_SECONDS, DEFAULT_POLL_INTERVAL_SECONDS, DEFAULT_TIMEOUT_SECONDS,
 };
+pub use handle::{channel_handles, publish_channels, RoutedChannelHandle};
 pub use inline::LlmInlineCaller;
 pub use job_store::{JobClaim, JobStoreSlot, LlmJobRow, LlmJobStore, NewLlmJob};
 pub use jobs::{JobOutcome, JobRunner, PollerHandle, DEFAULT_POLLER_TICK};
-pub use request::{parse_destination, parse_request_body, CallRequest};
+pub use media::{resolve_media, MediaFailure};
+pub use request::{
+    echo_without_media, parse_destination, parse_request_body, CallRequest, MediaReference,
+    MediaSlot,
+};
 pub use sink::{
-    build_reply, failure_outcome, reply_body, route, route_submit, LlmSink, ReplyPort,
-    RouteFailure, RoutedAnswer, SubmittedJob, MODEL_HEADER, PROVIDER_HEADER,
+    build_reply, failure_outcome, reply_body, route, route_pipeline, route_streaming, route_submit,
+    structured_answer, structured_answer_error, LlmSink, ReplyPort, RouteFailure, RoutedAnswer,
+    SubmittedJob, MODEL_HEADER, PROVIDER_HEADER,
 };
 
 /// The `transport:` value and URI scheme.
@@ -106,6 +128,8 @@ pub struct LlmTransport {
     callbacks: Arc<CallbackTable>,
     resolver: EnvRefResolver,
     jobs: Option<JobSupport>,
+    /// Whether each installed set is published to the process-wide channel registry.
+    publish: bool,
 }
 
 /// `mode: job` channels are refused without persistence.
@@ -161,6 +185,7 @@ impl LlmTransport {
             callbacks,
             resolver,
             jobs,
+            publish: false,
         };
         let mut failures = transport.install(definitions);
         if !failures.is_empty() {
@@ -177,7 +202,18 @@ impl LlmTransport {
         }
         self.table.swap(parsed.channels);
         self.callbacks.swap(parsed.callbacks);
+        if self.publish {
+            sutra_llm_spi::llm_channels().swap(channel_handles(&self.table));
+        }
         parsed.failures
+    }
+
+    /// Publish the installed set, and every set a rewire installs, to the process-wide channel
+    /// registry ([`sutra_llm_spi::llm_channels`]).
+    pub fn publishing(mut self) -> LlmTransport {
+        self.publish = true;
+        sutra_llm_spi::llm_channels().swap(channel_handles(&self.table));
+        self
     }
 
     /// The job runner, when persistence is configured.
@@ -254,7 +290,8 @@ fn spawn(
         definitions,
         resolver,
         jobs,
-    )?;
+    )?
+    .publishing();
     if let Some(jobs) = &transport.jobs {
         jobs.start(&handle, DEFAULT_POLLER_TICK);
     }

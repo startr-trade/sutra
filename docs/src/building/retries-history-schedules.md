@@ -173,7 +173,7 @@ correlation aliases, and enqueues its final emissions.
 |---|---|
 | `GET /sutra/instances/{id}` and its admin twin | The retained projection — status, node progress, variables — for as long as retention keeps the row. |
 | `GET /admin/instances` | Excludes finished instances by default; `includeTerminal=true` (or a terminal `status` filter) includes them. |
-| `GET /admin/instances/{id}/history` | The audit journal, sequence-ordered and paged: *how* it got there, event by event, with whatever payload the process captured. Admin-only — an audit row can carry business data. |
+| `GET /admin/instances/{id}/history` | The audit journal, paged: *how* it got there, event by event, with whatever payload the process captured. Page with `?afterOrdinal=` and the response's `nextAfterOrdinal`: each event's `ordinal` is its position in the journal, assigned in commit order, so no event written later lands behind a cursor already returned. `?afterSeq=` still works, but can miss a transport event, which shares the `seq` of the engine event it followed. Admin-only — an audit row can carry business data. |
 
 **Retention.** `sutra.instance.retention` (ISO-8601, default `P7D`) is how long terminal snapshots
 stay queryable; a lease-gated sweeper purges past-window rows on

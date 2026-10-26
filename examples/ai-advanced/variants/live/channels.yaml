@@ -1,9 +1,10 @@
 # Channels for the ai-advanced module, 1.0.0 — the `live` variant: the real OpenAI and Anthropic
 # APIs. live-check.sh deploys it; keys come from the engine's environment (OPENAI_API_KEY,
-# ANTHROPIC_API_KEY). Reference: docs/guide/llm-channels.md in the Sutra source tree.
+# ANTHROPIC_API_KEY, and GEMINI_API_KEY for the vision flow). Reference: docs/guide/llm-channels.md
+# in the Sutra source tree.
 #
-# The flows live once, in ../../shared/bpmn; this file is the only thing that differs between the
-# `stub` and `live` variants. `sutra package` composes the layers:
+# The shared flows live once, in ../../shared/bpmn; apart from the two Gemini flows in ./bpmn, this
+# file is the only thing that differs between the `stub` and `live` variants. `sutra package` composes the layers:
 #
 #   sutra package examples/ai-advanced/variants/live \
 #       --overlay examples/ai-advanced/shared --out examples/ai-advanced/deploy/deployments
@@ -14,6 +15,16 @@
 #   JOB   POST /channels/summarize-job      -> job-model        OpenAI background job, polled
 #   JOB   POST /channels/summarize-webhook  -> webhook-model    OpenAI background job, webhook
 #   JOB   POST /channels/summarize-batch    -> batch-model      Anthropic Message Batch, polled
+#   SYNC  POST /channels/voice              -> voice-model      audio in, spoken answer out (OpenAI audio model)
+#   SYNC  POST /channels/voice-pipeline     -> voice-pipeline-model  speech-to-text, a text model, text-to-speech
+#   SYNC  POST /channels/vision             -> vision-model     an image or video frames in, a JSON answer out (native Gemini)
+#   SYNC  POST /channels/hear               -> hear-model       audio in (inline or a media reference), a text answer out (native Gemini)
+#   SYNC  POST /channels/extract            -> extract-model    a ticket in, a parsed JSON answer out (native Gemini)
+#
+# `hear` and `extract` are this variant's own flows (./bpmn), which live-check.sh's Gemini checks
+# drive; `hear-model` and `voice-model` read media references from the object store `media`, which
+# deploy/compose.media.yaml declares (MinIO). Without that store a reference is refused at call
+# time; inline audio still works.
 #
 # The three sync channels declare `ack-mode: on-complete`: the call is inline and the HTTP caller
 # gets the answer on its own connection. The three job channels are `mode: job` on the outbound
@@ -250,3 +261,167 @@ channels:
     transport: http
     bind: "http://model-stub:8000/sink"
     cloudevents-mode: none
+
+  # ---- audio: one utterance in, a spoken answer out (sync) -------------------------------------
+
+  # { requestId, audio: { data: <base64>, format: <media type> }, audioOutput: <media type> }
+  - name: voice
+    transport: http
+    bind: "POST /channels/voice"
+    codec: json
+    ack-mode: on-complete
+    cloudevents-mode: none
+    auth:
+      scheme: apikey
+      apikey:
+        value: env:AI_ADVANCED_API_KEY
+        header: X-Api-Key
+
+  - name: voice-pipeline
+    transport: http
+    bind: "POST /channels/voice-pipeline"
+    codec: json
+    ack-mode: on-complete
+    cloudevents-mode: none
+    auth:
+      scheme: apikey
+      apikey:
+        value: env:AI_ADVANCED_API_KEY
+        header: X-Api-Key
+
+  # AUDIO-NATIVE: an OpenAI audio chat model hears and speaks the audio itself. The recording may
+  # also be a media reference, read from the object store `media` like hear-model's below.
+  # live-check.sh substitutes OPENAI_AUDIO_MODEL for the model id, and OPENAI_TRANSCRIBE_MODEL /
+  # OPENAI_TTS_MODEL for the pipeline's, in the copy it deploys.
+  - name: voice-model
+    direction: outbound
+    transport: llm
+    bind: "llm://voice-model"
+    ack-mode: on-complete
+    llm:
+      media-store: media
+      media-max-bytes: 1048576
+      candidates:
+        - provider: openai
+          model: gpt-audio-1.5
+          api-key: env:OPENAI_API_KEY
+      require: [audio-understanding]
+      output-voice: alloy
+      timeout-seconds: 60
+
+  # THE PIPELINE: OpenAI transcribes and speaks, Anthropic (no audio) answers in text.
+  - name: voice-pipeline-model
+    direction: outbound
+    transport: llm
+    bind: "llm://voice-pipeline-model"
+    ack-mode: on-complete
+    llm:
+      voice: pipeline
+      speech:
+        provider: openai
+        api-key: env:OPENAI_API_KEY
+        transcribe-model: gpt-transcribe
+        speech-model: gpt-4o-mini-tts
+        voice: alloy
+      candidates:
+        - provider: anthropic
+          model: claude-haiku-5-5
+          api-key: env:ANTHROPIC_API_KEY
+      max-output-tokens: 200
+      timeout-seconds: 60
+
+  # ---- vision: an image or sampled video frames in, a JSON scene description out (sync) ------
+
+  # { requestId, image: { data, format } } or { requestId, video: { frames: [...] } }
+  - name: vision
+    transport: http
+    bind: "POST /channels/vision"
+    codec: json
+    ack-mode: on-complete
+    cloudevents-mode: none
+    auth:
+      scheme: apikey
+      apikey:
+        value: env:AI_ADVANCED_API_KEY
+        header: X-Api-Key
+
+  # NATIVE GEMINI. `provider: gemini` is Gemini's own API (not the Chat Completions-compatible
+  # `google-gemini` route), which carries images, video frames and clips. `require:` skips any
+  # candidate that cannot read video or answer in JSON. Video understanding is preview in 0.6.
+  # gemini-2.5-flash thinks before it answers, and its thinking tokens count against
+  # max-output-tokens: a small cap cuts the answer off (finish: length, and no parsed `json`).
+  - name: vision-model
+    direction: outbound
+    transport: llm
+    bind: "llm://vision-model"
+    ack-mode: on-complete
+    llm:
+      candidates:
+        - provider: gemini
+          model: gemini-2.5-flash
+          api-key: env:GEMINI_API_KEY
+      require: [video-understanding, json-output]
+      max-output-tokens: 2048
+      timeout-seconds: 60
+
+  # ---- Gemini: audio understanding and structured answers (sync) ------------------------------
+
+  # { requestId, audio: { data, format } } or { requestId, audio: { ref, sha256, format } }
+  - name: hear
+    transport: http
+    bind: "POST /channels/hear"
+    codec: json
+    ack-mode: on-complete
+    cloudevents-mode: none
+    auth:
+      scheme: apikey
+      apikey:
+        value: env:AI_ADVANCED_API_KEY
+        header: X-Api-Key
+
+  # { ticketId, description }
+  - name: extract
+    transport: http
+    bind: "POST /channels/extract"
+    codec: json
+    ack-mode: on-complete
+    cloudevents-mode: none
+    auth:
+      scheme: apikey
+      apikey:
+        value: env:AI_ADVANCED_API_KEY
+        header: X-Api-Key
+
+  # AUDIO UNDERSTANDING ON GEMINI: the model hears the recording itself. A media reference is read
+  # from the object store `media` (engine configuration, deploy/compose.media.yaml), checked
+  # against its SHA-256 and size, and only then sent; a mismatch is refused before any call.
+  - name: hear-model
+    direction: outbound
+    transport: llm
+    bind: "llm://hear-model"
+    ack-mode: on-complete
+    llm:
+      media-store: media
+      media-max-bytes: 1048576
+      require: [audio-understanding]
+      candidates:
+        - provider: gemini
+          model: gemini-2.5-flash
+          api-key: env:GEMINI_API_KEY
+      max-output-tokens: 2048
+      timeout-seconds: 60
+
+  # STRUCTURED ANSWER ON GEMINI: the flow's request says `json: true`.
+  - name: extract-model
+    direction: outbound
+    transport: llm
+    bind: "llm://extract-model"
+    ack-mode: on-complete
+    llm:
+      require: [json-output]
+      candidates:
+        - provider: gemini
+          model: gemini-2.5-flash
+          api-key: env:GEMINI_API_KEY
+      max-output-tokens: 2048
+      timeout-seconds: 60

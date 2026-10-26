@@ -49,6 +49,12 @@ The relayed message doesn't carry an engine-internal instance id — it carries 
 correlation survives a restart and works identically across every replica. See
 [The q: namespace](q-namespace.md) for the full `q:alias` shape.
 
+A relay is matched by the start event's alias even when the wait binds its message under a name of
+its own (`<q:source channel="revision" name="revision"/>`): while the alias is evaluated, the
+relayed message is also visible under the start event's payload name, so `payload.E2EId` reads the
+relayed `E2EId`. The name a wait gives its payload is local to that wait. It is what the steps
+after it read (`revision.note`), and it does not change which instance a message finds.
+
 ```mermaid
 sequenceDiagram
     participant A as Requester
@@ -105,6 +111,246 @@ still do.
 
 The [design reasoning](../internals/durable-execution.md#the-typed-value-encoding) — the encoding,
 the compatibility posture, and why encrypted values are typed too — is in the internals chapter.
+
+## Waiting at the same node again: loops
+
+Since 0.6, a process instance can wait at the same node any number of times. A loop that brings
+the token back to a message catch, a receive task, a user task, a channel call (async or
+synchronous), a timer catch or an event-based gateway parks a **new** wait on each pass, with its
+own wait row, its own timer and `<q:timeout>` rows, its own `<q:retry>` budget and its own
+`<q:alias>` rows. The step that answers a pass resolves that pass's rows and retires its
+correlation keys, so a late message for a past pass resumes nothing. Before 0.6 the token found
+the node already done and ran past it, or the instance could not park there again.
+
+Behind this, a resume continues from the satisfied node itself instead of replaying the graph
+from the start event. Nothing upstream runs again, other parked waits carry over untouched, and a
+converging gateway regains its earlier arrivals from a side-effect-free walk over the completed
+nodes. The snapshot format is unchanged, so instances parked by an earlier engine resume under
+the new rules.
+
+Related rules that came with it:
+
+- A message that correlates to an instance but names a wait the instance is not parked at is
+  refused before anything runs, with `SUTRA.RUNTIME.RESUME.NOT_WAITING`.
+- A wait node's own `<q:alias>` (on a message catch, receive task or user task) is indexed when
+  the node parks, so a message correlates by it.
+- An **event-based gateway** continues along the arm that fired when the instance resumes.
+- A **parallel join** inside a loop waits for a full set of tokens each time round.
+- A message on a channel that several wait nodes of one process subscribe to resumes the node the
+  instance is parked at.
+
+### Walkthrough: a review loop
+
+The `examples/review-loop` package sends a draft round review, revision and a short cool-off
+until a reviewer approves it:
+
+```
+POST /channels/drafts            { draftId }                     rounds := 0
+  AwaitReview    user task, answered on POST /channels/drafts/review { draftId, decision }
+  Count          rounds := rounds + 1
+  Decide         review.decision = "approve" -> End
+                 otherwise -> AwaitRevision (message catch, POST /channels/drafts/revision)
+                           -> CoolOff (timer catch, PT2S) -> back to AwaitReview
+```
+
+The loop is ordinary BPMN: `AwaitReview` has two incoming flows, one from the start and one back
+from `CoolOff`:
+
+```xml
+<bpmn:userTask id="AwaitReview" name="Review the draft">
+  <bpmn:extensionElements>
+    <q:source channel="review" name="review"/>
+  </bpmn:extensionElements>
+  <bpmn:incoming>F2</bpmn:incoming><bpmn:incoming>F8</bpmn:incoming>
+  <bpmn:outgoing>F3</bpmn:outgoing>
+</bpmn:userTask>
+…
+<bpmn:intermediateCatchEvent id="CoolOff" name="Cool-off, 2 s">
+  <bpmn:incoming>F7</bpmn:incoming><bpmn:outgoing>F8</bpmn:outgoing>
+  <bpmn:timerEventDefinition id="CoolOff_Timer">
+    <bpmn:timeDuration>PT2S</bpmn:timeDuration>
+  </bpmn:timerEventDefinition>
+</bpmn:intermediateCatchEvent>
+<bpmn:sequenceFlow id="F8" sourceRef="CoolOff" targetRef="AwaitReview"/>
+```
+
+Every message after the first finds the instance through the start event's
+`<q:alias name="draftId" expression="payload.draftId" unique="true" onConflict="correlate"/>`.
+The waits bind their messages under names of their own (`name="review"`, `name="revision"`), and
+`Decide` reads `review.decision`; the alias still reads `payload.draftId`, because a wait's name is
+local to it. The process declares `<q:audit capture="metadata"/>`, so each step is in the
+instance's audit history.
+
+**Prerequisites:** [Before you try a walkthrough](../whats-new-0-6.md#before-you-try-a-walkthrough).
+
+**1. Start the stack and deploy the package.** The `waits` helper lists the instance's wait rows
+from the engine database:
+
+```bash
+C=examples/review-loop/deploy/compose.yaml
+docker compose -f $C up -d --wait
+sutra package examples/review-loop/deployments-src/default--review--1.0.0 \
+    --out examples/review-loop/deploy/deployments 2>/dev/null
+PORT=$(docker compose -f $C port engine 8080 | cut -d: -f2)
+H=(-H 'Content-Type: application/json' -H 'X-Api-Key: dev-only-review-key')
+until curl -sf "http://127.0.0.1:$PORT/sutra/deployments" | grep -q '"phase":"Active"'; do sleep 1; done
+send() { curl -s -w " HTTP %{http_code}\n" -X POST "http://127.0.0.1:$PORT/channels/drafts$1" "${H[@]}" -d "$2"; }
+waits() {
+  docker compose -f $C exec -T engine-db psql -U postgres -d sutra -At -c \
+    "select node_id, kind, status from waiting_event order by created_at"
+}
+```
+
+```text
+packaged examples/review-loop/deploy/deployments/default--review--1.0.0.sutra (deploymentId dep-84173f6525975bed01d706ee)
+```
+
+**2. Submit a draft.** It parks at the review:
+
+```bash
+send "" '{"draftId":"d-1"}'
+ID=$(curl -s "http://127.0.0.1:$PORT/admin/instances/by-alias/draftId/d-1" | python3 -c 'import json,sys; print(json.load(sys.stdin)["instanceId"])')
+waits
+```
+
+```text
+ HTTP 200
+AwaitReview|MESSAGE|WAITING
+```
+
+**3. Round one: ask for a revision, submit it, and let the cool-off run:**
+
+```bash
+send /review '{"draftId":"d-1","decision":"revise"}'
+waits
+send /revision '{"draftId":"d-1"}'
+waits
+sleep 4
+waits
+```
+
+```text
+ HTTP 200
+AwaitReview|MESSAGE|RESOLVED
+AwaitRevision|MESSAGE|WAITING
+ HTTP 200
+AwaitReview|MESSAGE|RESOLVED
+AwaitRevision|MESSAGE|RESOLVED
+CoolOff|TIMER|WAITING
+AwaitReview|MESSAGE|WAITING
+AwaitRevision|MESSAGE|RESOLVED
+CoolOff|TIMER|RESOLVED
+```
+
+After the timer fired, the token came back to `AwaitReview`, and its wait is armed again
+(`WAITING`) for round two.
+
+**4. Round two, and a message for a wait the instance has left.** The second review asks for
+another revision. A third review arrives while the instance waits for that revision, so it is
+refused and nothing runs:
+
+```bash
+send /review '{"draftId":"d-1","decision":"revise"}'
+send /review '{"draftId":"d-1","decision":"approve"}'
+```
+
+```text
+ HTTP 200
+{"type":"urn:bpm:diag:SUTRA.RUNTIME.RESUME.NOT_WAITING","title":"SUTRA.RUNTIME.RESUME.NOT_WAITING","status":500,"detail":"Instance 43a748ee-92ef-4845-bf59-10492c4b45ee is not waiting at 'AwaitReview' (it is parked at [\"AwaitRevision\"]); this relay on channel 'review' arrived for a wait the instance already left and is refused — nothing was executed.","code":"SUTRA.RUNTIME.RESUME.NOT_WAITING","attributes":{"instanceId":"43a748ee-92ef-4845-bf59-10492c4b45ee","nodeId":"AwaitReview"}} HTTP 500
+```
+
+**5. Finish round two, then approve in round three:**
+
+```bash
+send /revision '{"draftId":"d-1"}'
+sleep 4
+curl -s "http://127.0.0.1:$PORT/admin/instances/$ID" | python3 -c 'import json,sys; r=json.load(sys.stdin); print(r["status"], r["variables"]["rounds"])'
+send /review '{"draftId":"d-1","decision":"approve"}'
+curl -s "http://127.0.0.1:$PORT/admin/instances"; echo
+```
+
+```text
+ HTTP 200
+SUSPENDED 2
+ HTTP 200
+{"instances":[]}
+```
+
+Before the last review, the instance was parked at `AwaitReview` for the third time with
+`rounds = 2`. The approval ended it, so no instance is live any more.
+
+**6. Read the audit history.** The journal is written asynchronously, so the loop waits for the
+completion event. Each event's `ordinal` is its position in the journal, which is what the history
+pages by:
+
+```bash
+until curl -s "http://127.0.0.1:$PORT/admin/instances/$ID/history" | grep -q INSTANCE_COMPLETED; do sleep 1; done
+curl -s "http://127.0.0.1:$PORT/admin/instances/$ID/history" | python3 -c '
+import json, sys
+for e in json.load(sys.stdin)["events"]:
+    print(e["ordinal"], e["eventType"], e["nodeId"] or "")'
+```
+
+```text
+1 INSTANCE_STARTED
+2 NODE_ENTERED Start
+3 NODE_LEFT Start
+4 NODE_ENTERED Init
+5 NODE_LEFT Init
+6 NODE_ENTERED AwaitReview
+7 INSTANCE_SUSPENDED
+8 INSTANCE_RESUMED
+9 NODE_LEFT AwaitReview
+10 NODE_ENTERED Count
+11 NODE_LEFT Count
+12 NODE_ENTERED Decide
+13 NODE_LEFT Decide
+14 NODE_ENTERED AwaitRevision
+15 INSTANCE_SUSPENDED
+16 INSTANCE_RESUMED
+17 NODE_LEFT AwaitRevision
+18 NODE_ENTERED CoolOff
+19 INSTANCE_SUSPENDED
+20 INSTANCE_RESUMED
+21 NODE_LEFT CoolOff
+22 NODE_ENTERED AwaitReview
+23 INSTANCE_SUSPENDED
+24 INSTANCE_RESUMED
+25 NODE_LEFT AwaitReview
+26 NODE_ENTERED Count
+27 NODE_LEFT Count
+28 NODE_ENTERED Decide
+29 NODE_LEFT Decide
+30 NODE_ENTERED AwaitRevision
+31 INSTANCE_SUSPENDED
+32 INSTANCE_RESUMED
+33 NODE_LEFT AwaitRevision
+34 NODE_ENTERED CoolOff
+35 INSTANCE_SUSPENDED
+36 INSTANCE_RESUMED
+37 NODE_LEFT CoolOff
+38 NODE_ENTERED AwaitReview
+39 INSTANCE_SUSPENDED
+40 INSTANCE_RESUMED
+41 NODE_LEFT AwaitReview
+42 NODE_ENTERED Count
+43 NODE_LEFT Count
+44 NODE_ENTERED Decide
+45 NODE_LEFT Decide
+46 NODE_ENTERED End
+47 NODE_LEFT End
+48 INSTANCE_COMPLETED
+```
+
+Each round reads the same way: the resume leaves the wait it came through (`NODE_LEFT
+AwaitReview`, `NODE_LEFT AwaitRevision`, `NODE_LEFT CoolOff`), and `Count` and `Decide` run once
+per round. The last round leaves `Decide` for `End`.
+
+**7. Clean up:**
+
+```bash
+docker compose -p sutra-review-loop down -v
+```
 
 ## Worked example: approval-hold
 

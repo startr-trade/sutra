@@ -317,6 +317,8 @@ async fn one_sync_post_exports_traces_metrics_and_logs_over_otlp() {
         rls_bypass_check_enabled: true,
         telemetry: telemetry_config,
         admin_auth: Default::default(),
+        capacity_pools: Vec::new(),
+        object_stores: Vec::new(),
         now_override: None,
     })
     .await

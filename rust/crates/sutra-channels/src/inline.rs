@@ -57,6 +57,23 @@ pub trait InlineCaller: Send + Sync {
         request: &'a OutboundMessage,
     ) -> BoxFuture<'a, Result<InlineResponse, InlineFailure>>;
 
+    /// Whether this caller acts on the session media-capture marker
+    /// ([`crate::audit::AUDIT_CAPTURE_HEADER`]); for every other caller it is stripped before
+    /// the call, so it never reaches a counterpart's wire.
+    fn records_media(&self) -> bool {
+        false
+    }
+
+    /// Whether this transport writes audit events for the instances whose requests it serves
+    /// ([`crate::transport_audit`]). Only then does the engine leave the instance's audit
+    /// routing and identity on the message (the reserved
+    /// [`crate::transport_audit::AUDIT_JOURNAL_HEADERS`]), for the transport to read with
+    /// [`crate::transport_audit::TransportAuditContext::from_headers`]; for every other one they
+    /// are stripped, so they never reach a counterpart's wire.
+    fn writes_audit_events(&self) -> bool {
+        false
+    }
+
     /// [`Self::call`], forwarding the answer to `on_chunk` piece by piece while it is produced
     /// (a model's token stream). The returned response is still the WHOLE answer. Default: a
     /// transport that cannot stream makes the plain call and emits no chunk.

@@ -10,6 +10,13 @@ Sutra: a Rust-native, message-native BPMN 2.0 + DMN workflow engine. One Cargo w
 (`rust/`), a set of end-to-end example apps (`examples/`), OpenTofu deployment modules
 (`deploy/`), authoritative XSD schemas (`xsd/`), and this mdBook (`docs/`).
 
+Telephony and video (the `voip` transport, the WebRTC media worker, the voice/IVR/meeting/video
+examples) are NOT here: they live in the separate repository
+[sutra-voice](https://github.com/startr-trade/sutra-voice), which consumes this engine as a git
+submodule. Generic seams they use (`llm` channels with audio, `AudioSession`, the `llm` channel
+registry, `q:audit capture="media"`, `sutra-objectstore`) belong to this engine; anything they need
+from an engine crate must be public API here, never copied there.
+
 ## Repository layout
 
 | Path | What it is |

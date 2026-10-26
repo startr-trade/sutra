@@ -359,6 +359,39 @@ pub trait InstanceBridge {
         emissions: &[OutboxEmission],
     ) -> Result<(), Diagnostic>;
 
+    /// [`Self::commit_repark`] that additionally RETIRES `retired_aliases` in the same
+    /// transaction — the correlation keys of the waits this step resolved, so a late relay for
+    /// a wait the instance already left (an earlier iteration of a loop) no longer correlates
+    /// to it. Retirement runs before the step's own alias rows are recorded, so a key the step
+    /// records again stays live.
+    ///
+    /// The default ignores the retirement and delegates — the posture of a bridge with no
+    /// durable alias index (the in-memory doubles); the durable bridge overrides it.
+    #[allow(clippy::too_many_arguments)]
+    async fn commit_repark_retiring(
+        &self,
+        deployment: &DeploymentId,
+        instance_id: &str,
+        snapshot: &SuspendedInstance,
+        satisfied_wait_nodes: &[String],
+        aliases: &[AliasRecord],
+        timer_waits: &[TimerWaitRecord],
+        emissions: &[OutboxEmission],
+        retired_aliases: &[AliasRecord],
+    ) -> Result<(), Diagnostic> {
+        let _ = retired_aliases;
+        self.commit_repark(
+            deployment,
+            instance_id,
+            snapshot,
+            satisfied_wait_nodes,
+            aliases,
+            timer_waits,
+            emissions,
+        )
+        .await
+    }
+
     /// Sync-path terminal step (start→end, no park): the completed activation's collected
     /// emissions enqueue in ONE transaction. No snapshot row lands — the instance never
     /// parked — but the atomicity rule is the same: all emissions commit, or none.

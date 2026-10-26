@@ -1297,6 +1297,22 @@ fn subscribers_of<'a>(deployment: &'a LoadedDeployment, channel: &str) -> Vec<Su
     subs
 }
 
+/// Whether a wait node (a message catch, a receive or user task, a channel-call's reply) of
+/// some process takes its messages from `channel` — a relay-only channel is not inert.
+fn waits_on(deployment: &LoadedDeployment, channel: &str) -> bool {
+    deployment.processes.values().any(|module| {
+        module.processes().iter().any(|process| {
+            process.nodes().iter().any(|node| {
+                !matches!(node, Node::StartEvent { .. })
+                    && process
+                        .bindings_for(node.id())
+                        .source()
+                        .is_some_and(|source| source.channel == channel)
+            })
+        })
+    })
+}
+
 fn full_match(message_type: &str, pattern: &str) -> bool {
     Regex::new(&format!("^(?:{pattern})$"))
         .map(|re| re.is_match(message_type))
@@ -1345,16 +1361,30 @@ fn check_channel_uniqueness(
         let channel = &def.binding.channel_name;
         let mut subscribers = subscribers_of(deployment, channel);
         if subscribers.is_empty() {
-            out.push(
-                LintDiagnostic::warning(
-                    codes::CONFIG_CHANNEL_INERT,
-                    format!(
-                        "deployment {dep_label}: channel '{channel}' has no <q:source> \
-                         subscriber — nothing handles its messages"
-                    ),
-                )
-                .at_named("channels.yaml", channel),
-            );
+            // A relay-only channel (its messages resume a waiting instance) has no start
+            // subscriber, and is not inert. Neither is a channel another channel names as its
+            // `session-end: on-message` — its messages correlate to an instance and release
+            // that instance's slots, with no wait in the flow taking them.
+            let ends_a_session = definitions.iter().any(|other| {
+                other
+                    .binding
+                    .session_end
+                    .as_ref()
+                    .and_then(|end| end.on_message.as_deref())
+                    == Some(channel.as_str())
+            });
+            if !waits_on(deployment, channel) && !ends_a_session {
+                out.push(
+                    LintDiagnostic::warning(
+                        codes::CONFIG_CHANNEL_INERT,
+                        format!(
+                            "deployment {dep_label}: channel '{channel}' has no <q:source> \
+                             subscriber — nothing handles its messages"
+                        ),
+                    )
+                    .at_named("channels.yaml", channel),
+                );
+            }
             continue;
         }
         let declared = declared_types(deployment, &def.binding.codec);

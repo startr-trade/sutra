@@ -1,0 +1,119 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  A REVIEW LOOP. A draft goes round review, revision and a short cool-off until a reviewer
+  approves it. The token comes back to the same three wait nodes — a user task, a message catch
+  and a timer — once per round, and each pass parks a NEW wait: its own wait row and timer, and
+  the step that answers it retires it, so a late message for a past round resumes nothing.
+
+    startEvent (JSON on `draft-submitted`: { draftId })      rounds := 0
+      then AwaitReview   : user task, answered on `review`: { draftId, decision }
+      then Count         : data task (FEEL) — rounds := rounds + 1
+      then Decide        : exclusive gateway on review.decision (the message that answered the task)
+           "approve"  -> End
+           otherwise  -> AwaitRevision : message catch on `revision`: { draftId }
+                         then CoolOff  : timer catch, PT2S
+                         then back to AwaitReview
+-->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI"
+                  xmlns:dc="http://www.omg.org/spec/DD/20100524/DC"
+                  xmlns:di="http://www.omg.org/spec/DD/20100524/DI"
+                  xmlns:q="urn:sutra:q:1.0"
+                  id="Definitions_review_loop"
+                  targetNamespace="urn:sutra:module:review:1.0.0">
+
+  <bpmn:process id="review-loop" name="Review a draft until it is approved" isExecutable="true">
+
+    <bpmn:extensionElements>
+      <!-- Metadata-level audit events: GET /admin/instances/{id}/history shows each round. -->
+      <q:audit capture="metadata"/>
+      <q:variables>
+        <q:variable name="rounds" type="number"/>
+      </q:variables>
+    </bpmn:extensionElements>
+
+    <bpmn:startEvent id="Start" name="Draft submitted">
+      <bpmn:extensionElements>
+        <q:source channel="draft-submitted"/>
+        <q:alias name="draftId" expression="payload.draftId" unique="true" onConflict="correlate"/>
+      </bpmn:extensionElements>
+      <bpmn:outgoing>F1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="F1" sourceRef="Start" targetRef="Init"/>
+
+    <bpmn:serviceTask id="Init" name="rounds := 0 (FEEL)">
+      <bpmn:incoming>F1</bpmn:incoming><bpmn:outgoing>F2</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>0</bpmn:from><bpmn:to>rounds</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F2" sourceRef="Init" targetRef="AwaitReview"/>
+
+    <!-- Entered once per round: the second flow into it is the loop back from CoolOff. -->
+    <bpmn:userTask id="AwaitReview" name="Review the draft">
+      <bpmn:extensionElements>
+        <q:source channel="review" name="review"/>
+      </bpmn:extensionElements>
+      <bpmn:incoming>F2</bpmn:incoming><bpmn:incoming>F8</bpmn:incoming>
+      <bpmn:outgoing>F3</bpmn:outgoing>
+    </bpmn:userTask>
+    <bpmn:sequenceFlow id="F3" sourceRef="AwaitReview" targetRef="Count"/>
+
+    <bpmn:serviceTask id="Count" name="rounds := rounds + 1 (FEEL)">
+      <bpmn:incoming>F3</bpmn:incoming><bpmn:outgoing>F4</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>rounds + 1</bpmn:from><bpmn:to>rounds</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F4" sourceRef="Count" targetRef="Decide"/>
+
+    <bpmn:exclusiveGateway id="Decide" name="Approved?" default="FRevise">
+      <bpmn:incoming>F4</bpmn:incoming>
+      <bpmn:outgoing>FApprove</bpmn:outgoing><bpmn:outgoing>FRevise</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:sequenceFlow id="FApprove" sourceRef="Decide" targetRef="End">
+      <bpmn:conditionExpression>review.decision = "approve"</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="FRevise" sourceRef="Decide" targetRef="AwaitRevision"/>
+
+    <bpmn:intermediateCatchEvent id="AwaitRevision" name="Revision submitted">
+      <bpmn:extensionElements>
+        <q:source channel="revision" name="revision"/>
+      </bpmn:extensionElements>
+      <bpmn:incoming>FRevise</bpmn:incoming><bpmn:outgoing>F7</bpmn:outgoing>
+      <bpmn:messageEventDefinition id="AwaitRevision_Msg"/>
+    </bpmn:intermediateCatchEvent>
+    <bpmn:sequenceFlow id="F7" sourceRef="AwaitRevision" targetRef="CoolOff"/>
+
+    <bpmn:intermediateCatchEvent id="CoolOff" name="Cool-off, 2 s">
+      <bpmn:incoming>F7</bpmn:incoming><bpmn:outgoing>F8</bpmn:outgoing>
+      <bpmn:timerEventDefinition id="CoolOff_Timer">
+        <bpmn:timeDuration>PT2S</bpmn:timeDuration>
+      </bpmn:timerEventDefinition>
+    </bpmn:intermediateCatchEvent>
+    <bpmn:sequenceFlow id="F8" sourceRef="CoolOff" targetRef="AwaitReview"/>
+
+    <bpmn:endEvent id="End" name="Draft approved"><bpmn:incoming>FApprove</bpmn:incoming></bpmn:endEvent>
+  </bpmn:process>
+
+  <bpmndi:BPMNDiagram id="Diagram_review_loop">
+    <bpmndi:BPMNPlane id="Plane_review_loop" bpmnElement="review-loop">
+      <bpmndi:BPMNShape id="S_Start" bpmnElement="Start"><dc:Bounds x="100" y="100" width="36" height="36"/></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="S_Init" bpmnElement="Init"><dc:Bounds x="180" y="78" width="110" height="80"/></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="S_AwaitReview" bpmnElement="AwaitReview"><dc:Bounds x="340" y="78" width="110" height="80"/></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="S_Count" bpmnElement="Count"><dc:Bounds x="500" y="78" width="110" height="80"/></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="S_Decide" bpmnElement="Decide" isMarkerVisible="true"><dc:Bounds x="660" y="93" width="50" height="50"/></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="S_End" bpmnElement="End"><dc:Bounds x="770" y="100" width="36" height="36"/></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="S_AwaitRevision" bpmnElement="AwaitRevision"><dc:Bounds x="667" y="240" width="36" height="36"/></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="S_CoolOff" bpmnElement="CoolOff"><dc:Bounds x="527" y="240" width="36" height="36"/></bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="E_F1" bpmnElement="F1"><di:waypoint x="136" y="118"/><di:waypoint x="180" y="118"/></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="E_F2" bpmnElement="F2"><di:waypoint x="290" y="118"/><di:waypoint x="340" y="118"/></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="E_F3" bpmnElement="F3"><di:waypoint x="450" y="118"/><di:waypoint x="500" y="118"/></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="E_F4" bpmnElement="F4"><di:waypoint x="610" y="118"/><di:waypoint x="660" y="118"/></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="E_FApprove" bpmnElement="FApprove"><di:waypoint x="710" y="118"/><di:waypoint x="770" y="118"/></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="E_FRevise" bpmnElement="FRevise"><di:waypoint x="685" y="143"/><di:waypoint x="685" y="240"/></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="E_F7" bpmnElement="F7"><di:waypoint x="667" y="258"/><di:waypoint x="563" y="258"/></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="E_F8" bpmnElement="F8"><di:waypoint x="527" y="258"/><di:waypoint x="395" y="258"/><di:waypoint x="395" y="158"/></bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</bpmn:definitions>

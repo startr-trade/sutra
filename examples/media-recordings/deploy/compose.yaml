@@ -1,0 +1,109 @@
+# Run the media-recordings example locally: engine + PostgreSQL + an S3-compatible object store
+# (MinIO) + the stub model server shared with ai-summarize. Nothing needs a real key.
+#
+#   docker compose -f examples/media-recordings/deploy/compose.yaml up -d
+#   sutra package examples/media-recordings/deployments-src/default--recordings--1.0.0 \
+#        --out examples/media-recordings/deploy/deployments
+#
+# The engine watches ./deployments and activates the archive without a restart. The project name
+# is explicit so this stack can never collide with another one that would default to `deploy`.
+
+name: sutra-media-recordings
+
+services:
+  engine:
+    # 0.6.0 or later. Override with SUTRA_ENGINE_IMAGE to run a locally built tag.
+    image: ${SUTRA_ENGINE_IMAGE:-ghcr.io/startr-trade/sutra:0.6.0}
+    environment:
+      SUTRA_DEPLOYMENTS_DIR: /deployments
+      SUTRA_HTTP_PORT: "8080"
+      SUTRA_DATASOURCE_URL: postgres://engine-db:5432/sutra
+      # A plain login role, not the postgres superuser — see engine-db-init.sh.
+      SUTRA_DATASOURCE_USERNAME: ${ENGINE_DB_USER:-sutra_engine}
+      SUTRA_DATASOURCE_PASSWORD: ${ENGINE_DB_PASSWORD:-sutra-dev-only}
+
+      # --- the object store ------------------------------------------------------------------
+      # One named store, `recordings`: the bucket `recordings`, key prefix `calls`, on the MinIO
+      # service below. A channel's `llm.media-store: recordings` reads from it; erasure and
+      # retention delete from it. The keys are references, resolved at boot.
+      SUTRA_OBJECT_STORES: recordings
+      SUTRA_OBJECT_STORES_RECORDINGS_URI: s3://recordings/calls
+      SUTRA_OBJECT_STORES_RECORDINGS_ENDPOINT: http://store:9000
+      SUTRA_OBJECT_STORES_RECORDINGS_ACCESS_KEY: env:STORE_ACCESS_KEY
+      SUTRA_OBJECT_STORES_RECORDINGS_SECRET_KEY: env:STORE_SECRET_KEY
+      # The sample uploads plain objects. A recording transport writes SEALED objects instead
+      # (encryption: envelope, the default), opened with the store's `kek` secret.
+      SUTRA_OBJECT_STORES_RECORDINGS_ENCRYPTION: none
+      STORE_ACCESS_KEY: ${STORE_ACCESS_KEY:-recordings-dev-only}
+      STORE_SECRET_KEY: ${STORE_SECRET_KEY:-recordings-dev-only-secret}
+
+      # --- audit, subjects, retention --------------------------------------------------------
+      # The SQL audit sink: q:audit events land in the engine's `audit_event` table, which is what
+      # GET /admin/instances/{id}/history reads.
+      SUTRA_AUDIT_SQL: "true"
+      # Blind-indexes `subjectKey` variables so POST /admin/subjects/erase can find an instance,
+      # and encrypts `sensitive` variables at rest. A reference like every secret: here to the
+      # variable below, a dev-only placeholder; a real engine names its secret store (secret:,
+      # vault:, ...).
+      SUTRA_CRYPTO_MASTER_KEY: env:RECORDINGS_MASTER_KEY
+      RECORDINGS_MASTER_KEY: ${RECORDINGS_MASTER_KEY:-dev-only-master-key-not-for-production}
+      # A finished instance is kept for two minutes (default P7D), and the purge runs every 15 s,
+      # so the retention delete is visible within a walkthrough.
+      SUTRA_INSTANCE_RETENTION: PT2M
+      SUTRA_INSTANCE_RETENTION_SWEEP_INTERVAL: PT15S
+      # DEV ONLY: /admin/* without authentication. Never in anything real.
+      SUTRA_ADMIN_OIDC_DEV_DISABLED: "true"
+
+      # --- what the package names ------------------------------------------------------------
+      RECORDINGS_API_KEY: ${RECORDINGS_API_KEY:-dev-only-recordings-key}
+      LLM_API_KEY: ${LLM_API_KEY:-stub-not-a-real-key}
+    volumes:
+      - ./deployments:/deployments:ro
+    ports:
+      # Dynamic host port, loopback only: `docker compose -f … port engine 8080` shows it.
+      - "127.0.0.1::8080"
+    depends_on:
+      engine-db:
+        condition: service_healthy
+      store:
+        condition: service_healthy
+      model-stub:
+        condition: service_started
+
+  # MinIO, pinned by digest. The image carries the `mc` client; MC_HOST_local points it at this
+  # server, so `docker compose exec store mc …` works with no setup.
+  store:
+    image: pgsty/minio@sha256:b6bfe7239bfc83fb90d31612d9704d86039dd714f7904b3f1ad68f211e602372
+    command: ["server", "/data"]
+    environment:
+      MINIO_ROOT_USER: ${STORE_ACCESS_KEY:-recordings-dev-only}
+      MINIO_ROOT_PASSWORD: ${STORE_SECRET_KEY:-recordings-dev-only-secret}
+      MC_HOST_local: http://${STORE_ACCESS_KEY:-recordings-dev-only}:${STORE_SECRET_KEY:-recordings-dev-only-secret}@127.0.0.1:9000
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9000/minio/health/live"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # The stub model server from ai-summarize, resolvable from the engine as http://model-stub:8000.
+  model-stub:
+    image: python:3.12-alpine
+    command: ["python3", "/stub/model-stub.py", "8000"]
+    volumes:
+      - ../../ai-summarize/stub:/stub:ro
+
+  engine-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: sutra
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_BOOTSTRAP_PASSWORD:-bootstrap-dev-only}
+      ENGINE_DB_USER: ${ENGINE_DB_USER:-sutra_engine}
+      ENGINE_DB_PASSWORD: ${ENGINE_DB_PASSWORD:-sutra-dev-only}
+    volumes:
+      - ./engine-db-init.sh:/docker-entrypoint-initdb.d/10-engine-role.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d sutra"]
+      interval: 2s
+      timeout: 3s
+      retries: 30

@@ -36,7 +36,9 @@ use std::sync::Arc;
 
 use sqlx::PgPool;
 use sutra_channels::LeaderGate;
-use sutra_persistence::stores::{InstanceStore, PgInflightChainStore, PgInstanceStore};
+use sutra_persistence::stores::{
+    InstanceStore, PgCapacitySlotStore, PgInflightChainStore, PgInstanceStore,
+};
 use sutra_persistence::DeploymentId as PersistDeploymentId;
 use tracing::{debug, info, warn};
 
@@ -82,6 +84,10 @@ impl Default for StuckInstanceScannerConfig {
 pub struct StuckInstanceScanner {
     store: PgInstanceStore,
     inflight: PgInflightChainStore,
+    /// Present when capacity pools are declared: the capacity-slot sweep runs with the in-flight
+    /// chain sweep.
+    capacity: Option<PgCapacitySlotStore>,
+    pool: PgPool,
     deployments: sutra_channels::LiveDeploymentSet,
     gate: Arc<dyn LeaderGate>,
     config: StuckInstanceScannerConfig,
@@ -97,11 +103,61 @@ impl StuckInstanceScanner {
     ) -> StuckInstanceScanner {
         StuckInstanceScanner {
             inflight: PgInflightChainStore::new(pool.clone()),
+            capacity: None,
+            pool: pool.clone(),
             store: PgInstanceStore::new(pool),
             deployments,
             gate,
             config,
         }
+    }
+
+    /// Also return stranded capacity-pool slots on every tick (see
+    /// [`Self::sweep_capacity_slots`]). Off unless pools are declared.
+    #[must_use]
+    pub fn with_capacity_sweep(mut self, enabled: bool) -> StuckInstanceScanner {
+        self.capacity = enabled.then(|| PgCapacitySlotStore::new(self.pool.clone()));
+        self
+    }
+
+    /// Return the capacity-pool slots nothing will ever release: those of an instance that has
+    /// finished, and those of an instance that was never stored and has no in-flight chain
+    /// marker once its holder is an earlier process on this host or the slot is older than
+    /// `inflight_chain_max_age`. Runs right after [`Self::sweep_inflight_chains`] (whose
+    /// released markers make a dead chain's slot eligible), on EVERY replica, ungated, over
+    /// every live deployment — like that sweep, only this replica can tell its own host's dead
+    /// processes apart, and the release is idempotent. Returns the slots released.
+    pub async fn sweep_capacity_slots(&self) -> u64 {
+        let Some(capacity) = &self.capacity else {
+            return 0;
+        };
+        let holder = sutra_channels::replica_id();
+        let host = holder.rsplitn(3, '-').nth(2).unwrap_or(holder).to_string();
+        let mut released = 0;
+        for deployment in self.deployments.snapshot() {
+            let Ok(dep) = PersistDeploymentId::new(deployment.value()) else {
+                continue;
+            };
+            match capacity
+                .sweep(&dep, &host, holder, self.config.inflight_chain_max_age)
+                .await
+            {
+                Ok(0) => {}
+                Ok(count) => {
+                    info!(
+                        deployment = deployment.value(),
+                        released = count,
+                        "returned capacity-pool slots whose holder finished or is gone"
+                    );
+                    released += count;
+                }
+                Err(e) => {
+                    warn!(deployment = deployment.value(), error = %e,
+                          "capacity-slot sweep failed for deployment");
+                }
+            }
+        }
+        released
     }
 
     /// One sweep across every live deployment, returning the number of claims cleared.
@@ -195,6 +251,7 @@ impl StuckInstanceScanner {
             loop {
                 interval.tick().await;
                 self.sweep_inflight_chains().await;
+                self.sweep_capacity_slots().await;
                 if !self.gate.is_leading() {
                     continue;
                 }
@@ -257,8 +314,14 @@ impl Default for TerminalRetentionConfig {
 /// would grow forever. Every tick, on the leader, it deletes every terminal row whose
 /// `terminal_at` is at or past the retention window, per live deployment.
 ///
+/// **Recorded media goes first.** Before the purge, the objects the `q:audit` media events of
+/// the expiring instances reference are deleted from the declared object stores and each event
+/// is amended to say so ([`crate::media`]); an instance whose media could not be deleted is kept
+/// out of the purge and retried on the next tick.
+///
 /// **Scope of the delete, stated precisely.** It removes rows from `instance_state` and nothing
-/// else. In particular it never touches `audit_event`: the per-token-move journal is the compliance
+/// else. In particular it never deletes from `audit_event` (media events are amended, not
+/// removed): the per-token-move journal is the compliance
 /// record that an instance RAN, it is opt-in and separately configured, and GDPR erasure treats it
 /// as something to REDACT (null the captured payloads, keep the metadata trail) rather than to
 /// delete — so folding it into an instance-state retention clock would quietly destroy evidence an
@@ -271,6 +334,7 @@ impl Default for TerminalRetentionConfig {
 /// [`RETENTION_SWEEPER_ROLE`].
 pub struct TerminalRetentionSweeper {
     store: PgInstanceStore,
+    audit: sutra_persistence::stores::PgAuditEventStore,
     deployments: sutra_channels::LiveDeploymentSet,
     gate: Arc<dyn LeaderGate>,
     config: TerminalRetentionConfig,
@@ -285,6 +349,7 @@ impl TerminalRetentionSweeper {
         config: TerminalRetentionConfig,
     ) -> TerminalRetentionSweeper {
         TerminalRetentionSweeper {
+            audit: sutra_persistence::stores::PgAuditEventStore::new(pool.clone()),
             store: PgInstanceStore::new(pool),
             deployments,
             gate,
@@ -306,7 +371,14 @@ impl TerminalRetentionSweeper {
                     continue;
                 }
             };
-            match self.store.purge_terminal(&dep, self.config.retention).await {
+            let Some(keep) = self.erase_expired_media(&dep).await else {
+                continue;
+            };
+            match self
+                .store
+                .purge_terminal_except(&dep, self.config.retention, &keep)
+                .await
+            {
                 Ok(0) => {}
                 Ok(rows) => {
                     // Loud on purpose: this is the moment finished instances stop being
@@ -328,6 +400,60 @@ impl TerminalRetentionSweeper {
             }
         }
         purged
+    }
+
+    /// Delete the recorded media of the instances whose retention has run out (the objects their
+    /// `q:audit` media events reference) and amend each event to say so. Returns the instances
+    /// whose media could not all be deleted: they are kept out of this purge, so their rows stay
+    /// retained and the next sweep retries — a recording is never left behind without a trace.
+    /// `None` when the media could not even be listed: the deployment's purge waits a tick.
+    async fn erase_expired_media(&self, dep: &PersistDeploymentId) -> Option<Vec<uuid::Uuid>> {
+        /// Media rows handled per deployment per sweep.
+        const MEDIA_BATCH: i64 = 1000;
+        let rows = match self
+            .audit
+            .list_expired_media(dep, self.config.retention, MEDIA_BATCH)
+            .await
+        {
+            Ok(rows) => rows,
+            Err(e) => {
+                warn!(deployment = dep.as_str(), error = %e,
+                      "retention sweeper could not list expired media; the purge waits a tick");
+                return None;
+            }
+        };
+        let mut keep = Vec::new();
+        let mut erased = 0usize;
+        for (row_id, instance, payload) in rows {
+            match crate::media::erase_media(&payload, crate::media::ERASED_FOR_RETENTION).await {
+                Ok(amended) => match self.audit.amend_payload(dep, row_id, &amended).await {
+                    Ok(_) => erased += 1,
+                    Err(e) => {
+                        warn!(deployment = dep.as_str(), instance = %instance, error = %e,
+                              "retention sweeper deleted media but could not amend its audit \
+                               event; the instance is kept and retried");
+                        keep.push(instance);
+                    }
+                },
+                Err(failures) => {
+                    warn!(deployment = dep.as_str(), instance = %instance, failures = ?failures,
+                          "retention sweeper could not delete recorded media; the instance is \
+                           kept and retried on the next sweep (declare the store holding it \
+                           under sutra.object-stores.<name>)");
+                    keep.push(instance);
+                }
+            }
+        }
+        if erased > 0 {
+            info!(
+                deployment = dep.as_str(),
+                events = erased,
+                "terminal retention deleted the recorded media of finished instances"
+            );
+        }
+        keep.sort();
+        keep.dedup();
+        Some(keep)
     }
 
     /// Spawn the interval loop. Runs until aborted (`RunningEngine::shutdown` / `drain`).

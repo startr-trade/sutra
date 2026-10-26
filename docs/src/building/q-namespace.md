@@ -31,7 +31,7 @@ and the same XSD drives the `sutra-modeler-plugin` property panels.
 | `q:variables` / `q:variable` | `bpmn:process` | Declared process variables — type or schema, `transient` / `sensitive` / `source`. |
 | `q:onValidation` | `bpmn:process` | The structural-failure policy (`route` / `reject` / `error`). |
 | `q:process` | `bpmn:process` | The retry-safety (idempotency) assertion. |
-| `q:audit` | `bpmn:process` | Audit capture level and data-class tagging. |
+| `q:audit` | `bpmn:process` | Audit capture level (`none` / `metadata` / `payload` / `media`) and data-class tagging. |
 | `q:coverage` | `bpmn:process` | An opt-in tracked compliance path. |
 
 ```mermaid
@@ -401,7 +401,10 @@ failure.
   scratch that is re-derived, never for anything the flow still needs on the other side),
   `sensitive` (persisted but redacted downstream), or `source`-bound (payload-initialized from a
   named channel).
-- **`q:audit`** — per-process audit sink/target/capture-level configuration.
+- **`q:audit`** — per-process audit sink/target/capture-level configuration. `capture` is `none`,
+  `metadata`, `payload` (the default) or, since 0.6, `media`: metadata-level events that carry the
+  media references found among the variables, never the media (see
+  [Recordings and media references](recordings-and-media.md#the-audit-trail-carries-references-never-media)).
 - **`q:coverage`** — declares one tracked compliance route (`path` id + the ordered `flows` it must
   traverse) for the path-coverage reporting the CLI's `sutra coverage` commands drive. This is the
   intra-process half of the mechanism; a route spanning several correlated processes is declared

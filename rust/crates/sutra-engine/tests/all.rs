@@ -26,6 +26,8 @@ mod archive_activation_conformance;
 mod call_log_csv_e2e;
 #[path = "all/call_log_load_it.rs"]
 mod call_log_load_it;
+#[path = "all/capacity_pool_config_test.rs"]
+mod capacity_pool_config_test;
 #[path = "all/channel_call_retry_it.rs"]
 mod channel_call_retry_it;
 #[path = "all/concurrency_cluster_it.rs"]
@@ -62,5 +64,9 @@ mod time_skipping_it;
 mod timer_channel_call_conformance;
 #[path = "all/timer_start_conformance.rs"]
 mod timer_start_conformance;
+#[path = "all/transport_audit_it.rs"]
+mod transport_audit_it;
 #[path = "all/typed_snapshot_it.rs"]
 mod typed_snapshot_it;
+#[path = "all/wait_loop_it.rs"]
+mod wait_loop_it;

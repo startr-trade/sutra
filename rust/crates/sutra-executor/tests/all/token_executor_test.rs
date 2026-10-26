@@ -369,6 +369,86 @@ async fn process_audit_routes_to_one_sink_captures_payload_and_node_none_suppres
     assert_eq!(of("U").0, None, "capture=\"none\" suppresses the node");
 }
 
+/// `capture="media"`: events carry no variable content, only the media references found among
+/// the variables (`kind: "media"` with a `uri` and a `sha256`), each once, never a `@sensitive`
+/// variable's; with no reference the payload stays empty.
+#[tokio::test]
+async fn media_capture_audits_media_references_and_nothing_else() {
+    let bpmn = r#"<?xml version="1.0"?>
+        <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                          xmlns:q="urn:sutra:q:1.0">
+          <bpmn:process id="p1">
+            <bpmn:extensionElements>
+              <q:audit sink="jsonl" capture="media"/>
+              <q:variable name="hidden" sensitive="true"/>
+            </bpmn:extensionElements>
+            <bpmn:startEvent id="S"/>
+            <bpmn:serviceTask id="T" implementation="${noop}"/>
+            <bpmn:endEvent id="E"/>
+            <bpmn:sequenceFlow id="f1" sourceRef="S" targetRef="T"/>
+            <bpmn:sequenceFlow id="f2" sourceRef="T" targetRef="E"/>
+          </bpmn:process>
+        </bpmn:definitions>"#;
+    let process = proc(bpmn, "p1");
+    assert_eq!(
+        process.audit.as_ref().map(|a| a.capture),
+        Some(sutra_bpmn::qbindings::AuditCapture::Media)
+    );
+    let reference = serde_json::json!({
+        "kind": "media", "uri": "s3://recordings/call-1.wav.sealed",
+        "sha256": "ab".repeat(32), "durationMs": 1200, "format": "audio/wav"
+    });
+    let feel = sutra_executor::variables::json_to_feel;
+    let run = |variables: Vec<(&'static str, FeelValue)>| {
+        let process = process.clone();
+        async move {
+            let registry = TaskRegistry::new().register("noop", |_, _| ok_map(&[]));
+            let recorder = Rc::new(PayloadRecorder {
+                events: RefCell::new(Vec::new()),
+            });
+            let executor = TokenExecutor::builder(registry)
+                .with_listener(Rc::clone(&recorder) as Rc<dyn ExecutionListener>)
+                .build();
+            executor
+                .execute_sync(&process, vars(&variables))
+                .await
+                .unwrap();
+            let payload = recorder
+                .events
+                .borrow()
+                .iter()
+                .find(|(n, _, _)| n == "T")
+                .and_then(|(_, _, payload)| payload.clone());
+            payload
+        }
+    };
+    let captured = run(vec![
+        ("amount", string("100")),
+        (
+            "ended",
+            feel(&serde_json::json!({"callId": "c1", "recording": reference})),
+        ),
+        ("copy", feel(&serde_json::json!([reference]))),
+        (
+            "hidden",
+            feel(
+                &serde_json::json!({"recording": {"kind": "media", "uri": "s3://x/secret",
+                                                    "sha256": "00"}}),
+            ),
+        ),
+    ])
+    .await
+    .expect("a media reference is audited");
+    let value: serde_json::Value = serde_json::from_str(&captured).unwrap();
+    assert_eq!(
+        value,
+        serde_json::json!({"media": [reference]}),
+        "one reference, nothing else"
+    );
+    assert!(!captured.contains("100") && !captured.contains("secret"));
+    assert_eq!(run(vec![("amount", string("100"))]).await, None);
+}
+
 struct Thrower;
 
 impl ExecutionListener for Thrower {

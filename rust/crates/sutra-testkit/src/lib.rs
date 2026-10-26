@@ -44,6 +44,10 @@ use std::sync::{Mutex, Once};
 #[cfg(feature = "conformance")]
 pub mod conformance;
 
+/// A throwaway S3-compatible store (MinIO) for the suites that test object-store code against a
+/// real one. Docker CLI only, so it stays in the light default layer.
+pub mod minio;
+
 /// Container ids registered by fixtures in this process, force-removed by the atexit hook.
 static REGISTRY: Mutex<Vec<String>> = Mutex::new(Vec::new());
 /// Docker network names registered for removal by the atexit hook — reaped AFTER the containers

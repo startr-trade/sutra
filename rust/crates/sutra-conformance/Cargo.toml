@@ -36,6 +36,9 @@ rdkafka = { workspace = true }
 # Raw archive inspection for the deployment-source assembly.
 zip = { workspace = true }
 serde_json = { workspace = true }
+# The tc_ai_ audio flows send and read back base64 audio.
+base64 = { workspace = true }
+sha2 = { workspace = true }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "sync"] }
 # HTTP client for the engine intake + Elasticsearch queries (rustls, no OpenSSL).
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }

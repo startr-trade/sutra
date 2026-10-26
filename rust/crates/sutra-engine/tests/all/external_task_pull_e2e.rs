@@ -299,6 +299,8 @@ async fn a_parked_task_is_fetched_completed_and_resumes_through_the_inbound_path
         rls_bypass_check_enabled: false,
         telemetry: sutra_engine::TelemetryConfig::default(),
         admin_auth: Default::default(),
+        capacity_pools: Vec::new(),
+        object_stores: Vec::new(),
         now_override: None,
     })
     .await

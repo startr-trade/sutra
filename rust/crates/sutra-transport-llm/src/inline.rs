@@ -54,9 +54,15 @@ impl LlmInlineCaller {
                 .with_attribute("channel", channel_name),
             ));
         };
-        let call = parse_request_body(&message.body).map_err(|d| {
+        let mut call = parse_request_body(&message.body).map_err(|d| {
             InlineFailure::Permanent(d.with_attribute("channel", channel.name.clone()))
         })?;
+        crate::media::resolve_media(&mut call, &channel)
+            .await
+            .map_err(|failure| match failure {
+                crate::media::MediaFailure::Permanent(d) => InlineFailure::Permanent(d),
+                crate::media::MediaFailure::Retryable(d) => InlineFailure::Retryable(d),
+            })?;
         let permit =
             match tokio::time::timeout(channel.timeout, channel.permits().clone().acquire_owned())
                 .await
@@ -83,9 +89,13 @@ impl LlmInlineCaller {
         drop(permit);
         match routed {
             Ok(answer) => {
-                let body =
-                    serde_json::to_vec(&reply_body(answer.candidate, &answer.response, &call.raw))
-                        .unwrap_or_default();
+                let body = serde_json::to_vec(&reply_body(
+                    answer.candidate,
+                    &answer.response,
+                    &call.raw,
+                    answer.audio_preserved,
+                ))
+                .unwrap_or_default();
                 let headers = BTreeMap::from([
                     (
                         PROVIDER_HEADER.to_string(),

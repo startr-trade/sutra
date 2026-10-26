@@ -35,8 +35,22 @@ pub const DEFAULT_CALLBACK_POLL_INTERVAL_SECONDS: u64 = 300;
 pub const DEFAULT_JOB_TIMEOUT_SECONDS: u64 = 86_400;
 /// Callback endpoints are served under this path prefix on the shared listener.
 pub const CALLBACK_PATH_PREFIX: &str = "/llm/";
+/// `llm.media-max-bytes` default: the largest object a media reference may name (20 MiB, the
+/// inline-media ceiling of the providers that take the most).
+pub const DEFAULT_MEDIA_MAX_BYTES: u64 = 20 * 1024 * 1024;
 
-const KNOWN_KEYS: [&str; 10] = [
+const KNOWN_KEYS: [&str; 21] = [
+    "voice",
+    "media-store",
+    "media-max-bytes",
+    "output-voice",
+    "speech.provider",
+    "speech.base-url",
+    "speech.api-key",
+    "speech.transcribe-model",
+    "speech.speech-model",
+    "speech.voice",
+    "speech.language",
     "mode",
     "candidates",
     "reply-channel",
@@ -51,9 +65,10 @@ const KNOWN_KEYS: [&str; 10] = [
 
 const CALLBACK_KEYS: [&str; 2] = ["callback-for", "callback-secret"];
 
-const CANDIDATE_KEYS: [&str; 9] = [
+const CANDIDATE_KEYS: [&str; 10] = [
     "provider",
     "model",
+    "transcription-model",
     "base-url",
     "api-key",
     "completion",
@@ -71,6 +86,30 @@ const JOB_CANDIDATE_KEYS: [&str; 5] = [
     "job-timeout-seconds",
     "callback-secret",
 ];
+
+/// How a channel treats audio (`llm.voice`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VoiceMode {
+    /// Audio goes to the model as audio; a candidate without audio input is skipped.
+    #[default]
+    Native,
+    /// Speech to text, the text model, then text to speech (`llm.speech`). The voice itself —
+    /// tone, emotion — never reaches the model, and the reply says `audioPreserved: false`.
+    Pipeline,
+}
+
+/// The `voice: pipeline` speech stage (`llm.speech.*`): one provider doing both directions.
+/// Deliberately not `Debug`: the built client carries the resolved credential.
+pub struct SpeechStage {
+    pub provider: String,
+    pub client: Arc<dyn LlmProvider>,
+    pub transcribe_model: String,
+    pub speech_model: String,
+    /// The spoken answer's voice; a request's `outputVoice` overrides it.
+    pub voice: Option<String>,
+    /// The spoken language, as a transcription hint.
+    pub language: Option<String>,
+}
 
 /// How an outbound `llm` channel calls (`llm.mode`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -121,6 +160,9 @@ pub struct LlmCandidate {
     pub config: LlmProviderConfig,
     pub client: Arc<dyn LlmProvider>,
     pub job: CandidateJob,
+    /// `transcription-model`: the provider's model that transcribes the caller's audio in a
+    /// live session opened on this candidate (a transcription-only session uses nothing else).
+    pub transcription_model: Option<String>,
 }
 
 impl LlmCandidate {
@@ -130,11 +172,7 @@ impl LlmCandidate {
 
     /// Whether this candidate has every capability in `need`.
     pub fn satisfies(&self, need: LlmCapabilities) -> bool {
-        let have = self.client.capabilities();
-        (!need.tools || have.tools)
-            && (!need.json_output || have.json_output)
-            && (!need.async_jobs || have.async_jobs)
-            && (!need.job_callbacks || have.job_callbacks)
+        self.client.capabilities().covers(&need)
     }
 }
 
@@ -157,6 +195,17 @@ pub struct LlmChannel {
     pub require: LlmCapabilities,
     /// In declaration order; the router tries them first to last.
     pub candidates: Vec<LlmCandidate>,
+    /// `llm.voice`.
+    pub voice: VoiceMode,
+    /// `llm.speech`, set exactly when `voice` is [`VoiceMode::Pipeline`].
+    pub speech: Option<SpeechStage>,
+    /// `llm.output-voice`: the default voice of a spoken answer.
+    pub output_voice: Option<String>,
+    /// `llm.media-store`: the engine-configured object store (`sutra.object-stores.<name>`)
+    /// media references are read from. `None` refuses every reference.
+    pub media_store: Option<String>,
+    /// `llm.media-max-bytes`: the largest object one reference may name.
+    pub media_max_bytes: u64,
     pub(crate) permits: Arc<Semaphore>,
 }
 
@@ -426,6 +475,7 @@ fn parse_candidates(
             )
         })?;
         let base_url = candidate_string(channel, index, entry, "base-url")?;
+        let transcription_model = candidate_string(channel, index, entry, "transcription-model")?;
         // Always through the resolver: a literal secret is rejected by package validation,
         // never echoed here.
         let api_key = candidate_string(channel, index, entry, "api-key")?
@@ -479,6 +529,7 @@ fn parse_candidates(
             config,
             client,
             job,
+            transcription_model,
         });
     }
     Ok(out)
@@ -576,6 +627,11 @@ pub fn parse_channel(
             match need.as_str() {
                 "tools" => require.tools = true,
                 "json-output" => require.json_output = true,
+                "audio-input" => require.audio_input = true,
+                "audio-output" => require.audio_output = true,
+                "audio-understanding" => require.audio_understanding = true,
+                "video-understanding" => require.video_understanding = true,
+                "realtime" => require.realtime = true,
                 other => {
                     return Err(config_error(
                         channel,
@@ -603,6 +659,57 @@ pub fn parse_channel(
                 "llm channel '{channel}': 'llm.mode: job' completes later and cannot serve an \
                  'ack-mode: on-complete' channel"
             ),
+        ));
+    }
+
+    let voice = match block.get("voice").map(|v| v.trim()) {
+        None | Some("native") => VoiceMode::Native,
+        Some("pipeline") => VoiceMode::Pipeline,
+        Some(other) => {
+            return Err(config_error(
+                channel,
+                format!("llm channel '{channel}': voice '{other}' is not 'native' or 'pipeline'"),
+            ))
+        }
+    };
+    let speech = parse_speech(channel, &block, voice, resolver)?;
+    if voice == VoiceMode::Pipeline {
+        if require.audio_understanding || require.audio_input || require.audio_output {
+            return Err(config_error(
+                channel,
+                format!(
+                    "llm channel '{channel}': 'voice: pipeline' turns speech into text before the \
+                     model, so it cannot 'require' audio-input, audio-output or \
+                     audio-understanding"
+                ),
+            ));
+        }
+        if mode == ChannelMode::Job {
+            return Err(config_error(
+                channel,
+                format!("llm channel '{channel}': 'voice: pipeline' needs 'llm.mode: call'"),
+            ));
+        }
+    }
+    let output_voice = block
+        .get("output-voice")
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+
+    let media_store = block
+        .get("media-store")
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+    let media_max_bytes = parse_number::<u64>(
+        channel,
+        "media-max-bytes",
+        block.get("media-max-bytes").copied(),
+    )?
+    .unwrap_or(DEFAULT_MEDIA_MAX_BYTES);
+    if media_max_bytes == 0 {
+        return Err(config_error(
+            channel,
+            format!("llm channel '{channel}': 'media-max-bytes' must be positive"),
         ));
     }
 
@@ -643,7 +750,91 @@ pub fn parse_channel(
         fallback_on,
         require,
         candidates,
+        voice,
+        speech,
+        output_voice,
+        media_store,
+        media_max_bytes,
         permits: Arc::new(Semaphore::new(concurrency)),
+    }))
+}
+
+/// Parse `llm.speech.*`: required with `voice: pipeline`, refused without it. The provider is
+/// built through the same factory as a candidate, and must do both speech directions.
+fn parse_speech(
+    channel: &str,
+    block: &BTreeMap<&str, &String>,
+    voice: VoiceMode,
+    resolver: EnvRefResolver,
+) -> Result<Option<SpeechStage>, Diagnostic> {
+    let get = |key: &str| {
+        block
+            .get(format!("speech.{key}").as_str())
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
+    let declared = block.keys().any(|k| k.starts_with("speech."));
+    if voice == VoiceMode::Native {
+        if declared {
+            return Err(config_error(
+                channel,
+                format!(
+                    "llm channel '{channel}': 'llm.speech' is only used with 'voice: pipeline'"
+                ),
+            ));
+        }
+        return Ok(None);
+    }
+    let required = |key: &str| {
+        get(key).ok_or_else(|| {
+            config_error(
+                channel,
+                format!("llm channel '{channel}': 'voice: pipeline' needs 'llm.speech.{key}'"),
+            )
+        })
+    };
+    let provider = required("provider")?;
+    let transcribe_model = required("transcribe-model")?;
+    let speech_model = required("speech-model")?;
+    let api_key = resolve_secret(channel, "speech.api-key", get("api-key"), resolver)?;
+    let factory = find_provider(&provider).ok_or_else(|| {
+        Diagnostic::error(
+            codes::PROVIDER_UNKNOWN,
+            format!(
+                "llm channel '{channel}': speech names provider '{provider}', which no linked \
+                 provider registered"
+            ),
+        )
+        .with_attribute("channel", channel)
+        .with_attribute("provider", provider.clone())
+    })?;
+    let config = LlmProviderConfig {
+        model: transcribe_model.clone(),
+        base_url: get("base-url"),
+        api_key,
+    };
+    let client = (factory.build)(&config).map_err(|d| {
+        d.with_attribute("channel", channel)
+            .with_attribute("provider", provider.clone())
+    })?;
+    let have = client.capabilities();
+    if !have.transcription || !have.speech_synthesis {
+        return Err(config_error(
+            channel,
+            format!(
+                "llm channel '{channel}': speech provider '{provider}' does not do both \
+                 transcription and speech synthesis"
+            ),
+        )
+        .with_attribute("provider", provider));
+    }
+    Ok(Some(SpeechStage {
+        provider,
+        client,
+        transcribe_model,
+        speech_model,
+        voice: get("voice"),
+        language: get("language"),
     }))
 }
 
@@ -676,7 +867,7 @@ pub fn parse_all(definitions: &[ChannelDefinition], resolver: EnvRefResolver) ->
     let mut out = ParsedChannels::default();
     for definition in definitions {
         let parsed = parse_channel(definition, resolver).and_then(|channel| match channel {
-            Some(channel) => Ok(Some(Either::Outbound(channel))),
+            Some(channel) => Ok(Some(Either::Outbound(Box::new(channel)))),
             None => parse_callback_channel(definition, resolver)
                 .map(|callback| callback.map(Either::Callback)),
         });
@@ -684,7 +875,7 @@ pub fn parse_all(definitions: &[ChannelDefinition], resolver: EnvRefResolver) ->
             Ok(Some(Either::Outbound(channel))) => {
                 out.channels.insert(
                     (channel.module_key.clone(), channel.name.clone()),
-                    Arc::new(channel),
+                    Arc::from(channel),
                 );
             }
             Ok(Some(Either::Callback(callback))) => {
@@ -719,7 +910,7 @@ pub fn parse_all(definitions: &[ChannelDefinition], resolver: EnvRefResolver) ->
 }
 
 enum Either {
-    Outbound(LlmChannel),
+    Outbound(Box<LlmChannel>),
     Callback(LlmCallbackChannel),
 }
 

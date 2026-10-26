@@ -644,10 +644,21 @@
   </xsd:complexType>
 
   <xsd:simpleType name="AuditCapture">
+    <xsd:annotation>
+      <xsd:documentation>
+        none: no audit event. metadata: events without variable content. payload: events with the
+        redacted variable snapshot. media (added in 0.6.0, semver-minor): metadata-level events,
+        and the process's outbound requests are marked so a media transport records the session
+        (a call's audio) to the deployment's object store; each event then carries the media
+        REFERENCES found among the variables (objects with kind "media", a uri and a sha256 —
+        never the media itself) under "media".
+      </xsd:documentation>
+    </xsd:annotation>
     <xsd:restriction base="xsd:string">
       <xsd:enumeration value="none"/>
       <xsd:enumeration value="metadata"/>
       <xsd:enumeration value="payload"/>
+      <xsd:enumeration value="media"/>
     </xsd:restriction>
   </xsd:simpleType>
 

@@ -69,7 +69,9 @@ dimensions.
 
 The threat-model backlog names a few more ceilings that aren't wired yet — a FEEL evaluation
 wall-clock/memory budget per expression, and a per-tenant audit-write rate cap. Until they land,
-the payload cap and the two tenant quotas above are the complete set.
+the payload cap and the two tenant quotas above are the complete set of per-message and
+per-tenant limits. Limits on a shared physical resource (lines, seats, connections) are
+[capacity pools](capacity-pools.md).
 
 ## Next
 

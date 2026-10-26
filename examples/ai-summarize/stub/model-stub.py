@@ -6,11 +6,48 @@ OpenAI wire (also every Chat Completions service: Gemini, Mistral, ...)
   POST /v1/chat/completions      a fixed answer; `stream: true` as server-sent events; `tools`
                                  -> a call of the first tool; `response_format: json_object` ->
                                  a JSON object as the text
+                                 `modalities` with "audio" -> a spoken answer: a fixed WAV
+                                 (24 kHz mono) plus its transcript; an `input_audio` part must
+                                 be valid base64 (and a RIFF/WAVE file when its format is wav)
+                                 A model id containing `voice` (sutra-voice: examples/voice-assistant) speaks
+                                 a longer, audible answer (800 ms of 440 Hz): a greeting when the
+                                 request carries no audio, "Transferring you to an agent now."
+                                 when the caller's latest turn lasts 2.5 s or more, else a fixed
+                                 answer. A model id containing `analytics` with
+                                 `response_format: json_object` answers the post-call analysis
+                                 (customer emotion per turn) as a JSON object
+  POST /v1/audio/transcriptions  multipart form (model + file) -> a fixed transcript
+  POST /v1/audio/speech          {model, input, voice, response_format} -> the fixed WAV
+                                 (`wav`) or its samples (`pcm`, 24 kHz 16-bit LE)
+  GET  /v1/realtime              a WebSocket (sutra-voice: examples/meeting-assistant): a Realtime session. A
+                                 transcription session (`session.update` with `type:
+                                 transcription`) is answered `session.updated`; the audio it is
+                                 sent (`input_audio_buffer.append`, PCM 24 kHz or G.711) is cut
+                                 at 500 ms silences by an energy detector, and each stretch of
+                                 speech is answered `speech_started` / `speech_stopped` (with its
+                                 audio offsets) and a completed transcription: the next line of
+                                 MEETING_LINES. `input_audio_buffer.commit` ends the stretch in
+                                 progress
   POST /v1/responses             a background job (`background: true`): answers `queued`
-  GET  /v1/responses/<id>        `in_progress` on the first poll, `completed` after it. A job
+  GET  /v1/responses/<id>        `in_progress` on the first poll, `completed` after it (a JSON job
+                                 whose model id contains `meeting` answers MEETING_REPORT). A job
                                  whose model id ends in `-webhook` is instead completed by a
                                  signed webhook (see WEBHOOKS) and stays `in_progress` until then,
                                  when STUB_WEBHOOK_SECRET is set
+
+Gemini native wire (sutra-voice: examples/video-meeting-assistant)
+  POST /v1beta/models/<model>:generateContent
+                                 a fixed answer; with `responseMimeType: application/json` a
+                                 segment analysis (VIDEO_ANALYSIS) that echoes what it was sent:
+                                 `framesSeen` (image parts) and `audioSeen` (an audio part), so a
+                                 test can check the frames reached the model; the modalities it
+                                 claims follow what was sent. A model id containing `vision`
+                                 (examples/ai-advanced vision.bpmn) answers JSON mode with a
+                                 fixed scene description plus `framesSeen` and `clipsSeen`
+  GET  /gemini/requests          every generateContent request so far, oldest first, as
+                                 {model, parts: [{mimeType, bytes, sha256} for each inlineData
+                                 part, the bytes decoded]}: a test can check the very media it
+                                 sent reached the model in the native wire shape
 
 Anthropic wire
   POST /v1/messages              a fixed answer; `stream: true` as Messages API events; `tools`
@@ -31,7 +68,8 @@ Failure and pass-through
 Bookkeeping
   POST /sink                     records and logs the body (the async flows' hand-off target)
   GET  /sink                     every body recorded so far, as a JSON array
-  GET  /stats                    requests served, by route
+  GET  /stats                    requests served, by route (Chat Completions also by model, as
+                                 `chat:<model>`)
   GET  /health                   200
 
 WEBHOOKS. With STUB_WEBHOOK_SECRET set, a `-webhook` job is completed about a second after it is
@@ -45,11 +83,13 @@ The stub never reads a prompt for meaning, and never logs prompts, answers or he
 import base64
 import hashlib
 import hmac
+import io
 import json
 import os
 import sys
 import threading
 import time
+import wave
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -58,12 +98,126 @@ SUMMARY = "STUB SUMMARY: the customer reports a problem and asks for it to be lo
 JSON_ANSWER = '{"category": "outage", "urgency": "high"}'
 TOOL_ARGUMENT = "Paris"
 USAGE_IN, USAGE_OUT = 42, 17
+SPOKEN_TRANSCRIPT = "STUB SPOKEN ANSWER: your appointment is confirmed for Tuesday."
+STT_TRANSCRIPT = "STUB TRANSCRIPT: I would like to confirm my appointment."
+AUDIO_RATE, AUDIO_MS = 24000, 200
+VOICE_GREETING = ("Hello, you have reached the assistant. This call is recorded and analysed to "
+                  "help us serve you. How can I help?")
+VOICE_ANSWER = "STUB VOICE ANSWER: your appointment is confirmed for Tuesday at ten."
+VOICE_TRANSFER = "Transferring you to an agent now."
+VOICE_LONG_TURN_MS = 2500
+ANALYTICS = {
+    "analyzedParties": ["customer"],
+    "customer": {
+        "overall": "neutral",
+        "trajectory": [{"turn": 1, "emotion": "concerned", "sentiment": -0.2},
+                       {"turn": 2, "emotion": "calm", "sentiment": 0.3}],
+        "escalation": False,
+    },
+    "resolved": True,
+    "topic": "appointment",
+    "summary": "The customer asked about an appointment and was answered.",
+}
+
+
+# The meeting-assistant's conference, line by line (sutra-voice: examples/meeting-assistant/deploy/sipp
+# plays four stretches of speech, two voices taking turns).
+MEETING_LINES = [
+    "Good morning, everyone. Let's go through the launch plan for the new booking page.",
+    "Thanks. The design is ready; the open question is the release date.",
+    "Then we agree to ship on the fifteenth. Action item: Priya books the accessibility review.",
+    "Agreed. I will send the summary to the client by Friday.",
+]
+MEETING_REPORT = {
+    "summary": "The team reviewed the launch plan for the new booking page and set the release date.",
+    "decisions": ["Ship the new booking page on the fifteenth."],
+    "actionItems": [
+        {"owner": "Priya", "item": "Book the accessibility review", "due": None},
+        {"owner": "Sam Rivera", "item": "Send the summary to the client", "due": "Friday"},
+    ],
+    "speakers": [
+        {"name": "Alex Chen", "role": "internal", "talkTimeMs": 4300, "attribution": "inferred",
+         "sentiment": "positive", "emotion": "focused"},
+        {"name": "Sam Rivera", "role": "external", "talkTimeMs": 3500, "attribution": "inferred",
+         "sentiment": "positive", "emotion": "engaged"},
+    ],
+    "attribution": "Speakers inferred from the transcript; the call carried no speaker labels.",
+}
+REALTIME_SILENCE_MS = 500
+REALTIME_MIN_SPEECH_MS = 300
+REALTIME_LOUD_RMS = 1000
+
+
+def fixed_samples():
+    """200 ms of a 400 Hz square wave at 24 kHz, 16-bit little-endian mono."""
+    period = AUDIO_RATE // 400
+    return b"".join((4000 if (i % period) < period // 2 else -4000).to_bytes(2, "little", signed=True)
+                    for i in range(AUDIO_RATE * AUDIO_MS // 1000))
+
+
+def fixed_wav():
+    out = io.BytesIO()
+    with wave.open(out, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(AUDIO_RATE)
+        w.writeframes(fixed_samples())
+    return out.getvalue()
+
+
+FIXED_SAMPLES = fixed_samples()
+FIXED_WAV = fixed_wav()
+
+
+def voice_wav():
+    """800 ms of a 440 Hz sine at 24 kHz: loud enough to tell apart from comfort noise."""
+    import math
+    out = io.BytesIO()
+    with wave.open(out, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(AUDIO_RATE)
+        w.writeframes(b"".join(int(9000 * math.sin(2 * math.pi * 440 * i / AUDIO_RATE)).to_bytes(
+            2, "little", signed=True) for i in range(AUDIO_RATE * 800 // 1000)))
+    return out.getvalue()
+
+
+VOICE_WAV = voice_wav()
+
+
+def wav_ms(data):
+    """The duration of a WAV file in milliseconds, 0 when it is not one."""
+    try:
+        with wave.open(io.BytesIO(data), "rb") as w:
+            return w.getnframes() * 1000 // max(1, w.getframerate())
+    except (wave.Error, EOFError):
+        return 0
+
+
+def last_turn_ms(request):
+    """The duration of the latest user turn's audio, None when the request carries none."""
+    found = None
+    for message in request.get("messages") or []:
+        content = message.get("content")
+        for part in content if isinstance(content, list) else []:
+            if part.get("type") == "input_audio":
+                audio = part.get("input_audio") or {}
+                found = wav_ms(base64.b64decode(audio.get("data", "") or ""))
+    return found
+
+
+def voice_transcript(request):
+    turn = last_turn_ms(request)
+    if turn is None:
+        return VOICE_GREETING
+    return VOICE_TRANSFER if turn >= VOICE_LONG_TURN_MS else VOICE_ANSWER
 RELAY_TARGETS = {"anthropic": "https://api.anthropic.com"}
 
 STATE = {
     "outage": os.environ.get("STUB_OUTAGE", "1") not in ("0", "false", "off", ""),
     "sink": [],
     "stats": {},
+    "gemini": [],   # generateContent requests: {model, parts: [{mimeType, bytes, sha256}]}
     "jobs": {},     # OpenAI background jobs: id -> {model, polls, completed, json}
     "batches": {},  # Anthropic batches: id -> {custom_id, model, polls, json}
     "seq": 0,
@@ -95,12 +249,45 @@ def tool_arguments(schema):
 # ---- OpenAI wire -----------------------------------------------------------------------------
 
 
+def input_audio_problem(request):
+    """None when every `input_audio` part is well-formed, else what is wrong with one."""
+    for message in request.get("messages") or []:
+        content = message.get("content")
+        for part in content if isinstance(content, list) else []:
+            if part.get("type") != "input_audio":
+                continue
+            audio = part.get("input_audio") or {}
+            count("chat-audio-in")
+            try:
+                data = base64.b64decode(audio.get("data", ""), validate=True)
+            except ValueError:
+                return "input_audio.data is not base64"
+            if audio.get("format") not in ("wav", "mp3"):
+                return "input_audio.format must be wav or mp3"
+            if audio.get("format") == "wav" and not (data[:4] == b"RIFF" and data[8:12] == b"WAVE"):
+                return "input_audio.data is not a WAV file"
+    return None
+
+
 def chat_answer(request):
     model = request.get("model", "test-model")
     message = {"role": "assistant", "content": SUMMARY}
     finish = "stop"
     tools = request.get("tools") or []
-    if tools:
+    if "voice" in model and "audio" in (request.get("modalities") or []):
+        count("chat-voice")
+        message = {"role": "assistant", "content": None, "audio": {
+            "id": "audio_stub_voice", "data": base64.b64encode(VOICE_WAV).decode(),
+            "expires_at": int(time.time()) + 3600, "transcript": voice_transcript(request)}}
+    elif "analytics" in model and (request.get("response_format") or {}).get("type") == "json_object":
+        count("chat-analytics")
+        message["content"] = json.dumps(ANALYTICS)
+    elif "audio" in (request.get("modalities") or []):
+        count("chat-audio-out")
+        message = {"role": "assistant", "content": None, "audio": {
+            "id": "audio_stub_1", "data": base64.b64encode(FIXED_WAV).decode(),
+            "expires_at": int(time.time()) + 3600, "transcript": SPOKEN_TRANSCRIPT}}
+    elif tools:
         function = tools[0].get("function", {})
         message = {"role": "assistant", "content": None, "tool_calls": [{
             "id": "call_stub_1", "type": "function",
@@ -135,7 +322,10 @@ def chat_stream_events(request):
 def response_object(job_id, job, status):
     body = {"id": job_id, "object": "response", "status": status, "model": job["model"]}
     if status == "completed":
-        text = JSON_ANSWER if job["json"] else SUMMARY
+        if job["json"] and "meeting" in job["model"]:
+            text = json.dumps(MEETING_REPORT)
+        else:
+            text = JSON_ANSWER if job["json"] else SUMMARY
         body["output"] = [{"type": "message", "role": "assistant", "status": "completed",
                            "content": [{"type": "output_text", "text": text}]}]
         body["usage"] = {"input_tokens": USAGE_IN, "output_tokens": USAGE_OUT}
@@ -171,6 +361,166 @@ def send_webhook(job_id, target, secret):
         except OSError as error:
             log(f"webhook for {job_id} failed: {error}")
         time.sleep(attempt)
+
+
+# ---- OpenAI Realtime (a minimal stdlib WebSocket) --------------------------------------------
+
+WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+
+def ws_read(stream):
+    """One frame from a client: (opcode, payload), or (None, b"") at the end."""
+    head = stream.read(2)
+    if len(head) < 2:
+        return None, b""
+    opcode, length = head[0] & 0x0F, head[1] & 0x7F
+    if length == 126:
+        length = int.from_bytes(stream.read(2), "big")
+    elif length == 127:
+        length = int.from_bytes(stream.read(8), "big")
+    mask = stream.read(4) if head[1] & 0x80 else b"\0\0\0\0"
+    data = stream.read(length)
+    return opcode, bytes(b ^ mask[i % 4] for i, b in enumerate(data))
+
+
+def ws_write(stream, payload, opcode=1):
+    data = payload.encode() if isinstance(payload, str) else payload
+    head = bytes([0x80 | opcode])
+    if len(data) < 126:
+        head += bytes([len(data)])
+    elif len(data) < 65536:
+        head += bytes([126]) + len(data).to_bytes(2, "big")
+    else:
+        head += bytes([127]) + len(data).to_bytes(8, "big")
+    stream.write(head + data)
+    stream.flush()
+
+
+def ulaw_to_linear(byte):
+    u = ~byte & 0xFF
+    magnitude = (((u & 0x0F) << 3) + 0x84) << ((u >> 4) & 0x07)
+    return (0x84 - magnitude) if u & 0x80 else (magnitude - 0x84)
+
+
+class RealtimeTranscriber:
+    """The transcription side of a Realtime session: speech stretches -> MEETING_LINES."""
+
+    def __init__(self, send):
+        self.send = send
+        self.rate, self.encoding = 24000, "pcm"
+        self.ms = 0.0
+        self.speaking_since = None
+        self.quiet_ms = 0.0
+        self.items = 0
+        self.line = 0
+
+    def configure(self, session):
+        fmt = ((session.get("audio") or {}).get("input") or {}).get("format") or {}
+        kind = fmt.get("type", "audio/pcm")
+        self.encoding = "pcmu" if kind == "audio/pcmu" else "pcm"
+        self.rate = 8000 if self.encoding == "pcmu" else int(fmt.get("rate") or 24000)
+
+    def append(self, raw):
+        if self.encoding == "pcmu":
+            samples = [ulaw_to_linear(b) for b in raw]
+        else:
+            samples = [int.from_bytes(raw[i:i + 2], "little", signed=True)
+                       for i in range(0, len(raw) - 1, 2)]
+        frame = max(1, self.rate // 50)
+        for start in range(0, len(samples), frame):
+            chunk = samples[start:start + frame]
+            rms = (sum(x * x for x in chunk) / max(1, len(chunk))) ** 0.5
+            step = len(chunk) * 1000.0 / self.rate
+            if rms >= REALTIME_LOUD_RMS:
+                if self.speaking_since is None:
+                    self.speaking_since = self.ms
+                self.quiet_ms = 0.0
+            elif self.speaking_since is not None:
+                self.quiet_ms += step
+                if self.quiet_ms >= REALTIME_SILENCE_MS:
+                    self.finish(self.ms - self.quiet_ms + step)
+            self.ms += step
+
+    def finish(self, end_ms):
+        start = self.speaking_since
+        self.speaking_since, self.quiet_ms = None, 0.0
+        if start is None or end_ms - start < REALTIME_MIN_SPEECH_MS:
+            return
+        self.items += 1
+        item = f"item_stub_{self.items}"
+        text = MEETING_LINES[self.line % len(MEETING_LINES)]
+        self.line += 1
+        count("realtime-segments")
+        self.send({"type": "input_audio_buffer.speech_started", "item_id": item,
+                   "audio_start_ms": int(start)})
+        self.send({"type": "input_audio_buffer.speech_stopped", "item_id": item,
+                   "audio_end_ms": int(end_ms)})
+        self.send({"type": "conversation.item.input_audio_transcription.completed",
+                   "item_id": item, "content_index": 0, "transcript": text})
+
+    def commit(self):
+        if self.speaking_since is not None:
+            self.finish(self.ms)
+
+
+# ---- Gemini native wire ------------------------------------------------------------------------
+
+def record_gemini(request, model):
+    """Keep what reached the model: each inline part's media type, size and SHA-256 (never the
+    bytes themselves)."""
+    parts = []
+    for content in request.get("contents") or []:
+        for part in content.get("parts") or []:
+            inline = part.get("inlineData")
+            if not isinstance(inline, dict):
+                continue
+            try:
+                data = base64.b64decode(inline.get("data") or "", validate=True)
+            except ValueError:
+                data = b""
+            parts.append({"mimeType": inline.get("mimeType"), "bytes": len(data),
+                          "sha256": hashlib.sha256(data).hexdigest()})
+    with LOCK:
+        STATE["gemini"].append({"model": model, "parts": parts})
+
+
+def gemini_answer(request, model=""):
+    parts = [part for content in request.get("contents") or []
+             for part in (content.get("parts") or [])]
+    kinds = [str((part.get("inlineData") or {}).get("mimeType", "")) for part in parts]
+    images = sum(1 for kind in kinds if kind.startswith("image/"))
+    audio = any(kind.startswith("audio/") for kind in kinds)
+    json_mode = (request.get("generationConfig") or {}).get("responseMimeType") == \
+        "application/json"
+    if json_mode and "vision" in model:
+        # examples/ai-advanced vision.bpmn: a neutral scene description that echoes how many
+        # images (frames) and whether a clip reached the model.
+        clips = sum(1 for kind in kinds if kind.startswith("video/"))
+        text = json.dumps({
+            "scene": "STUB SCENE: a bicycle leans against a blue door.",
+            "objects": ["bicycle", "door"],
+            "framesSeen": images,
+            "clipsSeen": clips,
+        })
+    elif json_mode:
+        text = json.dumps({
+            "expression": "attentive" if images else "not visible",
+            "engagement": "high" if audio else "medium",
+            "attention": "on the meeting",
+            "bodyLanguage": ["nodding", "open posture"] if images else [],
+            "emotion": {"label": "interested", "confidence": 0.6,
+                        "modalities": {"voice": audio, "face": images > 0,
+                                       "body": images > 0, "words": True}},
+            "disagreement": {"flagged": False, "detail": None},
+            "reactions": [],
+            "framesSeen": images,
+            "audioSeen": audio,
+        })
+    else:
+        text = SUMMARY
+    return {"candidates": [{"content": {"role": "model", "parts": [{"text": text}]},
+                            "finishReason": "STOP"}],
+            "usageMetadata": {"promptTokenCount": USAGE_IN, "candidatesTokenCount": USAGE_OUT}}
 
 
 # ---- Anthropic wire --------------------------------------------------------------------------
@@ -314,12 +664,18 @@ class Handler(BaseHTTPRequestHandler):
             self._relay(relay, path, b"")
         elif path == "/health":
             self._send(200, {"status": "ok"})
+        elif path.split("?")[0] == "/v1/realtime" and \
+                self.headers.get("Upgrade", "").lower() == "websocket":
+            self._realtime()
         elif path == "/sink":
             with LOCK:
                 self._send(200, list(STATE["sink"]))
         elif path == "/stats":
             with LOCK:
                 self._send(200, dict(STATE["stats"]))
+        elif path == "/gemini/requests":
+            with LOCK:
+                self._send(200, list(STATE["gemini"]))
         elif path == "/control/outage":
             self._send(200, {"on": STATE["outage"]})
         elif path.startswith("/v1/responses/"):
@@ -355,15 +711,24 @@ class Handler(BaseHTTPRequestHandler):
             log(f"outage switch {'on' if STATE['outage'] else 'off'}")
             self._send(200, {"on": STATE["outage"]})
             return
+        if path == "/v1/audio/transcriptions":
+            self._transcribe(raw)
+            return
         request = json.loads(raw or b"{}")
         if path == "/v1/chat/completions":
             count("chat")
+            count(f"chat:{request.get('model')}")
             log(f"chat completion model={request.get('model')!r} "
                 f"stream={bool(request.get('stream'))} tools={len(request.get('tools') or [])}")
-            if request.get("stream"):
+            problem = input_audio_problem(request)
+            if problem:
+                self._send(400, {"error": {"message": f"model-stub: {problem}"}})
+            elif request.get("stream"):
                 self._stream(chat_stream_events(request))
             else:
                 self._send(200, chat_answer(request))
+        elif path == "/v1/audio/speech":
+            self._speak(request)
         elif path == "/v1/responses":
             self._submit_response(request)
         elif path == "/v1/messages":
@@ -376,8 +741,83 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, message_answer(request))
         elif path == "/v1/messages/batches":
             self._submit_batch(request)
+        elif path.startswith("/v1beta/models/") and path.endswith(":generateContent"):
+            count("gemini-generate")
+            log(f"gemini generateContent model={path[len('/v1beta/models/'):-16]!r}")
+            record_gemini(request, path[len('/v1beta/models/'):-16])
+            self._send(200, gemini_answer(request, path[len('/v1beta/models/'):-16]))
         else:
             self._send(404)
+
+    # -- OpenAI Realtime --
+
+    def _realtime(self):
+        count("realtime-sessions")
+        key = self.headers.get("Sec-WebSocket-Key", "")
+        accept = base64.b64encode(hashlib.sha1((key + WS_GUID).encode()).digest()).decode()
+        self.wfile.write(("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
+                          "Connection: Upgrade\r\nSec-WebSocket-Accept: " + accept +
+                          "\r\n\r\n").encode())
+        self.wfile.flush()
+        self.close_connection = True
+        lock = threading.Lock()
+
+        def send(event):
+            with lock:
+                ws_write(self.wfile, json.dumps(event))
+
+        transcriber = RealtimeTranscriber(send)
+        log(f"realtime session {self.path.split('?', 1)[-1]!r}")
+        while True:
+            opcode, payload = ws_read(self.rfile)
+            if opcode is None or opcode == 8:
+                if opcode == 8:
+                    with lock:
+                        ws_write(self.wfile, b"", 8)
+                break
+            if opcode == 9:
+                with lock:
+                    ws_write(self.wfile, payload, 10)
+                continue
+            if opcode != 1:
+                continue
+            event = json.loads(payload or b"{}")
+            kind = event.get("type")
+            if kind == "session.update":
+                session = event.get("session") or {}
+                transcriber.configure(session)
+                send({"type": "session.updated", "session": session})
+            elif kind == "input_audio_buffer.append":
+                transcriber.append(base64.b64decode(event.get("audio", "")))
+            elif kind == "input_audio_buffer.commit":
+                transcriber.commit()
+        log(f"realtime session closed after {transcriber.items} segments")
+
+    # -- OpenAI speech --
+
+    def _transcribe(self, raw):
+        count("transcriptions")
+        kind = self.headers.get("Content-Type", "")
+        if not kind.startswith("multipart/form-data") or b'name="model"' not in raw \
+                or b'name="file"' not in raw:
+            self._send(400, {"error": {"message": "model-stub: expected a multipart form "
+                                                  "with model and file"}})
+            return
+        log("transcription")
+        self._send(200, {"text": STT_TRANSCRIPT})
+
+    def _speak(self, request):
+        count("speech")
+        fmt = request.get("response_format", "mp3")
+        log(f"speech model={request.get('model')!r} format={fmt!r}")
+        if not request.get("input"):
+            self._send(400, {"error": {"message": "model-stub: speech needs input"}})
+        elif fmt == "wav":
+            self._send(200, FIXED_WAV, "audio/wav")
+        elif fmt == "pcm":
+            self._send(200, FIXED_SAMPLES, "audio/pcm")
+        else:
+            self._send(400, {"error": {"message": f"model-stub: speech format {fmt} not stubbed"}})
 
     # -- OpenAI background jobs --
 

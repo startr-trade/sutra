@@ -1,7 +1,7 @@
-# ai-advanced — fallback, JSON mode, tools, provider jobs and webhooks
+# ai-advanced — fallback, JSON mode, tools, provider jobs, webhooks, audio and vision
 
-The companion to `examples/ai-summarize`: six flows for the parts of the v0.5.0 `llm` transport
-beyond a plain call. Every model sits behind an ordinary outbound channel and is called by an
+The companion to `examples/ai-summarize`: nine flows for the parts of the `llm` transport beyond a
+plain call. Every model sits behind an ordinary outbound channel and is called by an
 ordinary channel-call task, so nothing in the BPMN is specific to models.
 
 | Flow (`shared/bpmn/`) | Inbound channel | Model channel | What it shows |
@@ -12,6 +12,9 @@ ordinary channel-call task, so nothing in the BPMN is specific to models.
 | `job-poll.bpmn` | `POST /channels/summarize-job` (202) | `job-model` | **An OpenAI background job**, `mode: job`, found by polling. |
 | `job-webhook.bpmn` | `POST /channels/summarize-webhook` (202) | `webhook-model` | **An OpenAI background job completed by a signed webhook** on `POST /llm/openai-hooks`. |
 | `batch.bpmn` | `POST /channels/summarize-batch` (202) | `batch-model` | **An Anthropic Message Batch**, `mode: job`, polled. |
+| `voice.bpmn` | `POST /channels/voice` (sync) | `voice-model` | **Audio in, a spoken answer out**: an uploaded WAV recording to an audio model, the spoken answer in the format the request asked for; `audioPreserved: true`. |
+| `voice-pipeline.bpmn` | `POST /channels/voice-pipeline` (sync) | `voice-pipeline-model` | **`voice: pipeline`**: transcribed, answered by a text model (Anthropic), spoken; `audioPreserved: false`. |
+| `vision.bpmn` | `POST /channels/vision` (sync) | `vision-model` | **Images and video frames** (preview) to the native `gemini` provider with `json: true`; the flow reads the parsed answer under `json`. |
 
 The three job flows park on their task, are resumed by the job's result on the channel's
 `reply-channel` (correlated by `<q:alias>` on the echoed `ticketId`), and hand the summary to
@@ -21,10 +24,12 @@ The three job flows park on their task, are resumed by the job's result on the c
 
 | Path | What it is |
 |---|---|
-| `shared/bpmn/` | the six flows (commented, with diagram interchange) |
+| `shared/bpmn/` | the nine flows (commented, with diagram interchange) |
+| `sample/` | `question.wav` (a 0.25 s tone) and two 8×8 PNG frames, for the audio and vision flows; for the real-provider checks, `spoken-question.wav` (a synthetic voice asking "What is the capital of France?", 16 kHz mono) and `moving-square.mp4` (a 2 s clip) |
 | `variants/stub/` | `package.yaml` + `channels.yaml`: every model is the stub. Needs no key; the engine's tier-2 tests deploy this one. |
-| `variants/live/` | the same channels against the real OpenAI and Anthropic APIs |
+| `variants/live/` | the same channels against the real OpenAI, Anthropic and Gemini APIs, plus two Gemini-only flows in `variants/live/bpmn/`: `hear.bpmn` (audio in, inline or as a media reference, a text answer out) and `extract.bpmn` (`json: true`, the parsed answer out) |
 | `deploy/compose.yaml` | engine + PostgreSQL + the stub (from `examples/ai-summarize/stub`), project name `sutra-ai-advanced` |
+| `deploy/compose.media.yaml` | adds a MinIO object store, declared to the engine as the store `media`, which `vision-model` (stub) and `hear-model` (live) read media references `{ref, sha256, format}` from |
 | `live-check.sh` | runs both examples against the real providers with your keys |
 
 A variant is one `channels.yaml` (plus its `package.yaml`, which an overlay layer may not carry);
@@ -55,6 +60,22 @@ curl -s -X POST "http://127.0.0.1:$PORT/channels/classify" "${H[@]}" \
 curl -s -X POST "http://127.0.0.1:$PORT/channels/weather" "${H[@]}" -d '{}'
 # => {"finish":"tool-calls","toolCalls":[{"arguments":{"city":"Paris"},"id":"toolu_stub_1","name":"get_weather"}]}
 
+# Audio: a WAV recording in, 16 kHz PCM out; then the same through the pipeline.
+AUDIO=$(base64 -w0 examples/ai-advanced/sample/question.wav)   # or any WAV file
+curl -s -X POST "http://127.0.0.1:$PORT/channels/voice" "${H[@]}" \
+    -d "{\"requestId\":\"Q-1\",\"audio\":{\"data\":\"$AUDIO\",\"format\":\"audio/wav\"},\"audioOutput\":\"audio/L16;rate=16000\"}" \
+    | python3 -c 'import json,sys; r=json.load(sys.stdin); r["audio"]["data"]="…"; print(r)'
+# => {'audio': {'data': '…', 'format': 'audio/L16;rate=16000'}, 'audioPreserved': True,
+#     'requestId': 'Q-1', 'provider': 'openai', 'text': 'STUB SPOKEN ANSWER: ...', ...}
+# /channels/voice-pipeline takes the same body and answers with 'audioPreserved': False,
+# 'provider': 'anthropic'.
+
+# Vision: one image, or sampled frames, to the native Gemini provider; a parsed JSON answer.
+IMG=$(base64 -w0 examples/ai-advanced/sample/frame-1.png)
+curl -s -X POST "http://127.0.0.1:$PORT/channels/vision" "${H[@]}" \
+    -d "{\"requestId\":\"V-1\",\"image\":{\"data\":\"$IMG\",\"format\":\"image/png\"}}"
+# => {"framesSeen":1,"objects":["bicycle","door"],"provider":"gemini","requestId":"V-1","scene":"STUB SCENE: ..."}
+
 # The three jobs: 202 at once, the summaries reach the sink a few seconds later.
 for c in summarize-job summarize-webhook summarize-batch; do
   curl -s -o /dev/null -w "$c %{http_code}\n" -X POST "http://127.0.0.1:$PORT/channels/$c" "${H[@]}" \
@@ -77,7 +98,7 @@ header lists every route.
 
 ## Run it against the real providers
 
-`variants/live` uses `gpt-4o-mini` and `claude-haiku-5-5` (plain strings in its `channels.yaml`:
+`variants/live` uses `gpt-4o-mini`, `claude-haiku-5-5` and, for the vision flow, `gemini-2.5-flash` (plain strings in its `channels.yaml`:
 edit them to change models). Its Anthropic fallback candidate reaches `api.anthropic.com` through
 the stub's `/relay/anthropic` gate, so the same outage switch takes a real provider down and up and
 both fallback answers are real.
@@ -90,7 +111,49 @@ examples/ai-advanced/live-check.sh
 `live-check.sh` packages each variant with `sutra package <variant> --overlay <shared>` into a
 temporary directory, starts the stack, runs every check and tears it down; it prints one line per
 check and never prints a key. It runs the three real `ai-summarize` variants for whichever keys you
-exported, then the `live` variant here when both OpenAI and Anthropic keys are present.
+exported, then the `live` variant here when an OpenAI key is present (its fallback, tool-call and
+Message Batch checks need the Anthropic key too).
+
+**Just the Gemini paths.** With only `GEMINI_API_KEY`, `ONLY=gemini` runs the ai-summarize
+`gemini` variant and every native-Gemini check: image, video frames and an MP4 clip, audio
+understanding (the answer must say Paris), a parsed JSON answer, the audio as a media reference
+read from MinIO, a wrong SHA-256 refused before any provider call, and a Gemini Live session
+(ephemeral token, constrained WebSocket, the WAV up, audio and transcripts back, no credential in
+any URL). They need an engine image and CLI from this tree:
+
+```bash
+make image && (cd rust && cargo build -p sutra-cli)
+GEMINI_API_KEY=... ONLY=gemini SUTRA_ENGINE_IMAGE=sutra-rust-engine:dev \
+    SUTRA_BIN=$PWD/rust/target/debug/sutra examples/ai-advanced/live-check.sh
+```
+
+The Live model is `GEMINI_LIVE_MODEL` (default `gemini-3.8-live`); the script's
+header says where to change it. The round trip under Gemini's own turn detection uses
+`gemini-2.5-flash-native-audio-latest` by default: the sample question is synthetic speech, and
+`gemini-3.8-live`'s voice-activity detection takes only its first word for speech, while it handles a
+real voice. To check `gemini-3.8-live` there, record your own question
+(`arecord -f S16_LE -r 16000 -c 1 -d 4 q.wav`) and set `GEMINI_LIVE_WAV` to it with
+`GEMINI_LIVE_MODEL=gemini-3.8-live`.
+
+**Just the OpenAI paths.** With only `OPENAI_API_KEY`, `ONLY=openai` runs every check that needs
+nothing else: the ai-summarize `openai` variant, JSON mode, the background job (polled, and by
+webhook when `OPENAI_WEBHOOK_SECRET` is set), audio understanding with a spoken answer (`voice`:
+the answer must say Paris, audio back, `audioPreserved: true`), the voice pipeline (transcribed,
+answered by `gpt-4o-mini` in place of Anthropic, spoken; `audioPreserved: false`), the audio as a
+media reference read from MinIO (and a wrong SHA-256, refused before any call), and an OpenAI
+Realtime session through the adapter (the WAV up, audio and transcripts back, the key only in the
+`Authorization` header). The cross-provider checks are skipped.
+
+```bash
+OPENAI_API_KEY=... ONLY=openai SUTRA_ENGINE_IMAGE=sutra-rust-engine:dev \
+    SUTRA_BIN=$PWD/rust/target/debug/sutra examples/ai-advanced/live-check.sh
+```
+
+The model ids may not match what your account offers; each is overridable without editing
+`channels.yaml` (the script substitutes them into the copy it deploys): `OPENAI_AUDIO_MODEL`
+(default `gpt-audio-1.5`), `OPENAI_TRANSCRIBE_MODEL` (`gpt-transcribe`), `OPENAI_TTS_MODEL`
+(`gpt-4o-mini-tts`) and `OPENAI_REALTIME_MODEL` (`gpt-realtime`). A model-not-found failure names
+the variable to set.
 
 **The webhook needs a tunnel.** OpenAI delivers webhooks to a public HTTPS URL, so:
 

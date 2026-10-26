@@ -29,6 +29,10 @@ use tracing::{info, warn};
 use sutra_bpmn::qbindings::ReplyMode;
 use sutra_executor::DeploymentId;
 
+use crate::capacity::{
+    CapacityPoolStore, SlotAcquisition, SlotDirection, SlotRequest, CAPACITY_CALL_HEADER,
+    CAPACITY_CALL_KEY_HEADER, CAPACITY_POOL_HEADER,
+};
 use crate::codes;
 use crate::diag::Diagnostic;
 use crate::sink::{BoxFuture, OutboundMessage, SinkRegistry};
@@ -253,6 +257,17 @@ pub trait OutboxRowStore: Send + Sync {
         &'a self,
         deployment: &'a DeploymentId,
         entry_id: &'a str,
+        diagnostic_json: &'a str,
+    ) -> BoxFuture<'a, Result<(), Diagnostic>>;
+
+    /// Puts an entry back WITHOUT counting a delivery attempt: sets the due time and records the
+    /// diagnostic, leaving the attempt count alone. Used while a pooled request waits for a slot
+    /// — nothing was sent, so nothing was attempted.
+    fn requeue<'a>(
+        &'a self,
+        deployment: &'a DeploymentId,
+        entry_id: &'a str,
+        new_due_at: OffsetDateTime,
         diagnostic_json: &'a str,
     ) -> BoxFuture<'a, Result<(), Diagnostic>>;
 }
@@ -676,7 +691,23 @@ pub struct DispatchStats {
     pub attempted: u32,
     pub succeeded: u32,
     pub failed: u32,
+    /// Entries for a pooled outbound channel put back to wait for a slot (no attempt counted).
+    pub waiting: u32,
 }
+
+/// What one claimed entry came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowOutcome {
+    Delivered,
+    Failed,
+    /// A pooled request had no slot: put back, no attempt counted.
+    Waiting,
+}
+
+/// How many extra claims one tick may make past entries that went back to wait for a pool
+/// slot — waiting entries are claimed first (they are the oldest), so without these a full
+/// batch of them would hold every other entry of the deployment back until a slot frees.
+const MAX_CLAIMS_PAST_WAITING: u32 = 8;
 
 /// Drains [`OutboxRowStore`] rows through the scheme-resolved sinks. Stateless across
 /// calls (multi-replica safe — the store's SKIP-LOCKED claim is the coordination);
@@ -700,6 +731,18 @@ pub struct OutboxDispatcher {
     /// validates against durable facts and a LOST prompt is recovered by the call's
     /// `<q:timeout>` boundary, so this fires-and-forgets and never blocks the drain loop.
     poison_notify: Option<Arc<dyn Fn(PoisonedDelivery) + Send + Sync>>,
+    /// The capacity pools a pooled outbound request takes its instance's slot from — the SAME
+    /// store the dispatcher lanes admit through. `None` = no pool declared: a request carrying
+    /// a pool marker is sent without one (and the marker is still stripped).
+    capacity: Option<Arc<dyn CapacityPoolStore>>,
+}
+
+/// The call a pooled request's slot is held for: its declared call key, else the entry's id.
+fn call_key(row: &ClaimedOutboxRow) -> String {
+    row.headers
+        .get(CAPACITY_CALL_KEY_HEADER)
+        .cloned()
+        .unwrap_or_else(|| row.entry_id.clone())
 }
 
 /// One terminal poison of a node-bearing outbox row, as handed to the poison notifier.
@@ -738,7 +781,16 @@ impl OutboxDispatcher {
             }),
             incidents: None,
             poison_notify: None,
+            capacity: None,
         }
+    }
+
+    /// Wire the capacity-pool store: an entry marked with a pool waits until its instance
+    /// holds a slot of that pool.
+    #[must_use]
+    pub fn with_capacity_pools(mut self, store: Arc<dyn CapacityPoolStore>) -> OutboxDispatcher {
+        self.capacity = Some(store);
+        self
     }
 
     /// Wire the terminal-poison notifier — the channel-call `<q:retry>` wake prompt (see the
@@ -788,36 +840,223 @@ impl OutboxDispatcher {
 
     /// Drain one batch of due entries for `deployment`. Safe to call repeatedly from the
     /// tick loop; never panics a delivery — failures defer/poison their own row only.
+    ///
+    /// Pooled entries that find no slot go back due one millisecond after this tick's claim
+    /// instant, so they keep their place ahead of every entry enqueued later (the oldest waiter
+    /// is offered the next free slot first), are not re-claimed within this tick, and are
+    /// re-checked on the next one. When a whole batch went back to wait, the tick claims again
+    /// at the same instant (bounded by [`MAX_CLAIMS_PAST_WAITING`]) so the rest of the
+    /// deployment's entries still flow.
     pub async fn dispatch_deployment(&self, deployment: &DeploymentId) -> DispatchStats {
         let now = (self.now)();
-        let claimed = match self.store.claim_due(deployment, now, self.batch_size).await {
-            Ok(claimed) => claimed,
-            Err(diagnostic) => {
-                warn!(
-                    deployment = %deployment.value(),
-                    code = %diagnostic.code,
-                    error = %diagnostic.message,
-                    "outbox claim failed — nothing drained this tick"
-                );
-                return DispatchStats::default();
+        let mut stats = DispatchStats::default();
+        // Pools found full this tick: their later entries wait without asking again, so a slot
+        // freed mid-tick cannot go to a newer entry ahead of an older one.
+        let mut exhausted: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for round in 0..=MAX_CLAIMS_PAST_WAITING {
+            let claimed = match self.store.claim_due(deployment, now, self.batch_size).await {
+                Ok(claimed) => claimed,
+                Err(diagnostic) => {
+                    warn!(
+                        deployment = %deployment.value(),
+                        code = %diagnostic.code,
+                        error = %diagnostic.message,
+                        "outbox claim failed — nothing more drained this tick"
+                    );
+                    return stats;
+                }
+            };
+            let full_batch = claimed.len() as i64 >= self.batch_size;
+            let mut waited = 0;
+            stats.attempted += claimed.len() as u32;
+            for row in &claimed {
+                match self
+                    .dispatch_one(deployment, row, now, &mut exhausted)
+                    .await
+                {
+                    RowOutcome::Delivered => stats.succeeded += 1,
+                    RowOutcome::Failed => stats.failed += 1,
+                    RowOutcome::Waiting => {
+                        stats.waiting += 1;
+                        waited += 1;
+                    }
+                }
             }
-        };
-        let mut stats = DispatchStats {
-            attempted: claimed.len() as u32,
-            ..DispatchStats::default()
-        };
-        for row in &claimed {
-            if self.dispatch_one(deployment, row).await {
-                stats.succeeded += 1;
-            } else {
-                stats.failed += 1;
+            // Claim again only when this batch was full AND some of it went back to wait —
+            // otherwise the next claim would return nothing new this tick.
+            if !full_batch || waited == 0 || round == MAX_CLAIMS_PAST_WAITING {
+                break;
             }
         }
         stats
     }
 
-    /// One entry: resolve → encode → send → row action. `true` = delivered + deleted.
-    async fn dispatch_one(&self, deployment: &DeploymentId, row: &ClaimedOutboxRow) -> bool {
+    /// One entry: pool slot → resolve → encode → send → row action.
+    async fn dispatch_one(
+        &self,
+        deployment: &DeploymentId,
+        row: &ClaimedOutboxRow,
+        claimed_at: OffsetDateTime,
+        exhausted: &mut std::collections::BTreeSet<String>,
+    ) -> RowOutcome {
+        if let Some(pool) = row.headers.get(CAPACITY_POOL_HEADER) {
+            match self.admit_pooled(deployment, row, pool, exhausted).await {
+                PoolAdmit::Send => {}
+                PoolAdmit::Wait(diagnostic) => {
+                    let json = diagnostic_json_marked(&diagnostic, incident_recorded(row));
+                    let due = claimed_at + time::Duration::milliseconds(1);
+                    if let Err(e) = self
+                        .store
+                        .requeue(deployment, &row.entry_id, due, &json)
+                        .await
+                    {
+                        warn!(
+                            entry_id = %row.entry_id,
+                            code = %e.code,
+                            error = %e.message,
+                            "outbox requeue of a pool-waiting entry failed — it stays due"
+                        );
+                    }
+                    return RowOutcome::Waiting;
+                }
+                PoolAdmit::Abandon(diagnostic) => {
+                    warn!(
+                        entry_id = %row.entry_id,
+                        instance = %row.instance_id,
+                        pool = %pool,
+                        "pooled channel-call request abandoned: its instance finished while it \
+                         waited for a slot (the entry is kept, terminal and redrivable)"
+                    );
+                    let json = diagnostic_json_marked(&diagnostic, incident_recorded(row));
+                    if let Err(e) = self
+                        .store
+                        .mark_poisoned(deployment, &row.entry_id, &json)
+                        .await
+                    {
+                        warn!(
+                            entry_id = %row.entry_id,
+                            code = %e.code,
+                            error = %e.message,
+                            "outbox terminal mark of an abandoned entry failed"
+                        );
+                    }
+                    return RowOutcome::Failed;
+                }
+            }
+        }
+        if self.send_row(deployment, row).await {
+            RowOutcome::Delivered
+        } else {
+            RowOutcome::Failed
+        }
+    }
+
+    /// Take a slot of `pool` for the request's call before it is sent. One slot per active
+    /// call: the call key is the request's declared `pool-call-key` header value, else the
+    /// outbox entry's own id, so a request on a call its instance already holds a slot for sends
+    /// at once. A store failure waits rather than risk oversubscribing the pool.
+    async fn admit_pooled(
+        &self,
+        deployment: &DeploymentId,
+        row: &ClaimedOutboxRow,
+        pool: &str,
+        exhausted: &mut std::collections::BTreeSet<String>,
+    ) -> PoolAdmit {
+        let Some(store) = &self.capacity else {
+            return PoolAdmit::Send;
+        };
+        let waiting = |detail: String| {
+            PoolAdmit::Wait(
+                Diagnostic::error(codes::OUTBOUND_POOL_WAITING, detail)
+                    .with_attribute("pool", pool),
+            )
+        };
+        if exhausted.contains(pool) {
+            // An ended session takes no slot, so a full pool is no reason for it to wait.
+            if store
+                .session_ended(deployment, &row.instance_id, &call_key(row))
+                .await
+            {
+                return PoolAdmit::Send;
+            }
+            return waiting(format!(
+                "waiting for a free slot of capacity pool '{pool}' (no attempt counted)"
+            ));
+        }
+        let tenant = row
+            .labels
+            .get("tenant")
+            .cloned()
+            .unwrap_or_else(|| UNRESOLVED_TENANT.to_string());
+        let request = SlotRequest {
+            pool,
+            deployment,
+            tenant: &tenant,
+            holder: &row.instance_id,
+            call: &call_key(row),
+            direction: SlotDirection::Outbound,
+            require_live: row.headers.contains_key(CAPACITY_CALL_HEADER),
+        };
+        match store.acquire(&request).await {
+            Ok(SlotAcquisition::Acquired | SlotAcquisition::AlreadyHeld) => PoolAdmit::Send,
+            // The instance's session ended while the request waited (or before it was sent): it
+            // is still sent, but an ended session holds no slot, so it takes none.
+            Ok(SlotAcquisition::SessionEnded) => PoolAdmit::Send,
+            Ok(SlotAcquisition::Exhausted {
+                inbound_used,
+                outbound_used,
+            }) => {
+                exhausted.insert(pool.to_string());
+                waiting(format!(
+                    "waiting for a free slot of capacity pool '{pool}' ({inbound_used} inbound + \
+                     {outbound_used} outbound held; no attempt counted)"
+                ))
+            }
+            Ok(SlotAcquisition::InstanceEnded) => PoolAdmit::Abandon(
+                Diagnostic::error(
+                    codes::OUTBOUND_POOL_ABANDONED,
+                    format!(
+                        "the request's instance {} finished while the request waited for a slot \
+                         of capacity pool '{pool}'; it was not sent",
+                        row.instance_id
+                    ),
+                )
+                .with_attribute("pool", pool),
+            ),
+            Ok(SlotAcquisition::UnknownPool) => {
+                warn!(
+                    entry_id = %row.entry_id,
+                    pool,
+                    "outbox entry names a capacity pool the engine no longer declares — sent \
+                     without a slot"
+                );
+                PoolAdmit::Send
+            }
+            Err(d) => waiting(format!(
+                "capacity pool '{pool}' could not be read ({}: {}); waiting (no attempt counted)",
+                d.code, d.message
+            )),
+        }
+    }
+
+    /// A pooled request was delivered, or given up on (poisoned): when its instance has already
+    /// finished, nothing is left to hold the request's slot for, so it is returned now rather
+    /// than at the next sweep. A request of a live instance keeps its slot — the call it opened
+    /// lasts until it ends (a `session-end:` naming it) or the instance does.
+    async fn release_finished_call(&self, deployment: &DeploymentId, row: &ClaimedOutboxRow) {
+        let (Some(store), true) = (
+            &self.capacity,
+            row.headers.contains_key(CAPACITY_POOL_HEADER),
+        ) else {
+            return;
+        };
+        store
+            .release_call_if_ended(deployment, &row.instance_id, &call_key(row))
+            .await;
+    }
+
+    /// Resolve → encode → send → row action. `true` = delivered + deleted.
+    async fn send_row(&self, deployment: &DeploymentId, row: &ClaimedOutboxRow) -> bool {
         let Some(sink) = self.sinks.resolve(&row.destination) else {
             // A retry can never grow a sink — the sink set is fixed at assembly, so an
             // unregistered scheme takes the poison posture (max-delay deferral) under the
@@ -836,6 +1075,23 @@ impl OutboxDispatcher {
         };
         let now_rfc3339 = rfc3339((self.now)());
         let mut message = encode_wire_message(row, &now_rfc3339, &*self.secret_env);
+        // The pool markers are engine bookkeeping, never wire headers.
+        message.headers.remove(CAPACITY_POOL_HEADER);
+        message.headers.remove(CAPACITY_CALL_HEADER);
+        message.headers.remove(CAPACITY_CALL_KEY_HEADER);
+        // The media-capture marker is for a sink that records the session it opens; any other
+        // destination never sees it.
+        if !sink.records_media() {
+            message.headers.remove(crate::audit::AUDIT_CAPTURE_HEADER);
+        }
+        // The instance's audit routing is for a sink that writes audit events; it gets the
+        // owning deployment and instance with it, every other sink none of the three.
+        crate::transport_audit::stamp_journal_identity(
+            &mut message.headers,
+            sink.writes_audit_events(),
+            deployment.value(),
+            &row.instance_id,
+        );
         // The PULL sink parks the delivery in a deployment-scoped table instead of dialing
         // anything, so it needs the owning deployment + instance — the two identities the
         // transport-neutral `OutboundMessage` deliberately does not carry onto a wire. Stamping
@@ -853,7 +1109,10 @@ impl OutboxDispatcher {
         }
         match sink.send(&message).await {
             SendOutcome::Delivered => match self.store.delete(deployment, &row.entry_id).await {
-                Ok(()) => true,
+                Ok(()) => {
+                    self.release_finished_call(deployment, row).await;
+                    true
+                }
                 Err(diagnostic) => {
                     // Delivered but the delete failed: the row survives and redelivers —
                     // at-least-once posture, consumer idempotency (outbox_key) absorbs the
@@ -930,6 +1189,7 @@ impl OutboxDispatcher {
         row: &ClaimedOutboxRow,
         diagnostic: &Diagnostic,
     ) {
+        self.release_finished_call(deployment, row).await;
         let attempts = row.attempt_count + 1;
         tracing::error!(
             code = codes::OUTBOUND_DELIVERY_ATTEMPTS_EXHAUSTED,
@@ -1015,6 +1275,7 @@ impl OutboxDispatcher {
             self.give_up(deployment, row, diagnostic).await;
             return;
         }
+        self.release_finished_call(deployment, row).await;
         warn!(
             entry_id = %row.entry_id,
             destination = %row.destination,
@@ -1075,6 +1336,13 @@ impl OutboxDispatcher {
             );
         }
     }
+}
+
+/// What a pooled entry may do this tick.
+enum PoolAdmit {
+    Send,
+    Wait(Diagnostic),
+    Abandon(Diagnostic),
 }
 
 /// The `last_diagnostic_json` column payload — `{code, message, attributes}` — with the once-only
@@ -1426,6 +1694,25 @@ mod tests {
             })
         }
 
+        fn requeue<'a>(
+            &'a self,
+            _deployment: &'a DeploymentId,
+            entry_id: &'a str,
+            new_due_at: OffsetDateTime,
+            diagnostic_json: &'a str,
+        ) -> BoxFuture<'a, Result<(), Diagnostic>> {
+            Box::pin(async move {
+                for (row, due, diag) in self.rows.lock().unwrap().iter_mut() {
+                    if row.entry_id == entry_id {
+                        *due = new_due_at;
+                        *diag = Some(diagnostic_json.to_string());
+                        row.last_diagnostic_json = Some(diagnostic_json.to_string());
+                    }
+                }
+                Ok(())
+            })
+        }
+
         fn mark_poisoned<'a>(
             &'a self,
             _deployment: &'a DeploymentId,
@@ -1580,7 +1867,8 @@ mod tests {
             DispatchStats {
                 attempted: 1,
                 succeeded: 1,
-                failed: 0
+                failed: 0,
+                waiting: 0
             }
         );
         assert_eq!(sink.sent.lock().unwrap().len(), 1);
@@ -1607,7 +1895,8 @@ mod tests {
             DispatchStats {
                 attempted: 1,
                 succeeded: 0,
-                failed: 1
+                failed: 1,
+                waiting: 0
             }
         );
         let rows = store.snapshot();
@@ -1679,7 +1968,8 @@ mod tests {
             DispatchStats {
                 attempted: 2,
                 succeeded: 1,
-                failed: 1
+                failed: 1,
+                waiting: 0
             }
         );
         let rows = store.snapshot();

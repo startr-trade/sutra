@@ -3,17 +3,21 @@
 
 use std::sync::Arc;
 
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine;
 use serde_json::{json, Value};
 use sutra_channels::dispatch::InboundMessage;
 use sutra_channels::http::EngineHandle;
 use sutra_channels::{BoxFuture, Diagnostic, MessageSink, OutboundMessage, SendOutcome};
+use sutra_llm_spi::audio::{adapt, transcode};
 use sutra_llm_spi::{
-    codes, LlmCapabilities, LlmFailure, LlmJobRef, LlmRequest, LlmResponse, RetryableClass,
+    codes, AudioFormat, FinishReason, LlmAudio, LlmCapabilities, LlmFailure, LlmJobRef, LlmRequest,
+    LlmResponse, LlmSpeechRequest, LlmTranscriptionRequest, RetryableClass,
 };
 use tracing::field::Empty;
 use tracing::Instrument;
 
-use crate::config::{ChannelMode, ChannelTable, LlmCandidate, LlmChannel};
+use crate::config::{ChannelMode, ChannelTable, LlmCandidate, LlmChannel, SpeechStage, VoiceMode};
 use crate::job_store::{JobStoreSlot, NewLlmJob};
 use crate::request::{parse_destination, parse_request_body, CallRequest};
 use crate::TRANSPORT;
@@ -51,25 +55,98 @@ pub enum RouteFailure {
         model: String,
         failure: LlmFailure,
     },
+    /// The call cannot be served as asked (audio the transport cannot convert, media on a job
+    /// channel). Never retried.
+    Rejected { detail: String },
 }
 
 /// The answering candidate and its response.
 pub struct RoutedAnswer<'c> {
     pub candidate: &'c LlmCandidate,
+    /// With a spoken answer, its audio is already in the format the call asked for.
     pub response: LlmResponse,
+    /// For a call involving audio: whether the model heard / spoke the audio itself (`true`) or
+    /// the `voice: pipeline` transcribed and synthesised it (`false`). `None` for a text call.
+    pub audio_preserved: Option<bool>,
 }
 
-fn build_request(channel: &LlmChannel, call: &CallRequest, model: &str) -> LlmRequest {
-    LlmRequest {
-        model: model.to_string(),
+fn audio_failure(detail: String) -> LlmFailure {
+    LlmFailure::Permanent {
+        detail: format!("{}: {detail}", codes::AUDIO_UNSUPPORTED),
+    }
+}
+
+/// The format to ask a provider for so `wanted` can be delivered: `wanted` itself when listed,
+/// else the first listed format this crate can convert from.
+fn provider_output_format(wanted: AudioFormat, offered: &[AudioFormat]) -> Option<AudioFormat> {
+    if offered.contains(&wanted) {
+        return Some(wanted);
+    }
+    if !wanted.is_decodable() {
+        return None;
+    }
+    offered.iter().copied().find(AudioFormat::is_decodable)
+}
+
+/// Convert a provider's spoken answer into the format the call asked for.
+fn deliver_audio(audio: LlmAudio, wanted: AudioFormat) -> Result<LlmAudio, LlmFailure> {
+    if audio.format == wanted {
+        return Ok(audio);
+    }
+    let data = transcode(&audio.data, audio.format, wanted)
+        .map_err(|e| audio_failure(format!("the spoken answer could not be converted: {e}")))?;
+    Ok(LlmAudio {
+        data,
+        format: wanted,
+    })
+}
+
+/// The provider request for `candidate`: each message's audio converted to a format the
+/// provider takes, and a spoken answer asked for in a format the transport can deliver.
+fn build_request(
+    channel: &LlmChannel,
+    call: &CallRequest,
+    candidate: &LlmCandidate,
+) -> Result<LlmRequest, LlmFailure> {
+    let mut messages = call.messages.clone();
+    if call.has_audio_input() {
+        let accepted = candidate.client.audio_input_formats();
+        for message in &mut messages {
+            if let Some(audio) = &message.audio {
+                let adapted = adapt(audio, &accepted).map_err(|e| {
+                    audio_failure(format!("the request's audio cannot be sent: {e}"))
+                })?;
+                message.audio = Some(adapted);
+            }
+        }
+    }
+    let audio_output = match call.audio_output {
+        None => None,
+        Some(wanted) => Some(
+            provider_output_format(wanted, &candidate.client.audio_output_formats()).ok_or_else(
+                || {
+                    audio_failure(format!(
+                        "no format the provider speaks converts to {wanted}"
+                    ))
+                },
+            )?,
+        ),
+    };
+    Ok(LlmRequest {
+        model: candidate.model().to_string(),
         system: call.system.clone().or_else(|| channel.system.clone()),
-        messages: call.messages.clone(),
+        messages,
         tools: call.tools.clone(),
         json_output: call.json_output,
         max_output_tokens: call.max_output_tokens.or(channel.max_output_tokens),
         temperature: call.temperature.or(channel.temperature),
         deadline: channel.timeout,
-    }
+        audio_output,
+        output_voice: call
+            .output_voice
+            .clone()
+            .or_else(|| channel.output_voice.clone()),
+    })
 }
 
 /// A job a candidate accepted.
@@ -79,12 +156,17 @@ pub struct SubmittedJob<'c> {
     pub job: LlmJobRef,
 }
 
+/// What a candidate must have to serve `call` on `channel`: the channel's `require:` plus what
+/// the request uses. Audio and video are never dropped, so a candidate that cannot take them is
+/// skipped rather than sent a text-only version of the call.
 fn needed(channel: &LlmChannel, call: &CallRequest) -> LlmCapabilities {
-    LlmCapabilities {
-        tools: channel.require.tools || !call.tools.is_empty(),
-        json_output: channel.require.json_output || call.json_output,
-        ..LlmCapabilities::default()
-    }
+    let mut need = channel.require;
+    need.tools |= !call.tools.is_empty();
+    need.json_output |= call.json_output;
+    need.audio_input |= call.has_audio_input();
+    need.audio_output |= call.audio_output.is_some();
+    need.video_understanding |= call.has_video_input();
+    need
 }
 
 /// Try the channel's candidates in order with `op`. A candidate lacking a capability in
@@ -108,14 +190,18 @@ where
         span.record("candidate", index);
         span.record("provider", candidate.provider.as_str());
         span.record("model", candidate.model());
-        let request = build_request(channel, call, candidate.model());
-        let outcome = match tokio::time::timeout(channel.timeout, op(candidate, &request)).await {
-            Ok(outcome) => outcome,
-            Err(_) => Err(LlmFailure::Retryable {
-                class: RetryableClass::Timeout,
-                retry_after: None,
-                detail: "the provider did not answer before the deadline".into(),
-            }),
+        let outcome = match build_request(channel, call, candidate) {
+            Err(failure) => Err(failure),
+            Ok(request) => {
+                match tokio::time::timeout(channel.timeout, op(candidate, &request)).await {
+                    Ok(outcome) => outcome,
+                    Err(_) => Err(LlmFailure::Retryable {
+                        class: RetryableClass::Timeout,
+                        retry_after: None,
+                        detail: "the provider did not answer before the deadline".into(),
+                    }),
+                }
+            }
         };
         match outcome {
             Ok(value) => return Ok((index, candidate, value)),
@@ -148,8 +234,20 @@ where
     Err(last)
 }
 
-/// Complete the call on the first candidate that answers (see [`try_candidates`]).
+/// Complete the call on the first candidate that answers (see [`try_candidates`]). With
+/// `voice: pipeline`, the audio is transcribed first and the answer spoken after (see
+/// [`route_pipeline`]).
 pub async fn route<'c>(
+    channel: &'c LlmChannel,
+    call: &CallRequest,
+) -> Result<RoutedAnswer<'c>, RouteFailure> {
+    if let Some(stage) = pipeline_stage(channel, call) {
+        return route_pipeline(channel, stage, call, None).await;
+    }
+    route_native(channel, call).await
+}
+
+async fn route_native<'c>(
     channel: &'c LlmChannel,
     call: &CallRequest,
 ) -> Result<RoutedAnswer<'c>, RouteFailure> {
@@ -157,10 +255,139 @@ pub async fn route<'c>(
         c.client.complete(r)
     })
     .await?;
+    native_answer(call, candidate, response)
+}
+
+/// The speech stage, when this call goes through it (a pipeline channel and audio involved).
+fn pipeline_stage<'c>(channel: &'c LlmChannel, call: &CallRequest) -> Option<&'c SpeechStage> {
+    match channel.voice {
+        VoiceMode::Pipeline if call.involves_audio() => channel.speech.as_ref(),
+        _ => None,
+    }
+}
+
+/// Finish a native answer: the spoken answer converted to the format the call asked for.
+fn native_answer<'c>(
+    call: &CallRequest,
+    candidate: &'c LlmCandidate,
+    mut response: LlmResponse,
+) -> Result<RoutedAnswer<'c>, RouteFailure> {
+    if let Some(wanted) = call.audio_output {
+        let audio = response.audio.take().ok_or_else(|| RouteFailure::Failed {
+            provider: candidate.provider.clone(),
+            model: candidate.model().to_string(),
+            failure: LlmFailure::Permanent {
+                detail: format!(
+                    "{}: a spoken answer was asked for and none came back",
+                    codes::RESPONSE_INVALID
+                ),
+            },
+        })?;
+        response.audio =
+            Some(
+                deliver_audio(audio, wanted).map_err(|failure| RouteFailure::Failed {
+                    provider: candidate.provider.clone(),
+                    model: candidate.model().to_string(),
+                    failure,
+                })?,
+            );
+    }
     Ok(RoutedAnswer {
         candidate,
         response,
+        audio_preserved: call.involves_audio().then_some(true),
     })
+}
+
+fn stage_failure(stage: &SpeechStage, model: &str, failure: LlmFailure) -> RouteFailure {
+    RouteFailure::Failed {
+        provider: stage.provider.clone(),
+        model: model.to_string(),
+        failure,
+    }
+}
+
+async fn bounded<T>(
+    deadline: std::time::Duration,
+    work: impl std::future::Future<Output = Result<T, LlmFailure>>,
+) -> Result<T, LlmFailure> {
+    tokio::time::timeout(deadline, work)
+        .await
+        .unwrap_or_else(|_| {
+            Err(LlmFailure::Retryable {
+                class: RetryableClass::Timeout,
+                retry_after: None,
+                detail: "the speech provider did not answer before the deadline".into(),
+            })
+        })
+}
+
+/// `voice: pipeline`: every audio turn is transcribed by the speech stage and becomes text,
+/// the text model answers through the ordinary candidate routing, and a spoken answer, when
+/// asked for, is synthesised from the answer text. The voice never reaches the model, so the
+/// answer is marked `audio_preserved: false`.
+pub async fn route_pipeline<'c>(
+    channel: &'c LlmChannel,
+    stage: &SpeechStage,
+    call: &CallRequest,
+    on_chunk: Option<sutra_channels::InlineChunkSink>,
+) -> Result<RoutedAnswer<'c>, RouteFailure> {
+    let mut text_call = call.clone();
+    text_call.audio_output = None;
+    let accepted = stage.client.transcription_formats();
+    for message in &mut text_call.messages {
+        let Some(audio) = message.audio.take() else {
+            continue;
+        };
+        let audio = adapt(&audio, &accepted).map_err(|e| RouteFailure::Rejected {
+            detail: format!("the request's audio cannot be transcribed: {e}"),
+        })?;
+        let request = LlmTranscriptionRequest {
+            model: stage.transcribe_model.clone(),
+            audio,
+            language: stage.language.clone(),
+            deadline: channel.timeout,
+        };
+        let transcript = bounded(channel.timeout, stage.client.transcribe(&request))
+            .await
+            .map_err(|f| stage_failure(stage, &stage.transcribe_model, f))?;
+        message.content = if message.content.is_empty() {
+            transcript.text
+        } else {
+            format!("{}\n\n{}", message.content, transcript.text)
+        };
+    }
+    let mut answer = match on_chunk {
+        Some(sink) => route_streaming_native(channel, &text_call, sink).await?,
+        None => route_native(channel, &text_call).await?,
+    };
+    if let Some(wanted) = call.audio_output {
+        let format =
+            provider_output_format(wanted, &stage.client.speech_formats()).ok_or_else(|| {
+                RouteFailure::Rejected {
+                    detail: format!("no format the speech provider produces converts to {wanted}"),
+                }
+            })?;
+        let request = LlmSpeechRequest {
+            model: stage.speech_model.clone(),
+            text: answer.response.text.clone(),
+            voice: call
+                .output_voice
+                .clone()
+                .or_else(|| stage.voice.clone())
+                .or_else(|| channel.output_voice.clone()),
+            format,
+            deadline: channel.timeout,
+        };
+        let spoken = bounded(channel.timeout, stage.client.synthesize(&request))
+            .await
+            .and_then(|audio| deliver_audio(audio, wanted))
+            .map_err(|f| stage_failure(stage, &stage.speech_model, f))?;
+        answer.response.audio = Some(spoken);
+        answer.response.transcript = Some(answer.response.text.clone());
+    }
+    answer.audio_preserved = Some(false);
+    Ok(answer)
 }
 
 /// [`route`], streaming the answer to `on_chunk` as the candidate produces it. A candidate that
@@ -168,6 +395,17 @@ pub async fn route<'c>(
 /// candidate's first piece is then preceded by a reset, so the caller discards the partial
 /// answer.
 pub async fn route_streaming<'c>(
+    channel: &'c LlmChannel,
+    call: &CallRequest,
+    on_chunk: sutra_channels::InlineChunkSink,
+) -> Result<RoutedAnswer<'c>, RouteFailure> {
+    if let Some(stage) = pipeline_stage(channel, call) {
+        return route_pipeline(channel, stage, call, Some(on_chunk)).await;
+    }
+    route_streaming_native(channel, call, on_chunk).await
+}
+
+async fn route_streaming_native<'c>(
     channel: &'c LlmChannel,
     call: &CallRequest,
     on_chunk: sutra_channels::InlineChunkSink,
@@ -194,10 +432,7 @@ pub async fn route_streaming<'c>(
             })
         })
         .await?;
-    Ok(RoutedAnswer {
-        candidate,
-        response,
-    })
+    native_answer(call, candidate, response)
 }
 
 /// Submit the call as a job on the first candidate with async jobs that accepts it, with the
@@ -206,6 +441,11 @@ pub async fn route_submit<'c>(
     channel: &'c LlmChannel,
     call: &CallRequest,
 ) -> Result<SubmittedJob<'c>, RouteFailure> {
+    if call.involves_audio() || call.has_video_input() {
+        return Err(RouteFailure::Rejected {
+            detail: "a 'mode: job' channel carries no audio or video; use 'mode: call'".into(),
+        });
+    }
     let need = LlmCapabilities {
         async_jobs: true,
         ..needed(channel, call)
@@ -223,6 +463,13 @@ pub async fn route_submit<'c>(
 /// anything else poisons it. The diagnostic names channel/provider/model, never content.
 pub fn failure_outcome(channel: &LlmChannel, failure: RouteFailure) -> SendOutcome {
     match failure {
+        RouteFailure::Rejected { detail } => SendOutcome::PermanentFailure(
+            Diagnostic::error(
+                codes::AUDIO_UNSUPPORTED,
+                format!("llm channel '{}': {detail}", channel.name),
+            )
+            .with_attribute("channel", channel.name.clone()),
+        ),
         RouteFailure::NoEligibleCandidate => SendOutcome::PermanentFailure(
             Diagnostic::error(
                 codes::CALL_FAILED,
@@ -259,14 +506,65 @@ pub fn failure_outcome(channel: &LlmChannel, failure: RouteFailure) -> SendOutco
     }
 }
 
-/// The reply body the process receives on the reply channel.
-pub fn reply_body(candidate: &LlmCandidate, response: &LlmResponse, request: &Value) -> Value {
+/// The parsed answer of a call that asked for JSON (`json: true` on the request): the answer
+/// text as a JSON object or array, so a flow reads its fields directly (FEEL has no JSON
+/// parser). `None` when the call did not ask, or the text is not a JSON object or array.
+pub fn structured_answer(text: &str, request: &Value) -> Option<Value> {
+    if request.get("json").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    let trimmed = text.trim();
+    let trimmed = trimmed
+        .strip_prefix("```json")
+        .or_else(|| trimmed.strip_prefix("```"))
+        .and_then(|rest| rest.trim_end().strip_suffix("```"))
+        .unwrap_or(trimmed)
+        .trim();
+    match serde_json::from_str::<Value>(trimmed) {
+        Ok(value @ (Value::Object(_) | Value::Array(_))) => Some(value),
+        _ => None,
+    }
+}
+
+/// Why a call that asked for JSON got no parsed `json`: the answer was cut off at
+/// `max-output-tokens` (a reasoning model's thinking counts against that limit too), or the
+/// answer is not a JSON object or array. `None` when the call did not ask, or it parsed.
+pub fn structured_answer_error(
+    text: &str,
+    finish: &FinishReason,
+    request: &Value,
+) -> Option<String> {
+    if request.get("json").and_then(Value::as_bool) != Some(true)
+        || structured_answer(text, request).is_some()
+    {
+        return None;
+    }
+    Some(if matches!(finish, FinishReason::Length) {
+        "the answer was cut off at max-output-tokens before the JSON was complete (finish: \
+         length); raise the channel's max-output-tokens — a reasoning model's thinking counts \
+         against it"
+            .to_string()
+    } else {
+        "the answer is not a JSON object or array".to_string()
+    })
+}
+
+/// The reply body the process receives on the reply channel. A spoken answer adds `audio`
+/// (`{data: <base64>, format: <media type>}`) and `transcript`; a call involving audio adds
+/// `audioPreserved`; a call that asked for JSON adds `json`, the parsed answer, or `jsonError`
+/// saying why there is none.
+pub fn reply_body(
+    candidate: &LlmCandidate,
+    response: &LlmResponse,
+    request: &Value,
+    audio_preserved: Option<bool>,
+) -> Value {
     let tool_calls: Vec<Value> = response
         .tool_calls
         .iter()
         .map(|c| json!({"id": c.id, "name": c.name, "arguments": c.arguments}))
         .collect();
-    json!({
+    let mut body = json!({
         "text": response.text,
         "toolCalls": tool_calls,
         "finish": response.finish.as_str(),
@@ -278,7 +576,25 @@ pub fn reply_body(candidate: &LlmCandidate, response: &LlmResponse, request: &Va
         "model": candidate.model(),
         "providerRequestId": response.provider_request_id,
         "request": request,
-    })
+    });
+    if let Some(audio) = &response.audio {
+        body["audio"] = json!({
+            "data": BASE64.encode(&audio.data),
+            "format": audio.format.media_type(),
+        });
+    }
+    if let Some(transcript) = &response.transcript {
+        body["transcript"] = json!(transcript);
+    }
+    if let Some(preserved) = audio_preserved {
+        body["audioPreserved"] = json!(preserved);
+    }
+    if let Some(parsed) = structured_answer(&response.text, request) {
+        body["json"] = parsed;
+    } else if let Some(why) = structured_answer_error(&response.text, &response.finish, request) {
+        body["jsonError"] = json!(why);
+    }
+    body
 }
 
 /// Build the reply [`InboundMessage`] for `message`: addressed to the reply channel of the
@@ -291,6 +607,7 @@ pub fn build_reply(
     candidate: &LlmCandidate,
     response: &LlmResponse,
     request: &Value,
+    audio_preserved: Option<bool>,
 ) -> InboundMessage {
     let mut headers = message.headers.clone();
     headers.insert(PROVIDER_HEADER.to_string(), candidate.provider.clone());
@@ -306,7 +623,8 @@ pub fn build_reply(
             traceparent.to_string(),
         );
     }
-    let body = serde_json::to_vec(&reply_body(candidate, response, request)).unwrap_or_default();
+    let body = serde_json::to_vec(&reply_body(candidate, response, request, audio_preserved))
+        .unwrap_or_default();
     InboundMessage {
         tenant: tenant.to_string(),
         module_key: channel.module_key.clone(),
@@ -426,7 +744,7 @@ impl LlmSink {
                 .with_attribute("channel", channel_name),
             );
         };
-        let call = match parse_request_body(&message.body) {
+        let mut call = match parse_request_body(&message.body) {
             Ok(call) => call,
             Err(diagnostic) => {
                 return SendOutcome::PermanentFailure(
@@ -434,6 +752,15 @@ impl LlmSink {
                 )
             }
         };
+        match crate::media::resolve_media(&mut call, &channel).await {
+            Ok(()) => {}
+            Err(crate::media::MediaFailure::Permanent(d)) => {
+                return SendOutcome::PermanentFailure(d)
+            }
+            Err(crate::media::MediaFailure::Retryable(d)) => {
+                return SendOutcome::RetryableFailure(d)
+            }
+        }
 
         if channel.mode == ChannelMode::Job {
             return self.submit(message, &tenant, &channel, &call).await;
@@ -486,6 +813,7 @@ impl LlmSink {
             answer.candidate,
             &answer.response,
             &call.raw,
+            answer.audio_preserved,
         );
         match self.port.deliver(reply).await {
             Ok(()) => SendOutcome::Delivered,

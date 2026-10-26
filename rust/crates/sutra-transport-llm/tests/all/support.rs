@@ -9,6 +9,9 @@ use std::time::Duration;
 use sutra_channels::dispatch::InboundMessage;
 use sutra_channels::{BoxFuture, ChannelDefinition, Diagnostic, OutboundMessage};
 use sutra_llm_spi::{
+    AudioFormat, LlmAudio, LlmSpeechRequest, LlmTranscript, LlmTranscriptionRequest,
+};
+use sutra_llm_spi::{
     FinishReason, LlmCallbackEvent, LlmCapabilities, LlmFailure, LlmJobRef, LlmJobState,
     LlmProvider, LlmProviderConfig, LlmProviderFactory, LlmRequest, LlmResponse, LlmToolCall,
     LlmUsage, RetryableClass,
@@ -62,6 +65,8 @@ fn answer(model: &str) -> LlmResponse {
             output_tokens: 22,
         },
         provider_request_id: Some(format!("req-{model}")),
+        audio: None,
+        transcript: None,
     }
 }
 
@@ -101,13 +106,60 @@ fn retryable(class: RetryableClass) -> LlmFailure {
     }
 }
 
+/// Every request a fake model was sent, by model.
+fn sent() -> &'static Mutex<HashMap<String, Vec<LlmRequest>>> {
+    static SENT: OnceLock<Mutex<HashMap<String, Vec<LlmRequest>>>> = OnceLock::new();
+    SENT.get_or_init(Default::default)
+}
+
+/// The last request `model` was sent.
+pub fn last_request(model: &str) -> Option<LlmRequest> {
+    sent()
+        .lock()
+        .unwrap()
+        .get(model)
+        .and_then(|r| r.last().cloned())
+}
+
+/// What the `speech*` fake transcribes every clip as.
+pub const FAKE_TRANSCRIPT: &str = "FAKE TRANSCRIPT";
+/// The transcript of an `audio*` fake's spoken answer.
+pub const FAKE_SPOKEN: &str = "FAKE SPOKEN ANSWER";
+
+/// `ms` of a 24 kHz mono tone as a WAV.
+pub fn wav_24k(ms: u32) -> Vec<u8> {
+    let n = (24 * ms) as usize;
+    sutra_llm_spi::audio::wav_wrap(&sutra_llm_spi::audio::Pcm {
+        rate: 24000,
+        channels: 1,
+        samples: (0..n).map(|i| ((i % 48) as i16 - 24) * 400).collect(),
+    })
+}
+
 impl LlmProvider for FakeProvider {
     fn complete<'a>(
         &'a self,
-        _request: &'a LlmRequest,
+        request: &'a LlmRequest,
     ) -> BoxFuture<'a, Result<LlmResponse, LlmFailure>> {
+        sent()
+            .lock()
+            .unwrap()
+            .entry(self.model.clone())
+            .or_default()
+            .push(request.clone());
         Box::pin(async move {
             let model = self.model.as_str();
+            if let (true, Some(format)) = (model.starts_with("audio"), request.audio_output) {
+                let mut response = answer(model);
+                response.text = FAKE_SPOKEN.into();
+                response.tool_calls.clear();
+                response.audio = Some(LlmAudio {
+                    data: wav_24k(100),
+                    format,
+                });
+                response.transcript = Some(FAKE_SPOKEN.into());
+                return Ok(response);
+            }
             match model {
                 "rate-limited" => Err(retryable(RetryableClass::RateLimited)),
                 "unavailable" => Err(retryable(RetryableClass::Unavailable)),
@@ -150,15 +202,92 @@ impl LlmProvider for FakeProvider {
         })
     }
 
+    /// `audio*` models take and speak WAV and hear the voice; `video*` models read video;
+    /// `speech*` models transcribe and synthesise (WAV).
     fn capabilities(&self) -> LlmCapabilities {
         let job = self.model.starts_with("job");
+        let audio = self.model.starts_with("audio");
+        let speech = self.model.starts_with("speech");
         LlmCapabilities {
             tools: !self.model.starts_with("no-tools"),
             json_output: true,
-            async_jobs: job,
+            async_jobs: job || self.model.starts_with("audio-job"),
             job_callbacks: job && !self.model.starts_with("job-poll"),
+            audio_input: audio,
+            audio_output: audio,
+            audio_understanding: audio,
+            video_understanding: self.model.starts_with("video"),
+            transcription: speech,
+            speech_synthesis: speech,
+            realtime: self.model.starts_with("live"),
             ..LlmCapabilities::default()
         }
+    }
+
+    fn audio_input_formats(&self) -> Vec<AudioFormat> {
+        if self.model.starts_with("audio") {
+            vec![AudioFormat::Wav]
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn audio_output_formats(&self) -> Vec<AudioFormat> {
+        self.audio_input_formats()
+    }
+
+    fn transcription_formats(&self) -> Vec<AudioFormat> {
+        vec![AudioFormat::Wav]
+    }
+
+    fn speech_formats(&self) -> Vec<AudioFormat> {
+        vec![AudioFormat::Wav]
+    }
+
+    fn transcribe<'a>(
+        &'a self,
+        request: &'a LlmTranscriptionRequest,
+    ) -> BoxFuture<'a, Result<LlmTranscript, LlmFailure>> {
+        Box::pin(async move {
+            if request.audio.format != AudioFormat::Wav {
+                return Err(LlmFailure::Permanent {
+                    detail: "fake transcribes WAV only".into(),
+                });
+            }
+            Ok(LlmTranscript {
+                text: format!("{FAKE_TRANSCRIPT} ({})", request.model),
+            })
+        })
+    }
+
+    fn synthesize<'a>(
+        &'a self,
+        request: &'a LlmSpeechRequest,
+    ) -> BoxFuture<'a, Result<LlmAudio, LlmFailure>> {
+        Box::pin(async move {
+            Ok(LlmAudio {
+                data: wav_24k(10 * request.text.len() as u32),
+                format: request.format,
+            })
+        })
+    }
+
+    /// `live-down` is unavailable, `live-refused` refuses permanently; any other `live*` model
+    /// opens a session that closes when asked. Every attempt is recorded ([`opened_sessions`]).
+    fn open_audio_session<'a>(
+        &'a self,
+        config: &'a sutra_llm_spi::AudioSessionConfig,
+    ) -> BoxFuture<'a, Result<Box<dyn sutra_llm_spi::AudioSession>, LlmFailure>> {
+        Box::pin(async move {
+            sessions().lock().unwrap().push(config.clone());
+            match self.model.as_str() {
+                "live-down" => Err(retryable(RetryableClass::Unavailable)),
+                "live-refused" => Err(LlmFailure::Permanent {
+                    detail: "fake session reject".into(),
+                }),
+                _ => Ok(Box::new(IdleSession) as Box<dyn sutra_llm_spi::AudioSession>),
+            }
+        })
     }
 
     fn submit<'a>(
@@ -227,6 +356,34 @@ impl LlmProvider for FakeProvider {
         secret: &str,
     ) -> bool {
         headers.get(SIGNATURE_HEADER).map(String::as_str) == Some(secret)
+    }
+}
+
+fn sessions() -> &'static Mutex<Vec<sutra_llm_spi::AudioSessionConfig>> {
+    static SESSIONS: OnceLock<Mutex<Vec<sutra_llm_spi::AudioSessionConfig>>> = OnceLock::new();
+    SESSIONS.get_or_init(Default::default)
+}
+
+/// Every session configuration a `live*` fake was asked to open, as passed to it.
+pub fn opened_sessions() -> Vec<sutra_llm_spi::AudioSessionConfig> {
+    sessions().lock().unwrap().clone()
+}
+
+/// A live session that never reports anything until closed.
+struct IdleSession;
+
+impl sutra_llm_spi::AudioSession for IdleSession {
+    fn send_audio<'a>(&'a self, _frame: &'a [u8]) -> BoxFuture<'a, Result<(), LlmFailure>> {
+        Box::pin(async { Ok(()) })
+    }
+    fn commit(&self) -> BoxFuture<'_, Result<(), LlmFailure>> {
+        Box::pin(async { Ok(()) })
+    }
+    fn next_event(&self) -> BoxFuture<'_, Option<sutra_llm_spi::AudioSessionEvent>> {
+        Box::pin(async { Some(sutra_llm_spi::AudioSessionEvent::Closed) })
+    }
+    fn close(&self) -> BoxFuture<'_, ()> {
+        Box::pin(async {})
     }
 }
 

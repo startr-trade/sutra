@@ -28,6 +28,14 @@ use crate::sink::BoxFuture;
 /// A sink write could not be persisted (best-effort — never fails execution).
 pub const AUDIT_SINK_WRITE_FAILED: &str = "SUTRA.AUDIT.SINK.WRITE_FAILED";
 
+/// Reserved header on every request a `capture="media"` process sends: value
+/// [`AUDIT_CAPTURE_MEDIA`]. A transport that carries a media session (a call) records it when it
+/// sees this mark, and reports the recording as a media reference (`kind: "media"`, `uri`,
+/// `sha256`, …) that the process's audit events then carry. Other transports ignore it.
+pub const AUDIT_CAPTURE_HEADER: &str = "sutra-audit-capture";
+/// The [`AUDIT_CAPTURE_HEADER`] value asking for the session's media to be recorded.
+pub const AUDIT_CAPTURE_MEDIA: &str = "media";
+
 /// One audit record — the deployment-scoped, per-instance-sequenced event the sinks persist.
 /// Maps 1:1 onto the shipped `audit_event` table (`deployment_id, instance_id, seq, at,
 /// event_type, node_id, diagnostic_code, diagnostic_json, payload_json`) and, via
@@ -218,39 +226,44 @@ pub fn spawn_audit_dispatcher(
 ) -> tokio::task::JoinHandle<()> {
     handle.spawn(async move {
         while let Some(event) = rx.recv().await {
-            // Single source of truth: route to the ONE sink the event names. If that sink is not
-            // registered, fall back to the first registered sink (deterministic — sorted names) so
-            // the trail is never silently dropped; audit is best-effort but never lost on a typo.
-            let sink = match registry.get(&event.sink) {
-                Some(s) => Some(s),
-                None => {
-                    let fallback = registry.all().into_iter().next();
-                    if let Some(fb) = &fallback {
-                        tracing::warn!(
-                            requested = %event.sink,
-                            using = %fb.name(),
-                            "audit sink '{}' is not registered — routing to fallback '{}'",
-                            event.sink,
-                            fb.name()
-                        );
-                    }
-                    fallback
-                }
-            };
-            if let Some(sink) = sink {
-                if let Err(d) = sink.emit(&event).await {
-                    tracing::warn!(
-                        code = %d.code,
-                        sink = sink.name(),
-                        instance = %event.instance_id,
-                        event_type = %event.event_type,
-                        "audit sink write failed (best-effort): {}",
-                        d.message
-                    );
-                }
-            }
+            deliver_audit_event(&registry, &event).await;
         }
     })
+}
+
+/// Deliver one event to the ONE sink it names, logging a failure (audit is best-effort). If that
+/// sink is not registered, the first registered sink (deterministic — sorted names) takes it, so
+/// the trail is never silently dropped on a typo. Shared by the execution-event dispatcher and
+/// the transport-event journal, so both route alike.
+pub async fn deliver_audit_event(registry: &AuditSinkRegistry, event: &AuditEvent) {
+    let sink = match registry.get(&event.sink) {
+        Some(s) => Some(s),
+        None => {
+            let fallback = registry.all().into_iter().next();
+            if let Some(fb) = &fallback {
+                tracing::warn!(
+                    requested = %event.sink,
+                    using = %fb.name(),
+                    "audit sink '{}' is not registered — routing to fallback '{}'",
+                    event.sink,
+                    fb.name()
+                );
+            }
+            fallback
+        }
+    };
+    if let Some(sink) = sink {
+        if let Err(d) = sink.emit(event).await {
+            tracing::warn!(
+                code = %d.code,
+                sink = sink.name(),
+                instance = %event.instance_id,
+                event_type = %event.event_type,
+                "audit sink write failed (best-effort): {}",
+                d.message
+            );
+        }
+    }
 }
 
 /// The [`ExecutionListener`] that turns per-instance / per-node execution lifecycle callbacks into

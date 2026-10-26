@@ -520,11 +520,30 @@ fn render() -> String {
     s.push_str("\nModel the parking node at the top level of the process instead.\n");
 
     s.push_str(
+        "\n## Loops through wait states\n\n\
+         Every parking node can be re-entered any number of times within one instance: a loop\n\
+         that brings the token back to a message catch, a receive task, a user task, a\n\
+         channel-call, a timer catch or an event-based gateway parks a NEW wait there. Each\n\
+         iteration gets its own wait row, its own timer and `<q:timeout>` rows, its own\n\
+         `<q:retry>` budget and its own `<q:alias>` rows; the step that answers an iteration\n\
+         resolves that iteration's rows and retires its correlation keys, so a late relay for\n\
+         a past iteration finds no instance (or, when it still correlates through a key the\n\
+         instance kept, is refused with `SUTRA.RUNTIME.RESUME.NOT_WAITING`). A resume continues\n\
+         from the satisfied node itself; nothing upstream of it runs again.\n",
+    );
+
+    s.push_str(
         "\n## The `q:` extension surface\n\n\
          Node types are only half the model; the `q:` namespace (`urn:sutra:q:1.0`) carries the\n\
          message binding, correlation, retry, store and audit contracts. `xsd/q.xsd` is\n\
          authoritative for its exact shape — read it, not a design doc, when you need the\n\
-         attributes an element supports.\n",
+         attributes an element supports.\n\n\
+         One of those contracts changes what a transport does, so it is stated here: a process's\n\
+         `<q:audit capture>` is `none`, `metadata` (the default), `payload` (events carry the\n\
+         redacted variable snapshot) or `media` (metadata-level events, every request the process\n\
+         sends is marked `sutra-audit-capture: media` so a media transport records the session it\n\
+         opens, and each event carries the media references found among the variables — `kind:\n\
+         \"media\"` with a `uri` and a `sha256` — never the media).\n",
     );
     s
 }

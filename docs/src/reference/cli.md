@@ -316,7 +316,7 @@ instance did, offline. See [Logging and audit](../operating/logging.md).
 ### `sutra version`
 
 ```
-sutra version            # sutra 0.5.1
+sutra version            # sutra 0.6.0
 sutra --version          # identical text
 sutra version --format json
 ```
@@ -328,14 +328,14 @@ binary name prints that name, and one that versions itself independently of the 
 
 ```
 <tool> 2.0.0
-sutra  0.5.1 (engine)
+sutra  0.6.0 (engine)
 ```
 
 `--format json` is the structured form and always separates the two — `version` is the
 reporting tool's own, `engine` the embedded engine's (equal for this binary):
 
 ```json
-{"name":"sutra","version":"0.5.1","engine":"0.5.1"}
+{"name":"sutra","version":"0.6.0","engine":"0.6.0"}
 ```
 
 ---
@@ -345,7 +345,7 @@ reporting tool's own, `engine` the embedded engine's (equal for this binary):
 The generators all recompute output that is **derived, not authored**, and all share one
 `--check` drift gate that regenerates without writing — which is the shape a CI or pre-commit
 gate wants. That shared contract is why they sit under one verb. It is also what separates them
-from [`sutra create`](#sutra-create), which scaffolds files that become *yours*: a scaffold is
+from [`sutra create`](#sutra-create-app), which scaffolds files that become *yours*: a scaffold is
 headed "edit freely — this file is yours" and needs `--force` to overwrite your edits, while a
 generated page is headed "Do not edit above the MANUAL NOTES sentinel" and `--check` fails the
 build if you edited it. Two verbs, opposite guarantees — never one.

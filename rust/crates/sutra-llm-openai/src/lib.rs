@@ -5,7 +5,18 @@
 //! default `base_url`. Any other server speaking the same wire format works by setting
 //! the candidate's `base_url`. The request/response mapping is pure ([`request_body`],
 //! [`parse_response`]); only [`OpenAiProvider::complete`] touches the network.
+//!
+//! AUDIO is the `openai` provider's alone — the compatible services do not advertise it:
+//! - turn-based audio through Chat Completions audio models (a model id containing `audio`):
+//!   `input_audio` content parts (WAV, MP3) and, with an audio output requested,
+//!   `modalities: ["text", "audio"]` plus `audio: {voice, format}`;
+//! - speech to text (`/audio/transcriptions`) and text to speech (`/audio/speech`), the
+//!   `voice: pipeline` building blocks;
+//! - a live session over the Realtime WebSocket API (a model id containing `realtime`), see
+//!   [`realtime`].
 #![forbid(unsafe_code)]
+
+pub mod realtime;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -22,10 +33,18 @@ use sutra_llm_spi::{
     LlmCapabilities, LlmFailure, LlmJobRef, LlmJobState, LlmProvider, LlmProviderConfig,
     LlmProviderFactory, LlmRequest, LlmResponse, LlmRole, LlmToolCall, LlmUsage,
 };
+use sutra_llm_spi::{
+    AudioFormat, AudioSession, AudioSessionConfig, LlmAudio, LlmSpeechRequest, LlmTranscript,
+    LlmTranscriptionRequest,
+};
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 
 struct OpenAiProvider {
+    /// The configured model id (audio and realtime capabilities are read from it).
+    model: String,
+    /// The endpoint base, without a trailing slash.
+    base: String,
     url: String,
     /// `<base>/responses` — the background-job endpoint (the `openai` provider only).
     responses_url: String,
@@ -76,6 +95,8 @@ fn build_for(
         .unwrap_or(default_base_url(provider))
         .trim_end_matches('/');
     Ok(Arc::new(OpenAiProvider {
+        model: config.model.clone(),
+        base: base.to_string(),
         url: format!("{base}/chat/completions"),
         responses_url: format!("{base}/responses"),
         first_party: provider == "openai",
@@ -128,18 +149,154 @@ impl LlmProvider for OpenAiProvider {
                 .post_json(&self.url, &headers, &body, request.deadline)
                 .await
                 .map_err(LlmFailure::from)?;
-            parse_response(&value)
+            parse_response_as(&value, request.audio_output)
         })
     }
 
     fn capabilities(&self) -> LlmCapabilities {
+        let audio = self.audio_model();
         LlmCapabilities {
             tools: true,
             json_output: true,
             streaming: true,
             async_jobs: self.first_party,
             job_callbacks: self.first_party,
+            audio_input: audio,
+            audio_output: audio,
+            // An audio model hears the voice itself, not a transcript of it.
+            audio_understanding: audio,
+            video_understanding: false,
+            realtime: self.realtime_model(),
+            transcription: self.first_party,
+            speech_synthesis: self.first_party,
         }
+    }
+
+    fn audio_input_formats(&self) -> Vec<AudioFormat> {
+        if self.audio_model() {
+            CHAT_AUDIO_INPUT.to_vec()
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn audio_output_formats(&self) -> Vec<AudioFormat> {
+        if self.audio_model() {
+            CHAT_AUDIO_OUTPUT.to_vec()
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn transcribe<'a>(
+        &'a self,
+        request: &'a LlmTranscriptionRequest,
+    ) -> BoxFuture<'a, Result<LlmTranscript, LlmFailure>> {
+        Box::pin(async move {
+            self.require_first_party("transcription")?;
+            let extension = transcription_extension(request.audio.format).ok_or_else(|| {
+                LlmFailure::Permanent {
+                    detail: format!("transcription does not take {}", request.audio.format),
+                }
+            })?;
+            let mut fields = vec![
+                ("model", request.model.as_str()),
+                ("response_format", "json"),
+            ];
+            if let Some(language) = &request.language {
+                fields.push(("language", language.as_str()));
+            }
+            let (content_type, body) = multipart_form(
+                &fields,
+                &format!("audio.{extension}"),
+                &request.audio.format.media_type(),
+                &request.audio.data,
+            );
+            let auth = self.auth();
+            let (bytes, _) = self
+                .client
+                .post_bytes(
+                    &format!("{}/audio/transcriptions", self.base),
+                    &auth_headers(&auth),
+                    &content_type,
+                    body,
+                    request.deadline,
+                )
+                .await
+                .map_err(LlmFailure::from)?;
+            let value: Value = serde_json::from_slice(&bytes)
+                .map_err(|e| failure(format!("the transcription is not JSON: {e}")))?;
+            let text = value["text"]
+                .as_str()
+                .ok_or_else(|| failure("the transcription has no 'text'".into()))?;
+            Ok(LlmTranscript {
+                text: text.to_string(),
+            })
+        })
+    }
+
+    fn transcription_formats(&self) -> Vec<AudioFormat> {
+        if self.first_party {
+            TRANSCRIPTION_INPUT.to_vec()
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn synthesize<'a>(
+        &'a self,
+        request: &'a LlmSpeechRequest,
+    ) -> BoxFuture<'a, Result<LlmAudio, LlmFailure>> {
+        Box::pin(async move {
+            self.require_first_party("speech synthesis")?;
+            let format =
+                speech_format_name(request.format).ok_or_else(|| LlmFailure::Permanent {
+                    detail: format!("speech synthesis does not produce {}", request.format),
+                })?;
+            let body = json!({
+                "model": request.model,
+                "input": request.text,
+                "voice": request.voice.as_deref().unwrap_or(DEFAULT_VOICE),
+                "response_format": format,
+            });
+            let auth = self.auth();
+            let (data, _) = self
+                .client
+                .post_bytes(
+                    &format!("{}/audio/speech", self.base),
+                    &auth_headers(&auth),
+                    "application/json",
+                    body.to_string().into_bytes(),
+                    request.deadline,
+                )
+                .await
+                .map_err(LlmFailure::from)?;
+            Ok(LlmAudio {
+                data,
+                format: request.format,
+            })
+        })
+    }
+
+    fn speech_formats(&self) -> Vec<AudioFormat> {
+        if self.first_party {
+            SPEECH_OUTPUT.to_vec()
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn open_audio_session<'a>(
+        &'a self,
+        config: &'a AudioSessionConfig,
+    ) -> BoxFuture<'a, Result<Box<dyn AudioSession>, LlmFailure>> {
+        Box::pin(async move {
+            self.require_first_party("live audio sessions")?;
+            let session =
+                realtime::RealtimeSession::open(&self.base, self.api_key.as_deref(), config)
+                    .await?;
+            Ok(Box::new(session) as Box<dyn AudioSession>)
+        })
     }
 
     fn complete_streaming<'a>(
@@ -148,6 +305,14 @@ impl LlmProvider for OpenAiProvider {
         on_chunk: ChunkSink<'a>,
     ) -> BoxFuture<'a, Result<LlmResponse, LlmFailure>> {
         Box::pin(async move {
+            if request.audio_output.is_some() {
+                // A spoken answer is returned whole; its text arrives as one piece.
+                let response = self.complete(request).await?;
+                if !response.text.is_empty() {
+                    on_chunk(&response.text);
+                }
+                return Ok(response);
+            }
             let mut body = request_body(request);
             body["stream"] = json!(true);
             if self.first_party {
@@ -232,7 +397,131 @@ const POLL_DEADLINE: Duration = Duration::from_secs(30);
 /// Standard Webhooks replay window.
 const WEBHOOK_TOLERANCE_SECS: u64 = 300;
 
+/// The audio formats a Chat Completions `input_audio` part takes.
+const CHAT_AUDIO_INPUT: [AudioFormat; 2] = [AudioFormat::Wav, AudioFormat::Mp3];
+/// The Chat Completions `audio.format` values used. (`pcm16` is left out: its rate is not
+/// stated by the API reference, so a WAV — which states its own — is asked for instead.)
+const CHAT_AUDIO_OUTPUT: [AudioFormat; 5] = [
+    AudioFormat::Wav,
+    AudioFormat::Mp3,
+    AudioFormat::Flac,
+    AudioFormat::Opus,
+    AudioFormat::Aac,
+];
+/// What `/audio/transcriptions` takes (mp3, mp4, mpeg, mpga, m4a, wav, webm).
+const TRANSCRIPTION_INPUT: [AudioFormat; 4] = [
+    AudioFormat::Wav,
+    AudioFormat::Mp3,
+    AudioFormat::M4a,
+    AudioFormat::Webm,
+];
+/// What `/audio/speech` produces; its `pcm` is 24 kHz 16-bit little-endian, headerless.
+const SPEECH_OUTPUT: [AudioFormat; 6] = [
+    AudioFormat::Wav,
+    AudioFormat::Mp3,
+    AudioFormat::Opus,
+    AudioFormat::Aac,
+    AudioFormat::Flac,
+    AudioFormat::L16 {
+        rate: 24000,
+        channels: 1,
+    },
+];
+/// The voice of a spoken answer when the request names none.
+pub const DEFAULT_VOICE: &str = "alloy";
+
+fn chat_audio_name(format: AudioFormat) -> Option<&'static str> {
+    match format {
+        AudioFormat::Wav => Some("wav"),
+        AudioFormat::Mp3 => Some("mp3"),
+        AudioFormat::Flac => Some("flac"),
+        AudioFormat::Opus => Some("opus"),
+        AudioFormat::Aac => Some("aac"),
+        _ => None,
+    }
+}
+
+fn transcription_extension(format: AudioFormat) -> Option<&'static str> {
+    match format {
+        AudioFormat::Wav => Some("wav"),
+        AudioFormat::Mp3 => Some("mp3"),
+        AudioFormat::M4a => Some("m4a"),
+        AudioFormat::Webm => Some("webm"),
+        _ => None,
+    }
+}
+
+fn speech_format_name(format: AudioFormat) -> Option<&'static str> {
+    match format {
+        AudioFormat::Wav => Some("wav"),
+        AudioFormat::Mp3 => Some("mp3"),
+        AudioFormat::Opus => Some("opus"),
+        AudioFormat::Aac => Some("aac"),
+        AudioFormat::Flac => Some("flac"),
+        AudioFormat::L16 {
+            rate: 24000,
+            channels: 1,
+        } => Some("pcm"),
+        _ => None,
+    }
+}
+
+/// A `multipart/form-data` body: the text `fields`, then one file part.
+fn multipart_form(
+    fields: &[(&str, &str)],
+    file_name: &str,
+    file_type: &str,
+    file: &[u8],
+) -> (String, Vec<u8>) {
+    let boundary = format!(
+        "sutra-{:016x}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0)
+    );
+    let mut body = Vec::with_capacity(file.len() + 512);
+    for (name, value) in fields {
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\ncontent-disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
+            )
+            .as_bytes(),
+        );
+    }
+    body.extend_from_slice(
+        format!(
+            "--{boundary}\r\ncontent-disposition: form-data; name=\"file\"; \
+             filename=\"{file_name}\"\r\ncontent-type: {file_type}\r\n\r\n"
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(file);
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    (format!("multipart/form-data; boundary={boundary}"), body)
+}
+
 impl OpenAiProvider {
+    /// A Chat Completions audio model (`gpt-audio-…`, `gpt-4o-audio-preview`, …) on `openai`.
+    fn audio_model(&self) -> bool {
+        self.first_party && self.model.contains("audio")
+    }
+
+    /// A Realtime model (`gpt-realtime-…`) on `openai`.
+    fn realtime_model(&self) -> bool {
+        self.first_party && self.model.contains("realtime")
+    }
+
+    fn require_first_party(&self, what: &str) -> Result<(), LlmFailure> {
+        if self.first_party {
+            Ok(())
+        } else {
+            Err(LlmFailure::Permanent {
+                detail: format!("this provider does not support {what}"),
+            })
+        }
+    }
+
     fn auth(&self) -> Option<String> {
         self.api_key.as_ref().map(|key| format!("Bearer {key}"))
     }
@@ -349,6 +638,8 @@ impl ChatStream {
             finish: map_finish(self.finish.as_deref()),
             usage: self.usage,
             provider_request_id: self.id,
+            audio: None,
+            transcript: None,
         })
     }
 }
@@ -478,6 +769,8 @@ fn parse_job_state(value: &Value) -> Result<LlmJobState, LlmFailure> {
                     output_tokens: value["usage"]["output_tokens"].as_u64().unwrap_or(0),
                 },
                 provider_request_id: value["id"].as_str().map(str::to_string),
+                audio: None,
+                transcript: None,
             }))
         }
         "failed" => Ok(LlmJobState::Failed(LlmFailure::Permanent {
@@ -574,7 +867,24 @@ fn request_body(request: &LlmRequest) -> Value {
     }
     for message in &request.messages {
         messages.push(match message.role {
-            LlmRole::User => json!({"role": "user", "content": message.content}),
+            LlmRole::User => match &message.audio {
+                None => json!({"role": "user", "content": message.content}),
+                Some(audio) => {
+                    let mut parts = Vec::new();
+                    if !message.content.is_empty() {
+                        parts.push(json!({"type": "text", "text": message.content}));
+                    }
+                    parts.push(json!({
+                        "type": "input_audio",
+                        "input_audio": {
+                            "data": BASE64.encode(&audio.data),
+                            // The transport adapts audio to `audio_input_formats` first.
+                            "format": chat_audio_name(audio.format).unwrap_or("wav"),
+                        },
+                    }));
+                    json!({"role": "user", "content": parts})
+                }
+            },
             LlmRole::Assistant => {
                 let mut turn = json!({"role": "assistant", "content": message.content});
                 if !message.tool_calls.is_empty() {
@@ -631,11 +941,30 @@ fn request_body(request: &LlmRequest) -> Value {
     if request.json_output {
         body.insert("response_format".into(), json!({"type": "json_object"}));
     }
+    if let Some(format) = request.audio_output {
+        body.insert("modalities".into(), json!(["text", "audio"]));
+        body.insert(
+            "audio".into(),
+            json!({
+                "voice": request.output_voice.as_deref().unwrap_or(DEFAULT_VOICE),
+                "format": chat_audio_name(format).unwrap_or("wav"),
+            }),
+        );
+    }
     Value::Object(body)
 }
 
 /// Map a Chat Completions answer to a provider-neutral response.
+#[cfg(test)]
 fn parse_response(value: &Value) -> Result<LlmResponse, LlmFailure> {
+    parse_response_as(value, None)
+}
+
+/// [`parse_response`], with the format a spoken answer was asked for.
+fn parse_response_as(
+    value: &Value,
+    audio_format: Option<AudioFormat>,
+) -> Result<LlmResponse, LlmFailure> {
     let choice = value
         .get("choices")
         .and_then(Value::as_array)
@@ -647,7 +976,23 @@ fn parse_response(value: &Value) -> Result<LlmResponse, LlmFailure> {
             ),
         })?;
     let message = &choice["message"];
-    let text = message["content"].as_str().unwrap_or("").to_string();
+    let mut text = message["content"].as_str().unwrap_or("").to_string();
+    let transcript = message["audio"]["transcript"].as_str().map(str::to_string);
+    let audio = match message["audio"]["data"].as_str() {
+        None => None,
+        Some(data) => Some(LlmAudio {
+            data: BASE64
+                .decode(data)
+                .map_err(|e| failure(format!("the answer's audio is not base64: {e}")))?,
+            format: audio_format.unwrap_or(AudioFormat::Wav),
+        }),
+    };
+    if text.is_empty() {
+        // A spoken answer's text is its transcript.
+        if let Some(transcript) = &transcript {
+            text = transcript.clone();
+        }
+    }
     let tool_calls = message["tool_calls"]
         .as_array()
         .map(|calls| {
@@ -677,6 +1022,8 @@ fn parse_response(value: &Value) -> Result<LlmResponse, LlmFailure> {
         finish,
         usage,
         provider_request_id: value["id"].as_str().map(str::to_string),
+        audio,
+        transcript,
     })
 }
 
@@ -702,6 +1049,8 @@ mod tests {
             max_output_tokens: None,
             temperature: None,
             deadline: Duration::from_secs(5),
+            audio_output: None,
+            output_voice: None,
         }
     }
 
@@ -755,12 +1104,16 @@ mod tests {
                 arguments: json!({"q": 1}),
             }],
             tool_call_id: None,
+            audio: None,
+            video: None,
         });
         req.messages.push(LlmMessage {
             role: LlmRole::Tool,
             content: "found".into(),
             tool_calls: Vec::new(),
             tool_call_id: Some("c1".into()),
+            audio: None,
+            video: None,
         });
         let body = request_body(&req);
         let call = &body["messages"][1]["tool_calls"][0];
@@ -976,12 +1329,16 @@ mod tests {
                 arguments: json!({"q": 1}),
             }],
             tool_call_id: None,
+            audio: None,
+            video: None,
         });
         req.messages.push(LlmMessage {
             role: LlmRole::Tool,
             content: "found".into(),
             tool_calls: Vec::new(),
             tool_call_id: Some("c1".into()),
+            audio: None,
+            video: None,
         });
         let body = responses_body(&req);
         assert_eq!(body["background"], true);
@@ -1168,5 +1525,195 @@ mod tests {
             String::from_utf8_lossy(&buf[..n]).to_string()
         });
         (format!("http://{addr}/v1/"), handle)
+    }
+
+    fn audio_provider(model: &str, provider_id: &str, base_url: String) -> Arc<dyn LlmProvider> {
+        build_for(
+            provider_id,
+            &LlmProviderConfig {
+                model: model.into(),
+                base_url: Some(base_url),
+                api_key: Some("test-key".into()),
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn only_openai_audio_models_advertise_audio() {
+        let url = "http://127.0.0.1:9/v1".to_string();
+        let audio = audio_provider("gpt-audio-1.5", "openai", url.clone());
+        let caps = audio.capabilities();
+        assert!(caps.audio_input && caps.audio_output && caps.audio_understanding);
+        assert!(!caps.video_understanding && !caps.realtime);
+        assert!(caps.transcription && caps.speech_synthesis);
+        assert_eq!(
+            audio.audio_input_formats(),
+            vec![AudioFormat::Wav, AudioFormat::Mp3]
+        );
+        assert_eq!(audio.audio_output_formats()[0], AudioFormat::Wav);
+        let text = audio_provider("gpt-4o-mini", "openai", url.clone());
+        assert!(!text.capabilities().audio_input);
+        assert!(text.audio_input_formats().is_empty());
+        assert!(
+            audio_provider("gpt-realtime-2.1", "openai", url.clone())
+                .capabilities()
+                .realtime
+        );
+        for (id, _) in COMPATIBLE_SERVICES.iter().filter(|(id, _)| *id != "openai") {
+            let caps = audio_provider("gpt-audio-1.5", id, url.clone()).capabilities();
+            assert!(
+                !caps.audio_input
+                    && !caps.audio_output
+                    && !caps.realtime
+                    && !caps.transcription
+                    && !caps.speech_synthesis,
+                "{id} must not advertise audio"
+            );
+        }
+    }
+
+    #[test]
+    fn audio_input_and_output_are_mapped() {
+        let mut req = request();
+        req.messages = vec![LlmMessage {
+            audio: Some(LlmAudio {
+                data: b"RIFF".to_vec(),
+                format: AudioFormat::Wav,
+            }),
+            ..LlmMessage::user("what is said here?")
+        }];
+        req.audio_output = Some(AudioFormat::Wav);
+        let body = request_body(&req);
+        assert_eq!(
+            body["messages"][0]["content"],
+            json!([
+                {"type": "text", "text": "what is said here?"},
+                {"type": "input_audio", "input_audio": {"data": "UklGRg==", "format": "wav"}},
+            ])
+        );
+        assert_eq!(body["modalities"], json!(["text", "audio"]));
+        assert_eq!(body["audio"], json!({"voice": "alloy", "format": "wav"}));
+        req.output_voice = Some("marin".into());
+        req.audio_output = Some(AudioFormat::Mp3);
+        assert_eq!(
+            request_body(&req)["audio"],
+            json!({"voice": "marin", "format": "mp3"})
+        );
+        // No audio asked: no modalities.
+        assert!(request_body(&request()).get("modalities").is_none());
+    }
+
+    #[test]
+    fn spoken_answer_is_parsed_with_its_transcript() {
+        let response = parse_response_as(
+            &json!({"choices": [{"message": {"content": null, "audio": {
+                "id": "audio_1", "data": "UklGRg==", "expires_at": 1, "transcript": "hello there"}},
+                "finish_reason": "stop"}]}),
+            Some(AudioFormat::Wav),
+        )
+        .unwrap();
+        let audio = response.audio.expect("audio");
+        assert_eq!(audio.data, b"RIFF");
+        assert_eq!(audio.format, AudioFormat::Wav);
+        assert_eq!(response.transcript.as_deref(), Some("hello there"));
+        assert_eq!(
+            response.text, "hello there",
+            "the text falls back to the transcript"
+        );
+        assert!(parse_response_as(
+            &json!({"choices": [{"message": {"audio": {"data": "%%%"}}}]}),
+            None
+        )
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn transcription_posts_a_multipart_form() {
+        let (url, seen) = stub(200, r#"{"text":"STUB TRANSCRIPT"}"#).await;
+        let provider = audio_provider("gpt-transcribe", "openai", url);
+        let transcript = provider
+            .transcribe(&LlmTranscriptionRequest {
+                model: "gpt-transcribe".into(),
+                audio: LlmAudio {
+                    data: b"RIFFdata".to_vec(),
+                    format: AudioFormat::Wav,
+                },
+                language: Some("en".into()),
+                deadline: Duration::from_secs(5),
+            })
+            .await
+            .unwrap();
+        assert_eq!(transcript.text, "STUB TRANSCRIPT");
+        let raw = seen.await.unwrap();
+        let lower = raw.to_lowercase();
+        assert!(lower.starts_with("post /v1/audio/transcriptions"), "{raw}");
+        assert!(
+            lower.contains("content-type: multipart/form-data; boundary="),
+            "{raw}"
+        );
+        assert!(
+            raw.contains("name=\"model\"\r\n\r\ngpt-transcribe\r\n"),
+            "{raw}"
+        );
+        assert!(raw.contains("name=\"language\"\r\n\r\nen\r\n"), "{raw}");
+        assert!(
+            raw.contains("filename=\"audio.wav\"\r\ncontent-type: audio/wav"),
+            "{raw}"
+        );
+        assert!(raw.contains("RIFFdata"), "{raw}");
+    }
+
+    #[tokio::test]
+    async fn speech_returns_the_audio_bytes() {
+        let (url, seen) = stub(200, "RIFFWAVE").await;
+        let provider = audio_provider("gpt-4o-mini-tts", "openai", url);
+        let audio = provider
+            .synthesize(&LlmSpeechRequest {
+                model: "gpt-4o-mini-tts".into(),
+                text: "hello".into(),
+                voice: None,
+                format: AudioFormat::Wav,
+                deadline: Duration::from_secs(5),
+            })
+            .await
+            .unwrap();
+        assert_eq!(audio.data, b"RIFFWAVE");
+        assert_eq!(audio.format, AudioFormat::Wav);
+        let raw = seen.await.unwrap();
+        assert!(
+            raw.to_lowercase().starts_with("post /v1/audio/speech"),
+            "{raw}"
+        );
+        let body: Value = serde_json::from_str(raw.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(
+            body,
+            json!({"model": "gpt-4o-mini-tts", "input": "hello", "voice": "alloy",
+                   "response_format": "wav"})
+        );
+    }
+
+    #[tokio::test]
+    async fn compatible_services_refuse_speech_and_sessions() {
+        let provider = audio_provider("m", "mistral", "http://127.0.0.1:9/v1".into());
+        let tts = LlmSpeechRequest {
+            model: "m".into(),
+            text: "x".into(),
+            voice: None,
+            format: AudioFormat::Wav,
+            deadline: Duration::from_secs(1),
+        };
+        assert!(matches!(
+            provider.synthesize(&tts).await,
+            Err(LlmFailure::Permanent { .. })
+        ));
+        assert!(speech_format_name(AudioFormat::Pcmu).is_none());
+        assert_eq!(
+            speech_format_name(AudioFormat::L16 {
+                rate: 24000,
+                channels: 1
+            }),
+            Some("pcm")
+        );
     }
 }

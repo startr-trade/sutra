@@ -1,0 +1,86 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  A SESSION ON A LIMITED NUMBER OF LINES. Each instance holds one slot of the `lines` pool for its
+  inbound call and, once its callback request is sent, one slot of the `callbacks` pool. Nothing
+  in the BPMN mentions a pool: they are channel settings.
+
+    startEvent (JSON on `session-start`: { sessionId }) — takes a `lines` slot
+      then BuildCallback : data task (FEEL) — responseBody := { sessionId, note }
+      then Notify        : send task on `agent-callback` — takes a `callbacks` slot when sent
+      then AwaitWrapUp   : message catch on `wrap-up` — the instance parks; a park releases nothing
+      then End           — releases whatever the instance still holds
+
+  `session-end: on-message: session-closed` on session-start lets a session give its slots back
+  before the instance ends: the instance keeps waiting at AwaitWrapUp without holding a line.
+-->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI"
+                  xmlns:dc="http://www.omg.org/spec/DD/20100524/DC"
+                  xmlns:di="http://www.omg.org/spec/DD/20100524/DI"
+                  xmlns:q="urn:sutra:q:1.0"
+                  id="Definitions_session"
+                  targetNamespace="urn:sutra:module:lines:1.0.0">
+
+  <bpmn:process id="session" name="A session on a pooled line" isExecutable="true">
+
+    <bpmn:extensionElements>
+      <q:variables>
+        <q:variable name="responseBody" type="object"/>  <!-- the callback request's body -->
+      </q:variables>
+    </bpmn:extensionElements>
+
+    <bpmn:startEvent id="Start" name="Session opened">
+      <bpmn:extensionElements>
+        <q:source channel="session-start"/>
+        <!-- How session-closed and wrap-up find this instance. -->
+        <q:alias name="sessionId" expression="payload.sessionId" unique="true" onConflict="correlate"/>
+      </bpmn:extensionElements>
+      <bpmn:outgoing>F1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="F1" sourceRef="Start" targetRef="BuildCallback"/>
+
+    <bpmn:serviceTask id="BuildCallback" name="Build the callback (FEEL)">
+      <bpmn:incoming>F1</bpmn:incoming><bpmn:outgoing>F2</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment>
+          <bpmn:from>{sessionId: payload.sessionId, note: "call the session back"}</bpmn:from>
+          <bpmn:to>responseBody</bpmn:to>
+        </bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F2" sourceRef="BuildCallback" targetRef="Notify"/>
+
+    <bpmn:sendTask id="Notify" name="Request a callback">
+      <bpmn:extensionElements>
+        <q:send channel="agent-callback"/>
+      </bpmn:extensionElements>
+      <bpmn:incoming>F2</bpmn:incoming><bpmn:outgoing>F3</bpmn:outgoing>
+    </bpmn:sendTask>
+    <bpmn:sequenceFlow id="F3" sourceRef="Notify" targetRef="AwaitWrapUp"/>
+
+    <bpmn:intermediateCatchEvent id="AwaitWrapUp" name="Wrap-up received">
+      <bpmn:extensionElements>
+        <q:source channel="wrap-up"/>
+      </bpmn:extensionElements>
+      <bpmn:incoming>F3</bpmn:incoming><bpmn:outgoing>F4</bpmn:outgoing>
+      <bpmn:messageEventDefinition id="AwaitWrapUp_Msg"/>
+    </bpmn:intermediateCatchEvent>
+    <bpmn:sequenceFlow id="F4" sourceRef="AwaitWrapUp" targetRef="End"/>
+
+    <bpmn:endEvent id="End" name="Session done"><bpmn:incoming>F4</bpmn:incoming></bpmn:endEvent>
+  </bpmn:process>
+
+  <bpmndi:BPMNDiagram id="Diagram_session">
+    <bpmndi:BPMNPlane id="Plane_session" bpmnElement="session">
+      <bpmndi:BPMNShape id="S_Start" bpmnElement="Start"><dc:Bounds x="100" y="100" width="36" height="36"/></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="S_BuildCallback" bpmnElement="BuildCallback"><dc:Bounds x="190" y="78" width="110" height="80"/></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="S_Notify" bpmnElement="Notify"><dc:Bounds x="350" y="78" width="110" height="80"/></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="S_AwaitWrapUp" bpmnElement="AwaitWrapUp"><dc:Bounds x="510" y="100" width="36" height="36"/></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="S_End" bpmnElement="End"><dc:Bounds x="610" y="100" width="36" height="36"/></bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="E_F1" bpmnElement="F1"><di:waypoint x="136" y="118"/><di:waypoint x="190" y="118"/></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="E_F2" bpmnElement="F2"><di:waypoint x="300" y="118"/><di:waypoint x="350" y="118"/></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="E_F3" bpmnElement="F3"><di:waypoint x="460" y="118"/><di:waypoint x="510" y="118"/></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="E_F4" bpmnElement="F4"><di:waypoint x="546" y="118"/><di:waypoint x="610" y="118"/></bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</bpmn:definitions>

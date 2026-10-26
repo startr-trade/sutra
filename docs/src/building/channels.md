@@ -29,6 +29,15 @@ protocol and no listener of their own. `local` delivers in-process to another ch
 the delivery as a task a worker fetches instead of dialing anything, which is the
 [external-task surface](external-tasks.md).
 
+Phone calls, IVRs and meetings are not part of this engine's build. The `voip` transport, the
+WebRTC media worker and the voice, IVR, meeting and video examples live in the separate
+open-source repository [sutra-voice](https://github.com/startr-trade/sutra-voice). It builds on
+this engine as a git submodule and ships its own engine image with the `voip` transport linked in.
+The model side they rely on stays here: `llm` channels with
+[audio parts](llm-channels.md#audio-images-and-video),
+[live audio sessions](llm-channels.md#live-audio-sessions-preview), `q:audit capture="media"` and
+the object store ([Recordings and media references](recordings-and-media.md)).
+
 ```mermaid
 flowchart LR
     H["http"] --> SPI

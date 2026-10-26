@@ -222,6 +222,8 @@ async fn boot(package_dir: PathBuf, datasource_url: &str) -> RunningEngine {
         rls_bypass_check_enabled: false,
         telemetry: sutra_engine::TelemetryConfig::default(),
         admin_auth: Default::default(),
+        capacity_pools: Vec::new(),
+        object_stores: Vec::new(),
         now_override: None,
     })
     .await

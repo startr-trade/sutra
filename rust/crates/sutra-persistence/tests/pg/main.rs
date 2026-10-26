@@ -4,6 +4,7 @@
 
 mod alias;
 mod audit_event;
+mod capacity;
 mod channel;
 mod data_key;
 mod dead_letter;

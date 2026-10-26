@@ -62,6 +62,36 @@ pub struct ChannelBinding {
     pub max_concurrent_instances: Option<u32>,
     /// Cap counting mode — `true` (default) counts only RUNNING instances.
     pub use_only_in_flight_for_concurrency_cap: bool,
+    /// `pool:` — the engine-declared capacity pool (`sutra.capacity-pools.<name>`) the
+    /// instances of this channel draw a slot from. On an inbound channel a new instance takes a
+    /// slot or is rejected busy; on an outbound channel a request waits in the outbox until its
+    /// call holds a slot. `None` = the channel draws from no pool.
+    pub pool: Option<String>,
+    /// `pool-call-key: header.<name>` — the header whose value identifies a call on this pooled
+    /// channel (stored lower-cased, without the `header.` prefix). The slot of an inbound
+    /// admission, or of an outbound request, is held for that call; absent (or absent from the
+    /// message), the delivery's or the outbox entry's own identity is the call key. On a
+    /// session channel the same header names the call a `session-end: on-message` ends.
+    pub pool_call_key: Option<String>,
+    /// `session-end:` (inbound channels only) — what ends the session an instance admitted here
+    /// holds, releasing its slot before the instance reaches End. `None` = only End (or a
+    /// failure) releases.
+    pub session_end: Option<SessionEnd>,
+}
+
+/// An inbound channel's `session-end:` block: the events that release an instance's slots (its
+/// channel admission slot and capacity-pool slots) while the instance runs on.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SessionEnd {
+    /// `on-message: <channel>` — an inbound channel of the same file; a message on it that
+    /// correlates to an instance (the usual `<q:alias>` correlation) ends a call of that
+    /// instance. When this channel declares `pool-call-key:` and the message carries that
+    /// header, only the call it names is released (its pool slot; and the channel slot too when
+    /// it is the inbound call this channel admitted). Otherwise the whole session is released.
+    pub on_message: Option<String>,
+    /// `on-reply: true` — the flow's destination-less reply on this channel ends the replying
+    /// instance's inbound call: its channel slot and the pool slot that call took.
+    pub on_reply: bool,
 }
 
 impl ChannelBinding {
@@ -84,7 +114,22 @@ impl ChannelBinding {
             broadcast: false,
             max_concurrent_instances: None,
             use_only_in_flight_for_concurrency_cap: true,
+            pool: None,
+            pool_call_key: None,
+            session_end: None,
         }
+    }
+
+    /// The call key a message (or request) with `headers` carries on this channel: the value of
+    /// the declared `pool-call-key` header, matched case-insensitively. `None` when the channel
+    /// declares none or the header is absent or empty.
+    pub fn call_key_in(&self, headers: &BTreeMap<String, String>) -> Option<String> {
+        let name = self.pool_call_key.as_deref()?;
+        headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.trim().to_string())
+            .filter(|v| !v.is_empty())
     }
 
     /// The single tenant authorised to receive on this channel.
@@ -157,8 +202,13 @@ impl ChannelDefinition {
     /// without a durable park. Deliberately not [`Self::effective_ack_mode`]: that applies the
     /// inbound per-transport default (`http` → `on-complete`), which must never turn an existing
     /// outbound channel synchronous.
+    ///
+    /// A channel that draws from a capacity pool (`pool:`) is never synchronous: its request
+    /// may have to wait for a slot, and only the outbox can hold a request back without holding
+    /// the caller's connection, so it takes the asynchronous path.
     pub fn is_sync_outbound(&self) -> bool {
         self.is_outbound()
+            && self.binding.pool.is_none()
             && self
                 .properties
                 .get("ack-mode")
@@ -251,8 +301,17 @@ const RESERVED_KEYS: [&str; 14] = [
 // (a 15th entry keeps the array literal readable).
 const RESERVED_IN_FLIGHT_KEY: &str = "use-only-in-flight-for-concurrency-cap";
 
+/// The capacity-pool and session keys, consumed as first-class binding fields.
+const POOL_KEY: &str = "pool";
+const POOL_CALL_KEY_KEY: &str = "pool-call-key";
+const SESSION_END_KEY: &str = "session-end";
+
 fn is_reserved(key: &str) -> bool {
-    RESERVED_KEYS.contains(&key) || key == RESERVED_IN_FLIGHT_KEY
+    RESERVED_KEYS.contains(&key)
+        || key == RESERVED_IN_FLIGHT_KEY
+        || key == POOL_KEY
+        || key == POOL_CALL_KEY_KEY
+        || key == SESSION_END_KEY
 }
 
 /// Load a tenant channel YAML into [`ChannelDefinition`]s. The `(tenant, module,
@@ -309,6 +368,9 @@ pub fn load_channel_definitions(
         let max_concurrent =
             optional_positive_int(entry, "max-concurrent-instances", i, source_for_errors)?;
         let use_only_in_flight = optional_boolean(entry, RESERVED_IN_FLIGHT_KEY, true);
+        let pool = optional_string(entry, POOL_KEY).map(|p| p.trim().to_string());
+        let pool_call_key = parse_pool_call_key(entry, &name, pool.is_some(), source_for_errors)?;
+        let session_end = parse_session_end(entry, &name, source_for_errors)?;
 
         let namespace = Namespace::new(tenant, module, version);
         let binding = ChannelBinding {
@@ -320,6 +382,9 @@ pub fn load_channel_definitions(
             broadcast,
             max_concurrent_instances: max_concurrent,
             use_only_in_flight_for_concurrency_cap: use_only_in_flight,
+            pool,
+            pool_call_key,
+            session_end,
         };
         out.push(ChannelDefinition {
             binding,
@@ -333,7 +398,144 @@ pub fn load_channel_definitions(
             properties: extract_properties(entry),
         });
     }
+    validate_session_ends(&out, source_for_errors)?;
     Ok(out)
+}
+
+/// Parse an entry's optional `pool-call-key: header.<name>`; it needs a `pool:` to key.
+fn parse_pool_call_key(
+    entry: &serde_yaml_ng::Mapping,
+    channel: &str,
+    pooled: bool,
+    source: &str,
+) -> Result<Option<String>, Diagnostic> {
+    let invalid = |detail: String| {
+        Diagnostic::error(
+            codes::CONFIG_CHANNEL_POOL_CALL_KEY_INVALID,
+            format!("Channel YAML {source}: channel '{channel}' pool-call-key {detail}"),
+        )
+        .with_attribute("channel", channel)
+    };
+    let raw = match get(entry, POOL_CALL_KEY_KEY) {
+        None | Some(serde_yaml_ng::Value::Null) => return Ok(None),
+        Some(serde_yaml_ng::Value::String(raw)) => raw.trim(),
+        Some(_) => return Err(invalid("must be a string (header.<name>)".to_string())),
+    };
+    let name = raw
+        .strip_prefix("header.")
+        .map(str::trim)
+        .filter(|n| {
+            !n.is_empty()
+                && n.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        })
+        .ok_or_else(|| invalid(format!("'{raw}' is not of the form header.<name>")))?;
+    if !pooled {
+        return Err(invalid(
+            "is declared on a channel that draws from no capacity pool (add pool:)".to_string(),
+        ));
+    }
+    Ok(Some(name.to_ascii_lowercase()))
+}
+
+/// Parse an entry's optional `session-end:` mapping (`on-message`, `on-reply`).
+fn parse_session_end(
+    entry: &serde_yaml_ng::Mapping,
+    channel: &str,
+    source: &str,
+) -> Result<Option<SessionEnd>, Diagnostic> {
+    let invalid = |detail: String| {
+        Diagnostic::error(
+            codes::CONFIG_CHANNEL_SESSION_END_INVALID,
+            format!("Channel YAML {source}: channel '{channel}' session-end {detail}"),
+        )
+        .with_attribute("channel", channel)
+    };
+    let block = match get(entry, SESSION_END_KEY) {
+        None | Some(serde_yaml_ng::Value::Null) => return Ok(None),
+        Some(serde_yaml_ng::Value::Mapping(block)) => block,
+        Some(_) => return Err(invalid("must be a mapping".to_string())),
+    };
+    let mut session_end = SessionEnd::default();
+    for (key, value) in block {
+        let serde_yaml_ng::Value::String(key) = key else {
+            return Err(invalid("keys must be strings".to_string()));
+        };
+        match (key.as_str(), value) {
+            ("on-message", serde_yaml_ng::Value::String(target)) if !target.trim().is_empty() => {
+                session_end.on_message = Some(target.trim().to_string());
+            }
+            ("on-message", _) => {
+                return Err(invalid("on-message must name a channel".to_string()));
+            }
+            ("on-reply", serde_yaml_ng::Value::Bool(b)) => session_end.on_reply = *b,
+            ("on-reply", _) => return Err(invalid("on-reply must be true or false".to_string())),
+            (other, _) => {
+                return Err(invalid(format!(
+                    "has unknown key '{other}' (expected on-message, on-reply)"
+                )))
+            }
+        }
+    }
+    if session_end.on_message.is_none() && !session_end.on_reply {
+        return Err(invalid(
+            "declares nothing that ends a session (set on-message and/or on-reply: true)"
+                .to_string(),
+        ));
+    }
+    Ok(Some(session_end))
+}
+
+/// Cross-entry `session-end:` rules: only an inbound channel declares one, and its
+/// `on-message` names ANOTHER inbound channel of the same file.
+fn validate_session_ends(
+    definitions: &[ChannelDefinition],
+    source: &str,
+) -> Result<(), Diagnostic> {
+    for def in definitions {
+        let Some(session_end) = &def.binding.session_end else {
+            continue;
+        };
+        let channel = &def.binding.channel_name;
+        let invalid = |detail: String| {
+            Diagnostic::error(
+                codes::CONFIG_CHANNEL_SESSION_END_INVALID,
+                format!("Channel YAML {source}: channel '{channel}' session-end {detail}"),
+            )
+            .with_attribute("channel", channel)
+        };
+        if def.is_outbound() {
+            return Err(invalid(
+                "is declared on an outbound channel; only an inbound channel admits sessions"
+                    .to_string(),
+            ));
+        }
+        if let Some(target) = &session_end.on_message {
+            if target == channel {
+                return Err(invalid(format!(
+                    "on-message names the session's own channel '{target}'"
+                )));
+            }
+            match definitions
+                .iter()
+                .find(|d| d.binding.channel_name == *target)
+            {
+                None => {
+                    return Err(invalid(format!(
+                        "on-message names '{target}', which is not a channel of this file"
+                    )))
+                }
+                Some(d) if d.is_outbound() => {
+                    return Err(invalid(format!(
+                        "on-message names '{target}', which is an outbound channel; it must be \
+                         an inbound channel"
+                    )))
+                }
+                Some(_) => {}
+            }
+        }
+    }
+    Ok(())
 }
 
 fn get<'a>(entry: &'a serde_yaml_ng::Mapping, key: &str) -> Option<&'a serde_yaml_ng::Value> {

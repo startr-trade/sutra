@@ -89,6 +89,40 @@ window — they need an operator before their deployment may retire; the operato
 [Retries, history, and schedules](../building/retries-history-schedules.md) for what the
 retention window makes queryable.
 
+With `<q:audit capture="media">`, retention also deletes the recordings the purged instances'
+audit events reference, from whichever declared object store holds them (below).
+
+## Capacity pools
+
+| `sutra.*` key | env |
+|---|---|
+| `sutra.capacity-pools` | `SUTRA_CAPACITY_POOLS` |
+| `sutra.capacity-pools.<name>.slots` | `SUTRA_CAPACITY_POOLS_<NAME>_SLOTS` |
+| `sutra.capacity-pools.<name>.reserve.inbound` | `SUTRA_CAPACITY_POOLS_<NAME>_RESERVE_INBOUND` |
+| `sutra.capacity-pools.<name>.reserve.outbound` | `SUTRA_CAPACITY_POOLS_<NAME>_RESERVE_OUTBOUND` |
+| `sutra.capacity-pools.<name>.tenants` | `SUTRA_CAPACITY_POOLS_<NAME>_TENANTS` |
+
+Named, cluster-wide slot counts that channels of any deployment draw from with `pool: <name>`.
+Full explanation, defaults and a walkthrough: [Capacity pools and sessions](capacity-pools.md).
+
+## Object stores
+
+| `sutra.*` key | env |
+|---|---|
+| `sutra.object-stores` | `SUTRA_OBJECT_STORES` |
+| `sutra.object-stores.<name>.uri` | `SUTRA_OBJECT_STORES_<NAME>_URI` |
+| `sutra.object-stores.<name>.endpoint` | `SUTRA_OBJECT_STORES_<NAME>_ENDPOINT` |
+| `sutra.object-stores.<name>.region` | `SUTRA_OBJECT_STORES_<NAME>_REGION` |
+| `sutra.object-stores.<name>.access-key` / `.secret-key` | `SUTRA_OBJECT_STORES_<NAME>_ACCESS_KEY` / `_SECRET_KEY` |
+| `sutra.object-stores.<name>.encryption` | `SUTRA_OBJECT_STORES_<NAME>_ENCRYPTION` |
+| `sutra.object-stores.<name>.kek` | `SUTRA_OBJECT_STORES_<NAME>_KEK` |
+| `sutra.object-stores.<name>.key-id` | `SUTRA_OBJECT_STORES_<NAME>_KEY_ID` |
+
+Named S3-compatible buckets the engine reads recorded media from (an `llm` channel's
+`media-store`) and deletes it in (erasure and retention). Credentials and the key-encryption
+secret are references, resolved at boot; a store that cannot be built refuses startup. Full
+explanation and a walkthrough: [Recordings and media references](../building/recordings-and-media.md#object-stores).
+
 ## External tasks (the pull worker surface) {#external-tasks-the-pull-worker-surface}
 
 | `sutra.*` key | env |

@@ -149,6 +149,10 @@ pub(crate) type ProcessNodeIndex = BTreeMap<String, NodeShape>;
 #[derive(Debug, Clone, Default)]
 pub struct DeploymentNodeIndex {
     processes: BTreeMap<String, ProcessNodeIndex>,
+    /// The deployment's tenant label. Published with the graph facts so a tenant-wide admin
+    /// operation (subject erasure) can enumerate a tenant's live deployments from this map,
+    /// whatever their source — a watched directory leaves the deployment archive table empty.
+    tenant: String,
 }
 
 impl DeploymentNodeIndex {
@@ -162,7 +166,21 @@ impl DeploymentNodeIndex {
                 processes.insert(process.id.clone(), nodes);
             }
         }
-        DeploymentNodeIndex { processes }
+        DeploymentNodeIndex {
+            processes,
+            tenant: String::new(),
+        }
+    }
+
+    /// The same index, labelled with the deployment's tenant.
+    pub(crate) fn with_tenant(mut self, tenant: &str) -> DeploymentNodeIndex {
+        self.tenant = tenant.to_owned();
+        self
+    }
+
+    /// The deployment's tenant label (empty when the index was built without one).
+    pub(crate) fn tenant(&self) -> &str {
+        &self.tenant
     }
 
     /// One process's node shapes, or `None` when the deployment does not declare that process.

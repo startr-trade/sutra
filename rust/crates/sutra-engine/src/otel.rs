@@ -566,6 +566,23 @@ pub use sutra_executor::telemetry::{
     link_span_to_traceparent, parse_traceparent,
 };
 
+/// The `sutra.audit.transport.dropped` counter: transport audit events dropped on a full journal
+/// queue, read from the process-wide registry. Registered ONCE per boot from `serve`, only when
+/// telemetry metrics are wired; fail-open like every meter here.
+pub fn register_transport_audit_meters() {
+    let meter: Meter = global::meter("sutra-engine");
+    let _ = meter
+        .u64_observable_counter(names::METRIC_AUDIT_TRANSPORT_DROPPED)
+        .with_description(
+            "Audit events a transport wrote that were dropped because the journal's queue was \
+             full.",
+        )
+        .with_callback(|observer| {
+            observer.observe(sutra_channels::transport_audit().dropped_total(), &[]);
+        })
+        .build();
+}
+
 // =====================================================================================
 // Metrics — the shard router's per-lane observable instruments (scale-out §6.1)
 // =====================================================================================

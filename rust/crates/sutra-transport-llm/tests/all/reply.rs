@@ -77,3 +77,50 @@ async fn rejected_reply_is_permanent() {
         "{outcome:?}"
     );
 }
+
+/// A call that asked for JSON gets the answer parsed under `json` (a flow cannot parse JSON
+/// text itself); a fenced answer is unwrapped; a call that did not ask, or an answer that is
+/// not an object or array, gets none.
+#[test]
+fn a_json_call_gets_its_answer_parsed() {
+    use sutra_transport_llm::structured_answer;
+    let asked = json!({"prompt": "classify", "json": true});
+    assert_eq!(
+        structured_answer(r#" {"emotion": "calm", "score": 0.2} "#, &asked),
+        Some(json!({"emotion": "calm", "score": 0.2}))
+    );
+    assert_eq!(
+        structured_answer("```json\n[1, 2]\n```", &asked),
+        Some(json!([1, 2]))
+    );
+    assert_eq!(structured_answer("not json", &asked), None);
+    assert_eq!(structured_answer("42", &asked), None);
+    assert_eq!(
+        structured_answer(r#"{"emotion": "calm"}"#, &json!({"prompt": "hi"})),
+        None
+    );
+}
+
+/// A JSON call without a parsed answer says why: cut off at the token limit (a reasoning
+/// model's thinking counts against it), or not JSON at all. A parsed answer, or a call that
+/// did not ask for JSON, says nothing.
+#[test]
+fn a_json_call_without_a_parsed_answer_says_why() {
+    use sutra_llm_spi::FinishReason;
+    use sutra_transport_llm::structured_answer_error;
+    let asked = json!({"prompt": "classify", "json": true});
+    let cut = structured_answer_error(r#"{"category": "outa"#, &FinishReason::Length, &asked)
+        .expect("a reason");
+    assert!(cut.contains("max-output-tokens"), "{cut}");
+    let prose = structured_answer_error("Sure! Here it is.", &FinishReason::Stop, &asked)
+        .expect("a reason");
+    assert!(prose.contains("not a JSON object"), "{prose}");
+    assert_eq!(
+        structured_answer_error(r#"{"a": 1}"#, &FinishReason::Stop, &asked),
+        None
+    );
+    assert_eq!(
+        structured_answer_error("text", &FinishReason::Length, &json!({"prompt": "hi"})),
+        None
+    );
+}

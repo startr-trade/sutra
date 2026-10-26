@@ -43,6 +43,37 @@
 //! | `sutra.admin.auth.scheme`         | `SUTRA_ADMIN_AUTH_SCHEME`         |
 //! | `sutra.admin.auth.key-ref`        | `SUTRA_ADMIN_AUTH_KEY_REF`        |
 //! | `sutra.admin.auth.header`         | `SUTRA_ADMIN_AUTH_HEADER`         |
+//! | `sutra.capacity-pools`            | `SUTRA_CAPACITY_POOLS`            |
+//! | `sutra.capacity-pools.<name>.slots` | `SUTRA_CAPACITY_POOLS_<NAME>_SLOTS` |
+//! | `sutra.capacity-pools.<name>.reserve.inbound` | `SUTRA_CAPACITY_POOLS_<NAME>_RESERVE_INBOUND` |
+//! | `sutra.capacity-pools.<name>.reserve.outbound` | `SUTRA_CAPACITY_POOLS_<NAME>_RESERVE_OUTBOUND` |
+//! | `sutra.capacity-pools.<name>.tenants` | `SUTRA_CAPACITY_POOLS_<NAME>_TENANTS` |
+//! | `sutra.object-stores`             | `SUTRA_OBJECT_STORES`             |
+//! | `sutra.object-stores.<name>.uri`  | `SUTRA_OBJECT_STORES_<NAME>_URI`  |
+//! | `sutra.object-stores.<name>.endpoint` | `SUTRA_OBJECT_STORES_<NAME>_ENDPOINT` |
+//! | `sutra.object-stores.<name>.region` | `SUTRA_OBJECT_STORES_<NAME>_REGION` |
+//! | `sutra.object-stores.<name>.access-key` | `SUTRA_OBJECT_STORES_<NAME>_ACCESS_KEY` |
+//! | `sutra.object-stores.<name>.secret-key` | `SUTRA_OBJECT_STORES_<NAME>_SECRET_KEY` |
+//! | `sutra.object-stores.<name>.encryption` | `SUTRA_OBJECT_STORES_<NAME>_ENCRYPTION` |
+//! | `sutra.object-stores.<name>.kek`  | `SUTRA_OBJECT_STORES_<NAME>_KEK`  |
+//! | `sutra.object-stores.<name>.key-id` | `SUTRA_OBJECT_STORES_<NAME>_KEY_ID` |
+//!
+//! Capacity pools: a pool is declared by any `sutra.capacity-pools.<name>.*` key in the file, or
+//! by naming it in the comma-separated `sutra.capacity-pools` list (the env-only route — the
+//! environment cannot be enumerated, so a pool set purely by env vars is listed there).
+//! `<NAME>` in an env var is the pool name upper-cased with `-` as `_`. `slots` is required;
+//! the reserves default to 0 and `tenants` (comma-separated) to every tenant.
+//!
+//! Object stores: a store is declared like a capacity pool — any `sutra.object-stores.<name>.*`
+//! file key, or the name in the comma-separated `sutra.object-stores` list. `uri` is
+//! `s3://<bucket>[/<prefix>]` (or `memory://…` for tests) and is required; `endpoint` addresses
+//! a self-hosted store path-style; `region` defaults to `us-east-1`; `access-key` /
+//! `secret-key` (required for `s3://`) and `kek` are secret references (`env:`, `secret:`, …)
+//! resolved at boot. `encryption` is `envelope` (the default: objects are sealed, `kek` required)
+//! or `none`; `key-id` (default `recordings`) is the key id sealed objects name. An `llm` channel
+//! reads media references from the store its `llm.media-store` names; erasure and terminal
+//! retention delete the recordings `q:audit` media events reference from whichever declared
+//! store holds them.
 //!
 //! Admin auth: the `/admin/*` surface is gated. Two models, fail-closed:
 //! * **Auth key + secret** (`sutra.admin.auth.*`) — the SAME static-secret model the channels use
@@ -112,8 +143,10 @@ pub struct EngineConfig {
     pub datasource_url: Option<String>,
     pub datasource_username: Option<String>,
     pub datasource_password: Option<String>,
-    /// Encryption at rest — the master secret (`sutra.crypto.master-key`, via `secret:`/`env:`)
-    /// from which per-tenant DEKs are HKDF-derived. `None` ⇒ encryption disabled:
+    /// Encryption at rest — the master secret (`sutra.crypto.master-key`) from which per-tenant
+    /// DEKs are HKDF-derived. Kept UNRESOLVED here: it is a reference (`env:`/`secret:`/`vault:`/
+    /// `${…}`) resolved whole-value at boot; a literal value is still accepted as the raw secret,
+    /// with a warning. `None` ⇒ encryption disabled:
     /// sensitive instance variables persist as plaintext v2 (backward-compatible). Set it to turn on
     /// at-rest encryption for `@sensitive` + redactor-controlled variables.
     pub crypto_master_key: Option<String>,
@@ -184,6 +217,13 @@ pub struct EngineConfig {
     /// The `/admin/*` OIDC gating keys (`sutra.admin.oidc.*`). Fail-CLOSED — the admin
     /// surface is never open by default; see [`AdminAuthConfig`].
     pub admin_auth: AdminAuthConfig,
+    /// The declared capacity pools (`sutra.capacity-pools.<name>.*`), sorted by name. Channels
+    /// reference them by name (`pool:`); a deployment naming an undeclared pool, or one whose
+    /// `tenants` allow-list excludes the channel's tenant, fails to load. Empty by default.
+    pub capacity_pools: Vec<sutra_channels::CapacityPool>,
+    /// The declared object stores (`sutra.object-stores.<name>.*`), sorted by name; installed at
+    /// boot into [`sutra_objectstore::registry`].
+    pub object_stores: Vec<ObjectStoreConfig>,
     /// TEST-ONLY seam (P1-7 time-skipping test runtime): installs a [`sutra_executor::TestClock`]
     /// as the "now" every temporal read in this boot uses — the executor's `now_supplier` (park
     /// due-ats, `<q:retry>` backoff), the timer poller's per-tick claim instant, and the
@@ -223,6 +263,8 @@ impl Default for EngineConfig {
             audit: AuditConfig::default(),
             telemetry: crate::otel::TelemetryConfig::default(),
             admin_auth: AdminAuthConfig::default(),
+            capacity_pools: Vec::new(),
+            object_stores: Vec::new(),
             now_override: None,
         }
     }
@@ -825,6 +867,8 @@ impl EngineConfig {
             None => false,
             Some(raw) => parse_bool(&raw, "sutra.incident.sql")?,
         };
+        let capacity_pools = parse_capacity_pools(file, &value)?;
+        let object_stores = parse_object_stores(file, &value)?;
 
         Ok(EngineConfig {
             deployment_source,
@@ -897,11 +941,210 @@ impl EngineConfig {
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty()),
             },
+            capacity_pools,
+            object_stores,
             // Deliberately not read from `file`/`env` — see the field doc: the ONLY way to set
             // this is constructing an `EngineConfig` from Rust code, never config-driven.
             now_override: None,
         })
     }
+}
+
+/// The `sutra.capacity-pools.*` declarations (see the module docs): every pool named by a file
+/// key or by the `sutra.capacity-pools` list, each field overridable by its canonical env var.
+/// A config-key lookup: `(file key, canonical env var) → resolved value`.
+type ConfigLookup<'a> = &'a dyn Fn(&str, &str) -> Result<Option<String>, ConfigError>;
+
+fn parse_capacity_pools(
+    file: &BTreeMap<String, String>,
+    value: ConfigLookup<'_>,
+) -> Result<Vec<sutra_channels::CapacityPool>, ConfigError> {
+    const PREFIX: &str = "sutra.capacity-pools.";
+    let mut names: std::collections::BTreeSet<String> = file
+        .keys()
+        .filter_map(|key| key.strip_prefix(PREFIX))
+        .filter_map(|rest| rest.split('.').next())
+        .map(str::to_string)
+        .collect();
+    if let Some(list) = value("sutra.capacity-pools", "SUTRA_CAPACITY_POOLS")? {
+        names.extend(
+            list.split(',')
+                .map(|n| n.trim().to_string())
+                .filter(|n| !n.is_empty()),
+        );
+    }
+    let count = |raw: &str, key: &str| -> Result<u32, ConfigError> {
+        raw.trim()
+            .parse::<u32>()
+            .map_err(|_| ConfigError(format!("{key}: '{raw}' is not a non-negative slot count")))
+    };
+    let mut pools = Vec::new();
+    for name in names {
+        let env_name = name.to_ascii_uppercase().replace('-', "_");
+        let key = |field: &str| format!("{PREFIX}{name}.{field}");
+        let env = |field: &str| {
+            format!(
+                "SUTRA_CAPACITY_POOLS_{env_name}_{}",
+                field.to_ascii_uppercase().replace(['.', '-'], "_")
+            )
+        };
+        let slots_key = key("slots");
+        let slots = match value(&slots_key, &env("slots"))? {
+            Some(raw) => count(&raw, &slots_key)?,
+            None => {
+                return Err(ConfigError(format!(
+                    "capacity pool '{name}' is declared but {slots_key} is not set"
+                )))
+            }
+        };
+        let mut reserves = [0u32; 2];
+        for (i, field) in ["reserve.inbound", "reserve.outbound"].iter().enumerate() {
+            let k = key(field);
+            if let Some(raw) = value(&k, &env(field))? {
+                reserves[i] = count(&raw, &k)?;
+            }
+        }
+        let mut pool =
+            sutra_channels::CapacityPool::new(&name, slots).with_reserves(reserves[0], reserves[1]);
+        if let Some(raw) = value(&key("tenants"), &env("tenants"))? {
+            let tenants: Vec<String> = raw
+                .split(',')
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty())
+                .collect();
+            if tenants.is_empty() {
+                return Err(ConfigError(format!(
+                    "{}: an empty allow-list would admit no tenant (leave the key unset to \
+                     allow every tenant)",
+                    key("tenants")
+                )));
+            }
+            pool = pool.with_tenants(tenants);
+        }
+        pool.validate().map_err(ConfigError)?;
+        pools.push(pool);
+    }
+    Ok(pools)
+}
+
+/// One declared object store (`sutra.object-stores.<name>.*`). The credential and key fields
+/// hold secret REFERENCES, resolved at boot ([`crate::media::install_object_stores`]).
+#[derive(Clone, PartialEq, Eq)]
+pub struct ObjectStoreConfig {
+    pub name: String,
+    /// `s3://<bucket>[/<prefix>]` or `memory://<bucket>[/<prefix>]`.
+    pub uri: String,
+    pub endpoint: Option<String>,
+    pub region: String,
+    pub access_key_ref: Option<String>,
+    pub secret_key_ref: Option<String>,
+    /// `encryption: envelope` — objects are sealed under `kek_ref`.
+    pub sealed: bool,
+    pub kek_ref: Option<String>,
+    pub key_id: String,
+}
+
+impl fmt::Debug for ObjectStoreConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ObjectStoreConfig")
+            .field("name", &self.name)
+            .field("uri", &self.uri)
+            .field("endpoint", &self.endpoint)
+            .field("region", &self.region)
+            .field(
+                "credentials",
+                &self.access_key_ref.as_ref().map(|_| "<set>"),
+            )
+            .field("sealed", &self.sealed)
+            .field("key_id", &self.key_id)
+            .finish()
+    }
+}
+
+/// The `sutra.object-stores.*` declarations (see the module docs), each field overridable by its
+/// canonical env var.
+fn parse_object_stores(
+    file: &BTreeMap<String, String>,
+    value: ConfigLookup<'_>,
+) -> Result<Vec<ObjectStoreConfig>, ConfigError> {
+    const PREFIX: &str = "sutra.object-stores.";
+    let mut names: std::collections::BTreeSet<String> = file
+        .keys()
+        .filter_map(|key| key.strip_prefix(PREFIX))
+        .filter_map(|rest| rest.split('.').next())
+        .map(str::to_string)
+        .collect();
+    if let Some(list) = value("sutra.object-stores", "SUTRA_OBJECT_STORES")? {
+        names.extend(
+            list.split(',')
+                .map(|n| n.trim().to_string())
+                .filter(|n| !n.is_empty()),
+        );
+    }
+    let mut stores = Vec::new();
+    for name in names {
+        let env_name = name.to_ascii_uppercase().replace('-', "_");
+        let key = |field: &str| format!("{PREFIX}{name}.{field}");
+        let get = |field: &str| -> Result<Option<String>, ConfigError> {
+            let env = format!(
+                "SUTRA_OBJECT_STORES_{env_name}_{}",
+                field.to_ascii_uppercase().replace('-', "_")
+            );
+            Ok(value(&key(field), &env)?
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty()))
+        };
+        let uri = get("uri")?.ok_or_else(|| {
+            ConfigError(format!(
+                "object store '{name}' is declared but {} is not set",
+                key("uri")
+            ))
+        })?;
+        let location = sutra_objectstore::StoreLocation::parse(&uri)
+            .map_err(|e| ConfigError(format!("{}: {e}", key("uri"))))?;
+        let sealed = match get("encryption")?
+            .map(|e| e.to_ascii_lowercase())
+            .as_deref()
+        {
+            None | Some("envelope") => true,
+            Some("none") => false,
+            Some(other) => {
+                return Err(ConfigError(format!(
+                    "{}: '{other}' is not envelope or none",
+                    key("encryption")
+                )))
+            }
+        };
+        let kek_ref = get("kek")?;
+        if sealed && kek_ref.is_none() {
+            return Err(ConfigError(format!(
+                "object store '{name}' seals its objects (encryption: envelope) and needs {}                  (or set {}=none when the store encrypts at rest)",
+                key("kek"),
+                key("encryption")
+            )));
+        }
+        let access_key_ref = get("access-key")?;
+        let secret_key_ref = get("secret-key")?;
+        if location.scheme == "s3" && (access_key_ref.is_none() || secret_key_ref.is_none()) {
+            return Err(ConfigError(format!(
+                "object store '{name}' is an s3:// store and needs {} and {}",
+                key("access-key"),
+                key("secret-key")
+            )));
+        }
+        stores.push(ObjectStoreConfig {
+            name: name.clone(),
+            uri,
+            endpoint: get("endpoint")?,
+            region: get("region")?.unwrap_or_else(|| "us-east-1".to_string()),
+            access_key_ref,
+            secret_key_ref,
+            sealed,
+            kek_ref: if sealed { kek_ref } else { None },
+            key_id: get("key-id")?.unwrap_or_else(|| "recordings".to_string()),
+        });
+    }
+    Ok(stores)
 }
 
 /// Parse a duration value: the ISO-8601 `P…DT…H…M…S` subset the configs use
@@ -1194,6 +1437,140 @@ mod tests {
             "PT0S".to_string(),
         );
         assert!(EngineConfig::from_sources(&file, &|_| None).is_err());
+    }
+
+    #[test]
+    fn object_stores_are_declared_by_file_keys_or_the_list_and_fail_closed() {
+        let mut file = BTreeMap::new();
+        file.insert("sutra.deployments.dir".to_string(), "/r".to_string());
+        assert!(EngineConfig::from_sources(&file, &|_| None)
+            .unwrap()
+            .object_stores
+            .is_empty());
+        file.insert(
+            "sutra.object-stores.recordings.uri".to_string(),
+            "s3://call-recordings/calls".to_string(),
+        );
+        file.insert(
+            "sutra.object-stores.recordings.endpoint".to_string(),
+            "http://store:9000".to_string(),
+        );
+        file.insert(
+            "sutra.object-stores.recordings.access-key".to_string(),
+            "env:STORE_ACCESS".to_string(),
+        );
+        file.insert(
+            "sutra.object-stores.recordings.secret-key".to_string(),
+            "env:STORE_SECRET".to_string(),
+        );
+        file.insert(
+            "sutra.object-stores.recordings.kek".to_string(),
+            "secret:recordings-kek".to_string(),
+        );
+        // `scratch` is declared by env alone, through the list key, and stores objects as is.
+        let env = |name: &str| match name {
+            "SUTRA_OBJECT_STORES" => Some("scratch".to_string()),
+            "SUTRA_OBJECT_STORES_SCRATCH_URI" => Some("memory://scratch-media".to_string()),
+            "SUTRA_OBJECT_STORES_SCRATCH_ENCRYPTION" => Some("none".to_string()),
+            "SUTRA_OBJECT_STORES_RECORDINGS_KEY_ID" => Some("calls-2026".to_string()),
+            _ => None,
+        };
+        let c = EngineConfig::from_sources(&file, &env).unwrap();
+        let names: Vec<&str> = c.object_stores.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["recordings", "scratch"]);
+        let rec = &c.object_stores[0];
+        assert_eq!(rec.endpoint.as_deref(), Some("http://store:9000"));
+        assert_eq!(rec.region, "us-east-1");
+        assert!(rec.sealed);
+        assert_eq!(rec.kek_ref.as_deref(), Some("secret:recordings-kek"));
+        assert_eq!(rec.key_id, "calls-2026");
+        assert!(!format!("{rec:?}").contains("STORE_ACCESS"));
+        let scratch = &c.object_stores[1];
+        assert!(!scratch.sealed && scratch.kek_ref.is_none());
+        assert_eq!(scratch.key_id, "recordings");
+
+        // Fail closed: no uri, a bad uri, sealed without a kek, s3 without credentials, an
+        // unknown encryption.
+        for (key, value) in [
+            ("sutra.object-stores.other.region", "eu-west-1"),
+            ("sutra.object-stores.recordings.uri", "ftp://x"),
+            ("sutra.object-stores.recordings.kek", ""),
+            ("sutra.object-stores.recordings.secret-key", ""),
+            ("sutra.object-stores.recordings.encryption", "rot13"),
+        ] {
+            let mut broken = file.clone();
+            broken.insert(key.to_string(), value.to_string());
+            assert!(
+                EngineConfig::from_sources(&broken, &|_| None).is_err(),
+                "{key}={value}"
+            );
+        }
+    }
+
+    #[test]
+    fn capacity_pools_are_declared_by_file_keys_or_the_list_and_env_overrides_each_field() {
+        let mut file = BTreeMap::new();
+        file.insert("sutra.deployments.dir".to_string(), "/r".to_string());
+        // None by default.
+        let c = EngineConfig::from_sources(&file, &|_| None).unwrap();
+        assert!(c.capacity_pools.is_empty());
+
+        file.insert(
+            "sutra.capacity-pools.trunk-main.slots".to_string(),
+            "30".to_string(),
+        );
+        file.insert(
+            "sutra.capacity-pools.trunk-main.reserve.inbound".to_string(),
+            "6".to_string(),
+        );
+        file.insert(
+            "sutra.capacity-pools.trunk-main.tenants".to_string(),
+            "default, acme".to_string(),
+        );
+        // `seats` is declared by env alone, through the list key.
+        let env = |name: &str| match name {
+            "SUTRA_CAPACITY_POOLS" => Some("seats".to_string()),
+            "SUTRA_CAPACITY_POOLS_SEATS_SLOTS" => Some("5".to_string()),
+            "SUTRA_CAPACITY_POOLS_TRUNK_MAIN_RESERVE_OUTBOUND" => Some("2".to_string()),
+            _ => None,
+        };
+        let c = EngineConfig::from_sources(&file, &env).unwrap();
+        assert_eq!(
+            c.capacity_pools,
+            vec![
+                sutra_channels::CapacityPool::new("seats", 5),
+                sutra_channels::CapacityPool::new("trunk-main", 30)
+                    .with_reserves(6, 2)
+                    .with_tenants(vec!["default".to_string(), "acme".to_string()]),
+            ]
+        );
+
+        // Fail closed: a declared pool without slots, reserves larger than the pool, a bad
+        // number, an empty allow-list.
+        let mut broken = file.clone();
+        broken.insert(
+            "sutra.capacity-pools.other.reserve.inbound".to_string(),
+            "1".to_string(),
+        );
+        assert!(EngineConfig::from_sources(&broken, &|_| None).is_err());
+        let mut broken = file.clone();
+        broken.insert(
+            "sutra.capacity-pools.trunk-main.reserve.outbound".to_string(),
+            "25".to_string(),
+        );
+        assert!(EngineConfig::from_sources(&broken, &|_| None).is_err());
+        let mut broken = file.clone();
+        broken.insert(
+            "sutra.capacity-pools.trunk-main.slots".to_string(),
+            "many".to_string(),
+        );
+        assert!(EngineConfig::from_sources(&broken, &|_| None).is_err());
+        let mut broken = file.clone();
+        broken.insert(
+            "sutra.capacity-pools.trunk-main.tenants".to_string(),
+            " , ".to_string(),
+        );
+        assert!(EngineConfig::from_sources(&broken, &|_| None).is_err());
     }
 
     #[test]

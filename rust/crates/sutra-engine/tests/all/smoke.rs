@@ -52,6 +52,8 @@ fn config_for(deployments_dir: PathBuf) -> EngineConfig {
         rls_bypass_check_enabled: true,
         telemetry: sutra_engine::TelemetryConfig::default(),
         admin_auth: Default::default(),
+        capacity_pools: Vec::new(),
+        object_stores: Vec::new(),
         now_override: None,
     }
 }

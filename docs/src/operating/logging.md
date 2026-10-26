@@ -40,6 +40,22 @@ active at once:
 | `sutra.audit.otel.endpoint` | `SUTRA_AUDIT_OTEL_ENDPOINT` | Ships audit events over OTLP to a collector. |
 | `sutra.audit.sql` | `SUTRA_AUDIT_SQL` | Persists audit rows durably in the engine's own datasource, under the same row-level-security policy as every other engine table — see [Multi-tenancy and isolation](../architecture/multi-tenancy.md). |
 
+## What an audit event captures
+
+A process chooses how much each of its audit events carries, with `<q:audit capture="…">`:
+
+| `capture` | Each event carries |
+|---|---|
+| `none` | no audit event at all |
+| `metadata` | the event, node and diagnostic, with no variable content |
+| `payload` (the default) | the redacted variable snapshot |
+| `media` (0.6) | metadata, plus the media references found among the variables (`{kind: "media", uri, sha256, …}`), never the media itself |
+
+With `media`, subject erasure and terminal retention also delete the recordings those events
+reference, and amend each event to say they are gone. See
+[Recordings and media references](../building/recordings-and-media.md) for the mechanism and a
+walkthrough.
+
 ## Replaying an instance's audit trail offline
 
 ```bash

@@ -77,6 +77,10 @@ pub const METRIC_ENGINE_SHARD_HANDOFFS: &str = "sutra.engine.shard.handoffs";
 /// cross-replica contention.
 pub const METRIC_ENGINE_SHARD_CLAIM_BOUNCES: &str = "sutra.engine.shard.claim-bounces";
 
+/// Audit events a transport wrote that were dropped because the journal's queue was full
+/// (cumulative since the process started). Non-zero means the audit store is not keeping up.
+pub const METRIC_AUDIT_TRANSPORT_DROPPED: &str = "sutra.audit.transport.dropped";
+
 // ---- attribute / dimension keys --------------------------------------------------------
 
 /// THE identity dimension — on every meter and span.
@@ -263,6 +267,10 @@ mod tests {
             assert_eq!(name, expected);
         }
         assert_eq!(ATTR_SHARD, "shard");
+        assert_eq!(
+            METRIC_AUDIT_TRANSPORT_DROPPED,
+            "sutra.audit.transport.dropped"
+        );
         assert_eq!(ATTR_CLAIM_BOUNCE_PATH, "path");
     }
 }

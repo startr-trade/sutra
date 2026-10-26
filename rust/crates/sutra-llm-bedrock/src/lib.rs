@@ -227,6 +227,8 @@ fn parse_response(value: &Value) -> Result<LlmResponse, LlmFailure> {
         usage,
         // The request id is a response header, which the shared client does not expose.
         provider_request_id: None,
+        audio: None,
+        transcript: None,
     })
 }
 
@@ -257,6 +259,8 @@ mod tests {
             max_output_tokens: None,
             temperature: None,
             deadline: Duration::from_secs(5),
+            audio_output: None,
+            output_voice: None,
         }
     }
 
@@ -266,6 +270,8 @@ mod tests {
             content: content.into(),
             tool_calls: vec![],
             tool_call_id: Some(id.into()),
+            audio: None,
+            video: None,
         }
     }
 
@@ -339,6 +345,8 @@ mod tests {
                 },
             ],
             tool_call_id: None,
+            audio: None,
+            video: None,
         };
         let b = request_body(&req(vec![
             LlmMessage::user("go"),

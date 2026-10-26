@@ -220,6 +220,7 @@ impl JobRunner {
             candidate,
             response,
             &request,
+            None,
         );
         // The row is authoritative: the channel may have been re-pointed since the submit.
         reply.module_key = job.module_key.clone();

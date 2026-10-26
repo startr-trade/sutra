@@ -1,0 +1,122 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  A STORED RECORDING, SUMMARISED, AUDITED BY REFERENCE. The request names a recording in an object
+  store by a media reference ({ kind: "media", uri, sha256, format }); the model channel reads the
+  object and sends it to the model as audio. Nothing in this process ever holds the audio itself.
+
+    startEvent (JSON on `recording-summary`: { recordingId, callerId, recording })
+      then BuildRequest : data task (FEEL) — requestBody := { messages: [ user turn + audio ref ] }
+      then AskModel     : channel-call task on `summary-model` (sync)
+      then BuildReply   : data task (FEEL) — { summary, provider, audioPreserved }, answered at once
+                          (<q:reply continue="true">)
+      then AwaitClose   : message catch on `recording-closed` — the instance stays live (parked)
+                          until the caller closes the recording
+      then End
+
+  <q:audit capture="media"> writes metadata-level audit events, and each event carries the media
+  references found among the instance's variables under `media` — the uri and digest, never the
+  audio. When the instance's data has to go (a data subject's erasure, or the end of terminal
+  retention) the engine deletes the referenced object from the store and amends those events.
+
+  `callerId` is the data subject: `subjectKey="true"` blind-indexes it, so
+  POST /admin/subjects/erase can find this instance by it.
+-->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI"
+                  xmlns:dc="http://www.omg.org/spec/DD/20100524/DC"
+                  xmlns:di="http://www.omg.org/spec/DD/20100524/DI"
+                  xmlns:q="urn:sutra:q:1.0"
+                  id="Definitions_recording_summary"
+                  targetNamespace="urn:sutra:module:recordings:1.0.0">
+
+  <bpmn:process id="recording-summary" name="Summarise a stored recording" isExecutable="true">
+
+    <bpmn:extensionElements>
+      <q:audit capture="media"/>
+      <q:variables>
+        <q:variable name="callerId" type="string" sensitive="true" subjectKey="true"/>
+        <q:variable name="recording" type="object"/>      <!-- the media reference -->
+        <q:variable name="requestBody" type="object"/>    <!-- what the model channel is sent -->
+        <q:variable name="answer" type="object"/>         <!-- the model's reply message -->
+        <q:variable name="responseObject" type="object"/> <!-- what the HTTP caller gets back -->
+      </q:variables>
+    </bpmn:extensionElements>
+
+    <bpmn:startEvent id="Start" name="Recording to summarise">
+      <bpmn:extensionElements>
+        <q:source channel="recording-summary"/>
+        <!-- How `recording-closed` finds this instance again. -->
+        <q:alias name="recordingId" expression="payload.recordingId" unique="true" onConflict="correlate"/>
+      </bpmn:extensionElements>
+      <bpmn:outgoing>F1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="F1" sourceRef="Start" targetRef="BuildRequest"/>
+
+    <!-- The audio part gives `ref` + `sha256` instead of `data`. -->
+    <bpmn:serviceTask id="BuildRequest" name="Build the request (FEEL)">
+      <bpmn:incoming>F1</bpmn:incoming><bpmn:outgoing>F2</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>payload.callerId</bpmn:from><bpmn:to>callerId</bpmn:to></bpmn:assignment>
+        <bpmn:assignment><bpmn:from>payload.recording</bpmn:from><bpmn:to>recording</bpmn:to></bpmn:assignment>
+        <bpmn:assignment>
+          <bpmn:from>{messages: [{role: "user", content: "Summarise this recording in one sentence.", audio: {ref: payload.recording.uri, sha256: payload.recording.sha256, format: payload.recording.format}}]}</bpmn:from>
+          <bpmn:to>requestBody</bpmn:to>
+        </bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F2" sourceRef="BuildRequest" targetRef="AskModel"/>
+
+    <bpmn:serviceTask id="AskModel" name="Ask the audio model" implementation="channel:summary-model">
+      <bpmn:extensionElements>
+        <q:timeout duration="PT60S"/>
+      </bpmn:extensionElements>
+      <bpmn:incoming>F2</bpmn:incoming><bpmn:outgoing>F3</bpmn:outgoing>
+      <bpmn:dataOutputAssociation>
+        <bpmn:assignment><bpmn:from>payload</bpmn:from><bpmn:to>answer</bpmn:to></bpmn:assignment>
+      </bpmn:dataOutputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F3" sourceRef="AskModel" targetRef="BuildReply"/>
+
+    <bpmn:serviceTask id="BuildReply" name="Build the reply (FEEL)">
+      <bpmn:extensionElements>
+        <q:reply mode="native" contentType="application/json" continue="true"/>
+      </bpmn:extensionElements>
+      <bpmn:incoming>F3</bpmn:incoming><bpmn:outgoing>F4</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment>
+          <bpmn:from>{summary: answer.text, provider: answer.provider, audioPreserved: answer.audioPreserved}</bpmn:from>
+          <bpmn:to>responseObject</bpmn:to>
+        </bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F4" sourceRef="BuildReply" targetRef="AwaitClose"/>
+
+    <!-- A wait: the instance parks here, durably, until { recordingId } arrives on recording-closed. -->
+    <bpmn:intermediateCatchEvent id="AwaitClose" name="Recording closed">
+      <bpmn:extensionElements>
+        <q:source channel="recording-closed"/>
+      </bpmn:extensionElements>
+      <bpmn:incoming>F4</bpmn:incoming><bpmn:outgoing>F5</bpmn:outgoing>
+      <bpmn:messageEventDefinition id="AwaitClose_Msg"/>
+    </bpmn:intermediateCatchEvent>
+    <bpmn:sequenceFlow id="F5" sourceRef="AwaitClose" targetRef="End"/>
+
+    <bpmn:endEvent id="End" name="Recording closed"><bpmn:incoming>F5</bpmn:incoming></bpmn:endEvent>
+  </bpmn:process>
+
+  <bpmndi:BPMNDiagram id="Diagram_recording_summary">
+    <bpmndi:BPMNPlane id="Plane_recording_summary" bpmnElement="recording-summary">
+      <bpmndi:BPMNShape id="S_Start" bpmnElement="Start"><dc:Bounds x="100" y="100" width="36" height="36"/></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="S_BuildRequest" bpmnElement="BuildRequest"><dc:Bounds x="190" y="78" width="110" height="80"/></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="S_AskModel" bpmnElement="AskModel"><dc:Bounds x="350" y="78" width="110" height="80"/></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="S_BuildReply" bpmnElement="BuildReply"><dc:Bounds x="510" y="78" width="110" height="80"/></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="S_AwaitClose" bpmnElement="AwaitClose"><dc:Bounds x="670" y="100" width="36" height="36"/></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="S_End" bpmnElement="End"><dc:Bounds x="770" y="100" width="36" height="36"/></bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="E_F1" bpmnElement="F1"><di:waypoint x="136" y="118"/><di:waypoint x="190" y="118"/></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="E_F2" bpmnElement="F2"><di:waypoint x="300" y="118"/><di:waypoint x="350" y="118"/></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="E_F3" bpmnElement="F3"><di:waypoint x="460" y="118"/><di:waypoint x="510" y="118"/></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="E_F4" bpmnElement="F4"><di:waypoint x="620" y="118"/><di:waypoint x="670" y="118"/></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="E_F5" bpmnElement="F5"><di:waypoint x="706" y="118"/><di:waypoint x="770" y="118"/></bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</bpmn:definitions>

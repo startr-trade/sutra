@@ -7,6 +7,8 @@ mod support;
 
 #[path = "all/async_lane_loop_test.rs"]
 mod async_lane_loop_test;
+#[path = "all/capacity_pool_test.rs"]
+mod capacity_pool_test;
 #[path = "all/channel_call_retry_dispatch_test.rs"]
 mod channel_call_retry_dispatch_test;
 #[path = "all/config_test.rs"]
@@ -23,6 +25,8 @@ mod inline_call_test;
 mod intake_test;
 #[path = "all/outbound_validation_test.rs"]
 mod outbound_validation_test;
+#[path = "all/outbox_pool_test.rs"]
+mod outbox_pool_test;
 #[path = "all/relay_resume_test.rs"]
 mod relay_resume_test;
 #[path = "all/reply_encode_test.rs"]
@@ -35,3 +39,5 @@ mod select_predicate_test;
 mod shard_router_pin_test;
 #[path = "all/shard_scale_out_test.rs"]
 mod shard_scale_out_test;
+#[path = "all/wait_loop_dispatch_test.rs"]
+mod wait_loop_dispatch_test;

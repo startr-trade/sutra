@@ -547,3 +547,144 @@ async fn a_backoff_park_withdraws_the_dead_attempts_rows_and_the_redrive_resets_
     .unwrap();
     assert_eq!(fresh, 1);
 }
+
+/// A wait inside a loop: each iteration's resume step RETIRES the key of the wait it left and
+/// records the key the next iteration parks on — one transaction. A later iteration that parks
+/// on an earlier, retired key REVIVES the instance's own row (unique or not), so the key
+/// correlates again; a retired key never correlates in between.
+#[ignore = "docker"]
+#[tokio::test]
+async fn a_resume_step_retires_the_left_waits_key_and_a_later_iteration_revives_it() {
+    use sutra_persistence::step::commit_step_with_timers_releasing_retiring;
+
+    let pool = fresh_pool().await;
+    let instance_id = Uuid::new_v4();
+    let aliases = PgAliasStore::new(pool.clone());
+    let iteration = |key: &str, unique: bool| StepWrite {
+        resolved_waits: vec!["waitApproval".to_owned()],
+        aliases: vec![StepAlias {
+            alias_name: "turn".to_owned(),
+            alias_value: key.to_owned(),
+            unique,
+        }],
+        outbox: Vec::new(),
+        ..step(instance_id)
+    };
+    let retire = |key: &str| vec![("turn".to_owned(), key.to_owned())];
+
+    commit_step(&pool, &iteration("T-1", true)).await.unwrap();
+    assert_eq!(
+        aliases.find_live(&dep_a(), "turn", "T-1").await.unwrap(),
+        Some(instance_id)
+    );
+
+    // Iteration 2: T-1 retires, T-2 is the live key.
+    commit_step_with_timers_releasing_retiring(
+        &pool,
+        &iteration("T-2", true),
+        &[],
+        None,
+        &retire("T-1"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        aliases.find_live(&dep_a(), "turn", "T-1").await.unwrap(),
+        None,
+        "the left wait's key no longer correlates"
+    );
+    assert_eq!(
+        aliases.find_live(&dep_a(), "turn", "T-2").await.unwrap(),
+        Some(instance_id)
+    );
+
+    // Iteration 3 parks on T-1 again: the retired row comes back to life.
+    commit_step_with_timers_releasing_retiring(
+        &pool,
+        &iteration("T-1", true),
+        &[],
+        None,
+        &retire("T-2"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        aliases.find_live(&dep_a(), "turn", "T-1").await.unwrap(),
+        Some(instance_id),
+        "a unique key retired by an earlier iteration is revived"
+    );
+    assert_eq!(
+        aliases.find_live(&dep_a(), "turn", "T-2").await.unwrap(),
+        None
+    );
+
+    // Same for a non-unique key.
+    commit_step_with_timers_releasing_retiring(
+        &pool,
+        &iteration("T-2", false),
+        &[],
+        None,
+        &retire("T-1"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        aliases.find_live(&dep_a(), "turn", "T-2").await.unwrap(),
+        Some(instance_id),
+        "a non-unique key retired by an earlier iteration is revived"
+    );
+
+    // One row per key, ever: retire/revive flips `live`, it never duplicates.
+    let rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM alias_index WHERE alias_name = 'turn'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(rows, 2);
+}
+
+/// Reviving a unique key never steals it: while ANOTHER live instance owns the value, this
+/// instance's retired row stays retired and the step reports the collision.
+#[ignore = "docker"]
+#[tokio::test]
+async fn reviving_a_unique_key_another_instance_owns_is_a_collision() {
+    use sutra_persistence::step::commit_step_with_timers_releasing_retiring;
+
+    let pool = fresh_pool().await;
+    let first = Uuid::new_v4();
+    let second = Uuid::new_v4();
+    let keyed = |instance_id: Uuid, key: &str| StepWrite {
+        aliases: vec![StepAlias {
+            alias_name: "turn".to_owned(),
+            alias_value: key.to_owned(),
+            unique: true,
+        }],
+        outbox: Vec::new(),
+        ..step(instance_id)
+    };
+    commit_step(&pool, &keyed(first, "T-1")).await.unwrap();
+    commit_step_with_timers_releasing_retiring(
+        &pool,
+        &keyed(first, "T-2"),
+        &[],
+        None,
+        &[("turn".to_owned(), "T-1".to_owned())],
+    )
+    .await
+    .unwrap();
+    // A different instance takes the freed key.
+    commit_step(&pool, &keyed(second, "T-1")).await.unwrap();
+
+    let err = commit_step(&pool, &keyed(first, "T-1"))
+        .await
+        .expect_err("the key is owned elsewhere");
+    assert!(
+        matches!(err, PersistenceError::AliasCollision { .. }),
+        "{err:?}"
+    );
+    let aliases = PgAliasStore::new(pool.clone());
+    assert_eq!(
+        aliases.find_live(&dep_a(), "turn", "T-1").await.unwrap(),
+        Some(second)
+    );
+}

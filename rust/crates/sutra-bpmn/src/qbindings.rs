@@ -42,6 +42,22 @@ pub enum AuditCapture {
     None,
     Metadata,
     Payload,
+    /// Metadata-level events; the process's outbound requests are marked so a media transport
+    /// records the session to the object store, and each event carries the media references
+    /// found among the variables (never the media).
+    Media,
+}
+
+impl AuditCapture {
+    /// The `xsd/q.xsd#AuditCapture` value.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AuditCapture::None => "none",
+            AuditCapture::Metadata => "metadata",
+            AuditCapture::Payload => "payload",
+            AuditCapture::Media => "media",
+        }
+    }
 }
 
 /// Validation policy on payload structural failure per `xsd/q.xsd#OnValidationMode`.

@@ -83,9 +83,28 @@ rejects a durable park nested inside one:
 
 Model the parking node at the top level of the process instead.
 
+## Loops through wait states
+
+Every parking node can be re-entered any number of times within one instance: a loop
+that brings the token back to a message catch, a receive task, a user task, a
+channel-call, a timer catch or an event-based gateway parks a NEW wait there. Each
+iteration gets its own wait row, its own timer and `<q:timeout>` rows, its own
+`<q:retry>` budget and its own `<q:alias>` rows; the step that answers an iteration
+resolves that iteration's rows and retires its correlation keys, so a late relay for
+a past iteration finds no instance (or, when it still correlates through a key the
+instance kept, is refused with `SUTRA.RUNTIME.RESUME.NOT_WAITING`). A resume continues
+from the satisfied node itself; nothing upstream of it runs again.
+
 ## The `q:` extension surface
 
 Node types are only half the model; the `q:` namespace (`urn:sutra:q:1.0`) carries the
 message binding, correlation, retry, store and audit contracts. `xsd/q.xsd` is
 authoritative for its exact shape — read it, not a design doc, when you need the
 attributes an element supports.
+
+One of those contracts changes what a transport does, so it is stated here: a process's
+`<q:audit capture>` is `none`, `metadata` (the default), `payload` (events carry the
+redacted variable snapshot) or `media` (metadata-level events, every request the process
+sends is marked `sutra-audit-capture: media` so a media transport records the session it
+opens, and each event carries the media references found among the variables — `kind:
+"media"` with a `uri` and a `sha256` — never the media).

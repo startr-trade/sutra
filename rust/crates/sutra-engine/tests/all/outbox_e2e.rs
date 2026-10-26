@@ -264,6 +264,8 @@ async fn three_emissions_from_one_instance_all_deliver() {
         rls_bypass_check_enabled: false,
         telemetry: sutra_engine::TelemetryConfig::default(),
         admin_auth: Default::default(),
+        capacity_pools: Vec::new(),
+        object_stores: Vec::new(),
         now_override: None,
     })
     .await

@@ -262,6 +262,8 @@ async fn boot(deployments_dir: PathBuf, datasource_url: String) -> RunningEngine
             dev_disabled: true,
             ..AdminAuthConfig::default()
         },
+        capacity_pools: Vec::new(),
+        object_stores: Vec::new(),
         now_override: None,
     })
     .await

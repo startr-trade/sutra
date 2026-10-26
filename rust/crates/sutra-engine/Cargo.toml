@@ -41,6 +41,9 @@ sutra-datastore = { path = "../sutra-datastore" }
 sutra-xsd = { path = "../sutra-xsd" }
 sutra-persistence = { path = "../sutra-persistence" }
 sutra-crypto = { path = "../sutra-crypto" }
+# Named object stores (`sutra.object-stores.<name>`): read by the `llm` transport's media
+# references, and deleted from by erasure and retention.
+sutra-objectstore = { path = "../sutra-objectstore" }
 sutra-feel = { path = "../sutra-feel" }
 sutra-dmn = { path = "../sutra-dmn" }
 sutra-srl = { path = "../sutra-srl" }

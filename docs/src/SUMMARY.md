@@ -1,6 +1,7 @@
 # Summary
 
 [Introduction](introduction.md)
+[What's new in 0.6](whats-new-0-6.md)
 
 # Getting Started
 
@@ -18,6 +19,7 @@
 - [The q: namespace](building/q-namespace.md)
 - [Rules: DMN, FEEL, and .srl](building/rules.md)
 - [Data stores](building/data-stores.md)
+- [Recordings and media references](building/recordings-and-media.md)
 - [Wait states and human tasks](building/wait-states.md)
 - [External tasks: the pull worker surface](building/external-tasks.md)
 - [Retries, history, and schedules](building/retries-history-schedules.md)
@@ -50,6 +52,7 @@
 - [Configuration reference](operating/configuration.md)
 - [Acknowledgement modes](operating/ack-modes.md)
 - [Limits and quotas](operating/limits.md)
+- [Capacity pools and sessions](operating/capacity-pools.md)
 - [Deploy, hot-deploy, and rollback](operating/deploy-rollback.md)
 - [Instance migration](operating/instance-migration.md)
 - [Logging and audit](operating/logging.md)

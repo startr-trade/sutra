@@ -11,7 +11,7 @@
 //! |---|---|---|
 //! | ai-summarize `stub-openai` | OpenAI Chat Completions | sync, SSE-streamed, async |
 //! | ai-summarize `stub-anthropic` | Anthropic Messages | sync, SSE-streamed, async |
-//! | ai-advanced `stub` | both | cross-provider fallback, JSON mode, tool call, OpenAI background job (polled), OpenAI background job (signed webhook), Anthropic Message Batch |
+//! | ai-advanced `stub` | OpenAI, Anthropic, Gemini native | cross-provider fallback, JSON mode, tool call, OpenAI background job (polled), OpenAI background job (signed webhook), Anthropic Message Batch, audio in / spoken answer out, `voice: pipeline`, image / video frames / media-referenced image in, a parsed JSON answer out |
 //!
 //! THE STUB. `examples/ai-summarize/stub/model-stub.py` runs in `python:3.12-alpine` with the
 //! script bind-mounted. The packages address it as `http://model-stub:8000`, so it must answer to
@@ -19,6 +19,11 @@
 //! starts under a unique name and joins the suite network with `model-stub` as a network ALIAS
 //! (`docker network connect --alias`), which is scoped to that network. Host-side, the tests read
 //! its `/sink`, `/stats` and flip its outage switch through the mapped port.
+//!
+//! THE OBJECT STORE. The ai-advanced engine also gets a MinIO (`sutra_testkit::minio`) joined to
+//! the suite network as `media-store`, declared to the engine as the named store `media`
+//! (`SUTRA_OBJECT_STORES_MEDIA_*`), which the stub variant's `vision-model` reads media
+//! references from. The tests put objects in it with the image's own `mc` client.
 //!
 //! WHAT IS READ BACK. Replies and SSE frames on the caller's connection; the stub's `/sink` for
 //! the async and job hand-offs; and the engine's own rows: a sync call leaves no
@@ -35,6 +40,9 @@ use testcontainers::core::{AccessMode, IntoContainerPort, Mount, WaitFor};
 use testcontainers::runners::SyncRunner;
 use testcontainers::{Container, GenericImage, ImageExt};
 
+use sha2::{Digest, Sha256};
+use sutra_testkit::minio::{MinioContainer, MINIO_ACCESS_KEY, MINIO_SECRET_KEY};
+
 use crate::support::compose;
 use crate::support::engine::{self, EngineBuilder, EngineHandle, PgFixture};
 use crate::support::util;
@@ -48,6 +56,8 @@ const WEBHOOK_SECRET: &str = "whsec_ZGV2LW9ubHktd2ViaG9vay1zZWNyZXQ=";
 /// The stub's fixed answer.
 const SUMMARY: &str =
     "STUB SUMMARY: the customer reports a problem and asks for it to be looked at.";
+/// The transcript of the stub's fixed spoken answer (200 ms of 24 kHz WAV).
+const SPOKEN: &str = "STUB SPOKEN ANSWER: your appointment is confirmed for Tuesday.";
 
 // ---- fixtures -------------------------------------------------------------------------------
 
@@ -116,6 +126,11 @@ struct Fixture {
 /// Compose `<example>/variants/<variant>` over `<example>/shared` (the `--overlay` path), seal
 /// it, and boot an engine on it against its own PostgreSQL.
 fn boot(example: &str, variant: &str, hint: &str) -> Fixture {
+    boot_with(example, variant, hint, &[])
+}
+
+/// [`boot`], with extra engine environment.
+fn boot_with(example: &str, variant: &str, hint: &str, extra_env: &[(&str, &str)]) -> Fixture {
     stub();
     let composed = compose::compose_variant(&util::examples_dir().join(example), variant);
     let archives = util::world_readable_temp_dir("sutra-archives");
@@ -127,7 +142,11 @@ fn boot(example: &str, variant: &str, hint: &str) -> Fixture {
     .unwrap_or_else(|e| panic!("package {example} variant {variant}: {e}"));
     util::make_world_readable(&archives);
     let pg = engine::start_postgres(hint);
-    let engine = EngineBuilder::new(hint, &pg)
+    let mut builder = EngineBuilder::new(hint, &pg);
+    for &(name, value) in extra_env {
+        builder = builder.env(name, value);
+    }
+    let engine = builder
         .env("SUMMARIZE_API_KEY", SUMMARIZE_KEY)
         .env("AI_ADVANCED_API_KEY", ADVANCED_KEY)
         .env("LLM_API_KEY", "stub-not-a-real-key")
@@ -155,12 +174,106 @@ fn summarize_anthropic() -> &'static Fixture {
     })
 }
 
+/// The object store the ai-advanced engine reads media references from: one MinIO, joined to the
+/// suite network as `media-store`, with the bucket `media` made.
+fn media_store() -> &'static MinioContainer {
+    static STORE: OnceLock<MinioContainer> = OnceLock::new();
+    STORE.get_or_init(|| {
+        let store = MinioContainer::start();
+        let network = util::network_for(SUITE);
+        let _ = Command::new("docker")
+            .args(["network", "create", network])
+            .output();
+        let connected = Command::new("docker")
+            .args([
+                "network",
+                "connect",
+                "--alias",
+                "media-store",
+                network,
+                store.name(),
+            ])
+            .output()
+            .expect("docker network connect");
+        assert!(
+            connected.status.success(),
+            "attach MinIO to {network} as media-store: {}",
+            String::from_utf8_lossy(&connected.stderr)
+        );
+        mc(&store, &["mb", "local/media"], None);
+        store
+    })
+}
+
+/// Run the MinIO client inside the store's container, optionally feeding `stdin`.
+fn mc(store: &MinioContainer, args: &[&str], stdin: Option<&[u8]>) {
+    use std::io::Write;
+    use std::process::Stdio;
+    let host = format!("MC_HOST_local=http://{MINIO_ACCESS_KEY}:{MINIO_SECRET_KEY}@127.0.0.1:9000");
+    let mut child = Command::new("docker")
+        .args(["exec", "-i", "-e", &host, store.name(), "mc"])
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("docker exec mc");
+    {
+        let mut input = child.stdin.take().expect("stdin");
+        if let Some(bytes) = stdin {
+            input.write_all(bytes).expect("feed mc");
+        }
+    }
+    let out = child.wait_with_output().expect("mc runs");
+    assert!(
+        out.status.success(),
+        "mc {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Put `bytes` in the media store at `clips/<name>`; the media reference's URI.
+fn put_media(name: &str, bytes: &[u8]) -> String {
+    mc(
+        media_store(),
+        &["pipe", &format!("local/media/clips/{name}")],
+        Some(bytes),
+    );
+    format!("s3://media/clips/{name}")
+}
+
 fn advanced() -> &'static Fixture {
     static F: OnceLock<Fixture> = OnceLock::new();
     F.get_or_init(|| {
-        std::thread::spawn(|| boot("ai-advanced", "stub", "ai-adv"))
-            .join()
-            .expect("ai-advanced stub topology")
+        std::thread::spawn(|| {
+            media_store();
+            boot_with(
+                "ai-advanced",
+                "stub",
+                "ai-adv",
+                &[
+                    ("SUTRA_OBJECT_STORES", "media"),
+                    ("SUTRA_OBJECT_STORES_MEDIA_URI", "s3://media/clips"),
+                    (
+                        "SUTRA_OBJECT_STORES_MEDIA_ENDPOINT",
+                        "http://media-store:9000",
+                    ),
+                    (
+                        "SUTRA_OBJECT_STORES_MEDIA_ACCESS_KEY",
+                        "env:STORE_ACCESS_KEY",
+                    ),
+                    (
+                        "SUTRA_OBJECT_STORES_MEDIA_SECRET_KEY",
+                        "env:STORE_SECRET_KEY",
+                    ),
+                    ("SUTRA_OBJECT_STORES_MEDIA_ENCRYPTION", "none"),
+                    ("STORE_ACCESS_KEY", MINIO_ACCESS_KEY),
+                    ("STORE_SECRET_KEY", MINIO_SECRET_KEY),
+                ],
+            )
+        })
+        .join()
+        .expect("ai-advanced stub topology")
     })
 }
 
@@ -558,11 +671,296 @@ async fn tc_ai_advanced_anthropic_batch() {
     );
 }
 
+// ---- ai-advanced: audio over HTTP ---------------------------------------------------------
+
+/// `ms` of 16 kHz mono PCM16 in a WAV.
+fn wav16k(ms: usize) -> Vec<u8> {
+    let samples: Vec<u8> = (0..16 * ms)
+        .flat_map(|i| (((i % 40) as i16 - 20) * 500).to_le_bytes())
+        .collect();
+    let mut wav = Vec::new();
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(36 + samples.len() as u32).to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&16000u32.to_le_bytes());
+    wav.extend_from_slice(&32000u32.to_le_bytes());
+    wav.extend_from_slice(&2u16.to_le_bytes());
+    wav.extend_from_slice(&16u16.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&(samples.len() as u32).to_le_bytes());
+    wav.extend_from_slice(&samples);
+    wav
+}
+
+fn b64(data: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(data)
+}
+
+fn unb64(value: &Value) -> Vec<u8> {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD
+        .decode(value.as_str().expect("base64 audio"))
+        .expect("valid base64")
+}
+
+/// An uploaded WAV recording to an audio-native model, the answer wanted as 16 kHz L16: the
+/// provider gets a WAV (the stub refuses anything else), and the transport converts the
+/// provider's 24 kHz WAV answer to what the request asked for. The model heard the audio, so
+/// `audioPreserved` is true.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "docker"]
+async fn tc_ai_advanced_voice_audio_in_audio_out() {
+    advanced();
+    let (heard, spoke) = (
+        stub_count("chat-audio-in").await,
+        stub_count("chat-audio-out").await,
+    );
+    let reply = advanced_sync(
+        "voice",
+        json!({ "requestId": "AUDIO-1",
+                "audio": { "data": b64(&wav16k(500)), "format": "audio/wav" },
+                "audioOutput": "audio/L16;rate=16000" }),
+    )
+    .await;
+    assert_eq!(reply["requestId"], "AUDIO-1", "{reply}");
+    assert_eq!(reply["audioPreserved"], true, "{reply}");
+    assert_eq!(reply["provider"], "openai");
+    assert_eq!(reply["transcript"], SPOKEN);
+    assert_eq!(reply["text"], SPOKEN);
+    assert_eq!(reply["audio"]["format"], "audio/L16;rate=16000");
+    assert_eq!(
+        unb64(&reply["audio"]["data"]).len(),
+        200 * 16 * 2,
+        "200 ms of 24 kHz WAV delivered as 200 ms of 16 kHz 16-bit PCM"
+    );
+    assert!(
+        stub_count("chat-audio-in").await > heard,
+        "the audio reached the model"
+    );
+    assert!(stub_count("chat-audio-out").await > spoke);
+}
+
+/// The same request on a `voice: pipeline` channel: transcribed by the speech provider, answered
+/// by a TEXT model (Anthropic), spoken by the speech provider — `audioPreserved: false`.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "docker"]
+async fn tc_ai_advanced_voice_pipeline() {
+    advanced();
+    let (stt, tts, messages) = (
+        stub_count("transcriptions").await,
+        stub_count("speech").await,
+        stub_count("messages").await,
+    );
+    let reply = advanced_sync(
+        "voice-pipeline",
+        json!({ "requestId": "AUDIO-2",
+                "audio": { "data": b64(&wav16k(300)), "format": "audio/wav" },
+                "audioOutput": "audio/L16;rate=16000" }),
+    )
+    .await;
+    assert_eq!(reply["requestId"], "AUDIO-2", "{reply}");
+    assert_eq!(reply["audioPreserved"], false, "{reply}");
+    assert_eq!(reply["provider"], "anthropic", "a text model answered");
+    assert_eq!(reply["text"], SUMMARY);
+    assert_eq!(
+        reply["transcript"], SUMMARY,
+        "the spoken answer says the text"
+    );
+    assert_eq!(reply["audio"]["format"], "audio/L16;rate=16000");
+    assert_eq!(
+        unb64(&reply["audio"]["data"]).len(),
+        200 * 16 * 2,
+        "200 ms of 24 kHz WAV delivered as 200 ms of 16 kHz 16-bit PCM"
+    );
+    assert!(stub_count("transcriptions").await > stt, "transcribed");
+    assert!(stub_count("messages").await > messages, "answered in text");
+    assert!(stub_count("speech").await > tts, "spoken");
+}
+
+// ---- ai-advanced: images and video frames to the native Gemini wire ------------------------
+
+/// The vision tests read the stub's request log by position, so they run one at a time.
+static VISION: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+fn sample(name: &str) -> Vec<u8> {
+    let path = util::examples_dir().join("ai-advanced/sample").join(name);
+    std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// The generateContent requests the stub received after the first `since`.
+async fn gemini_requests_since(since: usize) -> Vec<Value> {
+    let all = stub_get("/gemini/requests").await;
+    all.as_array().expect("a list")[since..].to_vec()
+}
+
+async fn gemini_request_count() -> usize {
+    stub_get("/gemini/requests")
+        .await
+        .as_array()
+        .expect("a list")
+        .len()
+}
+
+/// The inline parts of the one generateContent request made since `since`, as
+/// `(mimeType, sha256)`, after checking it went to the vision model.
+async fn sent_parts(since: usize) -> Vec<(String, String)> {
+    let requests = gemini_requests_since(since).await;
+    assert_eq!(requests.len(), 1, "one generateContent call: {requests:?}");
+    assert_eq!(requests[0]["model"], "gemini-vision-stub");
+    requests[0]["parts"]
+        .as_array()
+        .expect("parts")
+        .iter()
+        .map(|p| {
+            (
+                p["mimeType"].as_str().unwrap_or_default().to_string(),
+                p["sha256"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect()
+}
+
+/// The candidate with no `video-understanding` (an OpenAI model, listed first) was never called.
+async fn assert_no_video_candidate_skipped() {
+    assert_eq!(
+        stub_count("chat:no-video-stub").await,
+        0,
+        "the candidate without video-understanding was skipped by `require:`"
+    );
+}
+
+/// One inline image: the PNG reaches the model as an `inlineData` part with its own media type
+/// and bytes, and the JSON answer comes back parsed (the flow reads `answer.json.*`).
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "docker"]
+async fn tc_ai_advanced_vision_inline_image() {
+    advanced();
+    let _one = VISION.lock().await;
+    let png = sample("frame-1.png");
+    let since = gemini_request_count().await;
+    let reply = advanced_sync(
+        "vision",
+        json!({ "requestId": "VISION-1", "image": { "data": b64(&png), "format": "image/png" } }),
+    )
+    .await;
+    assert_eq!(reply["requestId"], "VISION-1", "{reply}");
+    assert_eq!(reply["provider"], "gemini", "{reply}");
+    assert_eq!(
+        reply["scene"],
+        "STUB SCENE: a bicycle leans against a blue door."
+    );
+    assert_eq!(reply["objects"], json!(["bicycle", "door"]));
+    assert_eq!(reply["framesSeen"], 1, "{reply}");
+    assert_eq!(
+        sent_parts(since).await,
+        vec![("image/png".to_string(), sha256_hex(&png))],
+        "the PNG's own bytes, inline, as image/png"
+    );
+    assert_no_video_candidate_skipped().await;
+}
+
+/// Sampled video frames: each frame is its own inline image part, in order.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "docker"]
+async fn tc_ai_advanced_vision_video_frames() {
+    advanced();
+    let _one = VISION.lock().await;
+    let (first, second) = (sample("frame-1.png"), sample("frame-2.png"));
+    let since = gemini_request_count().await;
+    let reply = advanced_sync(
+        "vision",
+        json!({ "requestId": "VISION-2", "video": { "frames": [
+            { "data": b64(&first), "format": "image/png", "atMs": 0 },
+            { "data": b64(&second), "format": "image/png", "atMs": 500 } ] } }),
+    )
+    .await;
+    assert_eq!(reply["requestId"], "VISION-2", "{reply}");
+    assert_eq!(reply["provider"], "gemini", "{reply}");
+    assert_eq!(reply["framesSeen"], 2, "{reply}");
+    assert_eq!(
+        sent_parts(since).await,
+        vec![
+            ("image/png".to_string(), sha256_hex(&first)),
+            ("image/png".to_string(), sha256_hex(&second)),
+        ],
+        "both frames, in order"
+    );
+    assert_no_video_candidate_skipped().await;
+}
+
+/// An image passed as a media reference: the transport reads it from the MinIO-backed store,
+/// checks its SHA-256, and sends the stored bytes inline, as if the caller had.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "docker"]
+async fn tc_ai_advanced_vision_media_reference() {
+    advanced();
+    let _one = VISION.lock().await;
+    let png = sample("frame-2.png");
+    let uri = put_media("vision-ref.png", &png);
+    let since = gemini_request_count().await;
+    let reply = advanced_sync(
+        "vision",
+        json!({ "requestId": "VISION-3",
+                "image": { "ref": uri, "sha256": sha256_hex(&png), "format": "image/png" } }),
+    )
+    .await;
+    assert_eq!(reply["requestId"], "VISION-3", "{reply}");
+    assert_eq!(reply["provider"], "gemini", "{reply}");
+    assert_eq!(reply["framesSeen"], 1, "{reply}");
+    assert_eq!(
+        sent_parts(since).await,
+        vec![("image/png".to_string(), sha256_hex(&png))],
+        "the stored object's bytes reached the model"
+    );
+}
+
+/// A media reference whose SHA-256 does not match the stored object is refused before any
+/// provider call, and the caller sees why.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "docker"]
+async fn tc_ai_advanced_vision_media_reference_wrong_digest() {
+    advanced();
+    let _one = VISION.lock().await;
+    let png = sample("frame-1.png");
+    let uri = put_media("vision-wrong.png", &png);
+    let wrong = sha256_hex(b"not the stored object");
+    let since = gemini_request_count().await;
+    let (status, _, body) = post(
+        advanced(),
+        ADVANCED_KEY,
+        "vision",
+        &json!({ "requestId": "VISION-4",
+                 "image": { "ref": uri, "sha256": wrong, "format": "image/png" } }),
+    )
+    .await;
+    // A refused media reference is the caller's error, with the real cause.
+    assert_eq!(status, 422, "a digest mismatch is refused: {body}");
+    assert!(
+        body.contains("SUTRA.LLM.MEDIA.REFUSED"),
+        "the caller sees the real cause: {body}"
+    );
+    assert!(
+        gemini_requests_since(since).await.is_empty(),
+        "refused before any provider call"
+    );
+}
+
 // ---- tier 1: every variant composes and lints clean ---------------------------------------
 
-/// Every committed variant of both examples — the real-provider ones CI cannot call included —
-/// composes over its `shared/` layer and passes package validation, as `sutra lint <variant>
-/// --overlay <shared>` would report.
+/// Every committed variant of the model examples — the real-provider ones CI cannot call
+/// included — composes over its `shared/` layer and passes package validation, as `sutra lint
+/// <variant> --overlay <shared>` would report.
 #[test]
 fn ai_example_variants_compose_and_lint_clean() {
     for example in ["ai-summarize", "ai-advanced"] {

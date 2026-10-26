@@ -59,7 +59,7 @@ use sutra_persistence::snapshot::{InstanceSnapshot, SnapshotCrypto};
 
 use crate::snapshot_values;
 use sutra_persistence::step::{
-    commit_step_with_timers, commit_step_with_timers_releasing, StepAlias, StepSubject,
+    commit_step_with_timers, commit_step_with_timers_releasing_retiring, StepAlias, StepSubject,
     StepTimerWait, StepWait, StepWrite,
 };
 use sutra_persistence::stores::{
@@ -209,24 +209,7 @@ impl PersistenceBridge {
         bytes: &[u8],
         instance_id: &str,
     ) -> Result<InstanceSnapshot, Diagnostic> {
-        let key_id = InstanceSnapshot::peek_key_id(bytes).map_err(decode_diag)?;
-        match (key_id, &self.key_provider) {
-            (Some(key_id), Some(provider)) => {
-                let key = provider.data_key(&key_id).map_err(crypto_diag)?;
-                let cipher = Aes256GcmCipher::new(&key);
-                let ctx = SnapshotCrypto::new(&cipher, &key_id, instance_id);
-                InstanceSnapshot::read_encrypted(bytes, Some(&ctx)).map_err(decode_diag)
-            }
-            (Some(_), None) => Err(Diagnostic::error(
-                channel_codes::RUNTIME_UNEXPECTED,
-                format!(
-                    "instance {instance_id} was persisted encrypted (sutra.keyId present) but no \
-                     encryption key provider is configured (sutra.crypto.master-key) — cannot \
-                     decrypt; refusing to resume in the clear"
-                ),
-            )),
-            (None, _) => InstanceSnapshot::read(bytes).map_err(decode_diag),
-        }
+        decode_persisted_snapshot(self.key_provider.as_deref(), bytes, instance_id)
     }
 
     /// Blind-index this instance's `@subjectKey` values: HMAC each raw value under the tenant's
@@ -255,6 +238,35 @@ impl PersistenceBridge {
 
 /// A cipher/key failure surfaced as a fatal diagnostic (fail-closed — never park/resume in the
 /// clear on a crypto error).
+/// Decode a persisted snapshot, decrypting its `sutra.enc.` values when the snapshot carries a
+/// keyId (read from the snapshot itself — no external tenant lookup). Fails closed on an
+/// encrypted snapshot with no key provider configured. Shared by resume (the bridge) and by the
+/// read-only inspection endpoints, so an encrypted instance reads the same way on both paths.
+pub(crate) fn decode_persisted_snapshot(
+    key_provider: Option<&(dyn KeyProvider + Send + Sync)>,
+    bytes: &[u8],
+    instance_id: &str,
+) -> Result<InstanceSnapshot, Diagnostic> {
+    let key_id = InstanceSnapshot::peek_key_id(bytes).map_err(decode_diag)?;
+    match (key_id, key_provider) {
+        (Some(key_id), Some(provider)) => {
+            let key = provider.data_key(&key_id).map_err(crypto_diag)?;
+            let cipher = Aes256GcmCipher::new(&key);
+            let ctx = SnapshotCrypto::new(&cipher, &key_id, instance_id);
+            InstanceSnapshot::read_encrypted(bytes, Some(&ctx)).map_err(decode_diag)
+        }
+        (Some(_), None) => Err(Diagnostic::error(
+            channel_codes::RUNTIME_UNEXPECTED,
+            format!(
+                "instance {instance_id} was persisted encrypted (sutra.keyId present) but no \
+                 encryption key provider is configured (sutra.crypto.master-key) — cannot \
+                 decrypt; refusing to resume in the clear"
+            ),
+        )),
+        (None, _) => InstanceSnapshot::read(bytes).map_err(decode_diag),
+    }
+}
+
 fn crypto_diag(e: CipherError) -> Diagnostic {
     Diagnostic::error(
         channel_codes::RUNTIME_UNEXPECTED,
@@ -627,6 +639,30 @@ impl InstanceBridge for PersistenceBridge {
         timer_waits: &[TimerWaitRecord],
         emissions: &[OutboxEmission],
     ) -> Result<(), Diagnostic> {
+        self.commit_repark_retiring(
+            deployment,
+            instance_id,
+            snapshot,
+            satisfied_wait_nodes,
+            aliases,
+            timer_waits,
+            emissions,
+            &[],
+        )
+        .await
+    }
+
+    async fn commit_repark_retiring(
+        &self,
+        deployment: &sutra_executor::DeploymentId,
+        instance_id: &str,
+        snapshot: &SuspendedInstance,
+        satisfied_wait_nodes: &[String],
+        aliases: &[AliasRecord],
+        timer_waits: &[TimerWaitRecord],
+        emissions: &[OutboxEmission],
+        retired_aliases: &[AliasRecord],
+    ) -> Result<(), Diagnostic> {
         let dep = persist_dep(deployment)?;
         let instance = parse_instance(instance_id)?;
         let step = StepWrite {
@@ -665,13 +701,25 @@ impl InstanceBridge for PersistenceBridge {
         // is handed back inside this same transaction, so the new frontier and the
         // hand-back become visible together (and a crash before the commit leaves the claim
         // for the StuckInstanceScanner rather than a half-advanced instance).
-        commit_step_with_timers_releasing(&self.pool, &step, &timers, Some(&self.claim_owner))
-            .await
-            .map_err(|e| persistence_diag("re-park step commit failed", &e))?;
+        // The waits this step resolved lose their correlation keys in the same transaction.
+        let retired: Vec<(String, String)> = retired_aliases
+            .iter()
+            .map(|a| (a.name.clone(), a.value.clone()))
+            .collect();
+        commit_step_with_timers_releasing_retiring(
+            &self.pool,
+            &step,
+            &timers,
+            Some(&self.claim_owner),
+            &retired,
+        )
+        .await
+        .map_err(|e| persistence_diag("re-park step commit failed", &e))?;
         info!(
             instance_id,
             deployment = deployment.value(),
             satisfied = ?satisfied_wait_nodes,
+            retired_aliases = retired.len(),
             waiting = ?snapshot.waiting_nodes,
             timers = timer_waits.len(),
             emissions = emissions.len(),

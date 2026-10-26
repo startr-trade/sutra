@@ -118,7 +118,7 @@ pub enum StatefulExecResult {
         /// token position AND a timer row).
         waiting_nodes: Vec<String>,
         /// Union of nodes done before this pass and during it (insertion-ordered,
-        /// deduplicated) — the snapshot's replay-as-done set.
+        /// deduplicated) — what a later resume's reconstruction walk may follow.
         completed_nodes: Vec<String>,
         /// The full variable context at the quiescent point.
         variables: Variables,
@@ -156,6 +156,14 @@ pub enum StatefulExecResult {
         /// retries never set it (no in-flight wait exists to disambiguate from), so snapshots
         /// of processes without channel-call retries are byte-identical to pre-F1 ones.
         retry_backoff: BTreeMap<String, String>,
+        /// The subset of `waiting_nodes` this pass parked as a NEW wait — the park ran its
+        /// side-effects (a request emission, fresh timer rows) and the node needs a fresh wait
+        /// row and fresh alias rows. The rest of `waiting_nodes` is carried over unchanged from
+        /// the prior pass. A node can appear here even though it was also waiting before this
+        /// pass: a loop that brings the token back to a wait node it just left parks a new
+        /// iteration of that wait, never a continuation of the old one. On a first pass every
+        /// waiting node is fresh.
+        fresh_waits: Vec<String>,
     },
 }
 
@@ -473,17 +481,19 @@ impl TokenExecutor {
             .await
     }
 
-    /// Re-enter a suspended instance once a relay satisfied one of its parked wait nodes:
-    /// replay from the start event skipping the side-effect of every node in
-    /// `completed_nodes` (and of `satisfied_wait_node`, now done), restoring
-    /// `prior_variables` merged with `relay_variables` (relay wins on collision). Gateways
-    /// re-evaluate deterministically over the restored variables; the instance then either
-    /// COMPLETES or SUSPENDS again — the "replay skipping completed" resume contract.
+    /// Re-enter a suspended instance once a relay satisfied one of its parked wait nodes,
+    /// restoring `prior_variables` merged with `relay_variables` (relay wins on collision).
     ///
-    /// `prior_waiting` is the snapshot's wait frontier (satisfied node included is fine —
-    /// its `prior_completed` fast-path wins): a still-waiting node reached again on this
-    /// replay RE-PARKS without re-firing its park side-effects (a channel-call must not
-    /// re-send its request; a pending timer must not reset its due-at).
+    /// The resume is FRONTIER-BASED: the token continues from `satisfied_wait_node` itself,
+    /// and every other node of `prior_waiting` (the snapshot's wait frontier) stays parked
+    /// exactly as it was — no request re-sent, no timer re-armed. Nothing upstream of the
+    /// satisfied node runs again, so a loop that brings the token back to a wait node it
+    /// already passed parks a NEW wait there, any number of times.
+    ///
+    /// The one piece of state the snapshot does not carry — how many tokens already sit at a
+    /// converging gateway — is rebuilt first by a side-effect-free reconstruction walk from the
+    /// start event over `completed_nodes` (see [`ExecutionState::ghost`]). That walk executes
+    /// nothing, parks nothing and emits nothing; it only counts join arrivals.
     #[allow(clippy::too_many_arguments)]
     pub async fn resume(
         &self,
@@ -525,8 +535,8 @@ impl TokenExecutor {
 
     /// Re-drive a channel-call `<q:retry>` node whose BACKOFF TIMER came due: the node re-runs
     /// its park side-effects — a FRESH request emission, fresh timer boundaries, a fresh
-    /// response wait — instead of the silent re-park an ordinary resume replay performs on a
-    /// still-waiting node.
+    /// response wait — where an ordinary resume would carry the still-waiting node over
+    /// untouched.
     ///
     /// A dedicated entry point rather than an inference inside [`Self::resume`], deliberately:
     /// for a channel-call node the snapshot facts alone cannot distinguish "the backoff came
@@ -576,7 +586,7 @@ impl TokenExecutor {
     /// Deliver a TASK FAILURE to a parked channel-call node from OUTSIDE the graph — today's
     /// one caller: the outbox terminally POISONED the node's request delivery
     /// (`sutra.outbox.retry.max-attempts` exhausted), so the in-flight attempt can never be
-    /// answered. The replay reaches the parked node and offers the failure to its `<q:retry>`
+    /// answered. The resume re-enters the parked node and offers the failure to its `<q:retry>`
     /// policy: budget left ⇒ a backoff park (the re-drive later RE-EMITS the request); budget
     /// spent or `code` non-retryable ⇒ the pass fails fatally and the dispatcher stamps the
     /// durable FAILED snapshot. The caller gates on the policy existing and on the durable
@@ -673,7 +683,7 @@ impl TokenExecutor {
     /// Re-enter a suspended instance because a TIMER
     /// fired. `fire.node_id` is the due TIMER `waiting_event` row's node:
     /// - an intermediate timer catch event ⇒ the wait is satisfied and the token follows
-    ///   its outgoing flow (plain replay-skipping-completed, no relay payload);
+    ///   its outgoing flow (an ordinary resume, no relay payload);
     /// - an INTERRUPTING timer boundary ⇒ the host task's wait is cancelled and the token
     ///   leaves through the boundary's outgoing flows; a route-less boundary (the
     ///   `<q:timeout>` form) raises the `SUTRA.DISPATCH.CHANNEL_CALL.TIMEOUT` BPMN error
@@ -826,15 +836,16 @@ impl TokenExecutor {
                 if implementation.starts_with(CHANNEL_CALL_PREFIX)
         );
         // A RETRY RE-DRIVE: the timer that came due is a `<q:retry>` task's backoff, not a
-        // satisfied wait. It is the one resume whose "satisfied" node must NOT join the
-        // replay-as-done set — the whole point is to run that task's side-effect AGAIN.
+        // satisfied wait. It is the one resume whose "satisfied" node is re-entered rather
+        // than left — the whole point is to run that task's side-effect AGAIN.
         //
         // For a REGISTERED task the condition is fully derivable from the snapshot the caller
         // already loaded, so no separate entry point is needed: the node carries a durable
-        // failed-attempt count, and it is not in `completed_nodes` (a task that ever succeeded
-        // is, and a retry park never records one). The inference is sound there because no
-        // relay can ever target a registered task — the only resume naming it is the backoff
-        // poller.
+        // failed-attempt count (a success drops it) and it is parked on the frontier — or, for a
+        // caller that passes no frontier, it is absent from `completed_nodes`. Being in
+        // `completed_nodes` alone proves nothing: a task inside a loop completed in an earlier
+        // iteration and is backing off in this one. The inference is sound because no relay can
+        // ever target a registered task — the only resume naming it is the backoff poller.
         //
         // For a CHANNEL-CALL task that inference is UNSOUND: a mid-retry relay (the response
         // to a live later attempt) also sees an outstanding attempt count on an uncompleted
@@ -846,14 +857,15 @@ impl TokenExecutor {
         } else {
             fired_timer.is_none()
                 && prior_retry_attempts.contains_key(satisfied_wait_node)
-                && !completed_nodes.iter().any(|n| n == satisfied_wait_node)
+                && (prior_waiting.iter().any(|n| n == satisfied_wait_node)
+                    || !completed_nodes.iter().any(|n| n == satisfied_wait_node))
         };
         // A channel-call failure delivery is not a satisfied wait either: the node must be
-        // REACHED (not replayed past) so its retry policy can rule on the failure.
+        // RE-ENTERED (not left) so its retry policy can rule on the failure.
         let failure_delivery = channel_call_failure.is_some();
         // Seed the prior-completed set: everything done before, plus the satisfied node.
         // A FIRED TIMER BOUNDARY is not a token position — the interception at the host
-        // task routes it; only an in-flow satisfied node joins the replay-as-done set.
+        // task routes it; only an in-flow satisfied node joins the completed set.
         for node in completed_nodes {
             state.push_prior_completed(node);
         }
@@ -884,9 +896,6 @@ impl TokenExecutor {
             state.retry_backoff.remove(satisfied_wait_node);
         }
         state.channel_call_failure = channel_call_failure;
-        if retry_redrive && satisfied_is_channel_call {
-            state.channel_call_redrive = Some(satisfied_wait_node.to_string());
-        }
         // Pending timer boundaries this resume retires BEFORE they fire: on a relay
         // resume, every timer boundary armed on the satisfied host; on a timer fire, its
         // sibling boundaries. The persistence layer resolves the rows in the same step;
@@ -915,28 +924,82 @@ impl TokenExecutor {
                 }
             }
         }
-        state.fired_timer = fired_timer;
-        // A node still waiting from the prior pass re-parks WITHOUT re-firing its park
-        // side-effects when the replay reaches it again — EXCEPT the node an explicit
-        // channel-call re-drive targets: its prior park is the DEAD attempt's, and the whole
-        // point of the re-drive is to re-fire the park side-effects (a fresh request emission,
-        // fresh timer boundaries). Leaving it out of `prior_waiting` is what routes
-        // `run_channel_call` onto its fresh-park path.
-        for node in prior_waiting {
-            if state.channel_call_redrive.as_deref() == Some(node.as_str()) {
-                continue;
+        // Where the token re-enters the graph. A satisfied wait (a relay, a due timer catch, a
+        // respond-and-continue self-resume) is DONE: the token leaves it along its outgoing
+        // flows. Every other resume re-enters a node that must run: the host of a fired timer
+        // boundary (its arm routes the boundary), a `<q:retry>` re-drive (the task runs again),
+        // a channel-call failure delivery (the retry policy rules on it).
+        let entry = match &fired_timer {
+            Some(fired) => ResumeEntry::Run(fired.host_id.clone()),
+            None if retry_redrive || failure_delivery => {
+                ResumeEntry::Run(satisfied_wait_node.to_string())
             }
+            None => ResumeEntry::Leave(satisfied_wait_node.to_string()),
+        };
+        state.fired_timer = fired_timer;
+        for node in prior_waiting {
             state.prior_waiting.insert(node.clone());
         }
         // Seed each coverage path's cursor from the prior snapshot's persisted counters so
-        // the contiguous prefix walked in earlier passes is not lost when this pass's replay
-        // diverges from the historically-taken route.
+        // the contiguous prefix walked in earlier passes is not lost when this pass's
+        // reconstruction walk diverges from the historically-taken route.
         state.seed_coverage_progress(prior_coverage);
         let start = match start_node_id {
             Some(s) if !s.trim().is_empty() => s.to_string(),
             _ => process.start_event()?.id().to_string(),
         };
+
+        // Phase 1 — reconstruct the join arrivals of tokens that already moved on, by walking
+        // the completed part of the graph from the start event. Side-effect free by
+        // construction (see `ghost_step`); a ghost that cannot proceed is simply dropped.
+        state.ghost = true;
+        state.resume_entry = Some(entry.node().to_string());
         state.work.push_back(start);
+        while let Some(node_id) = state.work.pop_front() {
+            if self.run_node(&node_id, &mut state).await.is_err() {
+                // A ghost a gateway cannot route (its condition no longer evaluates, no flow
+                // matches) carries no live token — dropping it loses nothing that exists.
+                continue;
+            }
+        }
+        state.ghost = false;
+        state.work.clear();
+
+        // Phase 2 — the live frontier. Every prior wait the entry does not consume stays
+        // parked as it is (no re-send, no re-armed timer). The entry consumes its own wait
+        // and, when it is an arm of an event-based gateway, every sibling arm: the race is won.
+        let mut consumed: Vec<String> = vec![entry.node().to_string()];
+        if let ResumeEntry::Leave(node) = &entry {
+            consumed.extend(race_siblings(process, node));
+        }
+        for node in prior_waiting {
+            if !consumed.contains(node) && !state.waiting.contains(node) {
+                state.waiting.push(node.clone());
+            }
+        }
+        match entry {
+            ResumeEntry::Leave(node) => {
+                // The satisfied wait is where the token leaves: report it (its park reported
+                // only the entry), so the journal records the wait the resume came through.
+                let (audit_sink, _) = self.resolve_token_audit(&node, &state);
+                let left = TokenEvent {
+                    deployment: state.deployment.clone(),
+                    labels: state.labels.clone(),
+                    instance_id: state.instance_id.clone(),
+                    node_id: node.clone(),
+                    node_type: process
+                        .node(&node)
+                        .map(|n| node_type(n).to_string())
+                        .unwrap_or_default(),
+                    audit_sink,
+                    payload_json: None,
+                };
+                self.notify(|l| l.on_token_left(&left));
+                state.visited.insert(node.clone());
+                self.enqueue_outgoing(&node, &mut state);
+            }
+            ResumeEntry::Run(node) => state.work.push_back(node),
+        }
         self.drive_stateful(state, &instance_event, start_node_id)
             .await
     }
@@ -980,6 +1043,7 @@ impl TokenExecutor {
                 coverage_progress: state.coverage_progress(),
                 retry_attempts: state.retry_attempts.clone(),
                 retry_backoff: state.retry_backoff.clone(),
+                fresh_waits: state.fresh_waits.clone(),
             });
         }
         if !state.reached_end {
@@ -1027,15 +1091,11 @@ impl TokenExecutor {
         let process = state.process;
         let node = process.node(node_id).map_err(fatal)?;
 
-        // Replay fast-path: on a resume pass, a node completed in a prior pass (a
-        // side-effecting activity, or the wait node the relay just satisfied) is walked
-        // past without re-firing its side-effect or its token events — only its outgoing
-        // flow is followed. Gateways and start/end events are never in prior_completed, so
-        // they always re-evaluate deterministically over the restored variables. This is
-        // what makes resume "replay skipping completed".
-        if state.prior_completed.contains(node_id) {
-            self.enqueue_outgoing(node_id, state);
-            state.visited.insert(node_id.to_string());
+        // A resume pass's reconstruction ghost never does real work — it only walks the
+        // completed part of the graph so converging gateways regain their arrivals. A LIVE
+        // token runs every node it reaches, including one completed in an earlier pass: that
+        // is a loop coming round again, and the node runs again.
+        if state.ghost && self.ghost_step(node_id, node, state)? {
             return Ok(());
         }
 
@@ -1052,7 +1112,13 @@ impl TokenExecutor {
             audit_sink,
             payload_json,
         };
-        self.notify(|l| l.on_token_entered(&token_event));
+        // A reconstruction ghost reaches here only for a gateway, to rebuild its arrival counts.
+        // It is not a token passing through, so it is not reported: the audit journal and every
+        // other listener see the live pass only — never a gateway the ghost re-evaluated.
+        let quiet = state.ghost;
+        if !quiet {
+            self.notify(|l| l.on_token_entered(&token_event));
+        }
 
         let mut left_handled = false;
 
@@ -1095,7 +1161,7 @@ impl TokenExecutor {
                     // a backoff timer, so the node is neither completed nor visited and nothing
                     // downstream of it may fire. It is deliberately kept OUT of
                     // `completed_activities` — that omission is what makes the timer re-drive
-                    // re-execute it instead of replaying past it. No reply/send is emitted
+                    // re-enter it instead of leaving it. No reply/send is emitted
                     // either: the task produced no output to emit. Returning here (rather than
                     // setting `left_handled`) is the same "token did not leave" exit the
                     // channel-call park takes, minus the `on_token_left` notify and the `visited`
@@ -1110,9 +1176,9 @@ impl TokenExecutor {
                     // Respond-and-continue: the reply (`responseBody`) is produced and any
                     // out-of-band reply emitted; the dispatcher flushes it to the caller NOW. Park
                     // here — the token stops, and a due-now timer wait self-resumes the remaining
-                    // nodes at once (the tail runs on the resume replay, skipping this completed
-                    // node). `is_sync_eligible` already forced this process onto the stateful path.
-                    state.waiting.push(id.clone());
+                    // nodes at once (the resume leaves this node along its outgoing flow).
+                    // `is_sync_eligible` already forced this process onto the stateful path.
+                    state.park_fresh(id);
                     // Due-now: the poller claims it on its next tick and self-resumes at once.
                     self.record_timer_wait(id, (self.now_supplier)(), state);
                     state.detached_reply = true;
@@ -1156,9 +1222,10 @@ impl TokenExecutor {
             Node::UserTask { id, .. }
             | Node::MessageCatchEvent { id, .. }
             | Node::ReceiveTask { id, .. } => {
-                // Wait state (S-X1/S-X2): the token PARKS. A satisfied wait node is
-                // short-circuited by the prior_completed fast-path above; reaching this arm
-                // means the branch suspends here until a relay resumes the instance. The
+                // Wait state (S-X1/S-X2): the token PARKS. A satisfied wait is never re-entered
+                // (the resume continues from its outgoing flows), so reaching this arm means a
+                // NEW wait — a first arrival or a loop coming round — until a relay resumes the
+                // instance. The
                 // outgoing flow is NOT enqueued; on_token_left is suppressed (the token did
                 // not leave) and the node is not marked visited (waiting, not done).
                 // `execute_sync` rejects wait-state processes up-front, so on the sync path
@@ -1178,15 +1245,16 @@ impl TokenExecutor {
                     }
                     Some(fired) => {
                         self.route_non_interrupting_boundary(&fired.boundary_id, state);
-                        state.waiting.push(id.clone());
+                        // The host keeps the wait it already had — the same wait, not a new
+                        // one, so its other boundaries keep their pending rows untouched.
+                        state.park_again(id);
                         // Re-arm before marking the park, so a recurring boundary gets its next
                         // occurrence from the SAME pass that consumed this one.
                         self.rearm_fired_boundary(&fired, state)?;
-                        self.schedule_timer_boundaries(id, state)?;
                         left_handled = true;
                     }
                     None => {
-                        state.waiting.push(id.clone());
+                        state.park_fresh(id);
                         self.schedule_timer_boundaries(id, state)?;
                         left_handled = true;
                     }
@@ -1195,11 +1263,11 @@ impl TokenExecutor {
             // Intermediate timer catch: the token parks on a durable TIMER
             // wait row; the poller resumes it at due-at (satisfied node = this node).
             Node::TimerCatchEvent { id, timer, .. } => {
-                state.waiting.push(id.clone());
-                if !state.prior_waiting.contains(id) {
-                    let due_at = self.compute_due_at(timer, id)?;
-                    self.record_timer_wait(id, due_at, state);
-                }
+                // A live token reaching a timer catch always arms it afresh — reaching it again
+                // (a loop) is a new wait with its own due-at, never the spent one.
+                state.park_fresh(id);
+                let due_at = self.compute_due_at(timer, id)?;
+                self.record_timer_wait(id, due_at, state);
                 left_handled = true;
             }
             Node::ExclusiveGateway {
@@ -1351,22 +1419,16 @@ impl TokenExecutor {
             // boundary (`resolved_waits_for`), in the SAME transaction that advances the winner —
             // which is what keeps this a race rather than a fork into N independent tokens.
             Node::EventBasedGateway { id, .. } => {
+                // A live token always arms a fresh race: reaching the gateway again (a loop)
+                // races again, whatever an earlier race decided.
                 for flow in state.process.outgoing(id) {
                     let target = flow.target_ref.clone();
-                    if state.prior_completed.contains(&target) {
-                        // This arm already won on an earlier pass; nothing to re-arm.
-                        continue;
-                    }
-                    if !state.waiting.contains(&target) {
-                        state.waiting.push(target.clone());
-                    }
+                    state.park_fresh(&target);
                     // A timer arm needs its durable row; a message arm is satisfied by a relay
                     // and needs none.
                     if let Ok(Node::TimerCatchEvent { timer, .. }) = state.process.node(&target) {
-                        if !state.prior_waiting.contains(&target) {
-                            let due_at = self.compute_due_at(timer, &target)?;
-                            self.record_timer_wait(&target, due_at, state);
-                        }
+                        let due_at = self.compute_due_at(timer, &target)?;
+                        self.record_timer_wait(&target, due_at, state);
                     }
                 }
                 left_handled = true;
@@ -1398,10 +1460,71 @@ impl TokenExecutor {
         }
 
         if !left_handled {
-            self.notify(|l| l.on_token_left(&token_event));
+            if !quiet {
+                self.notify(|l| l.on_token_left(&token_event));
+            }
             state.visited.insert(node_id.to_string());
         }
         Ok(())
+    }
+
+    /// One step of a resume pass's RECONSTRUCTION walk ([`ExecutionState::ghost`]). Returns
+    /// `true` when the ghost was handled here (moved on or dropped), `false` for the nodes
+    /// whose ordinary handling is already side-effect free and must run as it would for a live
+    /// token — the converging/diverging gateways, so their arrival counts are rebuilt exactly.
+    ///
+    /// The rules, in order:
+    /// - the resume entry and every node still on the prior frontier: dropped — the live
+    ///   pass re-enters the one and carries the others over as they are;
+    /// - a gateway: ordinary handling (its conditions read the restored variables; nothing it
+    ///   does has a side-effect);
+    /// - an event-based gateway whose race was decided in an earlier pass: the ghost follows
+    ///   the arm(s) that completed;
+    /// - a pass-through event (start, link catch/throw, plain throw, boundary): followed,
+    ///   minus any emission or escalation a live token would have raised;
+    /// - a node completed in an earlier pass: followed;
+    /// - anything else (an end event, a node that never completed): dropped — no live token
+    ///   is behind it.
+    fn ghost_step(
+        &self,
+        node_id: &str,
+        node: &Node,
+        state: &mut ExecutionState<'_>,
+    ) -> Result<bool, Signal> {
+        if state.resume_entry.as_deref() == Some(node_id) || state.prior_waiting.contains(node_id) {
+            return Ok(true);
+        }
+        match node {
+            Node::ExclusiveGateway { .. }
+            | Node::InclusiveGateway { .. }
+            | Node::ParallelGateway { .. }
+            | Node::ComplexGateway { .. } => return Ok(false),
+            Node::EventBasedGateway { id, .. } => {
+                for flow in state.process.outgoing(id) {
+                    let arm = flow.target_ref.as_str();
+                    if state.prior_completed.contains(arm)
+                        && !state.prior_waiting.contains(arm)
+                        && state.resume_entry.as_deref() != Some(arm)
+                    {
+                        state.fire(flow);
+                    }
+                }
+            }
+            Node::IntermediateThrowEvent {
+                id,
+                kind: ThrowKind::Link,
+                reference,
+                ..
+            } => self.jump_to_link_catch(id, reference.as_deref(), state)?,
+            Node::StartEvent { .. }
+            | Node::LinkCatchEvent { .. }
+            | Node::BoundaryEvent { .. }
+            | Node::IntermediateThrowEvent { .. } => self.enqueue_outgoing(node_id, state),
+            _ if state.prior_completed.contains(node_id) => self.enqueue_outgoing(node_id, state),
+            _ => return Ok(true),
+        }
+        state.visited.insert(node_id.to_string());
+        Ok(true)
     }
 
     // ---- service task (task-kind routing) ----------------------------------------
@@ -1605,7 +1728,7 @@ impl TokenExecutor {
                 match self.plan_retry(id, parkable, &msg, state)? {
                     RetryDisposition::Park { due_at, attempt } => {
                         state.retry_attempts.insert(id.to_string(), attempt);
-                        state.waiting.push(id.to_string());
+                        state.park_fresh(id);
                         self.record_timer_wait(id, due_at, state);
                         Ok(true)
                     }
@@ -1804,16 +1927,10 @@ impl TokenExecutor {
             self.route_timer_boundary(&fired.boundary_id, id, state)?;
             return Ok(false);
         }
-        // Still waiting from a prior pass (a resume replay reached the parked call):
-        // RE-PARK only — the request was already sent and the pending timer rows keep
-        // their original due-at. An explicit retry RE-DRIVE never takes this exit: the
-        // resume seeding left the re-driven node OUT of `prior_waiting`, so it falls
-        // through to the fresh-park path below and RE-EMITS its request.
-        if state.prior_waiting.contains(id) {
-            state.waiting.push(id.to_string());
-            return Ok(true);
-        }
-
+        // Every other way a live token reaches a call is a NEW attempt: a first arrival, a
+        // loop coming round again, or a `<q:retry>` re-drive. A call still waiting from a
+        // prior pass is never re-entered — the resume carries its wait over untouched — so
+        // there is no silent re-park here: the request goes out.
         let channel_name = implementation
             .strip_prefix(CHANNEL_CALL_PREFIX)
             .expect("caller matched the channel: prefix")
@@ -1893,7 +2010,7 @@ impl TokenExecutor {
         self.notify(|l| l.on_reply_emitted(&reply_event));
 
         // PARK: the host task is the wait frontier; its timer boundaries become TIMER rows.
-        state.waiting.push(id.to_string());
+        state.park_fresh(id);
         self.schedule_timer_boundaries(id, state)?;
         Ok(true)
     }
@@ -1939,7 +2056,7 @@ impl TokenExecutor {
             RetryDisposition::Park { due_at, attempt } => {
                 state.retry_attempts.insert(id.to_string(), attempt);
                 state.retry_backoff.insert(id.to_string(), code.to_string());
-                state.waiting.push(id.to_string());
+                state.park_fresh(id);
                 self.record_timer_wait(id, due_at, state);
                 Ok(true)
             }
@@ -1955,8 +2072,8 @@ impl TokenExecutor {
         }
     }
 
-    /// Arm every (interrupting) timer boundary attached to `host_id` that is not already
-    /// pending from a prior pass: compute due-at from the ISO-8601 duration and record the
+    /// Arm every timer boundary attached to `host_id` — the host is parking a NEW wait, so its
+    /// boundaries start new timers (not already armed in this pass): compute due-at from the ISO-8601 duration and record the
     /// fresh timer wait (`on_timer_scheduled` fires).
     fn schedule_timer_boundaries(
         &self,
@@ -1974,7 +2091,6 @@ impl TokenExecutor {
             } = n
             {
                 if attached_to_ref != host_id
-                    || state.prior_waiting.contains(host_id)
                     || state.timer_waits.iter().any(|t| &t.node_id == boundary_id)
                 {
                     continue;
@@ -2042,8 +2158,8 @@ impl TokenExecutor {
         for flow in state.process.outgoing(boundary_id) {
             state.fire(flow);
         }
-        // NOT marked visited: a recurring boundary must stay re-enterable, and `visited` is the
-        // replay-as-done set. `rearm_fired_boundary` decides whether another occurrence follows.
+        // NOT marked visited: a recurring boundary is not done, it may fire again.
+        // `rearm_fired_boundary` decides whether another occurrence follows.
     }
 
     /// Re-arm a fired non-interrupting boundary for its next occurrence, when it recurs.
@@ -2692,7 +2808,9 @@ impl TokenExecutor {
             };
             let expected = *state.inclusive_expected.get(id).unwrap_or(&0);
             if expected > 0 && arrivals < expected {
-                self.notify(|l| l.on_token_left(token_event));
+                if !state.ghost {
+                    self.notify(|l| l.on_token_left(token_event));
+                }
                 return Ok(true);
             }
             state.inclusive_arrivals.remove(id);
@@ -2758,9 +2876,14 @@ impl TokenExecutor {
                 *e
             };
             if arrived < incoming.len() {
-                self.notify(|l| l.on_token_left(token_event));
+                if !state.ghost {
+                    self.notify(|l| l.on_token_left(token_event));
+                }
                 return Ok(true);
             }
+            // The join fired: its count starts over, so a loop that brings tokens back to it
+            // waits for a full set again instead of passing on the first arrival.
+            state.parallel_arrivals.remove(id);
         }
         for flow in process.outgoing(id) {
             state.fire(flow);
@@ -2781,7 +2904,9 @@ impl TokenExecutor {
         if incoming.len() > 1 {
             // Converging N-of-M join; a late token after the firing is absorbed.
             if state.complex_fired.contains(id) {
-                self.notify(|l| l.on_token_left(token_event));
+                if !state.ghost {
+                    self.notify(|l| l.on_token_left(token_event));
+                }
                 return Ok(true);
             }
             let arrived = {
@@ -2800,7 +2925,9 @@ impl TokenExecutor {
                 }
             };
             if !fire {
-                self.notify(|l| l.on_token_left(token_event));
+                if !state.ghost {
+                    self.notify(|l| l.on_token_left(token_event));
+                }
                 return Ok(true);
             }
             state.complex_fired.insert(id.to_string());
@@ -4278,6 +4405,7 @@ impl TokenExecutor {
         };
         let payload = match state.process.audit.as_ref().map(|a| a.capture) {
             Some(AuditCapture::Payload) => Some(redacted_variable_snapshot(state)),
+            Some(AuditCapture::Media) => media_reference_snapshot(state),
             _ => None,
         };
         (Some(sink), payload)
@@ -4464,20 +4592,21 @@ struct ExecutionState<'p> {
     /// Data-store optimistic concurrency — revision captured per `"<store>#<key>"` at read time.
     store_revs: HashMap<String, i64>,
     /// Nodes completed in PRIOR passes of this instance (from a suspend snapshot; empty on
-    /// a fresh start). On a resume pass the executor replays from the start event but skips
-    /// the side-effect of every node here — "replay skipping completed".
+    /// a fresh start). Read only by a resume pass's reconstruction walk, which may follow a
+    /// node only when it is here; a live token runs every node it reaches.
     prior_completed: HashSet<String>,
     /// The same set, insertion-ordered (the snapshot's `completedNodes` order).
     prior_completed_ordered: Vec<String>,
     /// Wait-state nodes the token parked at during THIS pass — the suspend frontier.
     waiting: Vec<String>,
-    /// Wait nodes still parked from the PRIOR pass (the snapshot's frontier): reached
-    /// again on a resume replay they RE-PARK without re-firing park side-effects.
+    /// Wait nodes parked at the PRIOR quiescent point (the snapshot's frontier). The resume
+    /// carries each one over unchanged unless the pass's entry consumes it; the
+    /// reconstruction walk stops at them.
     prior_waiting: HashSet<String>,
     /// Timer waits scheduled FRESH by this pass.
     timer_waits: Vec<TimerWait>,
-    /// The interrupting timer boundary this resume pass is firing, consumed when
-    /// the replay reaches its host activity.
+    /// The timer boundary this resume pass is firing, consumed when the resume re-enters its
+    /// host activity.
     fired_timer: Option<FiredTimer>,
     /// Respond-and-continue: set when this pass parked at a `<q:reply continue>` service
     /// task — the dispatcher flushes the produced reply (`responseBody`) to the caller now, then the
@@ -4502,24 +4631,69 @@ struct ExecutionState<'p> {
     /// like `retry_attempts`.
     retry_backoff: BTreeMap<String, String>,
     /// The channel-call TASK FAILURE this resume pass is delivering (a terminally-poisoned
-    /// request delivery), consumed when the replay reaches the named node — the poison
+    /// request delivery), consumed when the resume re-enters the named node — the poison
     /// counterpart of `fired_timer`. Set only by
     /// [`TokenExecutor::resume_channel_call_failure`].
     channel_call_failure: Option<ChannelCallFailure>,
-    /// The channel-call node this resume pass EXPLICITLY re-drives (its backoff came due):
-    /// the node re-runs its park side-effects — a FRESH request emission, fresh timer
-    /// boundaries — instead of the silent re-park an ordinary resume replay performs on a
-    /// still-waiting node. Explicit rather than inferred, because for a channel-call node the
-    /// durable facts alone cannot distinguish a backoff re-drive from a relay that resumed
-    /// the node mid-retry (both carry an outstanding attempt count); the DISPATCHER derives
-    /// the verdict from the durable `retry_backoff` marker under the instance claim and
-    /// passes it down. Set only by [`TokenExecutor::resume_retry_redrive`].
-    channel_call_redrive: Option<String>,
+    /// True while a resume pass runs its RECONSTRUCTION walk: the tokens moving through the
+    /// graph are ghosts of tokens that already passed, walked from the start event over the
+    /// completed part of the graph only so that converging gateways get back the arrivals
+    /// they had at the last quiescent point. A ghost executes nothing, parks nothing and
+    /// emits nothing ([`TokenExecutor::ghost_step`]); it is dropped wherever a live token
+    /// would have had to do real work. False on every live pass.
+    ghost: bool,
+    /// The node the resume pass re-enters at — a reconstruction ghost reaching it is dropped
+    /// (the live token is injected there directly). `None` on a first pass.
+    resume_entry: Option<String>,
+    /// The sequence flows a reconstruction ghost has already taken this pass. Each flow is
+    /// taken at most once, which is what bounds the walk on a cyclic graph: the walk
+    /// reconstructs one collapsed view of the history, never one lap per loop iteration.
+    ghost_flows: HashSet<String>,
+    /// Wait nodes THIS pass parked as a new wait (park side-effects ran) — the
+    /// `fresh_waits` of the suspend result.
+    fresh_waits: Vec<String>,
     /// The correlation dims the inbound message driving THIS pass carried (trace-id +
     /// the leg's `<q:alias>` value), stamped onto any cross-process reconstruction fragment
     /// `mark_coverage` writes at completion. Defaults empty (both `None`) for internal passes; the
     /// spawn/relay drive sites populate it. Best-effort — the union-find is edge-tolerant.
     correlation: CoverageCorrelation,
+}
+
+/// Where a resume pass re-enters the graph (see [`TokenExecutor::resume`]).
+enum ResumeEntry {
+    /// The wait node is satisfied: the token leaves it along its outgoing flows.
+    Leave(String),
+    /// The node must run: a fired timer boundary's host, a retry re-drive, a failure delivery.
+    Run(String),
+}
+
+impl ResumeEntry {
+    fn node(&self) -> &str {
+        match self {
+            ResumeEntry::Leave(n) | ResumeEntry::Run(n) => n,
+        }
+    }
+}
+
+/// The other arms of every event-based gateway `node` is an arm of — the waits a won race
+/// retires along with the winner. Static model structure, so nothing about the race has to
+/// survive a park.
+fn race_siblings(process: &ProcessDefinition, node: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for gw in process.nodes() {
+        if !matches!(gw, Node::EventBasedGateway { .. }) {
+            continue;
+        }
+        let arms: Vec<&str> = process
+            .outgoing(gw.id())
+            .iter()
+            .map(|f| f.target_ref.as_str())
+            .collect();
+        if arms.contains(&node) {
+            out.extend(arms.into_iter().filter(|a| *a != node).map(str::to_string));
+        }
+    }
+    out
 }
 
 /// The fired-timer-boundary marker a [`TokenExecutor::resume_timer`] pass carries.
@@ -4538,8 +4712,8 @@ struct FiredTimer {
 
 /// The channel-call task-failure marker a [`TokenExecutor::resume_channel_call_failure`] pass
 /// carries: `node_id`'s in-flight request failed terminally OUTSIDE the graph (today: the
-/// outbox poisoned its delivery), and the replay must offer that failure to the node's
-/// `<q:retry>` policy when it reaches it.
+/// outbox poisoned its delivery), and the resume must offer that failure to the node's
+/// `<q:retry>` policy when it re-enters it.
 #[derive(Debug, Clone)]
 struct ChannelCallFailure {
     node_id: String,
@@ -4590,7 +4764,10 @@ impl<'p> ExecutionState<'p> {
             retry_parkable: true,
             retry_backoff: BTreeMap::new(),
             channel_call_failure: None,
-            channel_call_redrive: None,
+            ghost: false,
+            resume_entry: None,
+            ghost_flows: HashSet::new(),
+            fresh_waits: Vec::new(),
             correlation: CoverageCorrelation::default(),
         }
     }
@@ -4621,6 +4798,25 @@ impl<'p> ExecutionState<'p> {
         None
     }
 
+    /// Park the current token at `node_id` as a NEW wait: it joins the suspend frontier and
+    /// the pass's fresh waits (the caller has run, or is about to run, the park side-effects).
+    fn park_fresh(&mut self, node_id: &str) {
+        if !self.waiting.iter().any(|n| n == node_id) {
+            self.waiting.push(node_id.to_string());
+        }
+        if !self.fresh_waits.iter().any(|n| n == node_id) {
+            self.fresh_waits.push(node_id.to_string());
+        }
+    }
+
+    /// Keep `node_id` parked as the SAME wait it already was (no side-effect re-fires): it
+    /// joins the frontier but not the pass's fresh waits.
+    fn park_again(&mut self, node_id: &str) {
+        if !self.waiting.iter().any(|n| n == node_id) {
+            self.waiting.push(node_id.to_string());
+        }
+    }
+
     /// Seed one prior-completed node (resume pass), keeping insertion order deduplicated.
     fn push_prior_completed(&mut self, node_id: &str) {
         if self.prior_completed.insert(node_id.to_string()) {
@@ -4632,6 +4828,9 @@ impl<'p> ExecutionState<'p> {
     /// per-pass trace AND advance every declared coverage path's contiguous-prefix cursor when
     /// this flow is the path's next expected flow (the cross-pass persisted cursor).
     fn fire(&mut self, flow: &SequenceFlow) {
+        if self.ghost && !self.ghost_flows.insert(flow.id.clone()) {
+            return;
+        }
         self.work.push_back(flow.target_ref.clone());
         if self.trace_coverage {
             self.flow_trace.push(flow.id.clone());
@@ -5158,6 +5357,72 @@ fn redacted_variable_snapshot(state: &ExecutionState<'_>) -> String {
         obj.insert(name.to_string(), rendered);
     }
     serde_json::Value::Object(obj).to_string()
+}
+
+/// How deep [`media_reference_snapshot`] looks inside a variable's value.
+const MEDIA_REFERENCE_DEPTH: usize = 4;
+
+/// The `capture="media"` audit payload: `{"media": [<reference>, …]}` — every media reference
+/// among the instance's variables, or `None` when there is none (the event then carries the
+/// metadata-level `{}`). A reference is an object with `kind: "media"` and string `uri` and
+/// `sha256` (what a recording transport reports, e.g. on a call's hang-up); it is copied as
+/// is, so it never holds the media itself. `@sensitive` variables are skipped; a reference
+/// found twice is listed once.
+fn media_reference_snapshot(state: &ExecutionState<'_>) -> Option<String> {
+    let sensitive: HashSet<&str> = state
+        .process
+        .declared_variables
+        .iter()
+        .filter(|d| d.sensitive)
+        .map(|d| d.name.as_str())
+        .collect();
+    let ctx = state.ctx.borrow();
+    let mut found: Vec<serde_json::Value> = Vec::new();
+    for (name, value) in ctx.variables.iter() {
+        if sensitive.contains(name) || name.ends_with(sutra_bpmn::REDACTION_COMPANION_SUFFIX) {
+            continue;
+        }
+        collect_media_references(&feel_to_json(value), MEDIA_REFERENCE_DEPTH, &mut found);
+    }
+    if found.is_empty() {
+        return None;
+    }
+    Some(serde_json::json!({ "media": found }).to_string())
+}
+
+fn is_media_reference(value: &serde_json::Value) -> bool {
+    value.get("kind").and_then(|k| k.as_str()) == Some("media")
+        && value.get("uri").is_some_and(|u| u.is_string())
+        && value.get("sha256").is_some_and(|h| h.is_string())
+}
+
+fn collect_media_references(
+    value: &serde_json::Value,
+    depth: usize,
+    found: &mut Vec<serde_json::Value>,
+) {
+    if is_media_reference(value) {
+        if !found.contains(value) {
+            found.push(value.clone());
+        }
+        return;
+    }
+    if depth == 0 {
+        return;
+    }
+    match value {
+        serde_json::Value::Object(map) => {
+            for nested in map.values() {
+                collect_media_references(nested, depth - 1, found);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for nested in items {
+                collect_media_references(nested, depth - 1, found);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Commit and release the open store transaction(s), if any. Returns the first backend

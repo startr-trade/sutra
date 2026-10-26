@@ -10,10 +10,14 @@ publish.workspace = true
 sutra-channels = { path = "../sutra-channels" }
 sutra-transport-spi = { path = "../sutra-transport-spi" }
 sutra-llm-spi = { path = "../sutra-llm-spi" }
+# Media references in a request are read from an engine-configured object store.
+sutra-objectstore = { path = "../sutra-objectstore" }
 inventory = "0.3.24"
 async-trait = { workspace = true }
 tracing = { workspace = true }
 serde_json = { workspace = true }
+# Audio and video parts travel base64-encoded in the request and reply bodies.
+base64 = { workspace = true }
 # The channel property bag carries a YAML list as its YAML text; parsed back here.
 serde_yaml_ng = "0.10"
 time = { workspace = true }
@@ -27,6 +31,8 @@ tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
 axum = { version = "0.8", default-features = false }
 
 [dev-dependencies]
+# The media-reference tests seal objects the way a recording transport does.
+sutra-crypto = { path = "../sutra-crypto" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "test-util"] }
 tower = { version = "0.5", features = ["util"] }
 # The docker-gated job-table tests: a postgres container migrated with the engine SQL.

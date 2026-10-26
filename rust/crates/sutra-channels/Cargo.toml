@@ -12,13 +12,15 @@ default = ["transport"]
 # dispatcher / outbox loop / audit dispatcher. OFF (`--no-default-features`) leaves the pure channel
 # MODEL (config/channels.yaml parse, codes, registry, sink::scheme_of) — the only part the
 # deploy-time lint consumes — compiling WITHOUT tokio/axum/hyper, hence to `wasm32-*`.
-transport = ["dep:axum", "dep:futures-core", "dep:tokio", "dep:http-body-util", "dep:hyper", "dep:hyper-util", "dep:hyper-rustls"]
+transport = ["dep:inventory", "dep:axum", "dep:futures-core", "dep:tokio", "dep:http-body-util", "dep:hyper", "dep:hyper-util", "dep:hyper-rustls"]
 
 [dependencies]
 # The dyn-safe async form of the persistence-facing trait seams (InstanceBridge,
 # InboxStore, ConcurrencyStore, IncidentSink — execution scale-out Phase 3). Runtime-agnostic
 # and wasm-clean, so it lives in the always-compiled model layer, not behind `transport`.
 async-trait = { workspace = true }
+# The extension-registered caller-fault codes the HTTP transport maps to 422 (transport only).
+inventory = { version = "0.3.24", optional = true }
 sutra-bpmn = { path = "../sutra-bpmn" }
 sutra-codec-spi = { path = "../sutra-codec-spi" }
 sutra-dmn = { path = "../sutra-dmn" }

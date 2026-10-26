@@ -11,11 +11,13 @@ pub mod admin;
 pub mod assembly;
 pub mod audit_sinks;
 pub mod bridge;
+pub mod capacity;
 pub mod concurrency;
 pub mod config;
 pub mod deploy;
 pub mod envref;
 pub mod external_task;
+pub mod media;
 pub mod migrate;
 pub mod otel;
 pub mod outbox;
@@ -26,6 +28,7 @@ pub mod stores;
 pub mod sweeper;
 pub mod test_clock;
 pub mod timer;
+pub mod transport_audit;
 pub mod xslt;
 
 /// The DB-lease leader election + intake adapter moved DOWN to `sutra-transport-spi`

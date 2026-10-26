@@ -87,7 +87,7 @@ channels:
           model: gemini-2.5-flash               # any model id your key can use
           api-key: env:GEMINI_API_KEY           # export GEMINI_API_KEY before `docker compose up`
       system: "You summarize support tickets in two sentences."
-      max-output-tokens: 256
+      max-output-tokens: 2048
       temperature: 0
       timeout-seconds: 30
 
@@ -103,7 +103,7 @@ channels:
           model: gemini-2.5-flash
           api-key: env:GEMINI_API_KEY
       system: "You summarize support tickets in two sentences."
-      max-output-tokens: 256
+      max-output-tokens: 2048
       temperature: 0
       timeout-seconds: 30
 

@@ -132,6 +132,7 @@ impl DeploymentPlan {
     /// mean re-verifying and re-planning a sealed archive on an admin request path.
     pub(crate) fn node_index(&self) -> crate::migrate::DeploymentNodeIndex {
         crate::migrate::DeploymentNodeIndex::of_modules(&self.modules)
+            .with_tenant(&self.namespace.tenant)
     }
 
     /// The durable timer-start schedules this deployment arms when it becomes ACTIVE — one per
@@ -438,6 +439,10 @@ pub(crate) fn build_engine_runtime(
     let actor_key_provider = key_provider;
     let actor_deferred_acks = Arc::clone(&deferred_acks);
     let actor_now_override = now_override;
+    // The capacity-pool store: ONE per runtime, shared by every lane and the outbox dispatcher
+    // (installed before the lanes are built, so each of them picks it up).
+    let capacity = crate::capacity::build_capacity_store(pool.clone());
+    crate::capacity::install_shared_store(capacity.clone());
     let boot_plans = Arc::new(plans);
     let boot_draining = Arc::new(draining_plans);
     // The activation's read-only registries — built ONCE here (execution scale-out §2 row 10),
@@ -640,6 +645,10 @@ pub(crate) fn build_engine_runtime(
         );
         if let Some(incidents) = outbox_incidents {
             dispatcher_build = dispatcher_build.with_incident_sink(incidents);
+        }
+        // A request on a pooled outbound channel waits here until its call holds a slot.
+        if let Some(capacity) = capacity.clone() {
+            dispatcher_build = dispatcher_build.with_capacity_pools(capacity);
         }
         // The channel-call `<q:retry>` poison wake: a node-bearing row going TERMINAL prompts
         // the engine to offer the failure to the parked task's retry policy NOW instead of at
@@ -1204,6 +1213,9 @@ pub(crate) fn plan_deployment(
     // leaving its channels unbound. (`/sutra/health/*` is unaffected — it is the engine's own
     // infra liveness API, not a channel transport.)
     reject_disallowed_transports(&definitions, &allowed_transports(), &dep)?;
+    // Capacity pools are engine configuration: a `pool:` must name a declared pool its tenant
+    // may use, or the deployment does not load.
+    crate::capacity::validate_pool_references(&definitions, &dep)?;
 
     // Outbound channels (`direction: outbound`) — `<q:send channel>` targets, resolved
     // fail-closed at startup (an invalid outbound binding aborts the load): the bind
@@ -1522,13 +1534,39 @@ pub(crate) async fn build_key_provider(
                 as Arc<dyn sutra_crypto::KeyProvider + Send + Sync>,
         ))
     } else if let Some(master) = &config.crypto_master_key {
+        let secret = resolve_master_key(master, crate::envref::resolve_value)?;
         Ok(Some(
-            Arc::new(sutra_crypto::HkdfKeyProvider::new(master.as_bytes()))
+            Arc::new(sutra_crypto::HkdfKeyProvider::new(secret.as_bytes()))
                 as Arc<dyn sutra_crypto::KeyProvider + Send + Sync>,
         ))
     } else {
         Ok(None)
     }
+}
+
+/// Resolve `sutra.crypto.master-key` the way every other secret config key is resolved: as a
+/// whole-value reference (`env:NAME`, `secret:KEY`, `vault:…`, `${NAME}`, …) through the envref
+/// registry. A value that is not a reference (it resolves to itself) is still accepted as the raw
+/// master secret, because deployments that set the key directly would otherwise lose access to
+/// the data they already encrypted; it is logged as a warning, since a literal key in the
+/// environment is exactly what the reference forms exist to avoid. An unresolvable reference, or
+/// one that resolves to an empty secret, refuses to boot.
+pub(crate) fn resolve_master_key(
+    configured: &str,
+    resolve: impl Fn(&str) -> Result<String, crate::envref::EnvRefError>,
+) -> Result<String, String> {
+    let resolved =
+        resolve(configured).map_err(|e| format!("sutra.crypto.master-key did not resolve: {e}"))?;
+    if resolved.is_empty() {
+        return Err("sutra.crypto.master-key resolved to an empty secret".to_string());
+    }
+    if resolved == configured {
+        warn!(
+            "sutra.crypto.master-key is a literal value, not a reference; it is used as the raw \
+             master secret. Set it as a reference (env:NAME, secret:KEY, vault:...) instead"
+        );
+    }
+    Ok(resolved)
 }
 
 /// The activation's READ-ONLY registries — built ONCE per activation and shared by every
@@ -1686,6 +1724,42 @@ pub(crate) fn build_shared_registries(
         formats: Arc::new(sutra_channels::FormatRegistry::with_builtins()),
         outbound_channels: Arc::new(outbound_channels),
     })
+}
+
+/// Install the engine's transport audit journal over `sinks`, routing deployment-level events of
+/// each of `plans` by its module key (an active deployment wins over a draining one of the same
+/// key, which comes after it).
+fn install_transport_audit_journal<'a>(
+    handle: &Handle,
+    sinks: sutra_channels::AuditSinkRegistry,
+    default_sink: Option<String>,
+    plans: impl Iterator<Item = &'a DeploymentPlan>,
+) {
+    let mut routes: Vec<(String, crate::transport_audit::DeploymentAuditRoute)> = Vec::new();
+    for plan in plans {
+        let module_key = plan.namespace.module_key();
+        if routes.iter().any(|(key, _)| *key == module_key) {
+            continue;
+        }
+        let route = crate::transport_audit::DeploymentAuditRoute::for_processes(
+            plan.dep.value(),
+            &plan.namespace.tenant,
+            plan.modules
+                .iter()
+                .flat_map(|m| m.processes())
+                .map(|p| p.audit.as_ref()),
+            default_sink.as_deref(),
+        );
+        routes.push((module_key, route));
+    }
+    let journal = crate::transport_audit::EngineTransportAuditJournal::spawn(
+        handle,
+        sinks,
+        default_sink,
+        routes,
+        crate::transport_audit::TRANSPORT_AUDIT_QUEUE_CAPACITY,
+    );
+    sutra_channels::transport_audit().install(journal);
 }
 
 /// Runs ON the actor lane: assemble the `Rc`-based executor + channel engine over the
@@ -1989,6 +2063,10 @@ pub(crate) fn build_engine(
                 ),
             }
         }
+        if registry.is_empty() && shard.index == 0 {
+            // No audit sink: transport events have nowhere to go.
+            sutra_channels::transport_audit().clear();
+        }
         if !registry.is_empty() {
             let names = registry.names().join(", ");
             // The engine-default audit sink for a process that declares no `<q:audit sink>` (and
@@ -1999,6 +2077,17 @@ pub(crate) fn build_engine(
                 .into_iter()
                 .find(|name| registry.get(name).is_some())
                 .map(str::to_string);
+            // The journal transports append their own events to (`sutra_channels::transport_audit`),
+            // over the same sinks. Installed by lane 0 only — every lane builds the same sinks and
+            // deployment set, and one journal (one writer) serves the process.
+            if shard.index == 0 {
+                install_transport_audit_journal(
+                    &handle,
+                    registry.clone(),
+                    default_audit_sink.clone(),
+                    active.iter().chain(draining.iter()),
+                );
+            }
             let (tx, rx) = sutra_channels::audit_channel();
             sutra_channels::spawn_audit_dispatcher(&handle, rx, registry);
             let listener = Rc::new(sutra_channels::AuditListener::new(tx, || {
@@ -2109,6 +2198,10 @@ pub(crate) fn build_engine(
     // suspend/resume + restart — the DB sink's uniqueness guard).
     if let Some(listener) = audit_listener {
         engine_builder = engine_builder.with_audit_listener(listener);
+    }
+    // Capacity pools: the runtime's one shared store (see `build_engine_runtime`).
+    if let Some(capacity) = crate::capacity::shared_store() {
+        engine_builder = engine_builder.with_capacity_pools(capacity);
     }
     for plan in active.iter() {
         engine_builder = engine_builder.with_channel_definitions(&plan.definitions);
@@ -2886,5 +2979,40 @@ mod projected_store_wiring_tests {
         assert!(def.structure.is_none());
         let backend = build_store_backend(&def, Vec::new(), None, None).expect("builds");
         assert!(matches!(backend, StoreBackend::Pg(_)));
+    }
+}
+
+#[cfg(test)]
+mod master_key_tests {
+    use super::resolve_master_key;
+    use crate::envref::EnvRefError;
+
+    fn resolver(input: &str) -> Result<String, EnvRefError> {
+        match input {
+            "env:SUTRA_TEST_MASTER" => Ok("resolved-master-secret".to_string()),
+            "env:EMPTY" => Ok(String::new()),
+            other if other.starts_with("env:") => Err(EnvRefError(format!("{other} unset"))),
+            literal => Ok(literal.to_string()),
+        }
+    }
+
+    #[test]
+    fn master_key_reference_is_resolved_not_used_as_bytes() {
+        let secret = resolve_master_key("env:SUTRA_TEST_MASTER", resolver).unwrap();
+        assert_eq!(secret, "resolved-master-secret");
+    }
+
+    #[test]
+    fn master_key_literal_is_accepted_as_raw_secret() {
+        let secret = resolve_master_key("dev-only-master", resolver).unwrap();
+        assert_eq!(secret, "dev-only-master");
+    }
+
+    #[test]
+    fn master_key_unresolvable_reference_refuses_boot() {
+        let err = resolve_master_key("env:MISSING", resolver).unwrap_err();
+        assert!(err.contains("did not resolve"), "{err}");
+        let err = resolve_master_key("env:EMPTY", resolver).unwrap_err();
+        assert!(err.contains("empty secret"), "{err}");
     }
 }

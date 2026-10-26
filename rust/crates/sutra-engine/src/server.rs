@@ -253,6 +253,34 @@ impl RunningEngine {
 pub async fn serve(config: EngineConfig) -> Result<RunningEngine, Box<dyn std::error::Error>> {
     let ready = Arc::new(AtomicBool::new(false));
 
+    // ---- capacity pools: engine configuration every deployment's `pool:` is checked against
+    // (installed before the first archive is planned) ------------------------------------------
+    crate::capacity::install_configured_pools(&config.capacity_pools);
+    if !config.capacity_pools.is_empty() {
+        info!(
+            pools = ?config
+                .capacity_pools
+                .iter()
+                .map(|p| format!("{}={}", p.name, p.slots))
+                .collect::<Vec<_>>(),
+            "capacity pools declared"
+        );
+    }
+
+    // ---- object stores: read by `llm` media references, deleted from by erasure and
+    // retention (installed before the first archive is planned) ------------------------------
+    crate::media::install_object_stores(&config.object_stores)?;
+    if !config.object_stores.is_empty() {
+        info!(
+            stores = ?config
+                .object_stores
+                .iter()
+                .map(|s| format!("{}={}", s.name, s.uri))
+                .collect::<Vec<_>>(),
+            "object stores declared"
+        );
+    }
+
     // ---- persistence: the ENGINE-INTERNAL datasource (the engine tables) ----------
     // Opened FIRST (before the deployment source) because the `db` source boots its active set
     // from the deployment_archive store. Configured ⇒ open the pool and run THE SAME shipped
@@ -469,6 +497,7 @@ pub async fn serve(config: EngineConfig) -> Result<RunningEngine, Box<dyn std::e
     // with the execution-listener wiring above.
     if metrics_labels.is_some() {
         crate::otel::register_shard_router_meters(engine_handle.shard_metrics());
+        crate::otel::register_transport_audit_meters();
     }
 
     // Arm the boot ACTIVE set's timer-start schedules (no-op without persistence, and without
@@ -618,6 +647,8 @@ pub async fn serve(config: EngineConfig) -> Result<RunningEngine, Box<dyn std::e
                 sweep_gate,
                 config.instance_sweep.clone(),
             )
+            // Capacity pools declared ⇒ the same tick also returns stranded pool slots.
+            .with_capacity_sweep(!config.capacity_pools.is_empty())
             .spawn();
 
             // The terminal-retention purge: drops finished instances past
@@ -1259,14 +1290,21 @@ pub(crate) async fn instance_inspect_response(
         };
         match store.load(&pdep, instance_id).await {
             Ok(Some(row)) => {
-                return match InstanceSnapshot::read(&row.serialised) {
+                // Decrypt with the engine's key provider (an instance with an encrypted
+                // `sensitive` variable carries a keyId); the projection then redacts the
+                // sensitive values exactly as for a plaintext row.
+                return match crate::bridge::decode_persisted_snapshot(
+                    state.key_provider.as_deref(),
+                    &row.serialised,
+                    &instance_id.to_string(),
+                ) {
                     Ok(snapshot) => (
                         StatusCode::OK,
                         Json(inspect_projection(instance_id, &snapshot)),
                     )
                         .into_response(),
                     Err(e) => {
-                        warn!(instance_id = %id, error = %e, "instance snapshot decode failed");
+                        warn!(instance_id = %id, error = %e.message, "instance snapshot decode failed");
                         (
                             StatusCode::INTERNAL_SERVER_ERROR,
                             Json(serde_json::json!({
@@ -2434,6 +2472,7 @@ fn audit_event_json(record: &AuditEventRecord) -> serde_json::Value {
     };
     serde_json::json!({
         "seq": record.seq,
+        "ordinal": record.ordinal,
         "at": record.at.format(rfc3339).unwrap_or_default(),
         "eventType": record.event_type,
         "nodeId": record.node_id,
@@ -2443,24 +2482,37 @@ fn audit_event_json(record: &AuditEventRecord) -> serde_json::Value {
     })
 }
 
-/// `?afterSeq=` (exclusive cursor, default 0 — seqs start at 1) and `?limit=` clamped by the
-/// store's page ceiling. A cursor rather than an offset because the journal of a still-running
-/// instance grows while it is being paged, and an offset page would then skip or repeat rows.
-fn history_paging(params: &HashMap<String, String>) -> (i32, i64) {
-    let after_seq = params
-        .get("afterSeq")
-        .and_then(|s| s.parse::<i32>().ok())
-        .unwrap_or(0)
-        .max(0);
+/// Where an instance-history page starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HistoryCursor {
+    /// `?afterOrdinal=` — the journal ordinal, assigned in commit order: lossless while the
+    /// instance is still writing. Also the cursor of a request that names neither (from 0).
+    Ordinal(i64),
+    /// `?afterSeq=` — the legacy cursor, kept for existing clients. The engine's per-instance
+    /// seq, which a transport event shares with the engine event it followed, so a transport
+    /// row written after a reader passed its seq is behind the cursor and never returned.
+    Seq(i32),
+}
+
+/// The cursor (`?afterOrdinal=` wins over `?afterSeq=`; neither = the start of the journal by
+/// ordinal) and `?limit=` clamped by the store's page ceiling. A cursor rather than an offset
+/// because the journal of a still-running instance grows while it is being paged, and an offset
+/// page would then skip or repeat rows.
+fn history_paging(params: &HashMap<String, String>) -> (HistoryCursor, i64) {
+    let cursor = match (params.get("afterOrdinal"), params.get("afterSeq")) {
+        (Some(ordinal), _) => HistoryCursor::Ordinal(ordinal.parse::<i64>().unwrap_or(0).max(0)),
+        (None, Some(seq)) => HistoryCursor::Seq(seq.parse::<i32>().unwrap_or(0).max(0)),
+        (None, None) => HistoryCursor::Ordinal(0),
+    };
     let limit = params
         .get("limit")
         .and_then(|l| l.parse::<i64>().ok())
         .unwrap_or(AUDIT_HISTORY_PAGE_DEFAULT)
         .clamp(1, AUDIT_HISTORY_PAGE_MAX);
-    (after_seq, limit)
+    (cursor, limit)
 }
 
-/// `GET /admin/instances/{id}/history` — one seq-ordered page of an instance's audit journal.
+/// `GET /admin/instances/{id}/history` — one page of an instance's audit journal.
 ///
 /// This is the surface that makes "what did this instance actually do?" answerable. The retained
 /// terminal snapshot (`GET /admin/instances/{id}`) says where an instance ended and with what
@@ -2487,7 +2539,7 @@ pub(crate) async fn instance_history_response(
     let Some(instance_id) = parse_uuid(id) else {
         return bad_uuid(id).into_response();
     };
-    let (after_seq, limit) = history_paging(params);
+    let (cursor, limit) = history_paging(params);
     let Some(pool) = state.pool.clone() else {
         return instance_not_found(id).into_response();
     };
@@ -2529,10 +2581,19 @@ pub(crate) async fn instance_history_response(
 
     let mut found: Option<(PersistDeploymentId, Vec<AuditEventRecord>)> = None;
     for dep in &scopes {
-        match audit
-            .list_for_instance(dep, instance_id, after_seq, limit)
-            .await
-        {
+        let page = match cursor {
+            HistoryCursor::Ordinal(after) => {
+                audit
+                    .list_for_instance_after_ordinal(dep, instance_id, after, limit)
+                    .await
+            }
+            HistoryCursor::Seq(after) => {
+                audit
+                    .list_for_instance(dep, instance_id, after, limit)
+                    .await
+            }
+        };
+        match page {
             Ok(rows) if !rows.is_empty() => {
                 found = Some((dep.clone(), rows));
                 break;
@@ -2559,15 +2620,23 @@ pub(crate) async fn instance_history_response(
 
     let events: Vec<serde_json::Value> = records.iter().map(audit_event_json).collect();
     // A FULL page means there may be more; a short one is the end of the journal.
-    let next_after_seq = (records.len() as i64 == limit)
-        .then(|| records.last().map(|r| r.seq))
+    let full = records.len() as i64 == limit;
+    let next_after_seq = full.then(|| records.last().map(|r| r.seq)).flatten();
+    let next_after_ordinal = full
+        .then(|| records.last().and_then(|r| r.ordinal))
         .flatten();
+    let (after_seq, after_ordinal) = match cursor {
+        HistoryCursor::Ordinal(after) => (None, Some(after)),
+        HistoryCursor::Seq(after) => (Some(after), None),
+    };
     let mut body = serde_json::json!({
         "instanceId": id,
         "deploymentId": deployment.as_ref().map(|d| d.as_str().to_owned()),
         "events": events,
+        "afterOrdinal": after_ordinal,
         "afterSeq": after_seq,
         "limit": limit,
+        "nextAfterOrdinal": next_after_ordinal,
         "nextAfterSeq": next_after_seq,
         "auditEnabled": state.audit_sql_enabled,
     });
@@ -2944,6 +3013,29 @@ fn now_rfc3339() -> String {
 /// Project one decoded snapshot into the inspect response, replacing every `@sensitive`
 /// variable's value with [`REDACTED_PLACEHOLDER`]. Pure over the decoded snapshot so the
 /// security-critical redaction is unit-testable without a database.
+/// The deployments a tenant-wide erasure covers: every live (active or draining) deployment this
+/// engine serves for `tenant`, plus every archive-table row (`(deploymentId, tenant)`) of it.
+/// Deduplicated and sorted, so the scan order is stable.
+fn tenant_deployments(
+    tenant: &str,
+    live: &crate::migrate::SharedNodeIndex,
+    archived: impl IntoIterator<Item = (String, String)>,
+) -> Vec<String> {
+    let mut ids: std::collections::BTreeSet<String> = archived
+        .into_iter()
+        .filter(|(_, t)| t == tenant)
+        .map(|(id, _)| id)
+        .collect();
+    if let Ok(live) = live.read() {
+        ids.extend(
+            live.iter()
+                .filter(|(_, index)| index.tenant() == tenant)
+                .map(|(id, _)| id.clone()),
+        );
+    }
+    ids.into_iter().collect()
+}
+
 fn inspect_projection(instance_id: Uuid, snapshot: &InstanceSnapshot) -> serde_json::Value {
     let sensitive: std::collections::BTreeSet<&str> =
         snapshot.sensitive().iter().map(String::as_str).collect();
@@ -3055,8 +3147,9 @@ fn health_body(status: &str, check: &str, check_status: &str) -> serde_json::Val
 }
 
 /// Resolve a data subject's instances via the HMAC blind index, then (unless `dryRun`)
+/// delete the media their `q:audit` media events reference from the declared object stores,
 /// hard-delete their state across the stores + null captured audit payloads (audit metadata is
-/// retained), and emit a metadata-only `SUTRA.SUBJECT_ERASED` audit event. Returns the matched /
+/// retained; a media event keeps an amended payload saying its media was erased), and emit a metadata-only `SUTRA.SUBJECT_ERASED` audit event. Returns the matched /
 /// erased instance ids. The `dryRun` path is GDPR requirement 6 (disclose the instances that WOULD
 /// be purged). Body (JSON): `{keyId, subjectName, value, deploymentId?, dryRun?}` — with
 /// `deploymentId` OMITTED the operation fans out across ALL of the tenant's active deployments (the
@@ -3140,17 +3233,22 @@ pub(crate) async fn subject_erase_response(
 
     // The deployment set: the one explicit deployment, or every ACTIVE-or-DRAINING deployment of
     // this tenant (keyId == the tenant label). DRAINING must be included: instances stay parked on
-    // a flipped-away deployment until it retires, and erasure has to reach them there.
+    // a flipped-away deployment until it retires, and erasure has to reach them there. The live
+    // set comes from what this engine is serving (the watcher-published per-deployment index,
+    // which covers a watched directory too), unioned with the deployment archive table (the `db`
+    // source, and deployments other replicas serve).
     let deployment_ids: Vec<String> = match &scoped_deployment {
         Some(d) => vec![d.clone()],
         None => {
             let archive = PgDeploymentArchiveStore::new(pool.clone());
             match archive.list_active_and_draining().await {
-                Ok(served) => served
-                    .into_iter()
-                    .filter(|row| row.archive.tenant == key_id)
-                    .map(|row| row.archive.deployment_id)
-                    .collect(),
+                Ok(served) => tenant_deployments(
+                    &key_id,
+                    &state.node_indexes,
+                    served
+                        .into_iter()
+                        .map(|row| (row.archive.deployment_id, row.archive.tenant)),
+                ),
                 Err(e) => {
                     return (
                         StatusCode::INTERNAL_SERVER_ERROR,
@@ -3198,6 +3296,47 @@ pub(crate) async fn subject_erase_response(
         if dry_run || ids.is_empty() {
             continue;
         }
+        // Recorded media first: every object a media audit event of these instances references
+        // is deleted, and the event amended to say so. A reference that cannot be deleted fails
+        // the erasure before anything else is touched, so a re-run (once the store is declared
+        // or reachable) finishes it — the media is never left dangling behind an erased subject.
+        let mut media_amendments: std::collections::HashMap<Uuid, Vec<(i64, String)>> =
+            std::collections::HashMap::new();
+        for id in &ids {
+            let rows = match audit.list_media_for_instance(&deployment, *id).await {
+                Ok(rows) => rows,
+                Err(e) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({
+                            "error": format!("media lookup failed on instance {id}: {e}")
+                        })),
+                    )
+                }
+            };
+            for (row_id, payload) in rows {
+                match crate::media::erase_media(&payload, crate::media::ERASED_FOR_SUBJECT).await {
+                    Ok(amended) => media_amendments
+                        .entry(*id)
+                        .or_default()
+                        .push((row_id, amended)),
+                    Err(failures) => {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({
+                                "error": format!(
+                                    "erasure stopped on instance {id}: recorded media could not \
+                                     be deleted (nothing of this instance was erased; re-run once \
+                                     resolved)"
+                                ),
+                                "media": failures,
+                                "erasedCount": erased_total,
+                            })),
+                        )
+                    }
+                }
+            }
+        }
         // Cascade — idempotent per instance; subject rows LAST so a crash before that leaves the
         // instance still discoverable (a re-run finds + finishes it).
         for id in &ids {
@@ -3212,7 +3351,10 @@ pub(crate) async fn subject_erase_response(
                 // `(deployment_id, instance_id)` key, the same delete.
                 instances.delete(&deployment, *id).await?;
                 aliases.delete(&deployment, *id).await?;
-                audit.redact_instance_payloads(&deployment, *id).await?;
+                let amended = media_amendments.get(id).map(Vec::as_slice).unwrap_or(&[]);
+                audit
+                    .redact_instance_payloads_amending(&deployment, *id, amended)
+                    .await?;
                 subjects.delete(&deployment, *id).await?;
                 Ok::<(), sutra_persistence::PersistenceError>(())
             };
@@ -3355,6 +3497,41 @@ mod tests {
     }
 
     // ---- redaction projection (tier-1, no DB — the security-critical part) -----------------
+
+    /// Tenant-wide erasure must reach deployments served from a watched directory, which never
+    /// appear in the deployment archive table — and must not reach another tenant's deployments.
+    #[test]
+    fn tenant_erasure_covers_live_deployments_whatever_their_source() {
+        let live: crate::migrate::SharedNodeIndex = Arc::new(std::sync::RwLock::new(
+            [
+                ("dep-watched", "acme"),
+                ("dep-other", "globex"),
+                ("dep-both", "acme"),
+            ]
+            .into_iter()
+            .map(|(id, tenant)| {
+                (
+                    id.to_owned(),
+                    Arc::new(crate::migrate::DeploymentNodeIndex::default().with_tenant(tenant)),
+                )
+            })
+            .collect(),
+        ));
+        let archived = vec![
+            ("dep-both".to_owned(), "acme".to_owned()),
+            ("dep-replica".to_owned(), "acme".to_owned()),
+            ("dep-x".to_owned(), "globex".to_owned()),
+        ];
+        assert_eq!(
+            tenant_deployments("acme", &live, archived),
+            vec!["dep-both", "dep-replica", "dep-watched"]
+        );
+        assert_eq!(
+            tenant_deployments("acme", &live, Vec::new()),
+            vec!["dep-both", "dep-watched"],
+            "an empty archive table (watched directory) still covers the live deployments"
+        );
+    }
 
     #[test]
     fn inspect_projection_redacts_sensitive_variable_values() {
@@ -3503,7 +3680,10 @@ mod tests {
     #[test]
     fn history_paging_defaults_and_clamps() {
         let empty = HashMap::new();
-        assert_eq!(history_paging(&empty), (0, AUDIT_HISTORY_PAGE_DEFAULT));
+        assert_eq!(
+            history_paging(&empty),
+            (HistoryCursor::Ordinal(0), AUDIT_HISTORY_PAGE_DEFAULT)
+        );
 
         let params = |pairs: &[(&str, &str)]| -> HashMap<String, String> {
             pairs
@@ -3513,7 +3693,12 @@ mod tests {
         };
         assert_eq!(
             history_paging(&params(&[("afterSeq", "17"), ("limit", "5")])),
-            (17, 5)
+            (HistoryCursor::Seq(17), 5)
+        );
+        // The ordinal cursor wins when both are given.
+        assert_eq!(
+            history_paging(&params(&[("afterSeq", "17"), ("afterOrdinal", "9")])).0,
+            HistoryCursor::Ordinal(9)
         );
         // A page bigger than the ceiling is clamped, not honoured — one request must never
         // materialise a long-lived instance's whole journal (each row can carry a payload).
@@ -3525,7 +3710,7 @@ mod tests {
         // Garbage falls back to the defaults rather than 400-ing a read-only surface.
         assert_eq!(
             history_paging(&params(&[("afterSeq", "abc"), ("limit", "-3")])),
-            (0, 1)
+            (HistoryCursor::Seq(0), 1)
         );
     }
 
@@ -3534,6 +3719,7 @@ mod tests {
         let record = AuditEventRecord {
             id: 7,
             seq: 3,
+            ordinal: Some(3),
             at: time::OffsetDateTime::UNIX_EPOCH,
             event_type: "NODE_LEFT".to_owned(),
             node_id: Some("Approve".to_owned()),
@@ -3565,6 +3751,7 @@ mod tests {
         let record = AuditEventRecord {
             id: 1,
             seq: 1,
+            ordinal: Some(1),
             at: time::OffsetDateTime::UNIX_EPOCH,
             event_type: "NODE_ENTERED".to_owned(),
             node_id: None,
@@ -3737,6 +3924,65 @@ mod tests {
                 .await
                 .expect("body");
             serde_json::from_slice(&bytes).expect("json body")
+        }
+
+        /// An instance whose `sensitive` variable is encrypted at rest inspects like a plaintext
+        /// one: the endpoint decrypts with the engine's key provider and still redacts the value,
+        /// instead of answering "snapshot decode failed".
+        #[ignore = "docker"]
+        #[tokio::test]
+        async fn an_encrypted_instance_is_inspectable_with_sensitive_values_redacted() {
+            use sutra_crypto::KeyProvider;
+            let pool = fresh_pool().await;
+            let provider = Arc::new(sutra_crypto::HkdfKeyProvider::new(b"inspect-test"));
+            let mut state = state_with(pool.clone(), std::time::Duration::from_secs(3600), false);
+            state.key_provider = Some(provider.clone() as Arc<dyn KeyProvider + Send + Sync>);
+            let id = Uuid::new_v4();
+            let snapshot = InstanceSnapshot::of_suspended(
+                "pay",
+                DEP,
+                vec!["S".to_owned()],
+                [
+                    ("ssn".to_owned(), "000-00-0000".to_owned()),
+                    ("amount".to_owned(), "42".to_owned()),
+                ]
+                .into_iter()
+                .collect(),
+                vec!["W".to_owned()],
+                "S",
+                0,
+            )
+            .with_sensitive(vec!["ssn".to_owned()]);
+            let key = provider.data_key("acme").unwrap();
+            let cipher = sutra_crypto::Aes256GcmCipher::new(&key);
+            let instance = id.to_string();
+            let ctx = sutra_persistence::snapshot::SnapshotCrypto::new(&cipher, "acme", &instance);
+            let names = ["ssn".to_owned()].into_iter().collect();
+            let serialised = snapshot.write_encrypted(Some(&ctx), &names).unwrap();
+            assert!(
+                InstanceSnapshot::read(&serialised).is_err(),
+                "the fixture really is encrypted"
+            );
+            PgInstanceStore::new(pool.clone())
+                .persist(
+                    &dep(),
+                    &InstanceState {
+                        instance_id: id,
+                        serialised,
+                    },
+                )
+                .await
+                .expect("persist");
+
+            let response = instance_inspect_response(&state, &instance).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = body_of(response).await;
+            assert_eq!(
+                body["variables"]["ssn"],
+                serde_json::json!(REDACTED_PLACEHOLDER)
+            );
+            assert_eq!(body["variables"]["amount"], serde_json::json!("42"));
+            assert!(!body.to_string().contains("000-00-0000"));
         }
 
         /// The headline P1-2 behaviour on the read surface: a finished instance ANSWERS instead of
@@ -3930,6 +4176,29 @@ mod tests {
             assert_eq!(events[0]["payload"]["step"], serde_json::json!(1));
             assert_eq!(events[1]["seq"], serde_json::json!(2));
             assert_eq!(body["nextAfterSeq"], serde_json::json!(2));
+            assert_eq!(body["nextAfterOrdinal"], serde_json::json!(2));
+            assert_eq!(events[1]["ordinal"], serde_json::json!(2));
+
+            // The ordinal cursor pages the same journal.
+            let by_ordinal = body_of(
+                instance_history_response(
+                    &state,
+                    &id.to_string(),
+                    &params(&[("limit", "2"), ("afterOrdinal", "2")]),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(
+                by_ordinal["events"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|e| e["ordinal"].as_i64().unwrap())
+                    .collect::<Vec<_>>(),
+                vec![3, 4]
+            );
+            assert_eq!(by_ordinal["afterOrdinal"], serde_json::json!(2));
 
             // Follow the cursor to the end; the last (short) page reports no successor.
             let body = body_of(
@@ -4015,6 +4284,447 @@ mod tests {
                 body["events"][0]["eventType"],
                 serde_json::json!("INSTANCE_COMPLETED")
             );
+        }
+
+        // ---- recorded media: erasure and retention delete it -----------------------------
+
+        /// Register an in-memory store over `bucket` (unique per test: the registry is
+        /// process-wide) holding one recording, and return the store with its reference.
+        async fn recording(
+            bucket: &str,
+        ) -> (sutra_objectstore::MemoryObjectStore, serde_json::Value) {
+            use sutra_objectstore::ObjectStore;
+            let location =
+                sutra_objectstore::StoreLocation::parse(&format!("memory://{bucket}/calls"))
+                    .unwrap();
+            let raw = sutra_objectstore::MemoryObjectStore::new(location.clone());
+            sutra_objectstore::registry::register(sutra_objectstore::NamedStore::new(
+                bucket,
+                Arc::new(raw.clone()),
+                location,
+                None,
+                "recordings",
+            ));
+            let stored = raw
+                .put("c1.wav", b"RIFF-recording".to_vec(), "audio/wav")
+                .await
+                .unwrap();
+            let reference = serde_json::json!({"kind": "media", "uri": stored.uri,
+                "sha256": stored.sha256, "bytes": stored.bytes, "callId": "c1"});
+            (raw, reference)
+        }
+
+        /// Settings for a store over `bucket` in `minio`, signing with `secret`.
+        fn s3_settings(
+            minio: &sutra_testkit::minio::MinioContainer,
+            bucket: &str,
+            secret: &str,
+        ) -> sutra_objectstore::StoreSettings {
+            sutra_objectstore::StoreSettings {
+                name: bucket.to_string(),
+                location: sutra_objectstore::StoreLocation::parse(&format!("s3://{bucket}/calls"))
+                    .unwrap(),
+                endpoint: Some(minio.endpoint().to_string()),
+                region: sutra_testkit::minio::MINIO_REGION.into(),
+                access_key: Some(sutra_testkit::minio::MINIO_ACCESS_KEY.into()),
+                secret_key: Some(secret.to_string()),
+                kek_secret: None,
+                key_id: "recordings".into(),
+            }
+        }
+
+        /// Store one recording in `bucket` on a real S3-compatible store and register that
+        /// bucket in the process-wide registry signing with `registered_secret` (a wrong secret
+        /// makes the store refuse the delete). Returns the uploading store and the reference.
+        async fn s3_recording(
+            minio: &sutra_testkit::minio::MinioContainer,
+            bucket: &str,
+            registered_secret: &str,
+        ) -> (sutra_objectstore::NamedStore, serde_json::Value) {
+            let uploader = sutra_objectstore::NamedStore::open(&s3_settings(
+                minio,
+                bucket,
+                sutra_testkit::minio::MINIO_SECRET_KEY,
+            ))
+            .unwrap();
+            uploader.store().ensure_bucket().await.unwrap();
+            let stored = uploader
+                .store()
+                .put("c1.wav", b"RIFF-recording".to_vec(), "audio/wav")
+                .await
+                .unwrap();
+            sutra_objectstore::registry::register(
+                sutra_objectstore::NamedStore::open(&s3_settings(minio, bucket, registered_secret))
+                    .unwrap(),
+            );
+            let reference = serde_json::json!({"kind": "media", "uri": stored.uri,
+                "sha256": stored.sha256, "bytes": stored.bytes, "callId": "c1"});
+            (uploader, reference)
+        }
+
+        async fn audit_event(pool: &PgPool, id: Uuid, seq: i32, event_type: &str, payload: String) {
+            PgAuditEventStore::new(pool.clone())
+                .insert(&AuditEventRow {
+                    deployment: dep(),
+                    instance_id: Some(id),
+                    seq,
+                    at: time::OffsetDateTime::now_utc(),
+                    event_type: event_type.to_owned(),
+                    node_id: None,
+                    diagnostic_code: None,
+                    diagnostic_json: None,
+                    payload_json: payload,
+                })
+                .await
+                .expect("audit insert");
+        }
+
+        async fn payloads(pool: &PgPool, id: Uuid) -> Vec<serde_json::Value> {
+            PgAuditEventStore::new(pool.clone())
+                .list_for_instance(&dep(), id, 0, 100)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|r| serde_json::from_str(&r.payload_json).unwrap())
+                .collect()
+        }
+
+        /// Erasure deletes the recordings an erased subject's media events reference, redacts
+        /// the rest of the journal as before, and leaves each media event saying what was erased.
+        #[ignore = "docker"]
+        #[tokio::test]
+        async fn subject_erasure_deletes_recorded_media_and_amends_its_events() {
+            use sutra_crypto::KeyProvider;
+            use sutra_persistence::stores::{PgSubjectIndexStore, SubjectIndexStore};
+            let pool = fresh_pool().await;
+            let provider = Arc::new(sutra_crypto::HkdfKeyProvider::new(b"erasure-media-test"));
+            let mut state = state_with(pool.clone(), std::time::Duration::from_secs(3600), true);
+            state.key_provider = Some(provider.clone() as Arc<dyn KeyProvider + Send + Sync>);
+            let id = park(&pool).await;
+            let blind = provider.blind_index_key("acme").unwrap().blind("caller-7");
+            PgSubjectIndexStore::new(pool.clone())
+                .record(&dep(), id, "caller", &blind)
+                .await
+                .unwrap();
+            let (raw, reference) = recording("erasure-media-it").await;
+            audit_event(
+                &pool,
+                id,
+                1,
+                "NODE_ENTERED",
+                serde_json::json!({"media": [reference.clone()]}).to_string(),
+            )
+            .await;
+            audit_event(
+                &pool,
+                id,
+                2,
+                "NODE_ENTERED",
+                serde_json::json!({"ssn": "000-00-0000"}).to_string(),
+            )
+            .await;
+
+            let body = serde_json::json!({"keyId": "acme", "subjectName": "caller",
+                "value": "caller-7", "deploymentId": DEP});
+            let (status, Json(answer)) = subject_erase_response(&state, body).await;
+            assert_eq!(status, StatusCode::OK, "{answer}");
+            assert_eq!(answer["erasedCount"], 1);
+            assert!(raw.keys().is_empty(), "the recording is deleted");
+            let events = payloads(&pool, id).await;
+            assert_eq!(
+                events[0]["media"][0],
+                serde_json::json!({"kind": "media", "uri": reference["uri"],
+                    "sha256": reference["sha256"], "bytes": reference["bytes"], "erased": true})
+            );
+            assert_eq!(
+                events[0][crate::media::MEDIA_ERASURE_KEY]["reason"],
+                crate::media::ERASED_FOR_SUBJECT
+            );
+            assert_eq!(events[1], serde_json::json!({}), "other payloads redacted");
+        }
+
+        /// A recording no declared store holds stops the erasure before anything is deleted, so
+        /// it can be re-run — the media is never left dangling behind an erased subject.
+        #[ignore = "docker"]
+        #[tokio::test]
+        async fn subject_erasure_refuses_to_leave_undeletable_media_behind() {
+            use sutra_crypto::KeyProvider;
+            use sutra_persistence::stores::{PgSubjectIndexStore, SubjectIndexStore};
+            let pool = fresh_pool().await;
+            let provider = Arc::new(sutra_crypto::HkdfKeyProvider::new(b"erasure-media-test"));
+            let mut state = state_with(pool.clone(), std::time::Duration::from_secs(3600), true);
+            state.key_provider = Some(provider.clone() as Arc<dyn KeyProvider + Send + Sync>);
+            let id = park(&pool).await;
+            let blind = provider.blind_index_key("acme").unwrap().blind("caller-8");
+            PgSubjectIndexStore::new(pool.clone())
+                .record(&dep(), id, "caller", &blind)
+                .await
+                .unwrap();
+            audit_event(
+                &pool,
+                id,
+                1,
+                "NODE_ENTERED",
+                serde_json::json!({"media": [{"kind": "media",
+                    "uri": "s3://erasure-undeclared-it/c.wav", "sha256": "00"}]})
+                .to_string(),
+            )
+            .await;
+            let body = serde_json::json!({"keyId": "acme", "subjectName": "caller",
+                "value": "caller-8", "deploymentId": DEP});
+            let (status, Json(answer)) = subject_erase_response(&state, body).await;
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+            assert!(answer["media"][0]
+                .as_str()
+                .unwrap()
+                .contains("erasure-undeclared-it"));
+            // Nothing was erased: the instance and its journal are intact for the re-run.
+            assert!(PgInstanceStore::new(pool.clone())
+                .load(&dep(), id)
+                .await
+                .unwrap()
+                .is_some());
+            assert!(payloads(&pool, id).await[0].get("mediaErasure").is_none());
+        }
+
+        /// Terminal retention deletes the recordings of the instances it purges — retained rows
+        /// past the window and rows already gone with a completion event — amends their events,
+        /// and keeps (and retries) an instance whose recording cannot be deleted.
+        #[ignore = "docker"]
+        #[tokio::test]
+        async fn retention_deletes_recorded_media_before_the_purge() {
+            let pool = fresh_pool().await;
+            let store = PgInstanceStore::new(pool.clone());
+            let finish = |id: Uuid| {
+                let store = store.clone();
+                async move {
+                    let bytes = store.load(&dep(), id).await.unwrap().unwrap().serialised;
+                    let terminal =
+                        InstanceSnapshot::mark_terminal(&bytes, STATUS_COMPLETED).unwrap();
+                    store.mark_terminal(&dep(), id, &terminal).await.unwrap();
+                }
+            };
+            let (raw, reference) = recording("retention-media-it").await;
+            let media = serde_json::json!({"media": [reference.clone()]}).to_string();
+            // A retained terminal instance with a recording.
+            let retained = park(&pool).await;
+            audit_event(&pool, retained, 1, "NODE_LEFT", media.clone()).await;
+            finish(retained).await;
+            // An instance deleted at terminal (`retention: PT0S`): no row, a completion event.
+            let deleted = Uuid::new_v4();
+            let (raw_b, reference_b) = recording("retention-media-it-b").await;
+            audit_event(
+                &pool,
+                deleted,
+                1,
+                "NODE_LEFT",
+                serde_json::json!({"media": [reference_b]}).to_string(),
+            )
+            .await;
+            audit_event(&pool, deleted, 2, "INSTANCE_COMPLETED", "{}".into()).await;
+            // A finished instance whose recording no declared store holds.
+            let stuck = park(&pool).await;
+            audit_event(
+                &pool,
+                stuck,
+                1,
+                "NODE_LEFT",
+                serde_json::json!({"media": [{"kind": "media",
+                    "uri": "s3://retention-undeclared-it/c.wav", "sha256": "00"}]})
+                .to_string(),
+            )
+            .await;
+            finish(stuck).await;
+            // A running instance with a recording: untouched.
+            let running = park(&pool).await;
+            audit_event(&pool, running, 1, "NODE_LEFT", media.clone()).await;
+
+            let sweeper = crate::sweeper::TerminalRetentionSweeper::new(
+                pool.clone(),
+                LiveDeploymentSet::new(vec![
+                    sutra_executor::DeploymentId::of(DEP).expect("deployment id")
+                ]),
+                Arc::new(sutra_channels::AlwaysLeading),
+                crate::sweeper::TerminalRetentionConfig {
+                    retention: std::time::Duration::ZERO,
+                    interval: std::time::Duration::from_secs(3600),
+                },
+            );
+            assert_eq!(sweeper.purge_once().await, 1, "only the retained instance");
+            assert!(raw.keys().is_empty() && raw_b.keys().is_empty());
+            for id in [retained, deleted] {
+                let events = payloads(&pool, id).await;
+                assert_eq!(events[0]["media"][0]["erased"], true);
+                assert_eq!(
+                    events[0][crate::media::MEDIA_ERASURE_KEY]["reason"],
+                    crate::media::ERASED_FOR_RETENTION
+                );
+            }
+            assert!(store.load(&dep(), retained).await.unwrap().is_none());
+            assert!(
+                store.load(&dep(), stuck).await.unwrap().is_some(),
+                "kept for the retry"
+            );
+            assert!(payloads(&pool, stuck).await[0]
+                .get("mediaErasure")
+                .is_none());
+            assert!(store.load(&dep(), running).await.unwrap().is_some());
+            assert!(payloads(&pool, running).await[0]
+                .get("mediaErasure")
+                .is_none());
+            // A second sweep changes nothing for the erased ones and still keeps the stuck one.
+            assert_eq!(sweeper.purge_once().await, 0);
+            assert!(store.load(&dep(), stuck).await.unwrap().is_some());
+        }
+
+        /// Subject erasure against a real S3-compatible store: the recording is deleted from it,
+        /// and a store that refuses the delete stops the erasure with nothing changed.
+        #[ignore = "docker"]
+        #[tokio::test]
+        async fn subject_erasure_deletes_recordings_from_a_real_s3_store() {
+            use sutra_crypto::KeyProvider;
+            use sutra_persistence::stores::{PgSubjectIndexStore, SubjectIndexStore};
+            let minio = sutra_testkit::minio::MinioContainer::start();
+            let pool = fresh_pool().await;
+            let provider = Arc::new(sutra_crypto::HkdfKeyProvider::new(b"erasure-s3-test"));
+            let mut state = state_with(pool.clone(), std::time::Duration::from_secs(3600), true);
+            state.key_provider = Some(provider.clone() as Arc<dyn KeyProvider + Send + Sync>);
+            let subject = |id: Uuid, value: &'static str| {
+                let pool = pool.clone();
+                let blind = provider.blind_index_key("acme").unwrap().blind(value);
+                async move {
+                    PgSubjectIndexStore::new(pool)
+                        .record(&dep(), id, "caller", &blind)
+                        .await
+                        .unwrap();
+                }
+            };
+
+            // Deleted from the store, and the event says so.
+            let (uploader, reference) = s3_recording(
+                &minio,
+                "erasure-s3-ok",
+                sutra_testkit::minio::MINIO_SECRET_KEY,
+            )
+            .await;
+            let id = park(&pool).await;
+            subject(id, "caller-s3-1").await;
+            audit_event(
+                &pool,
+                id,
+                1,
+                "NODE_ENTERED",
+                serde_json::json!({"media": [reference.clone()]}).to_string(),
+            )
+            .await;
+            let body = serde_json::json!({"keyId": "acme", "subjectName": "caller",
+                "value": "caller-s3-1", "deploymentId": DEP});
+            let (status, Json(answer)) = subject_erase_response(&state, body).await;
+            assert_eq!(status, StatusCode::OK, "{answer}");
+            assert_eq!(uploader.store().get("c1.wav").await.unwrap(), None);
+            let events = payloads(&pool, id).await;
+            assert_eq!(events[0]["media"][0]["erased"], true);
+            assert_eq!(
+                events[0][crate::media::MEDIA_ERASURE_KEY]["reason"],
+                crate::media::ERASED_FOR_SUBJECT
+            );
+
+            // The store refuses the delete (the engine signs with the wrong secret): 500, the
+            // recording is still there, and the instance and its journal are intact.
+            let (uploader, reference) =
+                s3_recording(&minio, "erasure-s3-refused", "not-the-secret").await;
+            let id = park(&pool).await;
+            subject(id, "caller-s3-2").await;
+            audit_event(
+                &pool,
+                id,
+                1,
+                "NODE_ENTERED",
+                serde_json::json!({"media": [reference]}).to_string(),
+            )
+            .await;
+            let body = serde_json::json!({"keyId": "acme", "subjectName": "caller",
+                "value": "caller-s3-2", "deploymentId": DEP});
+            let (status, Json(answer)) = subject_erase_response(&state, body).await;
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{answer}");
+            assert!(answer["media"][0]
+                .as_str()
+                .unwrap()
+                .contains("erasure-s3-refused"));
+            assert!(uploader.store().get("c1.wav").await.unwrap().is_some());
+            assert!(PgInstanceStore::new(pool.clone())
+                .load(&dep(), id)
+                .await
+                .unwrap()
+                .is_some());
+            assert!(payloads(&pool, id).await[0].get("mediaErasure").is_none());
+        }
+
+        /// Terminal retention against a real S3-compatible store: the purged instance's
+        /// recording is deleted from it; an instance whose store refuses the delete is kept, with
+        /// its recording, for the next sweep.
+        #[ignore = "docker"]
+        #[tokio::test]
+        async fn retention_deletes_recordings_from_a_real_s3_store() {
+            let minio = sutra_testkit::minio::MinioContainer::start();
+            let pool = fresh_pool().await;
+            let store = PgInstanceStore::new(pool.clone());
+            let finish = |id: Uuid| {
+                let store = store.clone();
+                async move {
+                    let bytes = store.load(&dep(), id).await.unwrap().unwrap().serialised;
+                    let terminal =
+                        InstanceSnapshot::mark_terminal(&bytes, STATUS_COMPLETED).unwrap();
+                    store.mark_terminal(&dep(), id, &terminal).await.unwrap();
+                }
+            };
+            let (uploader, reference) = s3_recording(
+                &minio,
+                "retention-s3-ok",
+                sutra_testkit::minio::MINIO_SECRET_KEY,
+            )
+            .await;
+            let purged = park(&pool).await;
+            audit_event(
+                &pool,
+                purged,
+                1,
+                "NODE_LEFT",
+                serde_json::json!({"media": [reference]}).to_string(),
+            )
+            .await;
+            finish(purged).await;
+            let (refusing, refused_reference) =
+                s3_recording(&minio, "retention-s3-refused", "not-the-secret").await;
+            let kept = park(&pool).await;
+            audit_event(
+                &pool,
+                kept,
+                1,
+                "NODE_LEFT",
+                serde_json::json!({"media": [refused_reference]}).to_string(),
+            )
+            .await;
+            finish(kept).await;
+
+            let sweeper = crate::sweeper::TerminalRetentionSweeper::new(
+                pool.clone(),
+                LiveDeploymentSet::new(vec![
+                    sutra_executor::DeploymentId::of(DEP).expect("deployment id")
+                ]),
+                Arc::new(sutra_channels::AlwaysLeading),
+                crate::sweeper::TerminalRetentionConfig {
+                    retention: std::time::Duration::ZERO,
+                    interval: std::time::Duration::from_secs(3600),
+                },
+            );
+            assert_eq!(sweeper.purge_once().await, 1, "only the deletable one");
+            assert_eq!(uploader.store().get("c1.wav").await.unwrap(), None);
+            assert_eq!(payloads(&pool, purged).await[0]["media"][0]["erased"], true);
+            assert!(store.load(&dep(), purged).await.unwrap().is_none());
+            assert!(refusing.store().get("c1.wav").await.unwrap().is_some());
+            assert!(store.load(&dep(), kept).await.unwrap().is_some());
+            assert!(payloads(&pool, kept).await[0].get("mediaErasure").is_none());
         }
 
         /// An empty page NAMES the reason. With the journal switched off, "no events" must never

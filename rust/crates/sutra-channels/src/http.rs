@@ -1247,10 +1247,16 @@ async fn serve_route(
         }
         // A non-idempotent process failed and was dead-lettered (consumed + recorded as a
         // durable incident). HTTP is synchronous with no engine-managed redelivery, so surface the
-        // failure to the caller as a problem+json carrying the at-most-once incident code.
-        Ok(DispatchOutcome::DeadLettered { code, detail, .. }) => {
-            let diagnostic = Diagnostic::error(&code, detail);
-            problem_response(status_for_code(&diagnostic.code), &diagnostic, problem_ct)
+        // failure to the caller as a problem+json naming its CAUSE, with the at-most-once
+        // incident code alongside.
+        Ok(DispatchOutcome::DeadLettered {
+            code,
+            cause_code,
+            detail,
+            ..
+        }) => {
+            let (status, diagnostic) = dead_letter_problem(&code, &cause_code, detail);
+            problem_response(status, &diagnostic, problem_ct)
         }
         // Unreachable: `EngineHandle::dispatch` consumes every handoff on the router side.
         Ok(DispatchOutcome::Handoff { .. } | DispatchOutcome::InlineCalls(_)) => problem_response(
@@ -1533,6 +1539,40 @@ pub fn sha256_truncated(body: &[u8]) -> String {
 /// that is not there, a handler that is ambiguous). Only the last of those is a 5xx, so the codes
 /// are mapped deliberately and anything unlisted keeps the fail-safe 500: a wrong 4xx tells a
 /// caller not to retry something that would have succeeded, which is worse than an honest 500.
+/// A diagnostic code an extension declares as the CALLER's fault: the request named something
+/// that cannot be honoured (a refused reference, a malformed request body), so retrying the same
+/// request cannot succeed. An extension registers each such code next to its definition with
+/// `inventory::submit!`; the core names none of them. The HTTP transport answers a failure
+/// caused by one of these codes `422 Unprocessable Content` instead of `500`, carrying the code
+/// itself so the caller sees the real cause.
+pub struct CallerFaultCode {
+    /// The stable `SUTRA.*` code.
+    pub code: &'static str,
+}
+
+inventory::collect!(CallerFaultCode);
+
+/// Whether `code` is registered as a [`CallerFaultCode`].
+pub fn is_caller_fault(code: &str) -> bool {
+    inventory::iter::<CallerFaultCode>
+        .into_iter()
+        .any(|registered| registered.code == code)
+}
+
+/// The problem a dead-lettered inbound answers: the cause's code and message (the message names
+/// the failing reference or step, never payload content), the status that cause deserves, and
+/// the at-most-once incident code under `incident` — the caller learns both why it failed and
+/// that the message was consumed rather than queued for redelivery.
+fn dead_letter_problem(incident: &str, cause_code: &str, detail: String) -> (u16, Diagnostic) {
+    let code = if cause_code.trim().is_empty() {
+        incident
+    } else {
+        cause_code
+    };
+    let diagnostic = Diagnostic::error(code, detail).with_attribute("incident", incident);
+    (status_for_code(code), diagnostic)
+}
+
 fn status_for_code(code: &str) -> u16 {
     match code {
         codes::INBOUND_REJECTED_AUTH => return 401,
@@ -1546,7 +1586,7 @@ fn status_for_code(code: &str) -> u16 {
         codes::INBOUND_QUOTA_EXCEEDED_RATE | codes::INBOUND_QUOTA_EXCEEDED_CONCURRENT => {
             return 429
         }
-        codes::INBOUND_CHANNEL_AT_CAPACITY => return 503,
+        codes::INBOUND_CHANNEL_AT_CAPACITY | codes::INBOUND_POOL_EXHAUSTED => return 503,
         _ => {}
     }
     if code.starts_with("SUTRA.INBOUND.REJECTED.") {
@@ -1554,6 +1594,10 @@ fn status_for_code(code: &str) -> u16 {
     }
     if code.starts_with("SUTRA.RESOLVE.") {
         return 404;
+    }
+    // An extension's code for a request that cannot be honoured as sent.
+    if is_caller_fault(code) {
+        return 422;
     }
     500
 }
@@ -1727,6 +1771,36 @@ fn now_rfc3339() -> String {
 #[cfg(test)]
 mod local_channel_tests {
 
+    // ---- a dead-lettered inbound names its cause ------------------------------------------
+
+    inventory::submit! { super::CallerFaultCode { code: "SUTRA.TEST.REFERENCE.REFUSED" } }
+
+    /// A failure the caller caused answers 422 with that cause's code; the at-most-once incident
+    /// code rides along. An unclassified cause stays a 500, still naming the cause.
+    #[test]
+    fn a_dead_lettered_inbound_answers_with_its_cause_and_a_fitting_status() {
+        let (status, d) = dead_letter_problem(
+            codes::INBOUND_NON_IDEMPOTENT_FAILURE,
+            "SUTRA.TEST.REFERENCE.REFUSED",
+            "'s3://bucket/missing.wav' does not exist".to_string(),
+        );
+        assert_eq!(status, 422);
+        assert_eq!(d.code, "SUTRA.TEST.REFERENCE.REFUSED");
+        assert_eq!(d.message, "'s3://bucket/missing.wav' does not exist");
+        assert_eq!(
+            d.attributes.get("incident").map(String::as_str),
+            Some(codes::INBOUND_NON_IDEMPOTENT_FAILURE)
+        );
+
+        let (status, d) = dead_letter_problem(
+            codes::INBOUND_NON_IDEMPOTENT_FAILURE,
+            "SUTRA.RUNTIME.TASK.UNCAUGHT",
+            "task failed".to_string(),
+        );
+        assert_eq!(status, 500);
+        assert_eq!(d.code, "SUTRA.RUNTIME.TASK.UNCAUGHT");
+    }
+
     // ---- R4: the problem document is rendered in the caller's format ------------------------
 
     fn diag() -> Diagnostic {
@@ -1766,6 +1840,7 @@ mod local_channel_tests {
         assert_eq!(status_for_code(codes::INBOUND_PAYLOAD_TOO_LARGE), 413);
         assert_eq!(status_for_code(codes::INBOUND_QUOTA_EXCEEDED_RATE), 429);
         assert_eq!(status_for_code(codes::INBOUND_CHANNEL_AT_CAPACITY), 503);
+        assert_eq!(status_for_code(codes::INBOUND_POOL_EXHAUSTED), 503);
         // The deployment's own fault stays a 500 — the caller can do nothing about either.
         assert_eq!(status_for_code(codes::INBOUND_CODEC_NOT_FOUND), 500);
         assert_eq!(status_for_code(codes::INBOUND_AMBIGUOUS_HANDLER), 500);

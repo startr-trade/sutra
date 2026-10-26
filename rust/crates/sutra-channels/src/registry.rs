@@ -560,6 +560,31 @@ impl ProcessModuleRegistry {
             .and_then(|ps| ps.iter().find(|p| p.id == process_id).cloned())
     }
 
+    /// Every `(process, start event id)` in `deployment` whose start event subscribes to
+    /// `channel`, regardless of message type or predicate — the processes whose instances a
+    /// session on that channel can belong to. Sorted (process id, start event id).
+    pub fn starts_on_channel(
+        &self,
+        deployment: &DeploymentId,
+        channel: &str,
+    ) -> Vec<(Arc<ProcessDefinition>, String)> {
+        let Some(processes) = self.modules.get(deployment.value()) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for process in processes {
+            for start in process.start_events() {
+                if let sutra_bpmn::model::Node::StartEvent { id, channels, .. } = start {
+                    if channels.iter().any(|c| c == channel) {
+                        out.push((Arc::clone(process), id.clone()));
+                    }
+                }
+            }
+        }
+        out.sort_by(|a, b| a.0.id.cmp(&b.0.id).then_with(|| a.1.cmp(&b.1)));
+        out
+    }
+
     /// Cross-process RELAY resolution: every process in `deployment` with a WAIT
     /// NODE (`<bpmn:userTask>` / intermediate message catch / channel-call serviceTask)
     /// whose `<q:source>` subscribes to `channel`. A relay message on

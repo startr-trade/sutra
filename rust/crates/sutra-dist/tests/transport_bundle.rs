@@ -15,6 +15,8 @@
 use sutra_llm_anthropic as _;
 #[cfg(feature = "llm-bedrock")]
 use sutra_llm_bedrock as _;
+#[cfg(feature = "llm-gemini")]
+use sutra_llm_gemini as _;
 #[cfg(feature = "llm-openai")]
 use sutra_llm_openai as _;
 #[cfg(feature = "amqp")]
@@ -114,17 +116,21 @@ fn broker_sinks_share_the_outbox_key_carrier_string() {
 #[test]
 #[allow(clippy::vec_init_then_push)] // the pushes are cfg-gated
 fn llm_bundle_registers_its_reply_sink_and_every_enabled_provider() {
-    let reply: Vec<&str> = sutra_transport_spi::reply_sink_factories()
+    let mut reply: Vec<&str> = sutra_transport_spi::reply_sink_factories()
         .iter()
         .map(|f| f.transport)
         .collect();
-    assert_eq!(reply, vec!["llm"]);
+    reply.sort_unstable();
+    let expected_reply = vec!["llm"];
+    assert_eq!(reply, expected_reply);
 
     let mut expected: Vec<&str> = Vec::new();
     #[cfg(feature = "llm-anthropic")]
     expected.push("anthropic");
     #[cfg(feature = "llm-bedrock")]
     expected.push("aws-bedrock");
+    #[cfg(feature = "llm-gemini")]
+    expected.push("gemini");
     #[cfg(feature = "llm-openai")]
     expected.extend([
         "deepseek",
@@ -136,9 +142,10 @@ fn llm_bundle_registers_its_reply_sink_and_every_enabled_provider() {
         "xai",
     ]);
     expected.sort_unstable();
-    let providers: Vec<&str> = sutra_llm_spi::provider_factories()
+    let mut providers: Vec<&str> = sutra_llm_spi::provider_factories()
         .iter()
         .map(|f| f.provider)
         .collect();
+    providers.sort_unstable();
     assert_eq!(providers, expected);
 }

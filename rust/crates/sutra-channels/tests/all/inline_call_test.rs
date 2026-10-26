@@ -612,7 +612,21 @@ fn rig_over(
     }));
     let bridge_state = Arc::clone(&observed);
     let handle = spawn_engine(tokio::runtime::Handle::current(), move || {
-        build_engine(bpmn, caller, cap, bridge_state, None)
+        build_engine(bpmn, caller, cap, bridge_state, None, None)
+    });
+    Rig { handle, observed }
+}
+
+/// [`rig`] with `start-in` drawing from the capacity pool `lines` held in `pools`.
+fn pooled_rig(
+    bpmn: &'static str,
+    caller: Arc<FakeCaller>,
+    pools: Arc<sutra_channels::InMemoryCapacityPools>,
+) -> Rig {
+    let observed = Arc::new(Mutex::new(Observed::default()));
+    let bridge_state = Arc::clone(&observed);
+    let handle = spawn_engine(tokio::runtime::Handle::current(), move || {
+        build_engine(bpmn, caller, None, bridge_state, None, Some(pools))
     });
     Rig { handle, observed }
 }
@@ -649,7 +663,7 @@ fn http_rig(
     let bridge_state = Arc::clone(&observed);
     let engine_defs = defs.clone();
     let handle = spawn_engine(tokio::runtime::Handle::current(), move || {
-        build_engine(bpmn, caller, None, bridge_state, Some(engine_defs))
+        build_engine(bpmn, caller, None, bridge_state, Some(engine_defs), None)
     });
     let app = sutra_channels::channel_router(&defs, handle.clone()).expect("router builds");
     HttpRig {
@@ -703,6 +717,7 @@ fn build_engine(
     cap: Option<u32>,
     bridge_state: Arc<Mutex<Observed>>,
     defs: Option<Vec<sutra_channels::ChannelDefinition>>,
+    pools: Option<Arc<sutra_channels::InMemoryCapacityPools>>,
 ) -> ChannelEngine {
     let module = BpmnModelLoader::new()
         .load(bpmn.as_bytes())
@@ -743,6 +758,9 @@ fn build_engine(
     let mut start = ChannelBinding::new("start-in", namespace(), deployment(), "json");
     start.max_concurrent_instances = cap;
     start.broadcast = bpmn == BROADCAST;
+    if pools.is_some() {
+        start.pool = Some("lines".to_string());
+    }
     let builder = ChannelEngine::builder(
         executor,
         sink,
@@ -762,6 +780,12 @@ fn build_engine(
                 deployment(),
                 "json",
             )),
+    };
+    let builder = match pools {
+        Some(pools) => {
+            builder.with_capacity_pools(pools as Arc<dyn sutra_channels::CapacityPoolStore>)
+        }
+        None => builder,
     };
     builder
         .with_module(&deployment(), &module)
@@ -1081,6 +1105,60 @@ async fn an_in_flight_chain_holds_its_admission_slot_until_it_ends() {
         .await
         .expect("admitted again");
     assert_eq!(reply_json(&third), serde_json::json!({"a": {"v": 1}}));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_in_flight_chain_holds_its_pool_slot_until_it_ends() {
+    use sutra_channels::CapacityPoolStore;
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let opened = Arc::clone(&gate);
+    let caller = FakeCaller::new(move |n| {
+        let gate = Arc::clone(&opened);
+        Box::pin(async move {
+            if n == 0 {
+                gate.notified().await;
+            }
+            json(r#"{"v":1}"#)
+        })
+    });
+    let pools = Arc::new(sutra_channels::InMemoryCapacityPools::new([
+        sutra_channels::CapacityPool::new("lines", 1),
+    ]));
+    let rig = pooled_rig(SINGLE, Arc::clone(&caller), Arc::clone(&pools));
+
+    let first = {
+        let handle = rig.handle.clone();
+        tokio::spawn(async move { handle.dispatch(start("k-1")).await })
+    };
+    for _ in 0..200 {
+        if caller.calls() == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(caller.calls(), 1);
+    // The chain took the slot at its start, before anything was stored.
+    assert_eq!(pools.usage("lines").await, (1, 0));
+
+    let refused = rig
+        .handle
+        .dispatch(start("k-2"))
+        .await
+        .expect_err("the pool of 1 is held by the in-flight chain");
+    assert_eq!(refused.code, "SUTRA.INBOUND.POOL.EXHAUSTED", "{refused:?}");
+
+    gate.notify_one();
+    first.await.unwrap().expect("the first chain completes");
+    assert_eq!(
+        pools.usage("lines").await,
+        (0, 0),
+        "the completed chain freed it"
+    );
+    rig.handle
+        .dispatch(start("k-3"))
+        .await
+        .expect("admitted again");
+    assert_eq!(pools.usage("lines").await, (0, 0));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1720,5 +1798,130 @@ async fn a_relayed_turn_that_replies_then_parks_answers_with_its_reply() {
     assert_eq!(
         trace(&rig),
         vec!["find_live_alias", "claim_instance", "load", "commit_repark"]
+    );
+}
+
+// ---- a loop whose wait is a synchronous call ----------------------------------------------
+
+/// start → sync call `A` → G: `a.n < 3` calls `A` again, else reply → end.
+const SYNC_LOOP: &str = r#"<?xml version="1.0"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0">
+  <bpmn:process id="syncloop">
+    <bpmn:startEvent id="S">
+      <bpmn:extensionElements><q:source channel="start-in" name="req"/></bpmn:extensionElements>
+    </bpmn:startEvent>
+    <bpmn:serviceTask id="A" implementation="channel:svc">
+      <bpmn:extensionElements>
+        <q:source channel="svc-answers" name="a"/>
+        <q:timeout duration="PT2S"/>
+      </bpmn:extensionElements>
+    </bpmn:serviceTask>
+    <bpmn:exclusiveGateway id="G" default="out"/>
+    <bpmn:serviceTask id="R" implementation="reply">
+      <bpmn:extensionElements><q:reply/></bpmn:extensionElements>
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="E"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="S" targetRef="A"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="A" targetRef="G"/>
+    <bpmn:sequenceFlow id="again" sourceRef="G" targetRef="A">
+      <bpmn:conditionExpression>a.n &lt; 3</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="out" sourceRef="G" targetRef="R"/>
+    <bpmn:sequenceFlow id="f3" sourceRef="R" targetRef="E"/>
+  </bpmn:process>
+</bpmn:definitions>"#;
+
+/// start → turn wait `U` → sync call `A` → G: `a.n < 2` waits for the next turn, else end.
+const TURN_CALL_LOOP: &str = r#"<?xml version="1.0"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0">
+  <bpmn:process id="turnloop">
+    <bpmn:startEvent id="S">
+      <bpmn:extensionElements>
+        <q:source channel="start-in" name="req"/>
+        <q:alias name="conv" expression="header.conv" onConflict="correlate"/>
+      </bpmn:extensionElements>
+    </bpmn:startEvent>
+    <bpmn:userTask id="U">
+      <bpmn:extensionElements><q:source channel="relay-in" name="turn"/></bpmn:extensionElements>
+    </bpmn:userTask>
+    <bpmn:serviceTask id="A" implementation="channel:svc">
+      <bpmn:extensionElements>
+        <q:source channel="svc-answers" name="a"/>
+        <q:timeout duration="PT2S"/>
+      </bpmn:extensionElements>
+    </bpmn:serviceTask>
+    <bpmn:exclusiveGateway id="G" default="done"/>
+    <bpmn:endEvent id="E"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="S" targetRef="U"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="U" targetRef="A"/>
+    <bpmn:sequenceFlow id="f3" sourceRef="A" targetRef="G"/>
+    <bpmn:sequenceFlow id="next" sourceRef="G" targetRef="U">
+      <bpmn:conditionExpression>a.n &lt; 2</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="done" sourceRef="G" targetRef="E"/>
+  </bpmn:process>
+</bpmn:definitions>"#;
+
+/// The n-th call (0-based) answers `{"n": n + 1}`.
+fn counting() -> Arc<FakeCaller> {
+    FakeCaller::new(|n| Box::pin(async move { json(&format!(r#"{{"n":{}}}"#, n + 1)) }))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sync_call_in_a_loop_is_made_again_inline_on_every_iteration() {
+    let caller = counting();
+    let rig = rig(SYNC_LOOP, Arc::clone(&caller), None);
+
+    let outcome = rig
+        .handle
+        .dispatch(start("k-loop"))
+        .await
+        .expect("the chain loops and completes");
+
+    assert_eq!(caller.calls(), 3, "each iteration makes its own call");
+    assert_eq!(reply_json(&outcome), serde_json::json!({"a": {"n": 3}}));
+    assert!(
+        trace(&rig).is_empty(),
+        "a loop of sync calls is still one in-memory chain: {:?}",
+        trace(&rig)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_turn_loop_with_a_sync_call_parks_the_next_turn_as_a_new_wait() {
+    let caller = counting();
+    let rig = rig_over(
+        TURN_CALL_LOOP,
+        Arc::clone(&caller),
+        None,
+        Some(parked("turnloop", "U")),
+    );
+
+    rig.handle
+        .dispatch(turn("t-1"))
+        .await
+        .expect("the first turn loops back to the turn wait");
+    {
+        let observed = rig.observed.lock().unwrap();
+        assert_eq!(caller.calls(), 1);
+        let (snapshot, resolved) = observed.reparks.last().expect("the turn re-parked");
+        assert_eq!(snapshot.waiting_nodes, vec!["U".to_string()]);
+        assert!(
+            resolved.contains(&"U".to_string()),
+            "the answered turn's wait row is resolved and the next turn's recorded fresh: \
+             {resolved:?}"
+        );
+    }
+
+    rig.handle
+        .dispatch(turn("t-2"))
+        .await
+        .expect("the second turn leaves the loop");
+    assert_eq!(caller.calls(), 2, "the second turn made its own call");
+    assert_eq!(
+        trace(&rig).last().map(String::as_str),
+        Some("commit_complete")
     );
 }

@@ -1,0 +1,72 @@
+# Run the capacity-pools example locally: engine + PostgreSQL + a sink that records what it is
+# sent (the stub server shared with ai-summarize). Nothing needs a real key.
+#
+#   docker compose -f examples/capacity-pools/deploy/compose.yaml up -d
+#   sutra package examples/capacity-pools/deployments-src/default--lines--1.0.0 \
+#        --out examples/capacity-pools/deploy/deployments
+#
+# The engine watches ./deployments and activates the archive without a restart. The project name
+# is explicit so this stack can never collide with another one that would default to `deploy`.
+
+name: sutra-capacity-pools
+
+services:
+  engine:
+    # 0.6.0 or later. Override with SUTRA_ENGINE_IMAGE to run a locally built tag.
+    image: ${SUTRA_ENGINE_IMAGE:-ghcr.io/startr-trade/sutra:0.6.0}
+    environment:
+      SUTRA_DEPLOYMENTS_DIR: /deployments
+      SUTRA_HTTP_PORT: "8080"
+      SUTRA_DATASOURCE_URL: postgres://engine-db:5432/sutra
+      # A plain login role, not the postgres superuser — see engine-db-init.sh.
+      SUTRA_DATASOURCE_USERNAME: ${ENGINE_DB_USER:-sutra_engine}
+      SUTRA_DATASOURCE_PASSWORD: ${ENGINE_DB_PASSWORD:-sutra-dev-only}
+      # A short outbox tick, so a waiting request is re-checked every second.
+      SUTRA_OUTBOX_TICK_INTERVAL: PT1S
+
+      # --- the pools ---------------------------------------------------------------------------
+      # Engine configuration, shared by every deployment and (through the database) every
+      # replica. Small on purpose, so the walkthrough fills them with three requests.
+      SUTRA_CAPACITY_POOLS: lines,callbacks
+      SUTRA_CAPACITY_POOLS_LINES_SLOTS: "2"
+      SUTRA_CAPACITY_POOLS_CALLBACKS_SLOTS: "1"
+
+      # DEV ONLY: /admin/* without authentication. Never in anything real.
+      SUTRA_ADMIN_OIDC_DEV_DISABLED: "true"
+
+      # --- what the package names --------------------------------------------------------------
+      LINES_API_KEY: ${LINES_API_KEY:-dev-only-lines-key}
+    volumes:
+      - ./deployments:/deployments:ro
+    ports:
+      # Dynamic host port, loopback only: `docker compose -f … port engine 8080` shows it.
+      - "127.0.0.1::8080"
+    depends_on:
+      engine-db:
+        condition: service_healthy
+      sink:
+        condition: service_started
+
+  # The stub server from ai-summarize, used only for its /sink: POST records a body, GET lists
+  # them. Resolvable from the engine as http://sink:8000.
+  sink:
+    image: python:3.12-alpine
+    command: ["python3", "/stub/model-stub.py", "8000"]
+    volumes:
+      - ../../ai-summarize/stub:/stub:ro
+
+  engine-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: sutra
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_BOOTSTRAP_PASSWORD:-bootstrap-dev-only}
+      ENGINE_DB_USER: ${ENGINE_DB_USER:-sutra_engine}
+      ENGINE_DB_PASSWORD: ${ENGINE_DB_PASSWORD:-sutra-dev-only}
+    volumes:
+      - ./engine-db-init.sh:/docker-entrypoint-initdb.d/10-engine-role.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d sutra"]
+      interval: 2s
+      timeout: 3s
+      retries: 30

@@ -1,0 +1,4 @@
+# Sealed archives are BUILD OUTPUT: `sutra package` derives one from deployments-src/, and
+# dropping it here is what deploys it. The directory itself is tracked so the compose bind mount
+# resolves on a fresh clone.
+*.sutra

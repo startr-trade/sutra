@@ -9,6 +9,7 @@
 
 mod alias;
 mod audit_event;
+mod capacity;
 mod channel;
 mod data_key;
 mod dead_letter;
@@ -27,6 +28,9 @@ pub use alias::{AliasRow, AliasStore, PgAliasStore};
 pub use audit_event::{
     AuditEventRecord, AuditEventRow, PgAuditEventStore, AUDIT_HISTORY_PAGE_DEFAULT,
     AUDIT_HISTORY_PAGE_MAX,
+};
+pub use capacity::{
+    PgCapacitySlotStore, SlotClaim, SlotGrant, SlotSelection, SLOT_INBOUND, SLOT_OUTBOUND,
 };
 pub use channel::{ChannelConcurrencyStore, PgChannelConcurrencyStore};
 pub use data_key::PgDataKeyStore;

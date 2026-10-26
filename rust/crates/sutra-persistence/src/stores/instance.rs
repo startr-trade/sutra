@@ -246,7 +246,8 @@ const SQL_MARK_TERMINAL: &str = "UPDATE instance_state SET \
 /// retention plus one sweep tick").
 const SQL_PURGE_TERMINAL: &str = "DELETE FROM instance_state \
      WHERE deployment_id = $1 AND terminal_at IS NOT NULL \
-       AND terminal_at <= now() - make_interval(secs => $2)";
+       AND terminal_at <= now() - make_interval(secs => $2) \
+       AND NOT (instance_id = ANY($3))";
 
 const SQL_HEARTBEAT: &str = "UPDATE instance_state SET last_heartbeat_at = now() \
      WHERE deployment_id = $1 AND instance_id = $2 AND claim_owner = $3";
@@ -366,10 +367,22 @@ impl PgInstanceStore {
         deployment: &DeploymentId,
         retention: std::time::Duration,
     ) -> Result<u64> {
+        self.purge_terminal_except(deployment, retention, &[]).await
+    }
+
+    /// [`Self::purge_terminal`], keeping the rows of `keep` — the instances whose recorded media
+    /// could not be deleted yet, which stay retained so the next sweep retries them.
+    pub async fn purge_terminal_except(
+        &self,
+        deployment: &DeploymentId,
+        retention: std::time::Duration,
+        keep: &[Uuid],
+    ) -> Result<u64> {
         let mut tx = begin_deployment_tx(&self.pool, deployment).await?;
         let purged = sqlx::query(SQL_PURGE_TERMINAL)
             .bind(deployment.as_str())
             .bind(retention.as_secs_f64())
+            .bind(keep)
             .execute(&mut *tx)
             .await
             .map_err(PersistenceError::db("instance purgeTerminal"))?

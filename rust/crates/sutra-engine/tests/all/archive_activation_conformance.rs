@@ -265,6 +265,8 @@ async fn boot_archive_engine(
         rls_bypass_check_enabled: false,
         telemetry: sutra_engine::TelemetryConfig::default(),
         admin_auth: Default::default(),
+        capacity_pools: Vec::new(),
+        object_stores: Vec::new(),
         now_override: None,
     })
     .await
@@ -767,6 +769,8 @@ async fn boot_db_engine(datasource_url: String) -> RunningEngine {
         instance_sweep: Default::default(),
         engine_shards: crate::shard_support::engine_shards_from_env(),
         instance_retention: Default::default(),
+        capacity_pools: Vec::new(),
+        object_stores: Vec::new(),
         now_override: None,
     })
     .await

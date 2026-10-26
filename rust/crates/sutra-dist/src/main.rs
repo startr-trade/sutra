@@ -47,6 +47,8 @@ use sutra_envref_vault as _;
 use sutra_llm_anthropic as _;
 #[cfg(feature = "llm-bedrock")]
 use sutra_llm_bedrock as _;
+#[cfg(feature = "llm-gemini")]
+use sutra_llm_gemini as _;
 #[cfg(feature = "llm-openai")]
 use sutra_llm_openai as _;
 #[cfg(feature = "amqp")]

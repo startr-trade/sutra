@@ -1,0 +1,61 @@
+# Channels for the recordings module, 1.0.0.
+#
+#   SYNC  POST /channels/recording-summary  -> summary-model   a stored recording, summarised
+#         POST /channels/recording-closed                      ends the instance (it waits for this)
+#
+# The request carries a MEDIA REFERENCE to a recording in an object store, not the recording:
+#
+#   { "recordingId": "q-1", "callerId": "caller-1",
+#     "recording": { "kind": "media", "uri": "s3://recordings/calls/q-1.wav",
+#                    "sha256": "<hex>", "format": "audio/wav" } }
+#
+# The model channel names the store it may read (`media-store`); the store itself is ENGINE
+# configuration (`sutra.object-stores.recordings.*`, set in deploy/compose.yaml), never package
+# content. The llm transport reads the object, checks its SHA-256 and size, and sends the audio to
+# the model as if it had been inline. The flow's variables, its snapshot and its audit trail only
+# ever hold the reference.
+#
+# SECRETS are `env:` references resolved by the ENGINE from its own environment; compose.yaml
+# defines every name with a dev-only placeholder.
+
+channels:
+  - name: recording-summary
+    transport: http
+    bind: "POST /channels/recording-summary"
+    codec: json
+    ack-mode: on-complete
+    cloudevents-mode: none
+    auth:
+      scheme: apikey
+      apikey:
+        value: env:RECORDINGS_API_KEY
+        header: X-Api-Key
+
+  # { recordingId } — resumes the instance parked at AwaitClose, correlated by recordingId.
+  - name: recording-closed
+    transport: http
+    bind: "POST /channels/recording-closed"
+    codec: json
+    cloudevents-mode: none
+    auth:
+      scheme: apikey
+      apikey:
+        value: env:RECORDINGS_API_KEY
+        header: X-Api-Key
+
+  # An audio model behind the stub (examples/ai-summarize/stub): it hears the recording itself.
+  - name: summary-model
+    direction: outbound
+    transport: llm
+    bind: "llm://summary-model"
+    ack-mode: on-complete
+    llm:
+      media-store: recordings          # sutra.object-stores.recordings (engine configuration)
+      media-max-bytes: 1048576         # refuse any referenced object over 1 MiB (default 20 MiB)
+      require: [audio-understanding]   # only a candidate that hears the voice itself
+      candidates:
+        - provider: openai
+          model: gpt-audio-stub
+          base-url: http://model-stub:8000/v1
+          api-key: env:LLM_API_KEY     # a real deployment: env:OPENAI_API_KEY, no base-url
+      timeout-seconds: 30

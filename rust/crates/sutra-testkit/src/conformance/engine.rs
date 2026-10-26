@@ -218,6 +218,7 @@ pub struct EngineBuilder {
     host_gateway: bool,
     expected_deployments: u64,
     shards: Option<u32>,
+    mounts: Vec<(String, String)>,
 }
 
 impl EngineBuilder {
@@ -235,7 +236,15 @@ impl EngineBuilder {
             host_gateway: false,
             expected_deployments: 1,
             shards: conformance_shards(),
+            mounts: Vec::new(),
         }
+    }
+
+    /// The engine container's name — its address on the suite network — known before
+    /// [`start`](Self::start), so a fixture started first (a gateway that calls the engine back)
+    /// can be configured with it.
+    pub fn container_name(&self) -> &str {
+        &self.container_name
     }
 
     /// Add a container env var (module credential refs, callback hosts, …).
@@ -267,6 +276,15 @@ impl EngineBuilder {
     /// recorder — the async out-of-band suites' callback endpoint.
     pub fn host_gateway(mut self) -> Self {
         self.host_gateway = true;
+        self
+    }
+
+    /// Bind-mount a host directory (or file) READ-ONLY into the engine container at `target` —
+    /// engine-wide files a suite's configuration points at (recorded prompts, a CA bundle). The
+    /// engine runs as an unprivileged user, so the host path must be world-readable.
+    pub fn mount_read_only(mut self, host: &Path, target: &str) -> Self {
+        self.mounts
+            .push((host.to_string_lossy().to_string(), target.to_string()));
         self
     }
 
@@ -319,6 +337,12 @@ impl EngineBuilder {
         }
         if let Some(mount) = secrets_mount {
             image = image.with_mount(mount);
+        }
+        for (host, target) in &self.mounts {
+            image = image.with_mount(
+                Mount::bind_mount(host.clone(), target.clone())
+                    .with_access_mode(AccessMode::ReadOnly),
+            );
         }
         if self.host_gateway {
             image = image.with_host("host.docker.internal", Host::HostGateway);

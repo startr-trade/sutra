@@ -447,3 +447,99 @@ fn only_an_explicit_on_complete_makes_an_outbound_channel_synchronous() {
     assert_eq!(defs[3].effective_ack_mode(), "on-complete");
     assert_eq!(defs[0].effective_ack_mode(), "on-complete");
 }
+
+// ---- capacity pools + session-end ---------------------------------------------------------------
+
+fn load(yaml: &str) -> Result<Vec<sutra_channels::ChannelDefinition>, sutra_channels::Diagnostic> {
+    load_channel_definitions(yaml.as_bytes(), "acme", "calls", "1.0.0", "channels.yaml")
+}
+
+#[test]
+fn pool_and_session_end_load_as_binding_fields() {
+    let defs = load(
+        r#"channels:
+- name: call-start
+  transport: http
+  pool: lines
+  pool-call-key: header.X-Call-Id
+  session-end:
+    on-message: call-hangup
+    on-reply: true
+- name: call-hangup
+  transport: http
+- name: dial
+  direction: outbound
+  transport: http
+  bind: https://example.test/dial
+  ack-mode: on-complete
+  pool: lines
+"#,
+    )
+    .expect("loads");
+    let start = &defs[0].binding;
+    assert_eq!(start.pool.as_deref(), Some("lines"));
+    assert_eq!(start.pool_call_key.as_deref(), Some("x-call-id"));
+    let headers =
+        std::collections::BTreeMap::from([("x-CALL-id".to_string(), " leg-a ".to_string())]);
+    assert_eq!(start.call_key_in(&headers).as_deref(), Some("leg-a"));
+    assert_eq!(defs[2].binding.pool_call_key, None);
+    assert_eq!(defs[2].binding.call_key_in(&headers), None);
+    let end = start.session_end.as_ref().expect("session-end");
+    assert_eq!(end.on_message.as_deref(), Some("call-hangup"));
+    assert!(end.on_reply);
+    // First-class fields, not stray properties.
+    assert!(!defs[0].properties.contains_key("pool"));
+    assert!(!defs[0].properties.contains_key("pool-call-key"));
+    assert!(!defs[0]
+        .properties
+        .keys()
+        .any(|k| k.starts_with("session-end")));
+    assert_eq!(defs[1].binding.session_end, None);
+    // A pooled outbound channel is never synchronous: only the outbox can hold it back.
+    assert_eq!(defs[2].binding.pool.as_deref(), Some("lines"));
+    assert!(!defs[2].is_sync_outbound());
+}
+
+#[test]
+fn a_malformed_session_end_fails_to_load() {
+    const CODE: &str = "SUTRA.CONFIG.CHANNEL.SESSION_END_INVALID";
+    let cases = [
+        // on-message names no channel of the file
+        "channels:\n- name: a\n  session-end:\n    on-message: nowhere\n",
+        // on-message names an outbound channel
+        "channels:\n- name: a\n  session-end:\n    on-message: b\n\
+         - name: b\n  direction: outbound\n  transport: http\n  bind: https://x.test/\n",
+        // on-message names the session's own channel
+        "channels:\n- name: a\n  session-end:\n    on-message: a\n",
+        // declared on an outbound channel
+        "channels:\n- name: b\n  direction: outbound\n  session-end:\n    on-reply: true\n",
+        // nothing ends the session
+        "channels:\n- name: a\n  session-end:\n    on-reply: false\n",
+        // unknown key / wrong type / not a mapping
+        "channels:\n- name: a\n  session-end:\n    on-hangup: b\n",
+        "channels:\n- name: a\n  session-end:\n    on-reply: yes-please\n",
+        "channels:\n- name: a\n  session-end: b\n",
+    ];
+    for yaml in cases {
+        let err = load(yaml).expect_err(yaml);
+        assert_eq!(err.code, CODE, "{yaml}: {err:?}");
+    }
+}
+
+#[test]
+fn a_malformed_pool_call_key_fails_to_load() {
+    const CODE: &str = "SUTRA.CONFIG.CHANNEL.POOL_CALL_KEY_INVALID";
+    let cases = [
+        // not header.<name>
+        "channels:\n- name: a\n  pool: lines\n  pool-call-key: x-call-id\n",
+        "channels:\n- name: a\n  pool: lines\n  pool-call-key: header.\n",
+        "channels:\n- name: a\n  pool: lines\n  pool-call-key: header.a b\n",
+        "channels:\n- name: a\n  pool: lines\n  pool-call-key: 3\n",
+        // nothing to key: the channel draws from no pool
+        "channels:\n- name: a\n  pool-call-key: header.x-call-id\n",
+    ];
+    for yaml in cases {
+        let err = load(yaml).expect_err(yaml);
+        assert_eq!(err.code, CODE, "{yaml}: {err:?}");
+    }
+}

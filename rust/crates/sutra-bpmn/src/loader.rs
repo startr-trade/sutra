@@ -3378,6 +3378,7 @@ fn parse_audit_capture(s: &str) -> Result<AuditCapture, SutraError> {
         "" | "payload" => Ok(AuditCapture::Payload),
         "none" => Ok(AuditCapture::None),
         "metadata" => Ok(AuditCapture::Metadata),
+        "media" => Ok(AuditCapture::Media),
         _ => Err(err(
             codes::PARSE_QXSD_INVALID_SOURCE,
             format!("Unknown q:audit capture: {s}"),

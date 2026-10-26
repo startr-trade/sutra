@@ -15,6 +15,9 @@
 #   JOB   POST /channels/summarize-job      -> job-model        OpenAI background job, polled
 #   JOB   POST /channels/summarize-webhook  -> webhook-model    OpenAI background job, webhook
 #   JOB   POST /channels/summarize-batch    -> batch-model      Anthropic Message Batch, polled
+#   SYNC  POST /channels/voice              -> voice-model      audio in, spoken answer out (OpenAI audio model)
+#   SYNC  POST /channels/voice-pipeline     -> voice-pipeline-model  speech-to-text, a text model, text-to-speech
+#   SYNC  POST /channels/vision             -> vision-model     an image or video frames in, a JSON answer out (native Gemini)
 #
 # The three sync channels declare `ack-mode: on-complete`: the call is inline and the HTTP caller
 # gets the answer on its own connection. The three job channels are `mode: job` on the outbound
@@ -257,3 +260,117 @@ channels:
     transport: http
     bind: "http://model-stub:8000/sink"
     cloudevents-mode: none
+
+  # ---- audio: one utterance in, a spoken answer out (sync) -------------------------------------
+
+  # { requestId, audio: { data: <base64>, format: <media type> }, audioOutput: <media type> }
+  - name: voice
+    transport: http
+    bind: "POST /channels/voice"
+    codec: json
+    ack-mode: on-complete
+    cloudevents-mode: none
+    auth:
+      scheme: apikey
+      apikey:
+        value: env:AI_ADVANCED_API_KEY
+        header: X-Api-Key
+
+  - name: voice-pipeline
+    transport: http
+    bind: "POST /channels/voice-pipeline"
+    codec: json
+    ack-mode: on-complete
+    cloudevents-mode: none
+    auth:
+      scheme: apikey
+      apikey:
+        value: env:AI_ADVANCED_API_KEY
+        header: X-Api-Key
+
+  # AUDIO-NATIVE. Audio goes to the model as audio. Only `provider: openai` advertises audio, and
+  # only for an audio model (a model id containing `audio`); a candidate that cannot take the
+  # request's audio is skipped, never sent a text-only version of it.
+  - name: voice-model
+    direction: outbound
+    transport: llm
+    bind: "llm://voice-model"
+    ack-mode: on-complete
+    llm:
+      candidates:
+        - provider: openai
+          model: gpt-audio-stub
+          base-url: http://model-stub:8000/v1
+          api-key: env:LLM_API_KEY
+      require: [audio-understanding]   # skip any candidate that would flatten the voice
+      output-voice: alloy
+      timeout-seconds: 30
+
+  # THE PIPELINE. `voice: pipeline` transcribes with `speech`, answers with the (text) candidate,
+  # and speaks the answer with `speech`; the reply carries `audioPreserved: false`.
+  - name: voice-pipeline-model
+    direction: outbound
+    transport: llm
+    bind: "llm://voice-pipeline-model"
+    ack-mode: on-complete
+    llm:
+      voice: pipeline
+      speech:
+        provider: openai
+        base-url: http://model-stub:8000/v1
+        api-key: env:LLM_API_KEY
+        transcribe-model: gpt-transcribe
+        speech-model: gpt-4o-mini-tts
+        voice: alloy
+      candidates:
+        - provider: anthropic
+          model: test-model
+          base-url: http://model-stub:8000
+          api-key: env:LLM_API_KEY
+      max-output-tokens: 200
+      timeout-seconds: 30
+
+  # ---- vision: an image or sampled video frames in, a JSON scene description out (sync) ------
+
+  # { requestId, image: { data, format } } or { requestId, video: { frames: [...] } }
+  - name: vision
+    transport: http
+    bind: "POST /channels/vision"
+    codec: json
+    ack-mode: on-complete
+    cloudevents-mode: none
+    auth:
+      scheme: apikey
+      apikey:
+        value: env:AI_ADVANCED_API_KEY
+        header: X-Api-Key
+
+  # NATIVE GEMINI. `provider: gemini` is Gemini's own API (not the Chat Completions-compatible
+  # `google-gemini` route), which carries images, video frames and clips. `require:` skips any
+  # candidate that cannot read video or answer in JSON — here the first one, a Chat Completions
+  # model, which is never called. Video understanding is preview in 0.6.
+  #
+  # MEDIA REFERENCES. An image or frame may also be `{ ref, sha256, format }`: the transport reads
+  # it from the object store `media` (engine configuration, `sutra.object-stores.media.*`; the
+  # stack's compose.media.yaml declares one on MinIO), checks the digest and size, and only then
+  # calls the model. Without that store a reference is refused; inline media still works.
+  - name: vision-model
+    direction: outbound
+    transport: llm
+    bind: "llm://vision-model"
+    ack-mode: on-complete
+    llm:
+      media-store: media
+      media-max-bytes: 1048576
+      candidates:
+        - provider: openai             # no video-understanding: skipped by `require:`
+          model: no-video-stub
+          base-url: http://model-stub:8000/v1
+          api-key: env:LLM_API_KEY
+        - provider: gemini
+          model: gemini-vision-stub      # the stub answers a `vision` model with a scene description
+          base-url: http://model-stub:8000
+          api-key: env:LLM_API_KEY
+      require: [video-understanding, json-output]
+      max-output-tokens: 300
+      timeout-seconds: 30

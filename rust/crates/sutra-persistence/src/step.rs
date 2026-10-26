@@ -266,6 +266,25 @@ pub async fn commit_step_with_timers_releasing(
     timer_waits: &[StepTimerWait],
     claim_owner: Option<&str>,
 ) -> Result<()> {
+    commit_step_with_timers_releasing_retiring(pool, step, timer_waits, claim_owner, &[]).await
+}
+
+/// [`commit_step_with_timers_releasing`] that additionally RETIRES the `(alias_name,
+/// alias_value)` rows in `retired_aliases` (ADDITIVE; the [`StepWrite`] shape is untouched).
+///
+/// A resume step passes the correlation keys of the waits it resolved: once the instance has
+/// left a wait, a late relay carrying that wait's key must not find the instance any more —
+/// the case that matters is a loop, whose earlier iteration's key would otherwise keep matching
+/// while the instance waits in a later iteration. The retirement runs BEFORE the step records
+/// its own alias rows, and recording revives a retired row of the same instance, so a key the
+/// new iteration parks on again stays live.
+pub async fn commit_step_with_timers_releasing_retiring(
+    pool: &sqlx::PgPool,
+    step: &StepWrite,
+    timer_waits: &[StepTimerWait],
+    claim_owner: Option<&str>,
+    retired_aliases: &[(String, String)],
+) -> Result<()> {
     for entry in &step.outbox {
         if entry.deployment != step.deployment || entry.instance_id != step.instance_id {
             return Err(PersistenceError::InvalidArgument(format!(
@@ -275,6 +294,16 @@ pub async fn commit_step_with_timers_releasing(
         }
     }
     let mut tx = begin_deployment_tx(pool, &step.deployment).await?;
+    for (alias_name, alias_value) in retired_aliases {
+        PgAliasStore::retire_one_in(
+            &mut tx,
+            &step.deployment,
+            step.instance_id,
+            alias_name,
+            alias_value,
+        )
+        .await?;
+    }
     write_step_with_timers_in(&mut tx, step, timer_waits).await?;
     // A synchronous-call chain's in-flight marker ends with the step that ends the chain.
     crate::stores::PgInflightChainStore::clear_in(&mut tx, &step.deployment, step.instance_id)

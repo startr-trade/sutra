@@ -56,6 +56,7 @@ sutra-transport-llm = { path = "../sutra-transport-llm", optional = true }
 sutra-llm-openai = { path = "../sutra-llm-openai", optional = true }
 sutra-llm-anthropic = { path = "../sutra-llm-anthropic", optional = true }
 sutra-llm-bedrock = { path = "../sutra-llm-bedrock", optional = true }
+sutra-llm-gemini = { path = "../sutra-llm-gemini", optional = true }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time"] }
 tracing = { workspace = true }
 
@@ -63,7 +64,7 @@ tracing = { workspace = true }
 # bundles HTTP + the five network brokers + file + dapr + knative (the general image). A
 # hardened / air-gapped build uses `--no-default-features` + only the transports it needs.
 [features]
-default = ["http", "kafka", "rabbitmq", "aws-sqs", "gcp-pubsub", "amqp", "file", "dapr", "knative", "llm-openai", "llm-anthropic", "llm-bedrock"]
+default = ["http", "kafka", "rabbitmq", "aws-sqs", "gcp-pubsub", "amqp", "file", "dapr", "knative", "llm-openai", "llm-anthropic", "llm-bedrock", "llm-gemini"]
 http = ["dep:sutra-transport-http"]
 kafka = ["dep:sutra-transport-kafka"]
 rabbitmq = ["dep:sutra-transport-rabbitmq"]
@@ -80,6 +81,9 @@ llm = ["dep:sutra-transport-llm"]
 llm-openai = ["llm", "dep:sutra-llm-openai"]
 llm-anthropic = ["llm", "dep:sutra-llm-anthropic"]
 llm-bedrock = ["llm", "dep:sutra-llm-bedrock"]
+# Gemini's native API (`provider: gemini`) — audio and video understanding the compatible route
+# (`google-gemini`, in llm-openai) cannot carry.
+llm-gemini = ["llm", "dep:sutra-llm-gemini"]
 
 [dev-dependencies]
 # The bundle-completeness tests (moved here — the distribution layer) resolve the assembled set.

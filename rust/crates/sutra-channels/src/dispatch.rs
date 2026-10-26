@@ -30,6 +30,10 @@ use crate::bridge::{
     auth_ref_to_json, cloud_event_to_json, new_uuid, AliasRecord, InstanceBridge,
     InstanceClaimOutcome, OutboxEmission, SuspendedInstance, TimerWaitRecord,
 };
+use crate::capacity::{
+    CallSelector, CapacityPoolStore, SlotAcquisition, SlotDirection, SlotRequest,
+    CAPACITY_CALL_HEADER, CAPACITY_CALL_KEY_HEADER, CAPACITY_POOL_HEADER,
+};
 use crate::codes;
 use crate::config::{ChannelBinding, ChannelDefinition, Namespace};
 use crate::diag::Diagnostic;
@@ -282,6 +286,22 @@ pub struct ChannelEngine {
     /// admission; the count is maintained by the persistence/tracker layer). `None` = caps
     /// declared but not enforced.
     concurrency: Option<Rc<dyn ConcurrencyStore>>,
+    /// The engine-declared capacity pools (`pool:` on a channel). Shared (`Arc`) by every lane
+    /// and the outbox dispatcher, so one count governs every acquirer. `None` = no pool is
+    /// declared; a `pool:` key then has nothing to draw from (load validation refuses it).
+    capacity: Option<Arc<dyn CapacityPoolStore>>,
+    /// The pool slot THIS start took under an admission key, not yet bound to its instance.
+    /// Set by `drive_resolved`, consumed (re-keyed to the instance id) where the instance
+    /// outlives the pass — its first durable park or a synchronous chain — and released by
+    /// `drive_resolved` when nothing consumed it. Actor-local scratch, like `pending_settle`.
+    pool_admission: std::cell::RefCell<Option<PoolAdmission>>,
+    /// Instances whose session a reply ended during the current entry point (`session-end:
+    /// on-reply`): released when the entry point returns, after any admission slot has been
+    /// bound to the instance.
+    session_releases: std::cell::RefCell<Vec<(DeploymentId, String)>>,
+    /// `(module_key, channel)` of every inbound channel named by another channel's
+    /// `session-end: on-message` → the session channels it ends.
+    session_end_targets: BTreeMap<(String, String), Vec<String>>,
     /// DRAINING deployments (the deployment lifecycle), most recently drained first: relay
     /// correlation falls back to these scopes so an instance pinned to a flipped-away
     /// deployment keeps resuming until it retires. New intake never starts here.
@@ -364,6 +384,10 @@ impl ChannelEngine {
                 feature_provider: None,
                 quota_enforcer: None,
                 concurrency: None,
+                capacity: None,
+                pool_admission: std::cell::RefCell::new(None),
+                session_releases: std::cell::RefCell::new(Vec::new()),
+                session_end_targets: BTreeMap::new(),
                 prior_deployments: Vec::new(),
                 deferred_acks: None,
                 pending_settle: std::cell::RefCell::new(None),
@@ -676,6 +700,17 @@ impl ChannelEngine {
         let predicate_faults = resolution.predicate_faults;
         let handlers = resolution.handlers;
         if handlers.is_empty() {
+            // `session-end: on-message`: this channel ends sessions another channel admitted. A
+            // correlated message releases its instance's slot whether or not a wait in the flow
+            // also subscribes; with none, it is accepted for the release alone.
+            if self
+                .session_end_targets
+                .contains_key(&(binding.namespace.module_key(), message.channel.clone()))
+            {
+                return self
+                    .end_session_on_message(&binding, &deployment, &decoded, message)
+                    .await;
+            }
             // Before failing "no start event", check whether this is a
             // channel-delivered RELAY: a wait node (userTask / message catch) subscribes to
             // this channel, so the inbound resumes a WAITING instance rather than minting
@@ -840,6 +875,45 @@ impl ChannelEngine {
         binding: &ChannelBinding,
         deployment: &DeploymentId,
         message: &InboundMessage,
+        variables: Variables,
+        routed_start: Option<String>,
+    ) -> Result<DispatchOutcome, Diagnostic> {
+        // ---- capacity pool (a start only — a relay or a timer resumes an instance that
+        // already holds its slot) --------------------------------------------------------------
+        // The slot is taken BEFORE the first pass runs, under a fresh admission key, so a full
+        // pool rejects without executing anything. The pass re-keys it to the instance where
+        // the instance outlives the pass (a park, a synchronous chain); otherwise it is
+        // released here.
+        let admission = self.admit_to_pool(binding, deployment, message).await?;
+        *self.pool_admission.borrow_mut() = admission;
+        let result = self
+            .drive_resolved_pass(
+                process,
+                start_id,
+                binding,
+                deployment,
+                message,
+                variables,
+                routed_start,
+            )
+            .await;
+        let unbound = self.pool_admission.borrow_mut().take();
+        if let (Some(admission), Some(store)) = (unbound, &self.capacity) {
+            store.release(&admission.deployment, &admission.key).await;
+        }
+        self.flush_session_releases().await;
+        result
+    }
+
+    /// The body of [`Self::drive_resolved`], run with any admission slot already taken.
+    #[allow(clippy::too_many_arguments)]
+    async fn drive_resolved_pass(
+        &self,
+        process: &ProcessDefinition,
+        start_id: &str,
+        binding: &ChannelBinding,
+        deployment: &DeploymentId,
+        message: &InboundMessage,
         mut variables: Variables,
         routed_start: Option<String>,
     ) -> Result<DispatchOutcome, Diagnostic> {
@@ -898,6 +972,8 @@ impl ChannelEngine {
             Ok(exec) => {
                 self.commit_sync_emissions(binding, deployment, message, process)
                     .await?;
+                self.mark_instance_ended(deployment, &exec.instance_id)
+                    .await;
                 let reply = self.build_reply(binding, process, message, &exec)?;
                 Ok(DispatchOutcome::Completed {
                     instance_id: exec.instance_id,
@@ -1047,6 +1123,220 @@ impl ChannelEngine {
         if let Some(store) = &self.concurrency {
             store.record_terminal(pinned, instance_id).await;
         }
+        self.release_pool_slots(pinned, instance_id).await;
+    }
+
+    /// Take a start's capacity-pool slot when its channel draws from a pool (`pool:`): under a
+    /// fresh admission key, since the instance id does not exist yet. A full pool is a
+    /// busy-signal reject. A store failure ADMITS (fail-open, like the channel cap's count): a
+    /// transient database blip must not turn every inbound away.
+    ///
+    /// The slot is held for the delivery's call: the declared `pool-call-key` header's value,
+    /// else the delivery's own identity (its idempotency key, else the admission key).
+    async fn admit_to_pool(
+        &self,
+        binding: &ChannelBinding,
+        deployment: &DeploymentId,
+        message: &InboundMessage,
+    ) -> Result<Option<PoolAdmission>, Diagnostic> {
+        let (Some(store), Some(pool)) = (&self.capacity, binding.pool.as_deref()) else {
+            return Ok(None);
+        };
+        let key = new_uuid();
+        let call = binding
+            .call_key_in(&message.headers)
+            .or_else(|| {
+                (!message.idempotency_key.is_empty()).then(|| message.idempotency_key.clone())
+            })
+            .unwrap_or_else(|| key.clone());
+        let request = SlotRequest {
+            pool,
+            deployment,
+            tenant: binding.tenant(),
+            holder: &key,
+            call: &call,
+            direction: SlotDirection::Inbound,
+            require_live: false,
+        };
+        match store.acquire(&request).await {
+            Ok(SlotAcquisition::Acquired | SlotAcquisition::AlreadyHeld) => {
+                Ok(Some(PoolAdmission {
+                    deployment: deployment.clone(),
+                    key,
+                }))
+            }
+            Ok(SlotAcquisition::Exhausted {
+                inbound_used,
+                outbound_used,
+            }) => {
+                let slots = store.pool(pool).map(|p| p.slots).unwrap_or(0);
+                Err(Diagnostic::error(
+                    codes::INBOUND_POOL_EXHAUSTED,
+                    format!(
+                        "Channel '{}' draws from capacity pool '{pool}', which has no free slot \
+                         ({inbound_used} inbound + {outbound_used} outbound of {slots}); the \
+                         inbound is rejected (busy).",
+                        binding.channel_name
+                    ),
+                )
+                .with_attribute("channel", &binding.channel_name)
+                .with_attribute("pool", pool)
+                .with_attribute("slots", slots.to_string()))
+            }
+            Ok(SlotAcquisition::UnknownPool) => {
+                tracing::warn!(
+                    channel = %binding.channel_name,
+                    pool,
+                    "channel names a capacity pool the engine no longer declares — admitted \
+                     without a slot"
+                );
+                Ok(None)
+            }
+            Ok(SlotAcquisition::InstanceEnded | SlotAcquisition::SessionEnded) => Ok(None),
+            Err(d) => {
+                tracing::warn!(
+                    channel = %binding.channel_name,
+                    pool,
+                    code = %d.code,
+                    error = %d.message,
+                    "capacity-pool acquisition failed — admitting without a slot (fail-open)"
+                );
+                Ok(None)
+            }
+        }
+    }
+
+    /// Bind this pass's admission slot to the instance that now outlives the pass (its first
+    /// durable park, or a synchronous chain). Returns whether a slot was bound.
+    async fn bind_admission(&self, instance_id: &str) -> bool {
+        let admission = self.pool_admission.borrow_mut().take();
+        let Some(admission) = admission else {
+            return false;
+        };
+        if let Some(store) = &self.capacity {
+            store
+                .rebind(&admission.deployment, &admission.key, instance_id)
+                .await;
+        }
+        true
+    }
+
+    /// The instance has FINISHED (End, a failure, a cancel): release every capacity-pool slot
+    /// it still holds, whatever call took it, and let the store know it ended — a request it
+    /// emitted before finishing then releases its slot as soon as it is delivered. Idempotent.
+    async fn release_pool_slots(&self, deployment: &DeploymentId, instance_id: &str) {
+        if let Some(store) = &self.capacity {
+            store.release_ended(deployment, instance_id).await;
+        }
+    }
+
+    /// A pass took an instance straight through to End: it may hold no slot, but requests it
+    /// emitted on a pooled channel will take one when the outbox sends them, and the store must
+    /// know their instance is over to return those slots at delivery.
+    async fn mark_instance_ended(&self, deployment: &DeploymentId, instance_id: &str) {
+        if !instance_id.is_empty() {
+            self.release_pool_slots(deployment, instance_id).await;
+        }
+    }
+
+    /// End an instance's WHOLE session (`session-end:` with no call key to go by): free its
+    /// channel admission slot and every pool slot while the instance runs on. Every later
+    /// suspend/resume record for the instance is a no-op, and nothing re-acquires at a park, so
+    /// the release sticks.
+    async fn end_session(&self, deployment: &DeploymentId, instance_id: &str) {
+        if let Some(store) = &self.concurrency {
+            store.record_terminal(deployment, instance_id).await;
+        }
+        if let Some(store) = &self.capacity {
+            store.end_session(deployment, instance_id, None).await;
+        }
+    }
+
+    /// End ONE call of an instance (`session-end:` naming it): release the pool slots held for
+    /// the calls `selector` names. When the call released is the instance's inbound admission,
+    /// its channel admission slot goes too — the session it opened is over. The instance's
+    /// other calls keep their slots.
+    async fn end_call(
+        &self,
+        deployment: &DeploymentId,
+        instance_id: &str,
+        selector: CallSelector<'_>,
+    ) {
+        let released = match (&self.capacity, selector) {
+            // A named call's session is over: a request on it still waiting in the outbox is
+            // sent without a slot, rather than re-taking the one released here.
+            (Some(store), CallSelector::Call(call)) => {
+                store.end_session(deployment, instance_id, Some(call)).await
+            }
+            (Some(store), selector) => store.release_calls(deployment, instance_id, selector).await,
+            (None, _) => Vec::new(),
+        };
+        let admission_ended = matches!(selector, CallSelector::Direction(SlotDirection::Inbound))
+            || released.contains(&SlotDirection::Inbound);
+        if admission_ended {
+            if let Some(store) = &self.concurrency {
+                store.record_terminal(deployment, instance_id).await;
+            }
+        }
+    }
+
+    /// End what a session-ending message names: the one call its key identifies when the
+    /// session channel declares `pool-call-key:` and the message carries it, the whole session
+    /// otherwise.
+    async fn end_named(&self, deployment: &DeploymentId, instance_id: &str, call: Option<&str>) {
+        match call {
+            Some(call) => {
+                self.end_call(deployment, instance_id, CallSelector::Call(call))
+                    .await
+            }
+            None => self.end_session(deployment, instance_id).await,
+        }
+    }
+
+    /// The call key a session-ending message on `binding` names: the value of the first session
+    /// channel's `pool-call-key` header that it carries.
+    fn session_call_key(
+        &self,
+        binding: &ChannelBinding,
+        message: &InboundMessage,
+    ) -> Option<String> {
+        let module_key = binding.namespace.module_key();
+        self.session_end_targets
+            .get(&(module_key.clone(), message.channel.clone()))?
+            .iter()
+            .filter_map(|session| self.channels.find(&module_key, session))
+            .find_map(|session| session.call_key_in(&message.headers))
+    }
+
+    /// The deployment scopes an instance correlated through `deployment` can live in: the live
+    /// one first, then the DRAINING ones.
+    fn session_scopes(&self, deployment: &DeploymentId) -> Vec<DeploymentId> {
+        let mut scopes = vec![deployment.clone()];
+        for prior in &self.prior_deployments {
+            if !scopes.contains(prior) {
+                scopes.push(prior.clone());
+            }
+        }
+        scopes
+    }
+
+    /// Release the sessions a reply ended (`session-end: on-reply`) since the last flush: the
+    /// replying instance's inbound call (its admission slot and channel slot) — any outbound
+    /// call it holds stays. Runs after the pass that rendered the reply bound any admission slot
+    /// to its instance.
+    async fn flush_session_releases(&self) {
+        let pending: Vec<(DeploymentId, String)> =
+            self.session_releases.borrow_mut().drain(..).collect();
+        for (deployment, instance_id) in pending {
+            for scope in self.session_scopes(&deployment) {
+                self.end_call(
+                    &scope,
+                    &instance_id,
+                    CallSelector::Direction(SlotDirection::Inbound),
+                )
+                .await;
+            }
+        }
     }
 
     /// The fail-closed guard both resume paths run BEFORE re-driving a loaded instance: a durably
@@ -1108,7 +1398,7 @@ impl ChannelEngine {
         message: &InboundMessage,
         process: &ProcessDefinition,
     ) -> Result<(), Diagnostic> {
-        let drained = self.emissions.drain();
+        let mut drained = self.emissions.drain();
         // Held to the destination's contract BEFORE the transactional commit: a rejection here
         // fails the step, so nothing is enqueued and nothing reaches the wire. Validating at the
         // sink instead would be after the commit, which turns a contract breach into a delivery
@@ -1118,7 +1408,7 @@ impl ChannelEngine {
             deployment,
             &binding.channel_name,
             process,
-            &drained,
+            &mut drained,
         )?;
         if let Some(bridge) = &self.bridge {
             let rows = to_outbox_emissions(drained, binding.labels(), inbound_traceparent(message));
@@ -1211,18 +1501,69 @@ impl ChannelEngine {
     /// the common case silently unvalidated, which is the same class of gap this check exists
     /// to close.
     #[allow(clippy::too_many_arguments)]
+    ///
+    /// The same pass stamps every request bound for a pooled outbound channel with the pool it
+    /// draws from ([`CAPACITY_POOL_HEADER`], plus [`CAPACITY_CALL_HEADER`] for a channel-call),
+    /// so the outbox dispatcher can hold the request until its call holds a slot.
     fn validate_emissions(
         &self,
         module_key: &str,
         deployment: &DeploymentId,
         host_channel: &str,
         process: &ProcessDefinition,
-        emissions: &[sutra_executor::Emission],
+        emissions: &mut [sutra_executor::Emission],
     ) -> Result<(), Diagnostic> {
-        for emission in emissions {
+        for emission in emissions.iter_mut() {
             self.validate_emission(module_key, deployment, host_channel, process, emission)?;
+            self.stamp_capacity_pool(module_key, process, emission);
+            stamp_media_capture(process, emission);
+            if self.audit_listener.is_some() {
+                stamp_audit_journal(process, emission);
+            }
         }
         Ok(())
+    }
+
+    /// Mark a request whose outbound channel declares `pool:` (see [`Self::validate_emissions`]).
+    fn stamp_capacity_pool(
+        &self,
+        module_key: &str,
+        process: &ProcessDefinition,
+        emission: &mut sutra_executor::Emission,
+    ) {
+        if emission.kind != sutra_executor::EmissionKind::Send {
+            return;
+        }
+        let call = channel_call_name(process, &emission.node_id);
+        let channel = call.clone().or_else(|| {
+            process
+                .bindings_for(&emission.node_id)
+                .send
+                .as_ref()
+                .and_then(|send| send.channel.clone())
+        });
+        let Some(binding) = channel
+            .as_deref()
+            .and_then(|c| self.channels.find(module_key, c.trim()))
+        else {
+            return;
+        };
+        let Some(pool) = binding.pool.clone() else {
+            return;
+        };
+        if let Some(call_key) = binding.call_key_in(&emission.headers) {
+            emission
+                .headers
+                .insert(CAPACITY_CALL_KEY_HEADER.to_string(), call_key);
+        }
+        emission
+            .headers
+            .insert(CAPACITY_POOL_HEADER.to_string(), pool);
+        if call.is_some() {
+            emission
+                .headers
+                .insert(CAPACITY_CALL_HEADER.to_string(), "true".to_string());
+        }
     }
 
     /// Evaluate every `<q:alias>` on the routed start event: bind the value into
@@ -1486,6 +1827,7 @@ impl ChannelEngine {
                 // behave exactly like a sync-eligible flow, reply included.
                 self.commit_sync_emissions(binding, deployment, message, process)
                     .await?;
+                self.mark_instance_ended(deployment, &instance_id).await;
                 let exec = ExecResult {
                     instance_id: instance_id.clone(),
                     outputs,
@@ -1509,6 +1851,7 @@ impl ChannelEngine {
                 coverage_progress,
                 retry_attempts,
                 retry_backoff,
+                fresh_waits,
             } => {
                 // Respond-and-continue: when the pass parked at a `<q:reply continue>`
                 // service task, flush the produced reply to the caller NOW. Built BEFORE the park
@@ -1529,13 +1872,13 @@ impl ChannelEngine {
                 // step collected (channel-call requests, `<q:send>`s before the park)
                 // ride the park step and commit ATOMICALLY with the snapshot — or not at
                 // all (the strict transactional outbox).
-                let drained = self.emissions.drain();
+                let mut drained = self.emissions.drain();
                 self.validate_emissions(
                     &binding.namespace.module_key(),
                     deployment,
                     &binding.channel_name,
                     process,
-                    &drained,
+                    &mut drained,
                 )?;
                 // Synchronous outbound calls: when a caller waits on this pass, nothing parks —
                 // the in-memory instance goes to the router side with its requests and is
@@ -1544,7 +1887,7 @@ impl ChannelEngine {
                 let sync_sites = if detached_reply {
                     Vec::new()
                 } else {
-                    self.sync_call_sites(process, deployment, &waiting_nodes, &[])
+                    self.sync_call_sites(process, deployment, &fresh_waits)
                 };
                 if !sync_sites.is_empty() {
                     let pinned = self.processes.find_in_module(deployment, &process.id);
@@ -1553,7 +1896,7 @@ impl ChannelEngine {
                             if self.inline_capable.get()
                                 && sync_sites.iter().all(|site| site.caller.is_some()) =>
                         {
-                            let chain = Box::new(InlineChain {
+                            let mut chain = Box::new(InlineChain {
                                 lane: self.shard.index,
                                 instance_id: instance_id.clone(),
                                 process: pinned,
@@ -1572,6 +1915,7 @@ impl ChannelEngine {
                                 alias_rows: alias_rows.iter().map(|r| r.record.clone()).collect(),
                                 held_aliases: false,
                                 counted: false,
+                                pooled: false,
                                 marked: false,
                                 stored: None,
                                 settle: if self.deferred_acks.is_some() {
@@ -1584,7 +1928,10 @@ impl ChannelEngine {
                                 visited: completed_nodes.iter().cloned().collect(),
                                 audit_seq: self.audit_seq_for(&instance_id),
                                 early_reply: None,
+                                fresh_waits: fresh_waits.clone(),
                             });
+                            // The chain carries the instance on: it holds the start's pool slot.
+                            chain.pooled = self.bind_admission(&instance_id).await;
                             return self.launch_inline_chain(chain, drained, sync_sites).await;
                         }
                         _ => self.warn_sync_degraded(
@@ -1634,14 +1981,9 @@ impl ChannelEngine {
                 };
                 let mut records: Vec<AliasRecord> =
                     alias_rows.into_iter().map(|r| r.record).collect();
-                // The channel-call park key: the task's declared <q:alias>,
+                // The wait nodes' own park keys: each parked node's declared <q:alias>,
                 // evaluated over the suspended context, recorded in the SAME step.
-                records.extend(channel_call_alias_rows(
-                    process,
-                    &waiting_nodes,
-                    &[],
-                    &variables,
-                )?);
+                records.extend(wait_alias_rows(process, &fresh_waits, &variables)?);
                 // `ack-mode: on-complete`: the delivering transport handed settle
                 // callbacks (`dispatch_deferred`). Registered BEFORE `commit_park` — the
                 // park/terminal ordering fix (execution scale-out §2.1): under the shard
@@ -1713,6 +2055,8 @@ impl ChannelEngine {
                         .await;
                     store.record_suspended(deployment, &instance_id).await;
                 }
+                // The parked instance keeps the pool slot its start took.
+                self.bind_admission(&instance_id).await;
                 // A plain suspended inbound has no synchronous reply body — the transport gets an
                 // accept; any reply flows later on resume+complete. A respond-and-continue park
                 // carries the flushed reply (`reply`, built above).
@@ -1723,6 +2067,123 @@ impl ChannelEngine {
                 })
             }
         }
+    }
+
+    /// A message on a channel named by a `session-end: on-message`: release the session of the
+    /// instance it correlates to, then deliver it to a subscribing wait as usual. A message no
+    /// wait takes — or one that correlates to no live instance — is ACCEPTED (the release, if
+    /// any, was its whole purpose) instead of being rejected as uncorrelatable.
+    async fn end_session_on_message(
+        &self,
+        binding: &ChannelBinding,
+        deployment: &DeploymentId,
+        decoded: &Option<DecodeResult>,
+        message: &InboundMessage,
+    ) -> Result<DispatchOutcome, Diagnostic> {
+        let call = self.session_call_key(binding, message);
+        let released = self
+            .release_correlated_session(binding, deployment, decoded, message, call.as_deref())
+            .await;
+        let accepted = |instance_id: Option<String>| DispatchOutcome::Completed {
+            instance_id: instance_id.unwrap_or_default(),
+            outputs: serde_json::json!({}),
+            reply: None,
+        };
+        match self
+            .resolve_relay(binding, deployment, decoded, message)
+            .await
+        {
+            Ok(Some(outcome)) => {
+                // The wait's own correlation may name the instance where the session process's
+                // alias did not: release it too (idempotent).
+                let resumed = match &outcome {
+                    DispatchOutcome::Completed { instance_id, .. } if !instance_id.is_empty() => {
+                        Some(instance_id.clone())
+                    }
+                    DispatchOutcome::Handoff { resolved, .. } => Some(resolved.instance_id.clone()),
+                    DispatchOutcome::InlineCalls(handoff) => handoff.instance_id(),
+                    _ => None,
+                };
+                if let Some(instance_id) = resumed {
+                    for scope in self.session_scopes(deployment) {
+                        self.end_named(&scope, &instance_id, call.as_deref()).await;
+                    }
+                }
+                Ok(outcome)
+            }
+            Ok(None) => Ok(accepted(released)),
+            Err(d) if d.code == codes::RUNTIME_RELAY_CORRELATION_NOT_FOUND => {
+                Ok(accepted(released))
+            }
+            Err(d) => Err(d),
+        }
+    }
+
+    /// Correlate a session-ending message to the instance it ends, through the `<q:alias
+    /// onConflict="correlate">` of the processes that START on the session channel, evaluated
+    /// against the message (its `event.*` view, and its decoded payload under the start event's
+    /// `<q:source name>`). Looks at stored instances and at in-flight synchronous chains, in the
+    /// live scope and then the DRAINING ones. Releases — the one `call` when the message names
+    /// one, the whole session otherwise — and returns the first instance found.
+    async fn release_correlated_session(
+        &self,
+        binding: &ChannelBinding,
+        deployment: &DeploymentId,
+        decoded: &Option<DecodeResult>,
+        message: &InboundMessage,
+        call: Option<&str>,
+    ) -> Option<String> {
+        let sessions = self
+            .session_end_targets
+            .get(&(binding.namespace.module_key(), message.channel.clone()))?;
+        let payload = decoded
+            .as_ref()
+            .filter(|d| d.outcome != sutra_codec_spi::DecodeOutcome::Fatal)
+            .map(|d| {
+                d.payload
+                    .as_ref()
+                    .map(crate::intake::payload_view)
+                    .unwrap_or(FeelValue::Null)
+            });
+        for scope in self.session_scopes(deployment) {
+            for session_channel in sessions {
+                for (process, start_id) in self.processes.starts_on_channel(&scope, session_channel)
+                {
+                    let mut variables = project_variables(message);
+                    if let Some(payload) = &payload {
+                        let name = process
+                            .bindings_for(&start_id)
+                            .source()
+                            .map(|source| source.name.clone())
+                            .unwrap_or_else(|| "payload".to_string());
+                        variables.insert(name, payload.clone());
+                    }
+                    let Some((alias_name, alias_value)) =
+                        correlation_for(&process, &variables, None)
+                    else {
+                        continue;
+                    };
+                    let stored = match &self.bridge {
+                        Some(bridge) => bridge
+                            .find_live_alias(&scope, &alias_name, &alias_value)
+                            .await
+                            .ok()
+                            .flatten(),
+                        None => None,
+                    };
+                    let instance_id = stored.or_else(|| {
+                        self.aliases
+                            .as_ref()
+                            .and_then(|store| store.find_live(&scope, &alias_name, &alias_value))
+                    });
+                    if let Some(instance_id) = instance_id {
+                        self.end_named(&scope, &instance_id, call).await;
+                        return Some(instance_id);
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// Resolve + drive a channel-delivered relay, or `Ok(None)` when the inbound is
@@ -1828,8 +2289,15 @@ impl ChannelEngine {
         // first (the channel-call park key), then the process-level
         // start-event `onConflict=correlate` alias (the approval-hold pattern).
         let Some((alias_name, alias_value)) =
-            correlation_for_wait_node(process, &target.wait_node_id, &relay_vars)
-                .or_else(|| correlation_for(process, &relay_vars))
+            correlation_for_wait_node(process, &target.wait_node_id, &relay_vars).or_else(|| {
+                let relay_payload = process
+                    .bindings_for(&target.wait_node_id)
+                    .sources
+                    .iter()
+                    .find(|source| source.channel == message.channel)
+                    .map(|source| source.name.as_str());
+                correlation_for(process, &relay_vars, relay_payload)
+            })
         else {
             return Ok(RelayResolution::NotCorrelated(Diagnostic::error(
                 codes::RUNTIME_RELAY_CORRELATION_NOT_FOUND,
@@ -1888,6 +2356,7 @@ impl ChannelEngine {
                 &instance_id,
                 &target.wait_node_id,
                 relay_vars,
+                &alias_name,
                 &alias_value,
                 &message.channel,
                 binding.labels(),
@@ -1916,6 +2385,7 @@ impl ChannelEngine {
         instance_id: &str,
         wait_node_id: &str,
         relay_vars: Variables,
+        alias_name: &str,
         alias_value: &str,
         channel: &str,
         labels: BTreeMap<String, String>,
@@ -2070,6 +2540,38 @@ impl ChannelEngine {
                 ));
             };
 
+            // Several wait nodes of one process may take messages from the same channel (a
+            // hang-up awaited while listening, and again after asking for one). Target
+            // resolution names the FIRST subscriber in model order; the relay belongs to the
+            // one this instance is actually parked at.
+            let (rebound_node, relay_vars) = rebind_relay_to_waiting(
+                Some(&resume_process),
+                &snapshot.waiting_nodes,
+                wait_node_id,
+                channel,
+                relay_vars,
+            );
+            let wait_node_id: &str = &rebound_node;
+            // (After the rebind above, so a channel shared by several wait nodes is judged against
+            // the node this instance is actually parked at.)
+            // The relay must name a wait the instance is parked at NOW. A relay for a node the
+            // token already left — a late answer to an earlier loop iteration, a duplicate of a
+            // relay that already resumed it — would otherwise be taken as satisfying a wait that
+            // no longer exists and run that node's continuation a second time. Refused before
+            // anything executes; the parked instance is untouched.
+            if !snapshot.waiting_nodes.iter().any(|n| n == wait_node_id) {
+                return Err(Diagnostic::error(
+                    codes::RUNTIME_RESUME_NOT_WAITING,
+                    format!(
+                        "Instance {instance_id} is not waiting at '{wait_node_id}' (it is parked \
+                         at {:?}); this relay on channel '{channel}' arrived for a wait the \
+                         instance already left and is refused — nothing was executed.",
+                        snapshot.waiting_nodes
+                    ),
+                )
+                .with_attribute("instanceId", instance_id)
+                .with_attribute("nodeId", wait_node_id));
+            }
             // Restored variables come back TYPED (the snapshot value model); the relay's variables
             // are merged in by resume() — relay wins on collision. Nothing is re-parsed here: a
             // string-to-number coercion on this path would double-convert a value the store already
@@ -2147,6 +2649,7 @@ impl ChannelEngine {
                     wait_node_id,
                     result,
                     reply_to,
+                    Some((alias_name.to_string(), alias_value.to_string())),
                 )
                 .await?;
             // The step committed under `pinned`; when that is the key we claimed under (the
@@ -2198,6 +2701,7 @@ impl ChannelEngine {
             &resolved.instance_id,
             &resolved.wait_node_id,
             resolved.variables.clone(),
+            &resolved.alias_name,
             &resolved.alias_value,
             &resolved.channel,
             resolved.labels.clone(),
@@ -2225,6 +2729,7 @@ impl ChannelEngine {
         satisfied_node: &str,
         result: StatefulExecResult,
         reply_to: Option<RelayReplyContext>,
+        relay_alias: Option<(String, String)>,
     ) -> Result<DispatchOutcome, Diagnostic> {
         match result {
             StatefulExecResult::Completed {
@@ -2232,13 +2737,13 @@ impl ChannelEngine {
                 outputs,
                 visited_nodes,
             } => {
-                let drained = self.emissions.drain();
+                let mut drained = self.emissions.drain();
                 self.validate_emissions(
                     &module_key_of_labels(&labels),
                     pinned,
                     "",
                     process,
-                    &drained,
+                    &mut drained,
                 )?;
                 let emissions = to_outbox_emissions(drained, labels, traceparent);
                 // Terminal step: no longer in-flight — drop the row, resolve every wait
@@ -2249,10 +2754,11 @@ impl ChannelEngine {
                     .await?;
                 // §6.1: a resume pass committed (terminal) on this lane.
                 self.shard_metrics.resumed();
-                // The instance is terminal — free its channel_instance slot.
+                // The instance is terminal — free its channel_instance slot and its pool slots.
                 if let Some(store) = &self.concurrency {
                     store.record_terminal(pinned, &instance_id).await;
                 }
+                self.release_pool_slots(pinned, &instance_id).await;
                 // A relay answers with the `<q:reply>` THIS pass reached, rendered against its
                 // own delivery; outputs stay empty, never the resumed instance's raw variable
                 // map (the drive-relay contract).
@@ -2287,16 +2793,17 @@ impl ChannelEngine {
                 coverage_progress,
                 retry_attempts,
                 retry_backoff,
+                fresh_waits,
             } => {
                 // The re-park step carries the emissions collected up to this
                 // quiescent point.
-                let drained = self.emissions.drain();
+                let mut drained = self.emissions.drain();
                 self.validate_emissions(
                     &module_key_of_labels(&labels),
                     pinned,
                     "",
                     process,
-                    &drained,
+                    &mut drained,
                 )?;
                 // Synchronous calls reached by a resume a caller drives (a relay, a timer fire):
                 // the chain keeps the claim, makes the calls inline and ends with the one
@@ -2304,12 +2811,7 @@ impl ChannelEngine {
                 let sync_sites = if detached_reply {
                     Vec::new()
                 } else {
-                    self.sync_call_sites(
-                        process,
-                        pinned,
-                        &waiting_nodes,
-                        &prior_snapshot.waiting_nodes,
-                    )
+                    self.sync_call_sites(process, pinned, &fresh_waits)
                 };
                 if !sync_sites.is_empty() {
                     let pinned_process = self.processes.find_in_module(pinned, &process.id);
@@ -2337,6 +2839,8 @@ impl ChannelEngine {
                                     coverage_progress,
                                     retry_attempts,
                                     retry_backoff,
+                                    fresh_waits,
+                                    relay_alias,
                                 },
                             );
                             return self.launch_inline_chain(chain, drained, sync_sites).await;
@@ -2403,28 +2907,35 @@ impl ChannelEngine {
                     encrypt_names: pv.encrypt_names,
                     subjects: pv.subjects,
                 };
-                // Fresh channel-call parks reached by THIS pass record their alias rows;
-                // nodes still waiting from the prior pass were indexed by the original
-                // park step and are skipped.
-                let aliases = channel_call_alias_rows(
+                // Waits THIS pass parked fresh record their alias rows (a loop's new iteration
+                // included); waits carried over from the prior pass keep the rows their own park
+                // step indexed.
+                let aliases = wait_alias_rows(process, &fresh_waits, &variables)?;
+                let resolved = resolved_with_fresh(process, satisfied_node, &fresh_waits);
+                let retired = retired_wait_aliases(
                     process,
+                    &resolved,
+                    prior_snapshot,
                     &waiting_nodes,
-                    &prior_snapshot.waiting_nodes,
-                    &variables,
-                )?;
+                    &fresh_waits,
+                    &aliases,
+                    relay_alias.as_ref(),
+                );
                 bridge
-                    .commit_repark(
+                    .commit_repark_retiring(
                         pinned,
                         &instance_id,
                         &new_snapshot,
-                        &resolved_waits_for(process, satisfied_node),
+                        &resolved,
                         &aliases,
                         &timer_records(&timer_waits),
                         &emissions,
+                        &retired,
                     )
                     .await?;
                 // §6.1: a resume pass committed (re-park) on this lane.
                 self.shard_metrics.resumed();
+                self.flush_session_releases().await;
                 Ok(DispatchOutcome::Completed {
                     instance_id,
                     outputs: serde_json::json!({}),
@@ -2751,10 +3262,11 @@ impl ChannelEngine {
             //   TIMER row keyed to a call node is a backoff park, and its marker commits in
             //   the same transaction. Resolve the row.
             // - a REGISTERED `<q:retry>` task: the row's node carries a durable attempt count
-            //   and is absent from `completed_nodes` (a retry park never records the task as
-            //   done — that omission IS the re-drive mechanism). Rides the relay resume path
-            //   (`resume_timer` would reject a non-timer node); the inference is sound there
-            //   because no relay can ever target a registered task.
+            //   (a success drops it) and is parked on the frontier (checked above). Whether it
+            //   is ALSO in `completed_nodes` says nothing — inside a loop it completed in an
+            //   earlier iteration. Rides the relay resume path (`resume_timer` would reject a
+            //   non-timer node); the inference is sound because no relay can ever target a
+            //   registered task.
             // - a `<q:reply continue>` marker: the respond-and-continue self-resume, node in
             //   `completed_nodes`, replay skips it and runs the tail.
             let call_node = matches!(
@@ -2762,12 +3274,11 @@ impl ChannelEngine {
                 Ok(Node::ServiceTask { implementation, .. })
                     if implementation.starts_with(CHANNEL_CALL_PREFIX)
             );
-            let retry_redrive = !snapshot.completed_nodes.iter().any(|n| n == &fire.node_id)
-                && if call_node {
-                    snapshot.retry_backoff.contains_key(&fire.node_id)
-                } else {
-                    snapshot.retry_attempts.contains_key(&fire.node_id)
-                };
+            let retry_redrive = if call_node {
+                snapshot.retry_backoff.contains_key(&fire.node_id)
+            } else {
+                snapshot.retry_attempts.contains_key(&fire.node_id)
+            };
             if call_node && !retry_redrive {
                 return Ok(TimerFireOutcome::Stale);
             }
@@ -2858,6 +3369,7 @@ impl ChannelEngine {
                     &fire.deployment,
                     &fire.node_id,
                     result,
+                    None,
                     None,
                 )
                 .await?;
@@ -3059,6 +3571,7 @@ impl ChannelEngine {
                 &fire.node_id,
                 result,
                 None,
+                None,
             )
             .await?;
             if pinned == fire.deployment {
@@ -3157,6 +3670,26 @@ impl ChannelEngine {
         message: &InboundMessage,
         exec: &sutra_executor::ExecResult,
     ) -> Result<Option<SyncReply>, Diagnostic> {
+        let reply = self.render_reply(binding, process, message, exec)?;
+        // `session-end: on-reply`: the reply on the session's channel ends the replying
+        // instance's session. Recorded here (the one place every reply is rendered) and
+        // released by the next flush, once the pass has bound any admission slot.
+        if reply.is_some() && binding.session_end.as_ref().is_some_and(|end| end.on_reply) {
+            self.session_releases
+                .borrow_mut()
+                .push((binding.deployment_id(), exec.instance_id.clone()));
+        }
+        Ok(reply)
+    }
+
+    /// Render the reply [`Self::build_reply`] answers with.
+    fn render_reply(
+        &self,
+        binding: &ChannelBinding,
+        process: &ProcessDefinition,
+        message: &InboundMessage,
+        exec: &sutra_executor::ExecResult,
+    ) -> Result<Option<SyncReply>, Diagnostic> {
         // A reply is something the flow DECLARED, not a by-product of having rendered
         // something. `responseBody` is the only slot the executor has for a template / script /
         // decision render, so a flow whose terminal task renders bytes for a `<q:send>` fills it
@@ -3241,21 +3774,17 @@ impl ChannelEngine {
 
     // ---- synchronous outbound calls (the in-memory chain) ---------------------------------
 
-    /// The channel-call nodes FRESHLY waiting in `waiting` (absent from `prior`) whose outbound
-    /// channel is synchronous, each with the inline caller its destination resolves to (`None`
+    /// The channel-call nodes among the pass's `fresh_waits` (the calls it just issued — a first
+    /// arrival or a loop coming round again) whose outbound channel is synchronous, each with the inline caller its destination resolves to (`None`
     /// when this engine has none for the scheme).
     fn sync_call_sites(
         &self,
         process: &ProcessDefinition,
         deployment: &DeploymentId,
-        waiting: &[String],
-        prior: &[String],
+        fresh_waits: &[String],
     ) -> Vec<SyncCallSite> {
         let mut sites = Vec::new();
-        for node_id in waiting {
-            if prior.contains(node_id) {
-                continue;
-            }
+        for node_id in fresh_waits {
             let Some(channel) = channel_call_name(process, node_id) else {
                 continue;
             };
@@ -3329,13 +3858,21 @@ impl ChannelEngine {
         // nothing durable.
         if let (Some(store), Some(_)) = (&self.concurrency, chain.binding.max_concurrent_instances)
         {
-            store
-                .record_started(
-                    &chain.deployment,
-                    &chain.instance_id,
-                    &chain.message.channel,
-                )
-                .await;
+            if chain.stored.is_some() {
+                // A stored instance already has its row (WAITING) — unless its session ended,
+                // in which case it must not take the slot back.
+                store
+                    .record_resumed(&chain.deployment, &chain.instance_id)
+                    .await;
+            } else {
+                store
+                    .record_started(
+                        &chain.deployment,
+                        &chain.instance_id,
+                        &chain.message.channel,
+                    )
+                    .await;
+            }
             chain.counted = true;
         }
         if chain.stored.is_some() {
@@ -3347,7 +3884,7 @@ impl ChannelEngine {
         // release (the delivery's dedup rows, an admission slot). Only written when there is
         // something to release.
         if let Some(bridge) = &self.bridge {
-            if !chain.dedup_keys.is_empty() || chain.counted {
+            if !chain.dedup_keys.is_empty() || chain.counted || chain.pooled {
                 if let Err(d) = bridge
                     .begin_inline_chain(&chain.deployment, &chain.instance_id, &chain.dedup_keys)
                     .await
@@ -3403,7 +3940,21 @@ impl ChannelEngine {
                 continue;
             };
             let node_id = emission.node_id.clone();
-            let request = self.inline_request(chain, emission);
+            let mut request = self.inline_request(chain, emission);
+            // The instance's audit routing and identity, for a caller that writes audit events
+            // only (the same rule the outbox dispatcher applies).
+            if self.audit_listener.is_some() && caller.writes_audit_events() {
+                request.headers.insert(
+                    crate::transport_audit::AUDIT_JOURNAL_HEADER.to_string(),
+                    audit_journal_policy(&chain.process),
+                );
+            }
+            crate::transport_audit::stamp_journal_identity(
+                &mut request.headers,
+                caller.writes_audit_events(),
+                chain.deployment.value(),
+                &chain.instance_id,
+            );
             // Streamed only when the task asks AND the delivery the chain answers asked for a
             // streamed reply; anywhere else `q:stream` changes nothing.
             let stream = matches!(
@@ -3644,13 +4195,13 @@ impl ChannelEngine {
                 }
             }
         }
-        let drained = self.emissions.drain();
+        let mut drained = self.emissions.drain();
         if let Err(d) = self.validate_emissions(
             &chain.binding.namespace.module_key(),
             &chain.deployment,
             &chain.binding.channel_name,
             &process,
-            &drained,
+            &mut drained,
         ) {
             return self.abort_chain(chain, d).await;
         }
@@ -3672,9 +4223,19 @@ impl ChannelEngine {
                 coverage_progress,
                 retry_attempts,
                 retry_backoff,
+                fresh_waits,
                 ..
             } => {
-                let prior_waiting = std::mem::replace(&mut chain.waiting_nodes, waiting_nodes);
+                chain.waiting_nodes = waiting_nodes;
+                // The waits still needing fresh rows at the chain's durable park: every new wait
+                // of every pass so far that is still waiting.
+                for node in &fresh_waits {
+                    if !chain.fresh_waits.contains(node) {
+                        chain.fresh_waits.push(node.clone());
+                    }
+                }
+                let still_waiting = chain.waiting_nodes.clone();
+                chain.fresh_waits.retain(|n| still_waiting.contains(n));
                 chain.visited.extend(completed_nodes.iter().cloned());
                 chain.completed_nodes = completed_nodes;
                 chain.variables = variables;
@@ -3707,12 +4268,7 @@ impl ChannelEngine {
                         Err(d) => return self.abort_chain(chain, d).await,
                     }
                 }
-                let sites = self.sync_call_sites(
-                    &process,
-                    &chain.deployment,
-                    &chain.waiting_nodes,
-                    &prior_waiting,
-                );
+                let sites = self.sync_call_sites(&process, &chain.deployment, &fresh_waits);
                 let (inline, degraded): (Vec<SyncCallSite>, Vec<SyncCallSite>) =
                     sites.into_iter().partition(|s| s.caller.is_some());
                 if !degraded.is_empty() {
@@ -3726,6 +4282,7 @@ impl ChannelEngine {
                 if chain.in_flight.is_empty() {
                     return self.park_chain(chain).await;
                 }
+                self.flush_session_releases().await;
                 InlineStep::More { chain, calls }
             }
         }
@@ -3802,6 +4359,7 @@ impl ChannelEngine {
         let reply = self.build_reply(&chain.binding, &chain.process, &chain.message, &exec);
         // The step is committed either way: the dedup row stays, as on the run-to-end path.
         self.release_chain(&chain, ChainEnd::Completed).await;
+        self.flush_session_releases().await;
         let outcome = reply.map(|reply| DispatchOutcome::Completed {
             instance_id: exec.instance_id.clone(),
             outputs: exec.outputs.to_json(),
@@ -3848,13 +4406,8 @@ impl ChannelEngine {
             Ok(reply) => reply.or_else(|| chain.early_reply.take()),
             Err(d) => return self.abort_chain(chain, d).await,
         };
-        let indexed: &[String] = chain
-            .stored
-            .as_ref()
-            .map(|s| s.prior.waiting_nodes.as_slice())
-            .unwrap_or(&[]);
         let mut records = chain.alias_rows.clone();
-        match channel_call_alias_rows(&process, &chain.waiting_nodes, indexed, &chain.variables) {
+        match wait_alias_rows(&process, &chain.fresh_waits, &chain.variables) {
             Ok(rows) => records.extend(rows),
             Err(d) => return self.abort_chain(chain, d).await,
         }
@@ -3890,15 +4443,33 @@ impl ChannelEngine {
             subjects: pv.subjects,
         };
         if let Some(stored) = &chain.stored {
+            // A wait the chain parked fresh replaces whatever row its node had; the satisfied
+            // waits' own aliases retire with them.
+            let mut resolved = stored.satisfied.clone();
+            for node in &chain.fresh_waits {
+                if !resolved.contains(node) {
+                    resolved.push(node.clone());
+                }
+            }
+            let retired = retired_wait_aliases(
+                &process,
+                &resolved,
+                &stored.prior,
+                &chain.waiting_nodes,
+                &chain.fresh_waits,
+                &records,
+                stored.relay_alias.as_ref(),
+            );
             if let Err(d) = bridge
-                .commit_repark(
+                .commit_repark_retiring(
                     &chain.deployment,
                     &chain.instance_id,
                     &snapshot,
-                    &stored.satisfied,
+                    &resolved,
                     &records,
                     &timer_records(&chain.pending_timers),
                     &emissions,
+                    &retired,
                 )
                 .await
             {
@@ -3906,6 +4477,7 @@ impl ChannelEngine {
             }
             self.shard_metrics.resumed();
             self.release_chain(&chain, ChainEnd::Parked).await;
+            self.flush_session_releases().await;
             return InlineStep::Done {
                 outcome: Ok(DispatchOutcome::Completed {
                     instance_id: chain.instance_id.clone(),
@@ -3970,6 +4542,7 @@ impl ChannelEngine {
                 .await;
         }
         self.release_chain(&chain, ChainEnd::Parked).await;
+        self.flush_session_releases().await;
         InlineStep::Done {
             outcome: Ok(DispatchOutcome::Completed {
                 instance_id: chain.instance_id.clone(),
@@ -4035,10 +4608,23 @@ impl ChannelEngine {
         if chain.held_aliases {
             self.retire_aliases(&chain.deployment, &chain.instance_id);
         }
-        if chain.counted && end != ChainEnd::Parked {
-            if let Some(store) = &self.concurrency {
-                store
-                    .record_terminal(&chain.deployment, &chain.instance_id)
+        // The instance is over (or, for a start, was never persisted): it holds no slot. A
+        // STORED instance whose chain aborted stays parked at its frontier, slots and all.
+        let ended = match end {
+            ChainEnd::Completed | ChainEnd::Failed => true,
+            ChainEnd::Aborted => chain.stored.is_none(),
+            ChainEnd::Parked => false,
+        };
+        if ended {
+            if chain.counted {
+                if let Some(store) = &self.concurrency {
+                    store
+                        .record_terminal(&chain.deployment, &chain.instance_id)
+                        .await;
+                }
+            }
+            if chain.pooled || chain.stored.is_some() {
+                self.release_pool_slots(&chain.deployment, &chain.instance_id)
                     .await;
             }
         }
@@ -4262,6 +4848,7 @@ impl ChannelEngine {
             alias_rows: Vec::new(),
             held_aliases: false,
             counted: false,
+            pooled: false,
             marked: false,
             settle: None,
             dedup_keys: self.dispatch_dedup.borrow_mut().drain(..).collect(),
@@ -4274,7 +4861,9 @@ impl ChannelEngine {
                 satisfied: resolved_waits_for(&process, satisfied_node),
                 labels,
                 replies,
+                relay_alias: pass.relay_alias,
             }),
+            fresh_waits: pass.fresh_waits,
         })
     }
 
@@ -4382,6 +4971,7 @@ impl ChannelEngineBuilder {
                     .payload_cap_policy
                     .set_channel_override(&def.binding.channel_name, cap);
             }
+            self.register_session_end(&def.binding);
             self.engine
                 .channels
                 .register(def.binding.clone())
@@ -4392,11 +4982,31 @@ impl ChannelEngineBuilder {
 
     /// Register a bare binding (tests / synthetic dispatch).
     pub fn with_binding(mut self, binding: ChannelBinding) -> Self {
+        self.register_session_end(&binding);
         self.engine
             .channels
             .register(binding)
             .expect("channel registration must not collide (validated at load/lint time)");
         self
+    }
+
+    /// Index a `session-end: on-message` so a message on the named channel finds the session
+    /// channels it ends.
+    fn register_session_end(&mut self, binding: &ChannelBinding) {
+        if let Some(target) = binding
+            .session_end
+            .as_ref()
+            .and_then(|end| end.on_message.clone())
+        {
+            let sessions = self
+                .engine
+                .session_end_targets
+                .entry((binding.namespace.module_key(), target))
+                .or_default();
+            if !sessions.contains(&binding.channel_name) {
+                sessions.push(binding.channel_name.clone());
+            }
+        }
     }
 
     /// Wire the two-tier payload-cap policy (global default + per-channel overrides).
@@ -4422,6 +5032,13 @@ impl ChannelEngineBuilder {
     /// Wire the per-channel concurrency admission gauge.
     pub fn with_concurrency_store(mut self, store: Rc<dyn ConcurrencyStore>) -> Self {
         self.engine.concurrency = Some(store);
+        self
+    }
+
+    /// Wire the capacity-pool store (`pool:` on a channel). The SAME `Arc` must be handed to
+    /// every lane and to the outbox dispatcher, so all of them count one pool.
+    pub fn with_capacity_pools(mut self, store: Arc<dyn CapacityPoolStore>) -> Self {
+        self.engine.capacity = Some(store);
         self
     }
 
@@ -4721,6 +5338,8 @@ pub struct InlineChain {
     held_aliases: bool,
     /// Whether the chain holds an admission slot in the concurrency store.
     counted: bool,
+    /// Whether the chain's start took a capacity-pool slot (bound to the instance at launch).
+    pooled: bool,
     /// Whether the durable in-flight marker was written.
     marked: bool,
     settle: Option<DeferredSettle>,
@@ -4737,6 +5356,10 @@ pub struct InlineChain {
     /// Set when the chain drives a STORED instance (a relay or timer resume): the chain ends
     /// with the commits that fit a stored row instead of a first park.
     stored: Option<StoredChain>,
+    /// The waits the chain's passes parked as NEW waits and that are still waiting — the ones
+    /// the chain's durable park records fresh wait and alias rows for. A wait the stored
+    /// snapshot already had and no pass re-entered is not here: its rows already exist.
+    fresh_waits: Vec<String>,
 }
 
 impl InlineChain {
@@ -4762,6 +5385,9 @@ struct StoredChain {
     labels: BTreeMap<String, String>,
     /// The chain answers a relay delivery (its binding and message are the chain's).
     replies: bool,
+    /// The `(name, value)` alias the relay that resumed the instance correlated on, if any —
+    /// retired with the satisfied wait it belonged to.
+    relay_alias: Option<(String, String)>,
 }
 
 /// The fields of the resume pass that reached a chain's first synchronous calls.
@@ -4775,6 +5401,8 @@ struct StoredPass {
     coverage_progress: BTreeMap<String, u64>,
     retry_attempts: BTreeMap<String, u32>,
     retry_backoff: BTreeMap<String, String>,
+    fresh_waits: Vec<String>,
+    relay_alias: Option<(String, String)>,
 }
 
 fn no_bridge() -> Diagnostic {
@@ -4803,6 +5431,13 @@ enum ChainPass {
     Timeout(String),
     /// The call failed (its inline retries, if any, spent): the task's failure path.
     Failure(Diagnostic),
+}
+
+/// A capacity-pool slot a start took, still keyed by its admission key.
+#[derive(Debug, Clone)]
+struct PoolAdmission {
+    deployment: DeploymentId,
+    key: String,
 }
 
 /// How a chain ended, for what it releases.
@@ -4915,6 +5550,66 @@ fn timer_records(timer_waits: &[TimerWait]) -> Vec<TimerWaitRecord> {
         .collect()
 }
 
+/// The wait node a correlated relay on `channel` satisfies: `named` (the first subscriber in
+/// model order) when the instance waits there, else the waiting node of the same process that
+/// subscribes `channel` — with the decoded payload moved from `named`'s `<q:source name>` to
+/// that node's. Unchanged when no other waiting node subscribes (the existing posture).
+fn rebind_relay_to_waiting(
+    process: Option<&ProcessDefinition>,
+    waiting: &[String],
+    named: &str,
+    channel: &str,
+    mut relay_vars: Variables,
+) -> (String, Variables) {
+    let Some(process) = process else {
+        return (named.to_string(), relay_vars);
+    };
+    if waiting.iter().any(|w| w == named) {
+        return (named.to_string(), relay_vars);
+    }
+    let subscribes = |node_id: &str| -> bool {
+        match process.node(node_id) {
+            Ok(Node::MessageCatchEvent { channels, .. }) | Ok(Node::UserTask { channels, .. }) => {
+                channels.iter().any(|c| c == channel)
+            }
+            Ok(Node::ServiceTask { implementation, .. })
+                if implementation.starts_with(CHANNEL_CALL_PREFIX) =>
+            {
+                process
+                    .bindings_for(node_id)
+                    .sources
+                    .iter()
+                    .any(|s| s.channel == channel)
+            }
+            _ => process
+                .bindings_for(node_id)
+                .sources
+                .iter()
+                .any(|s| s.channel == channel),
+        }
+    };
+    let Some(waiting_node) = waiting.iter().find(|w| subscribes(w)) else {
+        return (named.to_string(), relay_vars);
+    };
+    let name_of = |node_id: &str| {
+        process
+            .bindings_for(node_id)
+            .sources
+            .iter()
+            .find(|s| s.channel == channel)
+            .map(|s| s.name.clone())
+    };
+    if let (Some(from), Some(to)) = (name_of(named), name_of(waiting_node)) {
+        if from != to {
+            if let Some(value) = relay_vars.get(&from).cloned() {
+                relay_vars.remove(&from);
+                relay_vars.insert(to, value);
+            }
+        }
+    }
+    (waiting_node.clone(), relay_vars)
+}
+
 /// The wait rows a resume step resolves: the satisfied node itself, the HOST's row when
 /// the satisfied node is a fired timer boundary, and every (other) timer boundary armed on
 /// that host — a satisfied host consumes its pending timers (the response cancels the
@@ -4970,29 +5665,44 @@ fn resolved_waits_for(process: &ProcessDefinition, satisfied: &str) -> Vec<Strin
     out
 }
 
-/// Evaluate the declared `<q:alias>` rows of every FRESHLY-parked
-/// channel-call task in `waiting_nodes` (nodes still waiting from the prior pass were
-/// indexed by their original park step and are skipped). A channel-call park with ZERO
-/// resolvable alias rows is refused — it could never be resumed.
-fn channel_call_alias_rows(
+/// Evaluate the declared `<q:alias>` rows of every wait in `fresh_waits` — the waits this pass
+/// parked as NEW waits (a first arrival, or a loop that brought the token back). Waits carried
+/// over unchanged from a prior pass were indexed by their own park step and are not here.
+///
+/// A CHANNEL-CALL park with ZERO resolvable alias rows is refused — its response could never
+/// resume it. Any other wait node (a message catch, a receive task, a user task) indexes the
+/// aliases that resolve and skips the rest: it can still be correlated through the start
+/// event's `onConflict="correlate"` alias, so an unresolvable expression there is not fatal.
+fn wait_alias_rows(
     process: &ProcessDefinition,
-    waiting_nodes: &[String],
-    prior_waiting: &[String],
+    fresh_waits: &[String],
     variables: &Variables,
 ) -> Result<Vec<AliasRecord>, Diagnostic> {
     let mut out = Vec::new();
     let ctx = variables.to_feel_context();
-    for node_id in waiting_nodes {
-        if prior_waiting.iter().any(|n| n == node_id) {
-            continue;
-        }
-        let Ok(Node::ServiceTask { implementation, .. }) = process.node(node_id) else {
-            continue;
+    for node_id in fresh_waits {
+        let channel_call = match process.node(node_id) {
+            Ok(Node::ServiceTask { implementation, .. }) => {
+                if !implementation.starts_with(CHANNEL_CALL_PREFIX) {
+                    continue;
+                }
+                true
+            }
+            Ok(
+                Node::MessageCatchEvent { .. } | Node::ReceiveTask { .. } | Node::UserTask { .. },
+            ) => false,
+            _ => continue,
         };
-        if !implementation.starts_with(CHANNEL_CALL_PREFIX) {
+        let aliases = &process.bindings_for(node_id).aliases;
+        if !channel_call {
+            for alias in aliases {
+                let Ok(value) = sutra_feel::expressions::eval(&alias.expression, &ctx) else {
+                    continue;
+                };
+                push_alias_values(&mut out, alias, &value);
+            }
             continue;
         }
-        let aliases = &process.bindings_for(node_id).aliases;
         let mut resolved_any = false;
         for alias in aliases {
             let value = sutra_feel::expressions::eval(&alias.expression, &ctx).map_err(|e| {
@@ -5005,30 +5715,7 @@ fn channel_call_alias_rows(
                     ),
                 )
             })?;
-            match &value {
-                FeelValue::Null => continue,
-                FeelValue::List(items) if alias.multi => {
-                    for item in items {
-                        if item.is_null() {
-                            continue;
-                        }
-                        out.push(AliasRecord {
-                            name: alias.name.clone(),
-                            value: sutra_feel::value::canonical_string_of(item),
-                            unique: alias.unique,
-                        });
-                        resolved_any = true;
-                    }
-                }
-                other => {
-                    out.push(AliasRecord {
-                        name: alias.name.clone(),
-                        value: sutra_feel::value::canonical_string_of(other),
-                        unique: alias.unique,
-                    });
-                    resolved_any = true;
-                }
-            }
+            resolved_any |= push_alias_values(&mut out, alias, &value);
         }
         if !resolved_any {
             return Err(Diagnostic::error(
@@ -5043,6 +5730,126 @@ fn channel_call_alias_rows(
         }
     }
     Ok(out)
+}
+
+/// Append the alias row(s) one evaluated `<q:alias>` value yields — one per non-null list item
+/// for a `multi` alias, else one for a non-null value. Returns whether any row was added.
+fn push_alias_values(out: &mut Vec<AliasRecord>, alias: &AliasBinding, value: &FeelValue) -> bool {
+    let mut added = false;
+    match value {
+        FeelValue::Null => {}
+        FeelValue::List(items) if alias.multi => {
+            for item in items.iter().filter(|i| !i.is_null()) {
+                out.push(AliasRecord {
+                    name: alias.name.clone(),
+                    value: sutra_feel::value::canonical_string_of(item),
+                    unique: alias.unique,
+                });
+                added = true;
+            }
+        }
+        other => {
+            out.push(AliasRecord {
+                name: alias.name.clone(),
+                value: sutra_feel::value::canonical_string_of(other),
+                unique: alias.unique,
+            });
+            added = true;
+        }
+    }
+    added
+}
+
+/// The wait rows a resume step resolves ([`resolved_waits_for`]) plus every wait the pass
+/// parked fresh: a node that parks a NEW wait replaces whatever row it had (a loop's previous
+/// iteration), so the step resolves the old row and records the new one in the same commit.
+fn resolved_with_fresh(
+    process: &ProcessDefinition,
+    satisfied: &str,
+    fresh_waits: &[String],
+) -> Vec<String> {
+    let mut out = resolved_waits_for(process, satisfied);
+    for node in fresh_waits {
+        if !out.contains(node) {
+            out.push(node.clone());
+        }
+    }
+    out
+}
+
+/// The alias rows a resume step RETIRES: the correlation keys of the waits it resolved, so a
+/// late relay for a wait the instance has left (an earlier loop iteration) no longer finds the
+/// instance at all.
+///
+/// The keys are re-derived the way the park step derived them — each resolved wait node's
+/// declared `<q:alias>` evaluated over the snapshot variables the park step saw — plus the
+/// `(name, value)` the resuming relay actually correlated on. Never retired:
+/// - a start-event alias name (the instance's business key lives for the whole instance);
+/// - a key this same step records again (a loop whose iteration reuses the value);
+/// - a key a wait that is still pending also answers to.
+fn retired_wait_aliases(
+    process: &ProcessDefinition,
+    resolved: &[String],
+    prior: &SuspendedInstance,
+    waiting_now: &[String],
+    fresh_waits: &[String],
+    recorded: &[AliasRecord],
+    relay_alias: Option<&(String, String)>,
+) -> Vec<AliasRecord> {
+    let mut prior_vars = Variables::new();
+    for (name, value) in &prior.variables {
+        prior_vars.insert(name.clone(), value.clone());
+    }
+    let ctx = prior_vars.to_feel_context();
+    let keys_of = |node: &str| -> Vec<AliasRecord> {
+        let mut rows = Vec::new();
+        for alias in &process.bindings_for(node).aliases {
+            if let Ok(value) = sutra_feel::expressions::eval(&alias.expression, &ctx) {
+                push_alias_values(&mut rows, alias, &value);
+            }
+        }
+        rows
+    };
+    let start_names: BTreeSet<&str> = process
+        .nodes()
+        .iter()
+        .filter(|n| matches!(n, Node::StartEvent { .. }))
+        .flat_map(|n| process.bindings_for(n.id()).aliases.iter())
+        .map(|a| a.name.as_str())
+        .collect();
+    let mut keep: BTreeSet<(String, String)> = recorded
+        .iter()
+        .map(|r| (r.name.clone(), r.value.clone()))
+        .collect();
+    for node in waiting_now.iter().filter(|n| !fresh_waits.contains(n)) {
+        keep.extend(keys_of(node).into_iter().map(|r| (r.name, r.value)));
+    }
+    let mut candidates: Vec<AliasRecord> = resolved
+        .iter()
+        .filter(|n| prior.waiting_nodes.contains(n))
+        .flat_map(|n| keys_of(n))
+        .collect();
+    if let Some((name, value)) = relay_alias {
+        candidates.push(AliasRecord {
+            name: name.clone(),
+            value: value.clone(),
+            unique: false,
+        });
+    }
+    let mut out: Vec<AliasRecord> = Vec::new();
+    for row in candidates {
+        let key = (row.name.clone(), row.value.clone());
+        if start_names.contains(row.name.as_str())
+            || keep.contains(&key)
+            || out
+                .iter()
+                .any(|o| o.name == row.name && o.value == row.value)
+        {
+            continue;
+        }
+        out.push(row);
+    }
+    out
 }
 
 /// The wait node's OWN declared `<q:alias>` correlation (the channel-call park key):
@@ -5279,10 +6086,34 @@ struct PersistedVariables {
 /// resolves non-blank against the relayed context (the correlation lookup). An alias
 /// whose expression fails to evaluate is skipped (uncorrelatable ⇒ the wait is the safe
 /// state).
-fn correlation_for(process: &ProcessDefinition, ctx: &Variables) -> Option<(String, String)> {
-    let feel_ctx = ctx.to_feel_context();
+///
+/// A start-event alias is written in the start event's own names: `payload.draftId` reads the
+/// payload under the start event's `<q:source name>`. The wait that receives the relay may bind
+/// its payload under a different name (`<q:source name="revision">`), which is a local choice of
+/// that wait and must not change which instance the message correlates to. So the relayed
+/// payload (`relay_payload`, the wait's source name) is also made visible under the start
+/// event's payload name for the evaluation, unless the relayed context already defines that name.
+fn correlation_for(
+    process: &ProcessDefinition,
+    ctx: &Variables,
+    relay_payload: Option<&str>,
+) -> Option<(String, String)> {
     for start in process.start_events() {
-        for alias in &process.bindings_for(start.id()).aliases {
+        let bindings = process.bindings_for(start.id());
+        let start_payload = bindings.source().map(|source| source.name.as_str());
+        let feel_ctx = match (relay_payload, start_payload) {
+            (Some(relayed), Some(start_name))
+                if relayed != start_name && !ctx.contains_key(start_name) =>
+            {
+                let mut aliased = ctx.clone();
+                if let Some(value) = ctx.get(relayed) {
+                    aliased.insert(start_name, value.clone());
+                }
+                aliased.to_feel_context()
+            }
+            _ => ctx.to_feel_context(),
+        };
+        for alias in &bindings.aliases {
             if alias.on_conflict != Some(AliasConflict::Correlate) {
                 continue;
             }
@@ -5523,6 +6354,50 @@ fn declared_reply_codec(
         }
     }
     None
+}
+
+/// Stamp a request with its instance's audit routing ([`crate::transport_audit::AUDIT_JOURNAL_HEADER`]):
+/// the process's `<q:audit>` level and sink, or metadata level into the engine's default sink
+/// for a process that declares none. Only stamped while the engine has an audit sink; the
+/// outbox dispatcher and the inline caller keep it (and add the instance identity) only for a
+/// transport that writes audit events.
+fn stamp_audit_journal(process: &ProcessDefinition, emission: &mut sutra_executor::Emission) {
+    if emission.kind != sutra_executor::EmissionKind::Send {
+        return;
+    }
+    let value = audit_journal_policy(process);
+    emission.headers.insert(
+        crate::transport_audit::AUDIT_JOURNAL_HEADER.to_string(),
+        value,
+    );
+}
+
+/// The [`crate::transport_audit::AUDIT_JOURNAL_HEADER`] value of `process`'s requests.
+fn audit_journal_policy(process: &ProcessDefinition) -> String {
+    match process.audit.as_ref() {
+        Some(audit) => {
+            crate::transport_audit::journal_policy_value(audit.capture, Some(&audit.sink))
+        }
+        None => crate::transport_audit::journal_policy_value(
+            sutra_bpmn::qbindings::AuditCapture::Metadata,
+            None,
+        ),
+    }
+}
+
+/// Mark every request of a `<q:audit capture="media">` process with
+/// [`crate::audit::AUDIT_CAPTURE_HEADER`], so a media transport records the session it opens.
+fn stamp_media_capture(process: &ProcessDefinition, emission: &mut sutra_executor::Emission) {
+    use sutra_bpmn::qbindings::AuditCapture;
+    if emission.kind != sutra_executor::EmissionKind::Send {
+        return;
+    }
+    if process.audit.as_ref().map(|a| a.capture) == Some(AuditCapture::Media) {
+        emission.headers.insert(
+            crate::audit::AUDIT_CAPTURE_HEADER.to_string(),
+            crate::audit::AUDIT_CAPTURE_MEDIA.to_string(),
+        );
+    }
 }
 
 #[cfg(test)]

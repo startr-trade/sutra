@@ -1,0 +1,44 @@
+# Channels for the review module, 1.0.0 — a review loop that waits at the same nodes every round.
+#
+#   POST /channels/drafts             draft-submitted  starts a review of { draftId }
+#   POST /channels/drafts/review      review           { draftId, decision: "revise" | "approve" }
+#                                                      answers the user task AwaitReview
+#   POST /channels/drafts/revision    revision         { draftId } answers the message catch
+#                                                      AwaitRevision
+#
+# Every message after the first is correlated to its instance by the start event's <q:alias> on
+# draftId. A message for a wait the instance is not parked at is refused before anything runs.
+
+channels:
+  - name: draft-submitted
+    transport: http
+    bind: "POST /channels/drafts"
+    codec: json
+    cloudevents-mode: none
+    auth:
+      scheme: apikey
+      apikey:
+        value: env:REVIEW_API_KEY
+        header: X-Api-Key
+
+  - name: review
+    transport: http
+    bind: "POST /channels/drafts/review"
+    codec: json
+    cloudevents-mode: none
+    auth:
+      scheme: apikey
+      apikey:
+        value: env:REVIEW_API_KEY
+        header: X-Api-Key
+
+  - name: revision
+    transport: http
+    bind: "POST /channels/drafts/revision"
+    codec: json
+    cloudevents-mode: none
+    auth:
+      scheme: apikey
+      apikey:
+        value: env:REVIEW_API_KEY
+        header: X-Api-Key

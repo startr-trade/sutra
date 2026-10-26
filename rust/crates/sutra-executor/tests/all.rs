@@ -19,6 +19,8 @@ mod dispatch_and_params_test;
 mod emissions_test;
 #[path = "all/errors_and_scopes_test.rs"]
 mod errors_and_scopes_test;
+#[path = "all/event_gateway_resume_test.rs"]
+mod event_gateway_resume_test;
 #[path = "all/gateways_test.rs"]
 mod gateways_test;
 #[path = "all/integration_examples_test.rs"]
@@ -31,3 +33,5 @@ mod task_kinds_test;
 mod time_skipping_retry_test;
 #[path = "all/token_executor_test.rs"]
 mod token_executor_test;
+#[path = "all/wait_loop_test.rs"]
+mod wait_loop_test;

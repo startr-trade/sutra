@@ -173,6 +173,38 @@ async fn defer_updates_next_attempt_and_increments_attempt_count() {
 
 #[ignore = "docker"]
 #[tokio::test]
+async fn requeue_moves_the_due_time_without_counting_an_attempt() {
+    let pool = fresh_pool().await;
+    let store = PgOutboxStore::new(pool);
+    let e = entry(Uuid::new_v4());
+    store.enqueue(&e).await.unwrap();
+
+    let recheck_at = now_micros() + Duration::seconds(5);
+    store
+        .requeue(
+            &dep_a(),
+            e.entry_id,
+            recheck_at,
+            Some("{\"code\":\"SUTRA.OUTBOUND.POOL.WAITING\"}"),
+        )
+        .await
+        .unwrap();
+    assert!(store
+        .claim_due(&dep_a(), now_micros(), 10)
+        .await
+        .unwrap()
+        .is_empty());
+    let claimed = store
+        .claim_due(&dep_a(), recheck_at + Duration::seconds(1), 10)
+        .await
+        .unwrap();
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].attempt_count, 0, "a pool wait is not an attempt");
+    assert_eq!(claimed[0].next_attempt_at, recheck_at);
+}
+
+#[ignore = "docker"]
+#[tokio::test]
 async fn delete_non_existent_is_noop() {
     let pool = fresh_pool().await;
     let store = PgOutboxStore::new(pool);

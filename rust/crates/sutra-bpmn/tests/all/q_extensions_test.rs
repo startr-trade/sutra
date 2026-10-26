@@ -804,6 +804,25 @@ fn parses_per_node_audit() {
 }
 
 #[test]
+fn process_audit_capture_media_parses() {
+    let bpmn = r#"<?xml version="1.0"?>
+        <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                          xmlns:q="urn:sutra:q:1.0">
+          <bpmn:process id="p1">
+            <bpmn:extensionElements><q:audit capture="media"/></bpmn:extensionElements>
+            <bpmn:startEvent id="S"/>
+            <bpmn:endEvent id="E"/>
+            <bpmn:sequenceFlow id="f1" sourceRef="S" targetRef="E"/>
+          </bpmn:process>
+        </bpmn:definitions>"#;
+    let module = load(bpmn).unwrap();
+    let audit = module.process("p1").unwrap().audit.clone().unwrap();
+    assert_eq!(audit.capture, AuditCapture::Media);
+    assert_eq!(audit.capture.as_str(), "media");
+    assert_eq!(audit.sink, "sql");
+}
+
+#[test]
 fn per_node_audit_does_not_collide_with_process_level_audit_version() {
     let bpmn = r#"<?xml version="1.0"?>
         <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"

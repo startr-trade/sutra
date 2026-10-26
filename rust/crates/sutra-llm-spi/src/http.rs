@@ -13,6 +13,46 @@ use serde_json::Value;
 
 type HttpsConnector = hyper_rustls::HttpsConnector<HttpConnector>;
 
+/// `url` as it may appear in a log line or a failure detail: every query value and any
+/// `user:password@` part replaced by `<redacted>`, so a credential a URL carries never leaves
+/// in a message. Parameter names are kept (they help diagnose); the path is kept as is.
+pub fn redact_url(url: &str) -> String {
+    let (head, fragment) = match url.split_once('#') {
+        Some((head, _)) => (head, "#<redacted>"),
+        None => (url, ""),
+    };
+    let (base, query) = match head.split_once('?') {
+        Some((base, query)) => (base, Some(query)),
+        None => (head, None),
+    };
+    let base = match base.split_once("://") {
+        Some((scheme, rest)) => {
+            let (authority, path) = match rest.find('/') {
+                Some(i) => rest.split_at(i),
+                None => (rest, ""),
+            };
+            match authority.rsplit_once('@') {
+                Some((_, host)) => format!("{scheme}://<redacted>@{host}{path}"),
+                None => base.to_string(),
+            }
+        }
+        None => base.to_string(),
+    };
+    let query = query
+        .map(|q| {
+            let pairs: Vec<String> = q
+                .split('&')
+                .map(|pair| match pair.split_once('=') {
+                    Some((name, _)) => format!("{name}=<redacted>"),
+                    None => pair.to_string(),
+                })
+                .collect();
+            format!("?{}", pairs.join("&"))
+        })
+        .unwrap_or_default();
+    format!("{base}{query}{fragment}")
+}
+
 /// Longest slice of a provider's error body kept in a failure detail.
 const DETAIL_LIMIT: usize = 300;
 
@@ -64,9 +104,9 @@ impl JsonHttpClient {
         body: &Value,
         deadline: Duration,
     ) -> Result<Value, HttpFailure> {
-        let uri: hyper::Uri = url
-            .parse()
-            .map_err(|e| HttpFailure::Invalid(format!("'{url}' is not a valid URI: {e}")))?;
+        let uri: hyper::Uri = url.parse().map_err(|e| {
+            HttpFailure::Invalid(format!("'{}' is not a valid URI: {e}", redact_url(url)))
+        })?;
         let mut builder = Request::builder()
             .method(hyper::Method::POST)
             .uri(uri)
@@ -177,9 +217,9 @@ impl JsonHttpClient {
         body: Option<&Value>,
         accept: &str,
     ) -> Result<hyper::Response<hyper::body::Incoming>, HttpFailure> {
-        let uri: hyper::Uri = url
-            .parse()
-            .map_err(|e| HttpFailure::Invalid(format!("'{url}' is not a valid URI: {e}")))?;
+        let uri: hyper::Uri = url.parse().map_err(|e| {
+            HttpFailure::Invalid(format!("'{}' is not a valid URI: {e}", redact_url(url)))
+        })?;
         let mut builder = Request::builder()
             .method(method)
             .uri(uri)
@@ -220,6 +260,57 @@ impl JsonHttpClient {
             retry_after,
             detail: format!("HTTP {status}: {detail}"),
         }
+    }
+
+    /// POST a raw `body` with `content_type` (a multipart form, say) and return the 2xx body as
+    /// bytes with its `content-type` — for endpoints that answer with media rather than JSON.
+    pub async fn post_bytes(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        content_type: &str,
+        body: Vec<u8>,
+        deadline: Duration,
+    ) -> Result<(Vec<u8>, Option<String>), HttpFailure> {
+        let uri: hyper::Uri = url.parse().map_err(|e| {
+            HttpFailure::Invalid(format!("'{}' is not a valid URI: {e}", redact_url(url)))
+        })?;
+        let mut builder = Request::builder()
+            .method(hyper::Method::POST)
+            .uri(uri)
+            .header("content-type", content_type)
+            .header("accept", "*/*");
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        let request = builder
+            .body(Full::new(Bytes::from(body)))
+            .map_err(|e| HttpFailure::Invalid(format!("request could not be built: {e}")))?;
+        let exchange = async {
+            let response = self
+                .client
+                .request(request)
+                .await
+                .map_err(|e| HttpFailure::Connect(e.to_string()))?;
+            if !response.status().is_success() {
+                return Err(Self::status_failure(response).await);
+            }
+            let kind = response
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
+            let bytes = response
+                .into_body()
+                .collect()
+                .await
+                .map_err(|e| HttpFailure::Connect(e.to_string()))?
+                .to_bytes();
+            Ok((bytes.to_vec(), kind))
+        };
+        tokio::time::timeout(deadline, exchange)
+            .await
+            .map_err(|_| HttpFailure::Timeout)?
     }
 
     /// GET `url` and return the 2xx body as text (a JSONL results file, for one).
@@ -308,6 +399,21 @@ impl JsonHttpClient {
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn redacted_urls_keep_no_query_value_or_userinfo() {
+        assert_eq!(
+            redact_url("wss://h.example/ws/x?key=secret&alt=sse"),
+            "wss://h.example/ws/x?key=<redacted>&alt=<redacted>"
+        );
+        assert_eq!(
+            redact_url("https://user:pw@h.example:8443/p?flag"),
+            "https://<redacted>@h.example:8443/p?flag"
+        );
+        assert_eq!(redact_url("http://h/p#frag"), "http://h/p#<redacted>");
+        assert_eq!(redact_url("http://h/p"), "http://h/p");
+        assert!(!redact_url("x?access_token=t0k").contains("t0k"));
+    }
 
     /// One-shot HTTP/1.1 stub answering `status` + `body`.
     async fn stub(status: u16, extra: &'static str, body: &'static str) -> String {

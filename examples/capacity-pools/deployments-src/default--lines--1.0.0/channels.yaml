@@ -1,0 +1,63 @@
+# Channels for the lines module, 1.0.0 — capacity pools and session-end.
+#
+#   POST /channels/sessions           session-start   opens a session: takes a `lines` slot, or 503
+#   POST /channels/sessions/closed    session-closed  ends the session early (session-end), the
+#                                                     instance runs on
+#   POST /channels/sessions/wrap-up   wrap-up         resumes the parked instance; it ends
+#   ->   http://sink:8000/sink        agent-callback  one request per session; takes a
+#                                                     `callbacks` slot, or WAITS in the outbox
+#
+# Both pools are ENGINE configuration (deploy/compose.yaml): `lines` has 2 slots, `callbacks` 1.
+# A channel only names the pool it draws from.
+
+channels:
+  # A new session takes a `lines` slot before its first step runs. With both slots held, the
+  # next start is answered 503 SUTRA.INBOUND.POOL.EXHAUSTED and no instance is created.
+  - name: session-start
+    transport: http
+    bind: "POST /channels/sessions"
+    codec: json
+    cloudevents-mode: none
+    pool: lines
+    session-end:
+      on-message: session-closed     # a correlated message there releases the session's slots
+    auth:
+      scheme: apikey
+      apikey:
+        value: env:LINES_API_KEY
+        header: X-Api-Key
+
+  # { sessionId } — correlated by the start event's <q:alias>. No wait in the flow takes it, so
+  # it is accepted for the release alone: the line and the callback slot go back to their pools,
+  # and the instance keeps waiting at AwaitWrapUp.
+  - name: session-closed
+    transport: http
+    bind: "POST /channels/sessions/closed"
+    codec: json
+    cloudevents-mode: none
+    auth:
+      scheme: apikey
+      apikey:
+        value: env:LINES_API_KEY
+        header: X-Api-Key
+
+  # { sessionId } — resumes the instance parked at AwaitWrapUp; it then ends.
+  - name: wrap-up
+    transport: http
+    bind: "POST /channels/sessions/wrap-up"
+    codec: json
+    cloudevents-mode: none
+    auth:
+      scheme: apikey
+      apikey:
+        value: env:LINES_API_KEY
+        header: X-Api-Key
+
+  # One outbound request per session, held back while the `callbacks` pool is full: the outbox
+  # puts it back without counting a delivery attempt and re-checks it on every tick.
+  - name: agent-callback
+    direction: outbound
+    transport: http
+    bind: "http://sink:8000/sink"
+    cloudevents-mode: none
+    pool: callbacks

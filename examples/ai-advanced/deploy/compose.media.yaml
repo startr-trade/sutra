@@ -1,0 +1,43 @@
+# Adds an S3-compatible object store (MinIO) to the ai-advanced stack, for the `live` variant's
+# `hear-model`, which reads media references ({ ref, sha256, format }) from the store `media`:
+#
+#   docker compose -f examples/ai-advanced/deploy/compose.yaml \
+#                  -f examples/ai-advanced/deploy/compose.media.yaml up -d
+#   docker compose -f … -f … exec store mc mb local/media
+#   docker compose -f … -f … exec -T store mc pipe local/media/clips/q.wav < examples/ai-advanced/sample/spoken-question.wav
+#
+# then `"audio": {"ref": "s3://media/clips/q.wav", "sha256": "<sha256sum of the file>", "format": "audio/wav"}`.
+# live-check.sh does exactly this for its Gemini media-reference checks. Every value here is a
+# dev-only placeholder; no provider key belongs in this file.
+
+services:
+  engine:
+    environment:
+      # One named store, `media`: the bucket `media`, key prefix `clips`, on the service below.
+      SUTRA_OBJECT_STORES: media
+      SUTRA_OBJECT_STORES_MEDIA_URI: s3://media/clips
+      SUTRA_OBJECT_STORES_MEDIA_ENDPOINT: http://store:9000
+      SUTRA_OBJECT_STORES_MEDIA_ACCESS_KEY: env:STORE_ACCESS_KEY
+      SUTRA_OBJECT_STORES_MEDIA_SECRET_KEY: env:STORE_SECRET_KEY
+      # Plain objects, as `mc pipe` writes them.
+      SUTRA_OBJECT_STORES_MEDIA_ENCRYPTION: none
+      STORE_ACCESS_KEY: ${STORE_ACCESS_KEY:-media-dev-only}
+      STORE_SECRET_KEY: ${STORE_SECRET_KEY:-media-dev-only-secret}
+    depends_on:
+      store:
+        condition: service_healthy
+
+  # MinIO, pinned by digest. The image carries the `mc` client; MC_HOST_local points it at this
+  # server, so `docker compose exec store mc …` works with no setup.
+  store:
+    image: pgsty/minio@sha256:b6bfe7239bfc83fb90d31612d9704d86039dd714f7904b3f1ad68f211e602372
+    command: ["server", "/data"]
+    environment:
+      MINIO_ROOT_USER: ${STORE_ACCESS_KEY:-media-dev-only}
+      MINIO_ROOT_PASSWORD: ${STORE_SECRET_KEY:-media-dev-only-secret}
+      MC_HOST_local: http://${STORE_ACCESS_KEY:-media-dev-only}:${STORE_SECRET_KEY:-media-dev-only-secret}@127.0.0.1:9000
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9000/minio/health/live"]
+      interval: 2s
+      timeout: 3s
+      retries: 30

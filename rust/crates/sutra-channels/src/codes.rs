@@ -39,6 +39,23 @@ pub const INBOUND_QUOTA_EXCEEDED_CONCURRENT: &str = "SUTRA.INBOUND.QUOTA_EXCEEDE
 /// A per-channel `max-concurrent-instances` cap is full — the inbound is a busy-signal
 /// reject (the `SUTRA.INBOUND.CHANNEL_AT_CAPACITY` code).
 pub const INBOUND_CHANNEL_AT_CAPACITY: &str = "SUTRA.INBOUND.CHANNEL_AT_CAPACITY";
+/// The capacity pool a channel draws from (`pool:`) has no free slot for a new inbound
+/// instance — the delivery is a busy-signal reject, like a full channel cap.
+pub const INBOUND_POOL_EXHAUSTED: &str = "SUTRA.INBOUND.POOL.EXHAUSTED";
+/// A channel names a capacity pool (`pool:`) the engine configuration does not declare
+/// (`sutra.capacity-pools.<name>.*`) — the deployment fails to load.
+pub const CONFIG_CHANNEL_POOL_UNDECLARED: &str = "SUTRA.CONFIG.CHANNEL.POOL_UNDECLARED";
+/// A channel names a capacity pool whose `tenants` allow-list does not contain the channel's
+/// tenant — the deployment fails to load.
+pub const CONFIG_CHANNEL_POOL_TENANT_NOT_ALLOWED: &str =
+    "SUTRA.CONFIG.CHANNEL.POOL_TENANT_NOT_ALLOWED";
+/// A channel's `session-end:` block is malformed: declared on an outbound channel, an unknown
+/// key, a non-boolean `on-reply`, or an `on-message` that does not name another inbound channel
+/// of the same file.
+pub const CONFIG_CHANNEL_SESSION_END_INVALID: &str = "SUTRA.CONFIG.CHANNEL.SESSION_END_INVALID";
+/// A channel's `pool-call-key:` is malformed (not `header.<name>`) or is declared on a channel
+/// that draws from no capacity pool (`pool:`).
+pub const CONFIG_CHANNEL_POOL_CALL_KEY_INVALID: &str = "SUTRA.CONFIG.CHANNEL.POOL_CALL_KEY_INVALID";
 pub const INBOUND_CODEC_NOT_FOUND: &str = "SUTRA.INBOUND.CODEC_NOT_FOUND";
 pub const INBOUND_CAPABILITY_MISMATCH: &str = "SUTRA.INBOUND.CAPABILITY_MISMATCH";
 pub const INBOUND_NO_START_EVENT_FOR_MESSAGE_TYPE: &str =
@@ -100,6 +117,10 @@ pub const RUNTIME_UNEXPECTED: &str = "SUTRA.RUNTIME.UNEXPECTED";
 pub const RUNTIME_RELAY_CORRELATION_NOT_FOUND: &str = "SUTRA.RUNTIME.RELAY.CORRELATION_NOT_FOUND";
 pub const RUNTIME_RESUME_INSTANCE_NOT_FOUND: &str = "SUTRA.RUNTIME.RESUME.INSTANCE_NOT_FOUND";
 pub const RUNTIME_RESUME_NOT_SUSPENDED: &str = "SUTRA.RUNTIME.RESUME.NOT_SUSPENDED";
+/// A relay correlated to a parked instance names a wait node the instance is NOT parked at —
+/// a late answer for a loop iteration the token already left, or a duplicate of a relay that
+/// already resumed it. Refused before anything executes; the parked instance is untouched.
+pub const RUNTIME_RESUME_NOT_WAITING: &str = "SUTRA.RUNTIME.RESUME.NOT_WAITING";
 /// A parked instance's PINNED deployment id cannot be read back as a deployment id (a
 /// corrupt/legacy snapshot column). Both resume paths — relay and timer — refuse the
 /// resume rather than fall back to the deployment the delivery arrived under: an instance
@@ -135,6 +156,13 @@ pub const OUTBOUND_VALIDATION_REJECT: &str = "SUTRA.OUTBOUND.VALIDATION_REJECT";
 pub const OUTBOUND_SEND_FAILED: &str = "SUTRA.OUTBOUND.SEND.FAILED";
 pub const OUTBOUND_HTTP_AUTH_REF_UNRESOLVED: &str = "SUTRA.OUTBOUND.HTTP.AUTH_REF_UNRESOLVED";
 pub const OUTBOUND_HTTP_MTLS_UNSUPPORTED: &str = "SUTRA.OUTBOUND.HTTP.MTLS_UNSUPPORTED";
+/// An outbox entry for a pooled outbound channel is waiting for a free slot: it was put back
+/// without counting a delivery attempt and is re-checked on the next dispatch tick. Recorded as
+/// the entry's last diagnostic so the wait is visible.
+pub const OUTBOUND_POOL_WAITING: &str = "SUTRA.OUTBOUND.POOL.WAITING";
+/// A channel-call request was still waiting for a pool slot when its instance finished, so the
+/// request was never sent (the entry is kept, marked terminal, and stays redrivable).
+pub const OUTBOUND_POOL_ABANDONED: &str = "SUTRA.OUTBOUND.POOL.ABANDONED";
 pub const PARSE_YAML_PARSE_ERROR: &str = "SUTRA.PARSE.YAML.PARSE_ERROR";
 
 // ---- channel-call / timer codes -------------------------------------------------------------

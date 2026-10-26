@@ -77,6 +77,24 @@ pub trait MessageSink: Send + Sync {
     /// sense — failures are [`SendOutcome`] arms, so per-entry poison isolation stays a
     /// dispatcher-side policy.
     fn send<'a>(&'a self, message: &'a OutboundMessage) -> BoxFuture<'a, SendOutcome>;
+
+    /// Whether this sink acts on the session media-capture marker
+    /// ([`crate::audit::AUDIT_CAPTURE_HEADER`]). Only a sink that opens a media session it can
+    /// record answers `true`; for every other sink the dispatcher strips the marker, so an
+    /// engine-internal header never reaches a counterpart's wire.
+    fn records_media(&self) -> bool {
+        false
+    }
+
+    /// Whether this transport writes audit events for the instances whose requests it serves
+    /// ([`crate::transport_audit`]). Only then does the engine leave the instance's audit
+    /// routing and identity on the message (the reserved
+    /// [`crate::transport_audit::AUDIT_JOURNAL_HEADERS`]), for the transport to read with
+    /// [`crate::transport_audit::TransportAuditContext::from_headers`]; for every other one they
+    /// are stripped, so they never reach a counterpart's wire.
+    fn writes_audit_events(&self) -> bool {
+        false
+    }
 }
 
 /// Scheme → sink resolution for the outbox dispatcher (the sink registry).

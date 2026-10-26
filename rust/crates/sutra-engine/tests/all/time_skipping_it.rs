@@ -347,6 +347,8 @@ async fn boot(deployments_dir: PathBuf, datasource_url: String, clock: TestClock
         rls_bypass_check_enabled: false,
         telemetry: sutra_engine::TelemetryConfig::default(),
         admin_auth: Default::default(),
+        capacity_pools: Vec::new(),
+        object_stores: Vec::new(),
         now_override: Some(clock),
     })
     .await

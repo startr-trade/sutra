@@ -38,6 +38,7 @@ pub use sutra_codec_spi::content_type;
 pub mod ack;
 pub mod auth;
 pub mod bridge;
+pub mod capacity;
 pub mod cloudevents;
 pub mod codes;
 pub mod config;
@@ -50,6 +51,7 @@ pub mod registry;
 pub mod shard_metrics;
 pub mod sink;
 pub mod stores;
+pub mod transport_audit;
 pub mod validators;
 
 // --- async TRANSPORT spine (feature `transport`, on by default; tokio/axum/hyper) ---
@@ -81,8 +83,9 @@ pub use sutra_executor::DeploymentId;
 pub use ack::{DeferredAckListener, DeferredAckRegistry};
 #[cfg(feature = "transport")]
 pub use audit::{
-    audit_channel, spawn_audit_dispatcher, AuditEvent, AuditListener, AuditSink, AuditSinkRegistry,
-    JsonlAuditSink, AUDIT_SINK_WRITE_FAILED,
+    audit_channel, deliver_audit_event, spawn_audit_dispatcher, AuditEvent, AuditListener,
+    AuditSink, AuditSinkRegistry, JsonlAuditSink, AUDIT_CAPTURE_HEADER, AUDIT_CAPTURE_MEDIA,
+    AUDIT_SINK_WRITE_FAILED,
 };
 #[cfg(feature = "transport")]
 pub use bridge::replica_id;
@@ -90,7 +93,14 @@ pub use bridge::{
     AliasRecord, InstanceBridge, InstanceClaimOutcome, OutboxEmission, SuspendedInstance,
     TimerWaitRecord,
 };
-pub use config::{load_channel_definitions, ChannelBinding, ChannelDefinition, Namespace};
+pub use capacity::{
+    CallSelector, CapacityPool, CapacityPoolStore, InMemoryCapacityPools, SlotAcquisition,
+    SlotDirection, SlotRequest, CAPACITY_CALL_HEADER, CAPACITY_CALL_KEY_HEADER,
+    CAPACITY_POOL_HEADER,
+};
+pub use config::{
+    load_channel_definitions, ChannelBinding, ChannelDefinition, Namespace, SessionEnd,
+};
 pub use diag::Diagnostic;
 #[cfg(feature = "transport")]
 pub use dispatch::{
@@ -146,6 +156,13 @@ pub use source::{
 pub use stores::{
     AliasStore, CollectingOutbox, InMemoryAliasStore, InMemoryInboxStore, InMemoryIncidentSink,
     InboundIncident, InboxStore, IncidentSink, OutboxSink,
+};
+pub use transport_audit::{
+    is_transport_event_type, transport_audit, transport_audit_payload, transport_event_type,
+    CapturingTransportAuditJournal, NoopTransportAuditJournal, TransportAuditContext,
+    TransportAuditEvent, TransportAuditJournal, TransportAuditOutcome, TransportAuditRegistry,
+    TransportAuditScope, AUDIT_JOURNAL_DEPLOYMENT_HEADER, AUDIT_JOURNAL_HEADER,
+    AUDIT_JOURNAL_HEADERS, AUDIT_JOURNAL_INSTANCE_HEADER,
 };
 pub use validators::{
     ContentValidator, DmnContentValidator, SrlContentValidator, ValidatorRegistry, ValidatorTier,
