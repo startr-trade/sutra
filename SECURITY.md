@@ -1,7 +1,7 @@
 # Security Policy
 
-We take the security of Sutra seriously — it processes financial, clinical, and other sensitive
-message formats. Thank you for helping keep it and its users safe.
+We take the security of Sutra seriously: it carries business messages, personal data and the
+credentials that reach other systems. Thank you for helping keep it and its users safe.
 
 ## Reporting a vulnerability
 
@@ -32,5 +32,9 @@ Please give us a reasonable window to release a fix before any public disclosure
 
 ## Supported versions
 
-Sutra is pre-1.0 (`1.0.0-rc` line). Security fixes land on `main` and the latest release
-candidate. Once 1.0.0 ships, this section will list the supported release series.
+Sutra is pre-1.0. Security fixes land on `main` and in the latest release (currently the `0.6.x`
+line); older lines are not patched. Once 1.0.0 ships, this section will list the supported
+release series.
+
+Telephony, IVR and meetings live in [Sutra Voice](https://github.com/startr-trade/sutra-voice),
+which has its own security policy; report issues in that code there.
