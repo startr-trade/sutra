@@ -504,7 +504,7 @@ impl ProcessModuleRegistry {
             .or_default();
         for p in module.processes() {
             // EVERY node carrying a `<q:source>`, not only start events: the same element is
-            // legal on a user task, a message catch event and a channel-call task, where it
+            // legal on a user task, a message catch event, a receive task and a channel-call task, where it
             // names the channel a correlated RESPONSE arrives on. Compiling only start events
             // would leave a predicate on a wait node silently doing nothing — which is the one
             // outcome worse than refusing it.
@@ -586,7 +586,8 @@ impl ProcessModuleRegistry {
     }
 
     /// Cross-process RELAY resolution: every process in `deployment` with a WAIT
-    /// NODE (`<bpmn:userTask>` / intermediate message catch / channel-call serviceTask)
+    /// NODE (`<bpmn:userTask>` / intermediate message catch / `<bpmn:receiveTask>` /
+    /// channel-call serviceTask)
     /// whose `<q:source>` subscribes to `channel`. A relay message on
     /// such a channel is correlated to a WAITING instance and resumes it — the
     /// re-activation counterpart to [`Self::resolve_handlers`]. Empty when the deployment
@@ -615,7 +616,8 @@ impl ProcessModuleRegistry {
             for node in process.nodes() {
                 let subscribed = match node {
                     sutra_bpmn::model::Node::UserTask { channels, .. }
-                    | sutra_bpmn::model::Node::MessageCatchEvent { channels, .. } => {
+                    | sutra_bpmn::model::Node::MessageCatchEvent { channels, .. }
+                    | sutra_bpmn::model::Node::ReceiveTask { channels, .. } => {
                         channels.iter().any(|c| c == channel)
                     }
                     // A channel-call task's <q:source channel> names the inbound

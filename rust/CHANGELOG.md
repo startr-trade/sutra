@@ -13,6 +13,29 @@ This is the changelog for the **Rust-native** engine (`rust/` workspace). It beg
 
 Nothing yet.
 
+## [0.6.1] — 2026-10-26
+
+A **patch** release with one fix: a message now reaches a process waiting at a `<receiveTask>`.
+No `q:` namespace change, no migration, and the snapshot format is unchanged; an instance parked
+by a 0.6.0 engine resumes under 0.6.1.
+
+### Fixed
+
+- **A `<receiveTask>` never received its message.** A receive task parks like an intermediate
+  message catch event, but when the correlated message arrived on its `<q:source>` channel the
+  engine did not recognise the receive task as the waiting node. The message was treated as one
+  that should start a process, and with no start event on that channel it was rejected with
+  `SUTRA.INBOUND.NO_START_EVENT_FOR_MESSAGE_TYPE` (HTTP 500) while the instance stayed parked
+  until its timer, if any, fired. It hit every receive task, including the "wait for a message,
+  or time out" pattern: a receive task with an interrupting timer boundary, often in a loop. A
+  receive task now behaves exactly like a message catch for that message: the `<q:source>`
+  filter and intake validation apply, correlation tries the task's own `<q:alias>` first and
+  then the start event's `onConflict="correlate"` alias, and a resume retires the task's timer
+  boundary in the same step. An event-based gateway arm that is a receive task is fixed by the
+  same change.
+- `sutra coverage init` now lists a `<q:send>` into a receive task's channel as a relay hop, as
+  it already did for a message catch or a user task.
+
 ## [0.6.0] — 2026-10-26
 
 A **minor** release: a process can work with sound, images and stored recordings, share a

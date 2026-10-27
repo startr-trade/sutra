@@ -712,7 +712,7 @@ impl ChannelEngine {
                     .await;
             }
             // Before failing "no start event", check whether this is a
-            // channel-delivered RELAY: a wait node (userTask / message catch) subscribes to
+            // channel-delivered RELAY: a wait node (userTask / message catch / receiveTask) subscribes to
             // this channel, so the inbound resumes a WAITING instance rather than minting
             // one. Same two-tier intake (validators run against the wait node's
             // `<q:source>`), then correlate by the process's `<q:alias>` and resume.
@@ -5569,9 +5569,9 @@ fn rebind_relay_to_waiting(
     }
     let subscribes = |node_id: &str| -> bool {
         match process.node(node_id) {
-            Ok(Node::MessageCatchEvent { channels, .. }) | Ok(Node::UserTask { channels, .. }) => {
-                channels.iter().any(|c| c == channel)
-            }
+            Ok(Node::MessageCatchEvent { channels, .. })
+            | Ok(Node::ReceiveTask { channels, .. })
+            | Ok(Node::UserTask { channels, .. }) => channels.iter().any(|c| c == channel),
             Ok(Node::ServiceTask { implementation, .. })
                 if implementation.starts_with(CHANNEL_CALL_PREFIX) =>
             {

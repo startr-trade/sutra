@@ -35,7 +35,7 @@ body:
     attributes:
       label: Version
       description: "`sutra --version`, or the engine image tag / commit."
-      placeholder: "v0.6.0 (or ghcr.io/startr-trade/sutra:0.6.0)"
+      placeholder: "v0.6.1 (or ghcr.io/startr-trade/sutra:0.6.1)"
     validations:
       required: true
 

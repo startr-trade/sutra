@@ -1,0 +1,82 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  A LISTEN WINDOW: wait for a correlated status, or give up after a few seconds; every status
+  that is not final loops back to wait for the next one.
+    startEvent (JSON on `listen-start`: { id })                     rounds := 0
+      then Listen   : receive task on `listen-status`: { id, state }
+                      interrupting timer boundary Timeout (PT4S) -> MarkTimeout -> TimedOut
+      then Count    : rounds := rounds + 1, outcome := "status"
+      then Decide   : status.state = "final" -> Done, otherwise back to Listen (a NEW wait, with
+                      a fresh window)
+-->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0"
+                  id="Definitions_listen_window"
+                  targetNamespace="urn:sutra:module:listen:1.0.0">
+  <bpmn:process id="listen-window" name="Listen for a status, or time out" isExecutable="true">
+    <bpmn:extensionElements>
+      <!-- Metadata-level audit events: the suite reads which path each instance took. -->
+      <q:audit capture="metadata"/>
+      <q:variables>
+        <q:variable name="rounds" type="number"/>
+        <q:variable name="outcome" type="string"/>
+      </q:variables>
+    </bpmn:extensionElements>
+    <bpmn:startEvent id="Start">
+      <bpmn:extensionElements>
+        <q:source channel="listen-start"/>
+        <q:alias name="listenId" expression="payload.id" unique="true" onConflict="correlate"/>
+      </bpmn:extensionElements>
+      <bpmn:outgoing>F1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="F1" sourceRef="Start" targetRef="Init"/>
+    <bpmn:serviceTask id="Init" name="rounds := 0 (FEEL)">
+      <bpmn:incoming>F1</bpmn:incoming><bpmn:outgoing>F2</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>0</bpmn:from><bpmn:to>rounds</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F2" sourceRef="Init" targetRef="Listen"/>
+    <!-- Entered once per round: the second flow into it is the loop back from Decide. -->
+    <bpmn:receiveTask id="Listen" name="Wait for a status">
+      <bpmn:extensionElements>
+        <q:source channel="listen-status" name="status"/>
+      </bpmn:extensionElements>
+      <bpmn:incoming>F2</bpmn:incoming><bpmn:incoming>FAgain</bpmn:incoming>
+      <bpmn:outgoing>F3</bpmn:outgoing>
+    </bpmn:receiveTask>
+    <bpmn:boundaryEvent id="Timeout" name="No status in time" attachedToRef="Listen">
+      <bpmn:outgoing>FT1</bpmn:outgoing>
+      <bpmn:timerEventDefinition id="Timeout_Timer">
+        <bpmn:timeDuration>PT4S</bpmn:timeDuration>
+      </bpmn:timerEventDefinition>
+    </bpmn:boundaryEvent>
+    <bpmn:sequenceFlow id="F3" sourceRef="Listen" targetRef="Count"/>
+    <bpmn:serviceTask id="Count" name="rounds := rounds + 1 (FEEL)">
+      <bpmn:incoming>F3</bpmn:incoming><bpmn:outgoing>F4</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>rounds + 1</bpmn:from><bpmn:to>rounds</bpmn:to></bpmn:assignment>
+        <bpmn:assignment><bpmn:from>"status"</bpmn:from><bpmn:to>outcome</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F4" sourceRef="Count" targetRef="Decide"/>
+    <bpmn:exclusiveGateway id="Decide" name="Final?" default="FAgain">
+      <bpmn:incoming>F4</bpmn:incoming>
+      <bpmn:outgoing>FDone</bpmn:outgoing><bpmn:outgoing>FAgain</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:sequenceFlow id="FDone" sourceRef="Decide" targetRef="Done">
+      <bpmn:conditionExpression>status.state = "final"</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="FAgain" sourceRef="Decide" targetRef="Listen"/>
+    <bpmn:endEvent id="Done" name="Final status"><bpmn:incoming>FDone</bpmn:incoming></bpmn:endEvent>
+    <bpmn:sequenceFlow id="FT1" sourceRef="Timeout" targetRef="MarkTimeout"/>
+    <bpmn:serviceTask id="MarkTimeout" name="outcome := timeout (FEEL)">
+      <bpmn:incoming>FT1</bpmn:incoming><bpmn:outgoing>FT2</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>"timeout"</bpmn:from><bpmn:to>outcome</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="FT2" sourceRef="MarkTimeout" targetRef="TimedOut"/>
+    <bpmn:endEvent id="TimedOut" name="Window closed"><bpmn:incoming>FT2</bpmn:incoming></bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>

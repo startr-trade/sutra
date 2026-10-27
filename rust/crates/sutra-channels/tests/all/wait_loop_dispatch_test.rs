@@ -148,6 +148,65 @@ const TWO_WAITS: &str = r#"<?xml version="1.0"?>
   </bpmn:process>
 </bpmn:definitions>"#;
 
+/// The listen-window pattern: S (business key) → Listen (a RECEIVE TASK on `turn-in`, with an
+/// interrupting timer boundary) → Prompt (counts the turn) → G: `turn < 3` back to Listen, else
+/// E. The boundary leaves through TimedOut (`${timedout}`) to its own end. The receive task
+/// declares no alias of its own, so a relay correlates through the start event's
+/// `onConflict="correlate"` alias — the same fallback a message catch uses.
+const LISTEN_WINDOW: &str = r#"<?xml version="1.0"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0">
+  <bpmn:process id="listen">
+    <bpmn:startEvent id="S">
+      <bpmn:extensionElements>
+        <q:source channel="start-in" name="req"/>
+        <q:alias name="conv" expression="event.body" unique="true" onConflict="correlate"/>
+      </bpmn:extensionElements>
+    </bpmn:startEvent>
+    <bpmn:receiveTask id="Listen">
+      <bpmn:extensionElements><q:source channel="turn-in" name="status"/></bpmn:extensionElements>
+    </bpmn:receiveTask>
+    <bpmn:boundaryEvent id="Timeout" attachedToRef="Listen">
+      <bpmn:timerEventDefinition><bpmn:timeDuration>PT30S</bpmn:timeDuration></bpmn:timerEventDefinition>
+    </bpmn:boundaryEvent>
+    <bpmn:serviceTask id="Prompt" implementation="${prompt}"/>
+    <bpmn:serviceTask id="TimedOut" implementation="${timedout}"/>
+    <bpmn:exclusiveGateway id="G" default="toEnd"/>
+    <bpmn:endEvent id="E"/>
+    <bpmn:endEvent id="ET"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="S" targetRef="Listen"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="Listen" targetRef="Prompt"/>
+    <bpmn:sequenceFlow id="f3" sourceRef="Prompt" targetRef="G"/>
+    <bpmn:sequenceFlow id="again" sourceRef="G" targetRef="Listen">
+      <bpmn:conditionExpression>turn &lt; 3</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="toEnd" sourceRef="G" targetRef="E"/>
+    <bpmn:sequenceFlow id="t1" sourceRef="Timeout" targetRef="TimedOut"/>
+    <bpmn:sequenceFlow id="t2" sourceRef="TimedOut" targetRef="ET"/>
+  </bpmn:process>
+</bpmn:definitions>"#;
+
+/// S → R (a RECEIVE TASK correlated by its OWN `<q:alias>`, resolved at park time from the start
+/// payload and at relay time from the relayed body) → E.
+const RECEIVE_OWN_ALIAS: &str = r#"<?xml version="1.0"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0">
+  <bpmn:process id="receive">
+    <bpmn:startEvent id="S">
+      <bpmn:extensionElements><q:source channel="start-in" name="req"/></bpmn:extensionElements>
+    </bpmn:startEvent>
+    <bpmn:receiveTask id="R">
+      <bpmn:extensionElements>
+        <q:source channel="turn-in" name="answer"/>
+        <q:alias name="ticket" expression="event.body"/>
+      </bpmn:extensionElements>
+    </bpmn:receiveTask>
+    <bpmn:endEvent id="E"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="S" targetRef="R"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="R" targetRef="E"/>
+  </bpmn:process>
+</bpmn:definitions>"#;
+
 // ---- an in-memory bridge with a real alias table ---------------------------------------------
 
 #[derive(Default)]
@@ -160,6 +219,8 @@ struct Store {
     emissions: Vec<OutboxEmission>,
     /// The waits each re-park step resolved.
     resolved: Vec<Vec<String>>,
+    /// The timer rows the latest park/re-park step armed, by node id.
+    timers: Vec<String>,
     completed: bool,
 }
 
@@ -212,11 +273,12 @@ impl InstanceBridge for LoopBridge {
         instance_id: &str,
         snapshot: &SuspendedInstance,
         aliases: &[AliasRecord],
-        _timer_waits: &[TimerWaitRecord],
+        timer_waits: &[TimerWaitRecord],
         emissions: &[OutboxEmission],
     ) -> Result<(), Diagnostic> {
         {
             let mut store = self.0.borrow_mut();
+            store.timers = timer_waits.iter().map(|t| t.node_id.clone()).collect();
             store.instance = Some(instance_id.to_string());
             store.snapshot = Some(snapshot.clone());
             store.emissions.extend(emissions.iter().cloned());
@@ -293,12 +355,13 @@ impl InstanceBridge for LoopBridge {
         snapshot: &SuspendedInstance,
         satisfied_wait_nodes: &[String],
         aliases: &[AliasRecord],
-        _timer_waits: &[TimerWaitRecord],
+        timer_waits: &[TimerWaitRecord],
         emissions: &[OutboxEmission],
         retired_aliases: &[AliasRecord],
     ) -> Result<(), Diagnostic> {
         {
             let mut store = self.0.borrow_mut();
+            store.timers = timer_waits.iter().map(|t| t.node_id.clone()).collect();
             for r in retired_aliases {
                 for row in &mut store.aliases {
                     if row.0 == r.name && row.1 == r.value {
@@ -339,6 +402,7 @@ struct Rig {
     engine: ChannelEngine,
     bridge: Rc<LoopBridge>,
     prompts: Rc<Cell<i64>>,
+    timeouts: Rc<Cell<i64>>,
 }
 
 fn rig(bpmn: &str) -> Rig {
@@ -347,7 +411,13 @@ fn rig(bpmn: &str) -> Rig {
         .expect("BPMN loads");
     let prompts = Rc::new(Cell::new(0));
     let count = Rc::clone(&prompts);
-    let tasks = TaskRegistry::new().register("prompt", move |_, _| {
+    let timeouts = Rc::new(Cell::new(0));
+    let timed_out = Rc::clone(&timeouts);
+    let tasks = TaskRegistry::new().register("timedout", move |_, _| {
+        timed_out.set(timed_out.get() + 1);
+        Ok(FeelValue::Null)
+    });
+    let tasks = tasks.register("prompt", move |_, _| {
         count.set(count.get() + 1);
         let turn = count.get();
         Ok(FeelValue::Map(BTreeMap::from([
@@ -403,6 +473,7 @@ fn rig(bpmn: &str) -> Rig {
         engine,
         bridge,
         prompts,
+        timeouts,
     }
 }
 
@@ -533,4 +604,110 @@ fn a_relay_for_a_wait_the_instance_already_left_is_refused() {
 
     send(&rig, "other-in", "K-1", "r-2").expect("B resumes");
     assert!(rig.bridge.0.borrow().completed);
+}
+
+// ---- receive task: the same relay park as a message catch, plus a boundary ------------------
+
+/// Fire the listen window's timer boundary for the rig's one instance.
+fn fire_timeout(rig: &Rig) -> sutra_channels::TimerFireOutcome {
+    let instance_id = rig
+        .bridge
+        .0
+        .borrow()
+        .instance
+        .clone()
+        .expect("an instance parked");
+    drive(rig.engine.fire_timer(&sutra_executor::TimerFire {
+        deployment: deployment(),
+        instance_id,
+        node_id: "Timeout".to_string(),
+        due_at: "2026-10-25T10:00:30Z".to_string(),
+        fired_at: "2026-10-25T10:00:30Z".to_string(),
+    }))
+    .expect("the timer fire resumes the instance")
+}
+
+#[test]
+fn a_receive_task_parks_and_a_relay_correlated_by_its_own_alias_resumes_it() {
+    let rig = rig(RECEIVE_OWN_ALIAS);
+    send(&rig, "start-in", "K-7", "s-1").expect("the instance parks at the receive task");
+    assert_eq!(rig.bridge.waiting(), ["R"]);
+    assert_eq!(rig.bridge.live(), [pair("ticket", "K-7")]);
+
+    send(&rig, "turn-in", "K-7", "r-1").expect("a relay on the receive task's channel resumes it");
+    assert!(rig.bridge.0.borrow().completed);
+    assert!(rig.bridge.live().is_empty(), "the answered key is retired");
+}
+
+#[test]
+fn a_looped_receive_task_resumes_on_each_message_before_its_timer() {
+    let rig = rig(LISTEN_WINDOW);
+    send(&rig, "start-in", "C-1", "s-1").expect("the instance parks at the receive task");
+    assert_eq!(rig.bridge.waiting(), ["Listen"]);
+    assert_eq!(
+        rig.bridge.0.borrow().timers,
+        ["Timeout"],
+        "the window's timer is armed"
+    );
+
+    send(&rig, "turn-in", "C-1", "r-1").expect("the first status resumes the receive task");
+    assert_eq!(rig.prompts.get(), 1);
+    assert_eq!(rig.bridge.waiting(), ["Listen"], "the loop waits again");
+    assert_eq!(
+        rig.bridge.0.borrow().timers,
+        ["Timeout"],
+        "the new wait arms a fresh window"
+    );
+    assert!(
+        rig.bridge.0.borrow().resolved[0].contains(&"Timeout".to_string()),
+        "the answered window's timer row is retired with it: {:?}",
+        rig.bridge.0.borrow().resolved
+    );
+
+    send(&rig, "turn-in", "C-1", "r-2").expect("the second status resumes it again");
+    assert_eq!(rig.prompts.get(), 2);
+    assert_eq!(rig.bridge.waiting(), ["Listen"]);
+
+    send(&rig, "turn-in", "C-1", "r-3").expect("the third status leaves the loop");
+    assert!(rig.bridge.0.borrow().completed);
+    assert_eq!(rig.timeouts.get(), 0, "the boundary path never ran");
+}
+
+#[test]
+fn a_receive_task_whose_timer_fires_first_takes_the_boundary_path() {
+    let rig = rig(LISTEN_WINDOW);
+    send(&rig, "start-in", "C-2", "s-1").expect("the instance parks at the receive task");
+
+    let outcome = fire_timeout(&rig);
+    assert!(
+        matches!(
+            outcome,
+            sutra_channels::TimerFireOutcome::Resumed {
+                completed: true,
+                ..
+            }
+        ),
+        "{outcome:?}"
+    );
+    assert_eq!(rig.timeouts.get(), 1, "the boundary path ran");
+    assert_eq!(rig.prompts.get(), 0, "the normal path did not");
+    assert!(rig.bridge.0.borrow().completed);
+
+    let d = send(&rig, "turn-in", "C-2", "r-late").expect_err("a late status finds nothing");
+    assert_eq!(d.code, "SUTRA.RUNTIME.RELAY.CORRELATION_NOT_FOUND", "{d:?}");
+}
+
+#[test]
+fn an_uncorrelated_relay_to_a_receive_task_is_refused_and_moves_nothing() {
+    let rig = rig(LISTEN_WINDOW);
+    send(&rig, "start-in", "C-3", "s-1").expect("the instance parks at the receive task");
+
+    let d = send(&rig, "turn-in", "C-OTHER", "r-x").expect_err("no instance carries that key");
+    assert_eq!(d.code, "SUTRA.RUNTIME.RELAY.CORRELATION_NOT_FOUND", "{d:?}");
+    assert_eq!(rig.prompts.get(), 0, "nothing ran");
+    assert_eq!(rig.bridge.waiting(), ["Listen"], "the instance still waits");
+    assert!(!rig.bridge.0.borrow().completed);
+
+    send(&rig, "turn-in", "C-3", "r-1").expect("the correlated status still resumes it");
+    assert_eq!(rig.prompts.get(), 1);
 }

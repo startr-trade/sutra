@@ -71,7 +71,7 @@ pub mod codes {
     pub const CONFIG_CORRELATION_FLOW_UNKNOWN: &str = "SUTRA.CONFIG.CORRELATION.FLOW_UNKNOWN";
     /// A `links` hop does not resolve to a channel link: its from-node emits nothing
     /// (`<q:send>`/`<q:reply>`), its to-node consumes nothing (a start-event `<q:source>` spawn or
-    /// an `imec` relay-wait `MessageCatchEvent`/`UserTask`), a named node is absent, or an explicit
+    /// an `imec` relay-wait `MessageCatchEvent`/`ReceiveTask`/`UserTask`), a named node is absent, or an explicit
     /// `<q:send channel>` names a channel the to-node does not consume.
     pub const CONFIG_CORRELATION_LINK_UNRESOLVED: &str = "SUTRA.CONFIG.CORRELATION.LINK_UNRESOLVED";
     /// A hop's **effective** key (the hop's own `key`, else the correlation's default `key`) does

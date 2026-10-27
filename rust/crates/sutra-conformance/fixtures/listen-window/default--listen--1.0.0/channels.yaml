@@ -1,0 +1,29 @@
+# Channels for the listen-window conformance suite.
+#
+#   POST /channels/listen          listen-start   { id }               starts a listen window
+#   POST /channels/listen/status   listen-status  { id, state }        answers the receive task
+#
+# Every status is correlated to its instance by the start event's <q:alias> on id.
+
+channels:
+  - name: listen-start
+    transport: http
+    bind: "POST /channels/listen"
+    codec: json
+    cloudevents-mode: none
+    auth:
+      scheme: apikey
+      apikey:
+        value: env:LISTEN_API_KEY
+        header: X-Api-Key
+
+  - name: listen-status
+    transport: http
+    bind: "POST /channels/listen/status"
+    codec: json
+    cloudevents-mode: none
+    auth:
+      scheme: apikey
+      apikey:
+        value: env:LISTEN_API_KEY
+        header: X-Api-Key

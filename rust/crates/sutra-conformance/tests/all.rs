@@ -24,6 +24,8 @@ mod support;
 mod tc_ai_examples;
 #[path = "all/tc_approval_hold.rs"]
 mod tc_approval_hold;
+#[path = "all/tc_listen_window.rs"]
+mod tc_listen_window;
 #[path = "all/tc_money_transfer.rs"]
 mod tc_money_transfer;
 #[path = "all/tc_multi_replica.rs"]

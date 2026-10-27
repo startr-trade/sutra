@@ -1,0 +1,8 @@
+# Deployment package for the listen-window conformance suite: a looped receive task with an
+# interrupting timer boundary. `sutra package <this dir>` seals it into one .sutra archive.
+labels:
+  "module": "listen"
+  "tenant": "default"
+  "version": "1.0.0"
+engine:
+  minContract: 1

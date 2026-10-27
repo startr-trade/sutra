@@ -2081,13 +2081,14 @@ fn effective_def<'a>(deployment: &'a LoadedDeployment, pid: &str) -> Option<&'a 
 }
 
 /// The channels a node CONSUMES inbound on: a start-event spawn or an `imec` relay-wait
-/// (`MessageCatchEvent` / `UserTask`) node's own channels, plus any `<q:source channel>`
+/// (`MessageCatchEvent` / `ReceiveTask` / `UserTask`) node's own channels, plus any `<q:source channel>`
 /// binding on it. Empty ⇒ the node is not a channel consumer.
 fn consumed_channels(def: &ProcessDefinition, node_id: &str) -> Vec<String> {
     let mut channels: Vec<String> = Vec::new();
     if let Ok(
         Node::StartEvent { channels: ch, .. }
         | Node::MessageCatchEvent { channels: ch, .. }
+        | Node::ReceiveTask { channels: ch, .. }
         | Node::UserTask { channels: ch, .. },
     ) = def.node(node_id)
     {

@@ -31,7 +31,7 @@ Every walkthrough runs from the root of a checkout of this repository. It needs:
   `base64 -i <file>` wherever a walkthrough says `base64 -w0 <file>`);
 - an engine image and the `sutra` CLI, both **0.6.0 or later**.
 
-The compose files default to the published `ghcr.io/startr-trade/sutra:0.6.0` image, and
+The compose files default to the published `ghcr.io/startr-trade/sutra:0.6.1` image, and
 [Installation](getting-started/installation.md) installs the CLI. To run a walkthrough against
 your own checkout instead, build both from it:
 

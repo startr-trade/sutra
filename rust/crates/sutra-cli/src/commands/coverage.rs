@@ -712,7 +712,7 @@ fn intra_process_adjacency(procs: &[&ProcessDefinition]) -> Adjacency {
 }
 
 /// A channel-X consumer: a start-event `<q:source>` (spawn) or an `imec` relay-wait
-/// (`MessageCatchEvent`/`UserTask`, relay), with its inferred ack-mode + correlation key.
+/// (`MessageCatchEvent`/`ReceiveTask`/`UserTask`, relay), with its inferred ack-mode + correlation key.
 struct Consumer<'a> {
     process: &'a str,
     node: &'a str,
@@ -732,12 +732,15 @@ fn inter_process_hops(procs: &[&ProcessDefinition]) -> Vec<HopInfo> {
         for node in p.nodes() {
             let kind = match node {
                 Node::StartEvent { .. } => HopKind::Spawn,
-                Node::MessageCatchEvent { .. } | Node::UserTask { .. } => HopKind::Relay,
+                Node::MessageCatchEvent { .. }
+                | Node::ReceiveTask { .. }
+                | Node::UserTask { .. } => HopKind::Relay,
                 _ => continue,
             };
             let channels = match node {
                 Node::StartEvent { channels, .. }
                 | Node::MessageCatchEvent { channels, .. }
+                | Node::ReceiveTask { channels, .. }
                 | Node::UserTask { channels, .. } => channels,
                 _ => continue,
             };
@@ -2174,6 +2177,46 @@ mod tests {
     use super::*;
     use crate::output::run_captured;
     use crate::test_fixtures::scratch_dir;
+
+    /// A `<q:send>` into a channel a RECEIVE TASK of another process listens on is a relay hop,
+    /// exactly as it is into a message catch or a user task.
+    #[test]
+    fn a_send_into_a_receive_task_channel_is_a_relay_hop() {
+        let xml = r#"<?xml version="1.0"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0">
+  <bpmn:process id="emit">
+    <bpmn:startEvent id="S1"/>
+    <bpmn:sendTask id="Notify">
+      <bpmn:extensionElements><q:send channel="status-in"/></bpmn:extensionElements>
+    </bpmn:sendTask>
+    <bpmn:endEvent id="E1"/>
+    <bpmn:sequenceFlow id="a1" sourceRef="S1" targetRef="Notify"/>
+    <bpmn:sequenceFlow id="a2" sourceRef="Notify" targetRef="E1"/>
+  </bpmn:process>
+  <bpmn:process id="listen">
+    <bpmn:startEvent id="S2">
+      <bpmn:extensionElements><q:source channel="start-in"/></bpmn:extensionElements>
+    </bpmn:startEvent>
+    <bpmn:receiveTask id="Listen">
+      <bpmn:extensionElements><q:source channel="status-in"/></bpmn:extensionElements>
+    </bpmn:receiveTask>
+    <bpmn:endEvent id="E2"/>
+    <bpmn:sequenceFlow id="b1" sourceRef="S2" targetRef="Listen"/>
+    <bpmn:sequenceFlow id="b2" sourceRef="Listen" targetRef="E2"/>
+  </bpmn:process>
+</bpmn:definitions>"#;
+        let module = sutra_bpmn::BpmnModelLoader::new()
+            .load(xml.as_bytes())
+            .expect("BPMN loads");
+        let emit = module.process("emit").expect("emit");
+        let listen = module.process("listen").expect("listen");
+        let hops = inter_process_hops(&[emit, listen]);
+        assert_eq!(hops.len(), 1, "one hop into the receive task");
+        assert_eq!(hops[0].from, "emit:Notify");
+        assert_eq!(hops[0].to, "listen:Listen");
+        assert!(hops[0].kind == HopKind::Relay);
+    }
 
     const PKG_BPMN: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
