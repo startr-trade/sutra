@@ -1126,6 +1126,48 @@ impl ChannelEngine {
         self.release_pool_slots(pinned, instance_id).await;
     }
 
+    /// Settle a resumed step that could not be committed, and hand back the diagnostic to
+    /// surface.
+    ///
+    /// A [`ResumeCommitError::Refused`] step will be refused identically on every retry (its
+    /// emissions break their contract, its reply cannot render, its aliases cannot be
+    /// evaluated), so the instance fails exactly as it would had the executor itself raised the
+    /// error: listeners hear `on_instance_failed` (the audit journal's `INSTANCE_FAILED`, an
+    /// `on-complete` ack's settlement), then [`Self::mark_instance_failed`] persists the durable
+    /// FAILED step, which resolves the instance's wait and timer rows. Without this a timer fire
+    /// re-ran the whole tail on every backoff tick, forever, with the instance stuck SUSPENDED.
+    ///
+    /// A [`ResumeCommitError::Transient`] error is returned untouched: nothing was committed, the
+    /// instance is where it was, and the caller's retry (the timer poller's backoff, a broker's
+    /// redelivery) is the right response to a store that was briefly unavailable.
+    #[allow(clippy::too_many_arguments)]
+    async fn fail_refused_resume(
+        &self,
+        bridge: &Rc<dyn InstanceBridge>,
+        process: &ProcessDefinition,
+        pinned: &DeploymentId,
+        instance_id: &str,
+        snapshot: &SuspendedInstance,
+        labels: &BTreeMap<String, String>,
+        error: ResumeCommitError,
+    ) -> Diagnostic {
+        let cause = match error {
+            ResumeCommitError::Transient(d) => return d,
+            ResumeCommitError::Refused(d) => d,
+        };
+        self.executor.notify_instance_failed(
+            process,
+            instance_id,
+            pinned,
+            labels,
+            &cause.code,
+            &cause.message,
+        );
+        self.mark_instance_failed(bridge, pinned, instance_id, snapshot, &cause)
+            .await;
+        cause
+    }
+
     /// Take a start's capacity-pool slot when its channel draws from a pool (`pool:`): under a
     /// fresh admission key, since the instance id does not exist yet. A full pool is a
     /// busy-signal reject. A store failure ADMITS (fail-open, like the channel cap's count): a
@@ -2637,6 +2679,8 @@ impl ChannelEngine {
                 }
             };
 
+            // The labels the executor pass ran under, for a failure step's listener event.
+            let failure_labels = labels.clone();
             let outcome = self
                 .commit_resume_outcome(
                     bridge,
@@ -2651,7 +2695,23 @@ impl ChannelEngine {
                     reply_to,
                     Some((alias_name.to_string(), alias_value.to_string())),
                 )
-                .await?;
+                .await;
+            let outcome = match outcome {
+                Ok(outcome) => outcome,
+                Err(e) => {
+                    return Err(self
+                        .fail_refused_resume(
+                            bridge,
+                            &resume_process,
+                            &pinned,
+                            instance_id,
+                            &snapshot,
+                            &failure_labels,
+                            e,
+                        )
+                        .await)
+                }
+            };
             // The step committed under `pinned`; when that is the key we claimed under (the
             // ordinary case — a DRAINING-scope resume is the exception), the release already rode
             // that transaction and there is nothing left to hand back. A synchronous chain took
@@ -2716,6 +2776,10 @@ impl ChannelEngine {
     /// enqueue the step's emissions); SUSPENDED ⇒ re-park step (snapshot + resolved waits
     /// incl. cancelled timer rows + fresh wait/timer/alias rows + emissions) — each ONE
     /// transaction.
+    ///
+    /// The error says whether the step can EVER commit (see [`ResumeCommitError`]): a step the
+    /// engine refuses to commit is the caller's cue to fail the instance, while a store error
+    /// leaves the instance untouched for the caller's retry.
     #[allow(clippy::too_many_arguments)]
     async fn commit_resume_outcome(
         &self,
@@ -2730,7 +2794,8 @@ impl ChannelEngine {
         result: StatefulExecResult,
         reply_to: Option<RelayReplyContext>,
         relay_alias: Option<(String, String)>,
-    ) -> Result<DispatchOutcome, Diagnostic> {
+    ) -> Result<DispatchOutcome, ResumeCommitError> {
+        use ResumeCommitError::{Refused, Transient};
         match result {
             StatefulExecResult::Completed {
                 instance_id,
@@ -2744,14 +2809,16 @@ impl ChannelEngine {
                     "",
                     process,
                     &mut drained,
-                )?;
+                )
+                .map_err(Refused)?;
                 let emissions = to_outbox_emissions(drained, labels, traceparent);
                 // Terminal step: no longer in-flight — drop the row, resolve every wait
                 // point, retire the aliases, enqueue the step's emissions (a completed
                 // instance never lingers; its sends never miss the commit).
                 bridge
                     .commit_complete(pinned, &instance_id, &emissions)
-                    .await?;
+                    .await
+                    .map_err(Transient)?;
                 // §6.1: a resume pass committed (terminal) on this lane.
                 self.shard_metrics.resumed();
                 // The instance is terminal — free its channel_instance slot and its pool slots.
@@ -2763,15 +2830,20 @@ impl ChannelEngine {
                 // own delivery; outputs stay empty, never the resumed instance's raw variable
                 // map (the drive-relay contract).
                 let reply = match &reply_to {
-                    Some(to) => self.relay_reply(
-                        to,
-                        process,
-                        prior_snapshot,
-                        &instance_id,
-                        outputs,
-                        visited_nodes,
-                        false,
-                    )?,
+                    Some(to) => self
+                        .relay_reply(
+                            to,
+                            process,
+                            prior_snapshot,
+                            &instance_id,
+                            outputs,
+                            visited_nodes,
+                            false,
+                        )
+                        // The terminal step has committed: the instance is complete, so a
+                        // reply that fails to render is the caller's error alone, never a
+                        // reason to fail it.
+                        .map_err(Transient)?,
                     None => None,
                 };
                 Ok(DispatchOutcome::Completed {
@@ -2804,7 +2876,8 @@ impl ChannelEngine {
                     "",
                     process,
                     &mut drained,
-                )?;
+                )
+                .map_err(Refused)?;
                 // Synchronous calls reached by a resume a caller drives (a relay, a timer fire):
                 // the chain keeps the claim, makes the calls inline and ends with the one
                 // commit that fits the stored row.
@@ -2843,7 +2916,11 @@ impl ChannelEngine {
                                     relay_alias,
                                 },
                             );
-                            return self.launch_inline_chain(chain, drained, sync_sites).await;
+                            // The chain owns its failure handling (`abort_chain`).
+                            return self
+                                .launch_inline_chain(chain, drained, sync_sites)
+                                .await
+                                .map_err(Transient);
                         }
                         _ => self.warn_sync_degraded(
                             process,
@@ -2860,15 +2937,17 @@ impl ChannelEngine {
                 // respond-and-continue receipt (the tail then runs on its due-now timer), or the
                 // last destination-less `<q:reply>` the turn rendered.
                 let early_reply = match &reply_to {
-                    Some(to) => self.relay_reply(
-                        to,
-                        process,
-                        prior_snapshot,
-                        &instance_id,
-                        variables.clone(),
-                        completed_nodes.iter().cloned().collect(),
-                        !detached_reply,
-                    )?,
+                    Some(to) => self
+                        .relay_reply(
+                            to,
+                            process,
+                            prior_snapshot,
+                            &instance_id,
+                            variables.clone(),
+                            completed_nodes.iter().cloned().collect(),
+                            !detached_reply,
+                        )
+                        .map_err(Refused)?,
                     None => None,
                 };
                 let emissions = to_outbox_emissions(drained, labels, traceparent);
@@ -2910,7 +2989,8 @@ impl ChannelEngine {
                 // Waits THIS pass parked fresh record their alias rows (a loop's new iteration
                 // included); waits carried over from the prior pass keep the rows their own park
                 // step indexed.
-                let aliases = wait_alias_rows(process, &fresh_waits, &variables)?;
+                let aliases =
+                    wait_alias_rows(process, &fresh_waits, &variables).map_err(Refused)?;
                 let resolved = resolved_with_fresh(process, satisfied_node, &fresh_waits);
                 let retired = retired_wait_aliases(
                     process,
@@ -2932,7 +3012,8 @@ impl ChannelEngine {
                         &emissions,
                         &retired,
                     )
-                    .await?;
+                    .await
+                    .map_err(Transient)?;
                 // §6.1: a resume pass committed (re-park) on this lane.
                 self.shard_metrics.resumed();
                 self.flush_session_releases().await;
@@ -3358,7 +3439,7 @@ impl ChannelEngine {
             // Timer fires run outside any channel binding; labels ride empty on the step's
             // emissions (authoring labels are observability payload, never identity), and no
             // inbound traceparent exists to bridge.
-            let outcome = self
+            let outcome = match self
                 .commit_resume_outcome(
                     &bridge,
                     BTreeMap::new(),
@@ -3372,7 +3453,23 @@ impl ChannelEngine {
                     None,
                     None,
                 )
-                .await?;
+                .await
+            {
+                Ok(outcome) => outcome,
+                Err(e) => {
+                    return Err(self
+                        .fail_refused_resume(
+                            &bridge,
+                            &process,
+                            &pinned,
+                            &fire.instance_id,
+                            &snapshot,
+                            &BTreeMap::new(),
+                            e,
+                        )
+                        .await)
+                }
+            };
             // A synchronous chain carries the claim on; the poller's task drives it to its end.
             if let DispatchOutcome::InlineCalls(handoff) = outcome {
                 released_in_tx.set(true);
@@ -3560,20 +3657,41 @@ impl ChannelEngine {
                     });
                 }
             };
-            self.commit_resume_outcome(
-                &bridge,
-                BTreeMap::new(),
-                None,
-                &process,
-                &snapshot,
-                &pinned,
-                &fire.deployment,
-                &fire.node_id,
-                result,
-                None,
-                None,
-            )
-            .await?;
+            match self
+                .commit_resume_outcome(
+                    &bridge,
+                    BTreeMap::new(),
+                    None,
+                    &process,
+                    &snapshot,
+                    &pinned,
+                    &fire.deployment,
+                    &fire.node_id,
+                    result,
+                    None,
+                    None,
+                )
+                .await
+            {
+                Ok(_) => {}
+                Err(ResumeCommitError::Transient(d)) => return Err(d),
+                Err(refused @ ResumeCommitError::Refused(_)) => {
+                    // The same durable FAILED step as the executor-error arm above.
+                    self.fail_refused_resume(
+                        &bridge,
+                        &process,
+                        &pinned,
+                        &fire.instance_id,
+                        &snapshot,
+                        &BTreeMap::new(),
+                        refused,
+                    )
+                    .await;
+                    return Ok(ChannelCallPoisonOutcome::Failed {
+                        instance_id: fire.instance_id.clone(),
+                    });
+                }
+            }
             if pinned == fire.deployment {
                 released_in_tx.set(true);
             }
@@ -5170,6 +5288,25 @@ impl ChannelEngineBuilder {
 /// are built from the namespace by `ChannelBinding::labels`, so this is that function read
 /// backwards; a label the binding omitted (an empty module or version) comes back empty, which
 /// is exactly what the key held in the first place.
+/// Why a resumed step could not be committed — the one fact a resume path needs to decide
+/// whether the instance is dead.
+///
+/// The executor's pass succeeded, but committing it runs checks of its own first, and those
+/// checks are deterministic: a step they refuse is refused the same way on every retry. A store
+/// error is the opposite case, since the same step may well commit a moment later. Folding both
+/// into one `Diagnostic` left the callers unable to tell them apart, and they treated a refusal
+/// as a store error: the timer poller re-fired the step every backoff tick, forever.
+#[derive(Debug)]
+enum ResumeCommitError {
+    /// The engine refused to commit the step, before anything was written: an emission broke its
+    /// contract (`SUTRA.OUTBOUND.VALIDATION_REJECT`), the relay reply could not render, or a fresh
+    /// wait's alias could not be evaluated. The instance must fail.
+    Refused(Diagnostic),
+    /// Anything else: the store failed to commit, or the failure came after the step committed.
+    /// The instance is not failed; the caller's own retry policy applies.
+    Transient(Diagnostic),
+}
+
 fn module_key_of_labels(labels: &BTreeMap<String, String>) -> String {
     let get = |k: &str| labels.get(k).cloned().unwrap_or_default();
     format!("{}/{}/{}", get("tenant"), get("module"), get("version"))

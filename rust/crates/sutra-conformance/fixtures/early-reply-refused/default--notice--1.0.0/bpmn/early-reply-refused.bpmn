@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Respond-and-continue, then a send the codec refuses.
+
+    Start   : { id } on notice-start (ack-mode on-persist)
+    Accept  : template + <q:reply continue="true"> - the caller gets its 202 receipt HERE; the
+              instance parks and the engine self-resumes to run the rest detached
+    Render  : template - renders the notice body, which lacks the "ref" urn:notice requires
+    Notify  : <q:send codec="urn:notice"> - the read-back refuses the body, so the step cannot
+              commit, and the instance must end FAILED (once), not refire forever
+    Done    : end
+-->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0"
+                  id="Definitions_early_reply_refused"
+                  targetNamespace="urn:sutra:module:notice:1.0.0">
+  <bpmn:process id="early-reply-refused" isExecutable="true">
+    <bpmn:startEvent id="Start">
+      <bpmn:extensionElements><q:source channel="notice-start" name="req"/></bpmn:extensionElements>
+      <bpmn:outgoing>F1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="F1" sourceRef="Start" targetRef="Accept"/>
+    <bpmn:serviceTask id="Accept" implementation="accepted.hbs">
+      <bpmn:extensionElements>
+        <q:reply mode="native" continue="true" contentType="application/json"/>
+      </bpmn:extensionElements>
+      <bpmn:incoming>F1</bpmn:incoming><bpmn:outgoing>F2</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F2" sourceRef="Accept" targetRef="Render"/>
+    <bpmn:serviceTask id="Render" implementation="notice.hbs">
+      <bpmn:incoming>F2</bpmn:incoming><bpmn:outgoing>F3</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F3" sourceRef="Render" targetRef="Notify"/>
+    <bpmn:sendTask id="Notify">
+      <bpmn:extensionElements>
+        <q:send destination="http://notice-sink.invalid/notices" codec="urn:notice"/>
+      </bpmn:extensionElements>
+      <bpmn:incoming>F3</bpmn:incoming><bpmn:outgoing>F4</bpmn:outgoing>
+    </bpmn:sendTask>
+    <bpmn:sequenceFlow id="F4" sourceRef="Notify" targetRef="Done"/>
+    <bpmn:endEvent id="Done"><bpmn:incoming>F4</bpmn:incoming></bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>

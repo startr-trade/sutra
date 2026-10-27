@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- A notice must carry its Ref; the fixture's render deliberately leaves it out. -->
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           targetNamespace="urn:sutra:notice"
+           xmlns="urn:sutra:notice"
+           elementFormDefault="qualified">
+  <xs:element name="Notice">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element name="Ref" type="xs:string"/>
+        <xs:element name="Note" type="xs:string" minOccurs="0"/>
+      </xs:sequence>
+    </xs:complexType>
+  </xs:element>
+</xs:schema>

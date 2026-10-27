@@ -1,0 +1,3 @@
+# The contract every outbound notice must satisfy (`urn:notice`, stated on the q:send).
+schemaKind: xsd
+formats: [xml]

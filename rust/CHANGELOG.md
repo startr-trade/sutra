@@ -13,6 +13,33 @@ This is the changelog for the **Rust-native** engine (`rust/` workspace). It beg
 
 Nothing yet.
 
+## [0.6.2] — 2026-10-27
+
+A **patch** release with one fix: a resumed step that the engine refuses to commit now fails
+the instance, once. Before, a timer resume retried that step every few seconds, forever. No `q:`
+namespace change, no migration, and the snapshot format is unchanged; an instance parked by a
+0.6.1 engine resumes under 0.6.2.
+
+### Fixed
+
+- **A refused send after an early reply left the instance SUSPENDED, re-running its tail
+  forever.** Before a resumed step commits, the engine runs its own checks. One of them reads
+  back every `<q:send>` with the codec it names and refuses a message that breaks that codec's
+  contract (`SUTRA.OUTBOUND.VALIDATION_REJECT`). That refusal is deterministic, but on a timer
+  resume it was handled like a database error. The step was never marked FAILED, and the timer
+  poller fired it again every 5 s with no limit. Each fire re-ran the tail up to the refused send
+  and repeated its audit events and any external calls, while the instance stayed SUSPENDED. A
+  `<q:reply continue="true">` flow hit this most often, because everything after the early reply
+  runs on a timer resume. It also hit a timer catch, a timer boundary and a `<q:retry>` backoff
+  re-drive. On a relay resume, the error went back to the sender and a broker redelivered it
+  indefinitely. Now a step the engine refuses to commit fails the instance the way an executor
+  failure does. It is persisted as FAILED with the refusal's code (shown as `failureCode` on
+  `GET /sutra/instances/{id}`), its wait and timer rows are resolved so nothing fires again, and
+  listeners receive one `INSTANCE_FAILED`. That event is the audit journal's entry, and an
+  `on-complete` acknowledgement settles on it. The same applies when a relay reply cannot render
+  or a fresh wait's `<q:alias>` cannot be evaluated. A database error while committing is still
+  retried exactly as before.
+
 ## [0.6.1] — 2026-10-26
 
 A **patch** release with one fix: a message now reaches a process waiting at a `<receiveTask>`.

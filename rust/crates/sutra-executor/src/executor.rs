@@ -583,6 +583,35 @@ impl TokenExecutor {
         .await
     }
 
+    /// Tell every listener that an instance FAILED after its pass returned successfully.
+    ///
+    /// The caller is the dispatcher, when it refuses to commit a resumed pass (an emission that
+    /// breaks its contract, for one). The pass itself ended without error, so the executor never
+    /// sent `on_instance_failed`; without this the audit journal would show no `INSTANCE_FAILED`
+    /// for an instance that is now durably FAILED, and an `on-complete` acknowledgement waiting on
+    /// the instance's terminal event would never settle. The event is built exactly as a pass
+    /// builds its own, so it routes to the same audit sink.
+    pub fn notify_instance_failed(
+        &self,
+        process: &ProcessDefinition,
+        instance_id: &str,
+        deployment: &DeploymentId,
+        labels: &BTreeMap<String, String>,
+        code: &str,
+        message: &str,
+    ) {
+        let instance_event = InstanceEvent {
+            deployment: deployment.clone(),
+            labels: labels.clone(),
+            instance_id: instance_id.to_string(),
+            process_id: process.id.clone(),
+            module_version: process.module_version.clone(),
+            audit_sink: self.effective_audit_sink(process),
+        };
+        let d = ExecError::diag(code, message).to_diagnostic();
+        self.notify(|l| l.on_instance_failed(&instance_event, &d));
+    }
+
     /// Deliver a TASK FAILURE to a parked channel-call node from OUTSIDE the graph — today's
     /// one caller: the outbox terminally POISONED the node's request delivery
     /// (`sutra.outbox.retry.max-attempts` exhausted), so the in-flight attempt can never be

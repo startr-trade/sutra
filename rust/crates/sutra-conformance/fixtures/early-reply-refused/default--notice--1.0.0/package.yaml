@@ -1,0 +1,8 @@
+# Deployment package for the early-reply-refused conformance suite: a respond-and-continue flow
+# whose detached tail renders a message its declared codec refuses.
+labels:
+  "module": "notice"
+  "tenant": "default"
+  "version": "1.0.0"
+engine:
+  minContract: 1

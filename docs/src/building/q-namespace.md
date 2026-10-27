@@ -225,6 +225,13 @@ posture toward a validation failure has said nothing about handling one, so the 
 must not leave. Egress bound to a bare format, or to no codec, asserts no schema and is
 unaffected — there is nothing there to fail.
 
+Where the refusal lands depends on where the step runs. On a request the caller is driving, it
+comes back to that caller as the error, and nothing is persisted. On a resumed step (the tail
+after a `<q:reply continue="true">`, a timer, a `<q:retry>` re-drive, a relayed message), there
+may be no caller left to tell, so the instance fails instead. It is marked FAILED with this code
+(the `failureCode` on `GET /sutra/instances/{id}`), and its waits and timers are resolved so
+nothing re-runs.
+
 `sutra lint` moves what it can to package time. It reads a template's own *unrendered* text with
 the governing codec and compares the answer against `template-manifest.yaml` — `outputMessageType`,
 and `outputAttributes` for the codec-reported attributes. That works because a template is text

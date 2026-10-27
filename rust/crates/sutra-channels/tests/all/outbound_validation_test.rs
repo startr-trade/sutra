@@ -14,12 +14,12 @@ use sutra_channels::{CodecRegistry, Diagnostic, FormatRegistry, InboundChain, Va
 use sutra_codec_spi::{CodecValue, DecodeResult, IssueSeverity, PayloadCodec, ValidationIssue};
 use sutra_executor::DeploymentId;
 
-const CODEC: &str = "contract-codec";
+pub(crate) const CODEC: &str = "contract-codec";
 const CHANNEL: &str = "orders-out";
 
 /// A codec with a contract small enough to state in one line: the body must contain
 /// `<Document>`. Standing in for every schema-backed codec, whose real contract is an XSD.
-struct ContractCodec;
+pub(crate) struct ContractCodec;
 
 impl PayloadCodec for ContractCodec {
     fn name(&self) -> &str {

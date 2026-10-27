@@ -31,6 +31,8 @@ mod outbox_pool_test;
 mod relay_resume_test;
 #[path = "all/reply_encode_test.rs"]
 mod reply_encode_test;
+#[path = "all/resume_commit_refusal_test.rs"]
+mod resume_commit_refusal_test;
 #[path = "all/retry_redrive_test.rs"]
 mod retry_redrive_test;
 #[path = "all/select_predicate_test.rs"]
