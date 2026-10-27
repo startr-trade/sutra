@@ -13,6 +13,23 @@ This is the changelog for the **Rust-native** engine (`rust/` workspace). It beg
 
 Nothing yet.
 
+## [0.6.3] — 2026-10-27
+
+A **patch** release with no engine change: the `ai-advanced` example's model stub no longer carries
+a signing secret in its source. No `q:` namespace change and no migration.
+
+### Fixed
+
+- **A dev-only webhook secret in the `ai-advanced` example matched a provider secret pattern.**
+  GitHub secret scanning flagged `STUB_WEBHOOK_SECRET` in `examples/ai-advanced/deploy/compose.yaml`
+  and the `WEBHOOK_SECRET` constant in the conformance suite, because the value began with the
+  `whsec_` prefix of a payment provider's webhook signing secret. It was never a credential: it only
+  let the example's local model stub sign webhooks that the engine verified. The compose file now
+  reads `${STUB_WEBHOOK_SECRET:-<dev-only-default>}`, where the default is plain base64 with no
+  provider prefix, and the quick start still runs with no exports. The `tc_ai_` conformance suite
+  generates a fresh random secret for each run instead of keeping a literal. The verifier accepts
+  the secret with or without a `whsec_` prefix, so nothing else changed.
+
 ## [0.6.2] — 2026-10-27
 
 A **patch** release with one fix: a resumed step that the engine refuses to commit now fails

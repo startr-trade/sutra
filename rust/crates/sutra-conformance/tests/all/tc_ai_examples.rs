@@ -51,8 +51,18 @@ use crate::support::util;
 const SUITE: &str = "ai";
 const SUMMARIZE_KEY: &str = "ai-summarize-e2e-key";
 const ADVANCED_KEY: &str = "ai-advanced-e2e-key";
-/// The stub's webhook signing secret; the engine verifies with the same value.
-const WEBHOOK_SECRET: &str = "whsec_ZGV2LW9ubHktd2ViaG9vay1zZWNyZXQ=";
+/// The stub's webhook signing secret; the engine verifies with the same value. Random per
+/// process (32 bytes, base64; the `whsec_` prefix is optional to both verifiers), so no secret-shaped
+/// literal lives in source.
+fn webhook_secret() -> &'static str {
+    static SECRET: OnceLock<String> = OnceLock::new();
+    SECRET.get_or_init(|| {
+        use base64::Engine;
+        let mut bytes = [0u8; 32];
+        getrandom::getrandom(&mut bytes).expect("os randomness");
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    })
+}
 /// The stub's fixed answer.
 const SUMMARY: &str =
     "STUB SUMMARY: the customer reports a problem and asks for it to be looked at.";
@@ -80,7 +90,7 @@ fn stub() -> &'static Stub {
                         .with_access_mode(AccessMode::ReadOnly),
                 )
                 .with_cmd(["python3", "/stub/model-stub.py", "8000"])
-                .with_env_var("STUB_WEBHOOK_SECRET", WEBHOOK_SECRET)
+                .with_env_var("STUB_WEBHOOK_SECRET", webhook_secret())
                 .with_container_name(format!("ai-model-stub-{}", util::short_id()))
                 .start()
                 .expect("start python:3.12-alpine (docker required)");
@@ -150,7 +160,7 @@ fn boot_with(example: &str, variant: &str, hint: &str, extra_env: &[(&str, &str)
         .env("SUMMARIZE_API_KEY", SUMMARIZE_KEY)
         .env("AI_ADVANCED_API_KEY", ADVANCED_KEY)
         .env("LLM_API_KEY", "stub-not-a-real-key")
-        .env("STUB_WEBHOOK_SECRET", WEBHOOK_SECRET)
+        .env("STUB_WEBHOOK_SECRET", webhook_secret())
         .expected_deployments(1)
         .start(&archives);
     Fixture { pg, engine }

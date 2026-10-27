@@ -14,7 +14,7 @@ name: sutra-ai-advanced
 
 services:
   engine:
-    image: ${SUTRA_ENGINE_IMAGE:-ghcr.io/startr-trade/sutra:0.6.2}
+    image: ${SUTRA_ENGINE_IMAGE:-ghcr.io/startr-trade/sutra:0.6.3}
     environment:
       SUTRA_DEPLOYMENTS_DIR: /deployments
       SUTRA_HTTP_PORT: "8080"
@@ -30,9 +30,10 @@ services:
       # defined; the placeholders are never valid credentials.
       AI_ADVANCED_API_KEY: ${AI_ADVANCED_API_KEY:-dev-only-advanced-key}
       # `stub` variant: any non-empty key satisfies the stub, and the stub signs its webhooks
-      # with the same dev-only secret it is given below.
+      # with the same dev-only secret it is given below (plain base64, no provider prefix;
+      # override with `export STUB_WEBHOOK_SECRET=...`).
       LLM_API_KEY: ${LLM_API_KEY:-stub-not-a-real-key}
-      STUB_WEBHOOK_SECRET: whsec_ZGV2LW9ubHktd2ViaG9vay1zZWNyZXQ=
+      STUB_WEBHOOK_SECRET: ${STUB_WEBHOOK_SECRET:-ZGV2LW9ubHktc3R1Yi13ZWJob29rLXNlY3JldA==}
       # `live` variant: export the real values before `up`. Without a real OPENAI_WEBHOOK_SECRET
       # no webhook verifies (each is refused 401) and the webhook job completes by its
       # safety-net poll instead.
@@ -61,7 +62,7 @@ services:
     command: ["python3", "/stub/model-stub.py", "8000"]
     environment:
       # Signs the `-webhook` jobs' completion events (the engine verifies with the same value).
-      STUB_WEBHOOK_SECRET: whsec_ZGV2LW9ubHktd2ViaG9vay1zZWNyZXQ=
+      STUB_WEBHOOK_SECRET: ${STUB_WEBHOOK_SECRET:-ZGV2LW9ubHktc3R1Yi13ZWJob29rLXNlY3JldA==}
     volumes:
       - ../../ai-summarize/stub:/stub:ro
 

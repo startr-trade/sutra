@@ -38,6 +38,8 @@ zip = { workspace = true }
 serde_json = { workspace = true }
 # The tc_ai_ audio flows send and read back base64 audio.
 base64 = { workspace = true }
+# The stub's webhook signing secret is random per run, never a literal in source.
+getrandom = { workspace = true }
 sha2 = { workspace = true }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "sync"] }
 # HTTP client for the engine intake + Elasticsearch queries (rustls, no OpenSSL).
