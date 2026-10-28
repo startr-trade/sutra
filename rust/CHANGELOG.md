@@ -13,6 +13,47 @@ This is the changelog for the **Rust-native** engine (`rust/` workspace). It beg
 
 Nothing yet.
 
+## [0.6.4] — 2026-10-28
+
+A **patch** release that adds one backward-compatible feature: a timer's interval can come from a
+FEEL expression. Every literal timer behaves exactly as before. The snapshot format is unchanged,
+and an instance parked by a 0.6.3 engine resumes under 0.6.4. The `q:` namespace change is
+additive (`<q:retry>` delays widen from `xsd:duration` to duration-or-expression).
+
+### Added
+
+- **Timer intervals from FEEL.** The body of a `<timeDuration>`, `<timeDate>` or `<timeCycle>`, a
+  `<q:timeout duration>` and the `<q:retry initialDelay|maxDelay>` may each be a FEEL expression
+  instead of an ISO-8601 literal. The rule is literal first, else FEEL. A text that parses as a
+  literal is that literal. A text that looks like a literal but is written wrong (`PT5X`,
+  `2026-03-01`) keeps its load error. Any other text that parses as FEEL is evaluated once, when
+  the timer is armed, against the instance variables plus `config`. A duration may be an ISO-8601
+  string or a FEEL days-and-time duration, a date an instant string with a zone or a zoned FEEL
+  date and time, and a cycle a repeating-interval string. Only the instant it resolves to is
+  stored, so a resume, a replay or a restart never evaluates the expression again.
+- **`properties:` in `package.yaml`**, the deployment configuration a timer expression reads as
+  `config.<key>`. Values are literals or `env:NAME` / `${NAME}` / `${NAME:default}` references.
+  The archive seals them unresolved, and the engine resolves them when it activates the
+  deployment, so one archive can run with different intervals in each environment. Secret
+  references are refused. A timer **start event** may use an expression that reads `config`
+  only (`SUTRA.CONFIG.BPMN.TIMER_START_EXPRESSION_SCOPE`). A `config.<key>` that `properties:`
+  does not declare is a lint, package and deploy error (`SUTRA.CONFIG.BPMN.TIMER_CONFIG_UNDECLARED`),
+  and an unset reference refuses the deployment (`SUTRA.DEPLOY.PROPERTY_UNRESOLVED`).
+- **One failure, never a default.** An expression that returns null, the wrong type, an
+  unparseable string, or a negative, calendar-length or zone-less value when its timer is armed
+  fails the instance once with `SUTRA.RUNTIME.TIMER.EXPRESSION_INVALID`. It is not retried by
+  `<q:retry>` and not caught by an error boundary. On a start event, the deployment refuses to
+  activate instead.
+- `examples/delivery-window`: a receive task whose delivery window comes from the order, or
+  from `config.defaultWindow`.
+
+### Changed
+
+- `sutra lint` in the editor also reads `package.yaml`, for its `properties:`.
+- A timer text that is not literal-shaped and is valid FEEL (`tomorrow`, `soon`) used to be a load
+  error. It now loads as an expression, and the instance fails when the timer is armed if the
+  expression does not produce a usable value.
+
 ## [0.6.3] — 2026-10-27
 
 A **patch** release with no engine change: the `ai-advanced` example's model stub no longer carries

@@ -31,6 +31,8 @@ mod retry_policy_test;
 mod task_kinds_test;
 #[path = "all/time_skipping_retry_test.rs"]
 mod time_skipping_retry_test;
+#[path = "all/timer_expression_exec_test.rs"]
+mod timer_expression_exec_test;
 #[path = "all/token_executor_test.rs"]
 mod token_executor_test;
 #[path = "all/wait_loop_test.rs"]

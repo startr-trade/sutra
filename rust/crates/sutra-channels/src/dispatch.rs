@@ -1929,7 +1929,7 @@ impl ChannelEngine {
                 let sync_sites = if detached_reply {
                     Vec::new()
                 } else {
-                    self.sync_call_sites(process, deployment, &fresh_waits)
+                    self.sync_call_sites(process, deployment, &fresh_waits, &variables)
                 };
                 if !sync_sites.is_empty() {
                     let pinned = self.processes.find_in_module(deployment, &process.id);
@@ -2884,7 +2884,7 @@ impl ChannelEngine {
                 let sync_sites = if detached_reply {
                     Vec::new()
                 } else {
-                    self.sync_call_sites(process, pinned, &fresh_waits)
+                    self.sync_call_sites(process, pinned, &fresh_waits, &variables)
                 };
                 if !sync_sites.is_empty() {
                     let pinned_process = self.processes.find_in_module(pinned, &process.id);
@@ -3895,11 +3895,16 @@ impl ChannelEngine {
     /// The channel-call nodes among the pass's `fresh_waits` (the calls it just issued — a first
     /// arrival or a loop coming round again) whose outbound channel is synchronous, each with the inline caller its destination resolves to (`None`
     /// when this engine has none for the scheme).
+    ///
+    /// A call whose `<q:retry>` delay expression cannot be armed against `variables` gets no
+    /// caller either, so it degrades to the durable path, where the executor evaluates the delay
+    /// again only if a retry is ever armed (and fails the instance once if it still cannot).
     fn sync_call_sites(
         &self,
         process: &ProcessDefinition,
         deployment: &DeploymentId,
         fresh_waits: &[String],
+        variables: &sutra_executor::Variables,
     ) -> Vec<SyncCallSite> {
         let mut sites = Vec::new();
         for node_id in fresh_waits {
@@ -3913,9 +3918,25 @@ impl ChannelEngine {
             if !resolved.sync {
                 continue;
             }
+            let mut caller = self.inline_callers.resolve(&resolved.destination);
+            if let Some(policy) = process.retry_policy(node_id) {
+                if let Err(reason) = self
+                    .executor
+                    .resolve_retry_delays(deployment, policy, variables)
+                {
+                    tracing::warn!(
+                        code = codes::CHANNEL_SYNC_CALL_DEGRADED,
+                        process = %process.id,
+                        node = %node_id,
+                        "synchronous channel-call takes the async path: its <q:retry> delay \
+                         expression could not be armed ({reason})"
+                    );
+                    caller = None;
+                }
+            }
             sites.push(SyncCallSite {
                 node_id: node_id.clone(),
-                caller: self.inline_callers.resolve(&resolved.destination),
+                caller,
             });
         }
         sites
@@ -4058,6 +4079,24 @@ impl ChannelEngine {
                 continue;
             };
             let node_id = emission.node_id.clone();
+            // A retry delay expression that cannot be armed here sends the call down the durable
+            // path instead: there the executor evaluates it again when (and only when) a retry is
+            // armed, and fails the instance once if it still cannot.
+            let retry = match inline_retry(&self.executor, chain, &node_id) {
+                Ok(retry) => retry,
+                Err(reason) => {
+                    self.warn_sync_degraded(
+                        &chain.process,
+                        &[SyncCallSite {
+                            node_id: node_id.clone(),
+                            caller: None,
+                        }],
+                        &format!("its <q:retry> delay expression could not be armed: {reason}"),
+                    );
+                    chain.emissions.push(emission);
+                    continue;
+                }
+            };
             let mut request = self.inline_request(chain, emission);
             // The instance's audit routing and identity, for a caller that writes audit events
             // only (the same rule the outbox dispatcher applies).
@@ -4086,8 +4125,8 @@ impl ChannelEngine {
                 node_id: node_id.clone(),
                 request,
                 caller,
-                budget: inline_call_budget(&chain.process, &node_id),
-                retry: inline_retry(&chain.process, &node_id),
+                budget: inline_call_budget(&chain.process, &node_id, &chain.pending_timers),
+                retry,
                 stream,
             });
             chain.in_flight.insert(node_id);
@@ -4159,7 +4198,7 @@ impl ChannelEngine {
                 }
             }
             InlineCallResult::TimedOut => {
-                let boundary = inline_timeout_boundary(&process, &node_id);
+                let boundary = inline_timeout_boundary(&process, &node_id, &chain.pending_timers);
                 match boundary {
                     // No policy: the timeout boundary fires, exactly as a durable timer would
                     // — its modelled route, or the catchable timeout error.
@@ -4386,7 +4425,12 @@ impl ChannelEngine {
                         Err(d) => return self.abort_chain(chain, d).await,
                     }
                 }
-                let sites = self.sync_call_sites(&process, &chain.deployment, &fresh_waits);
+                let sites = self.sync_call_sites(
+                    &process,
+                    &chain.deployment,
+                    &fresh_waits,
+                    &chain.variables,
+                );
                 let (inline, degraded): (Vec<SyncCallSite>, Vec<SyncCallSite>) =
                     sites.into_iter().partition(|s| s.caller.is_some());
                 if !degraded.is_empty() {
@@ -5599,7 +5643,15 @@ fn channel_call_name(process: &ProcessDefinition, node_id: &str) -> Option<Strin
 }
 
 /// The interrupting timer boundaries on a call, with how long each allows from now.
-fn call_timeouts(process: &ProcessDefinition, node_id: &str) -> Vec<(String, std::time::Duration)> {
+///
+/// A FEEL-expression boundary (an expression `<q:timeout>` among them) was evaluated when the
+/// executor armed it, in the same pass that issued the call, so its budget is read from that
+/// armed row in `pending` rather than evaluated a second time.
+fn call_timeouts(
+    process: &ProcessDefinition,
+    node_id: &str,
+    pending: &[TimerWait],
+) -> Vec<(String, std::time::Duration)> {
     let mut out = Vec::new();
     for n in process.nodes() {
         let Node::BoundaryEvent {
@@ -5629,6 +5681,20 @@ fn call_timeouts(process: &ProcessDefinition, node_id: &str) -> Vec<(String, std
                     })
             }
             sutra_bpmn::timer::TimerDefinition::Cycle(_) => None,
+            sutra_bpmn::timer::TimerDefinition::Expression { .. } => pending
+                .iter()
+                .find(|t| &t.node_id == id)
+                .and_then(|t| {
+                    time::OffsetDateTime::parse(
+                        &t.due_at,
+                        &time::format_description::well_known::Rfc3339,
+                    )
+                    .ok()
+                })
+                .map(|due| {
+                    let left = due - time::OffsetDateTime::now_utc();
+                    std::time::Duration::try_from(left).unwrap_or_default()
+                }),
         };
         if let Some(allowed) = allowed {
             out.push((id.clone(), allowed));
@@ -5639,8 +5705,12 @@ fn call_timeouts(process: &ProcessDefinition, node_id: &str) -> Vec<(String, std
 
 /// A synchronous call's whole budget: its earliest interrupting timer boundary (the loader
 /// guarantees every channel-call has one).
-fn inline_call_budget(process: &ProcessDefinition, node_id: &str) -> std::time::Duration {
-    call_timeouts(process, node_id)
+fn inline_call_budget(
+    process: &ProcessDefinition,
+    node_id: &str,
+    pending: &[TimerWait],
+) -> std::time::Duration {
+    call_timeouts(process, node_id, pending)
         .into_iter()
         .map(|(_, d)| d)
         .min()
@@ -5648,24 +5718,37 @@ fn inline_call_budget(process: &ProcessDefinition, node_id: &str) -> std::time::
 }
 
 /// The boundary a synchronous call's timeout fires — the one that set its budget.
-fn inline_timeout_boundary(process: &ProcessDefinition, node_id: &str) -> Option<String> {
-    call_timeouts(process, node_id)
+fn inline_timeout_boundary(
+    process: &ProcessDefinition,
+    node_id: &str,
+    pending: &[TimerWait],
+) -> Option<String> {
+    call_timeouts(process, node_id, pending)
         .into_iter()
         .min_by_key(|(_, d)| *d)
         .map(|(id, _)| id)
 }
 
-/// A call task's `<q:retry>` resolved to durations (validated parseable at load).
-fn inline_retry(process: &ProcessDefinition, node_id: &str) -> Option<InlineRetry> {
-    let policy = process.retry_policy(node_id)?;
-    let parse = |raw: &str| sutra_bpmn::duration::parse_iso8601_duration(raw).unwrap_or_default();
-    Some(InlineRetry {
+/// A call task's `<q:retry>` resolved to durations: literals were validated at load; a FEEL
+/// delay is evaluated now, as the synchronous call arms its policy, against the chain's
+/// variables plus `config`. `Err` carries why an expression could not be armed.
+fn inline_retry(
+    executor: &sutra_executor::TokenExecutor,
+    chain: &InlineChain,
+    node_id: &str,
+) -> Result<Option<InlineRetry>, String> {
+    let Some(policy) = chain.process.retry_policy(node_id) else {
+        return Ok(None);
+    };
+    let (initial_delay, max_delay) =
+        executor.resolve_retry_delays(&chain.deployment, policy, &chain.variables)?;
+    Ok(Some(InlineRetry {
         max_attempts: policy.max_attempts,
-        initial_delay: parse(&policy.initial_delay),
+        initial_delay,
         backoff_coefficient: policy.backoff_coefficient,
-        max_delay: parse(&policy.max_delay),
+        max_delay,
         non_retryable_codes: policy.non_retryable_codes.clone(),
-    })
+    }))
 }
 
 fn now_rfc3339() -> String {

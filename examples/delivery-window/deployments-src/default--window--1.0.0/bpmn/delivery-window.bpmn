@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  A DELIVERY WINDOW whose length is data, not a literal:
+    startEvent (JSON on `order-placed`: { orderId, window? })
+      AwaitDelivery : receive task on `delivered`: { orderId }
+                      interrupting timer boundary WindowClosed, duration =
+                        payload.window when the order names one, else config.defaultWindow
+      -> Delivered (end)          a delivery inside the window
+      WindowClosed -> Late (end)  no delivery in time
+-->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0"
+                  id="Definitions_delivery_window"
+                  targetNamespace="urn:sutra:module:window:1.0.0">
+  <bpmn:process id="delivery-window" name="Wait for a delivery, or flag it late" isExecutable="true">
+    <bpmn:extensionElements>
+      <q:audit capture="metadata"/>
+    </bpmn:extensionElements>
+    <bpmn:startEvent id="Start">
+      <bpmn:extensionElements>
+        <q:source channel="order-placed"/>
+        <q:alias name="orderId" expression="payload.orderId" unique="true" onConflict="correlate"/>
+      </bpmn:extensionElements>
+      <bpmn:outgoing>F1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="F1" sourceRef="Start" targetRef="AwaitDelivery"/>
+    <bpmn:receiveTask id="AwaitDelivery" name="Wait for the delivery">
+      <bpmn:extensionElements>
+        <q:source channel="delivered" name="delivery"/>
+      </bpmn:extensionElements>
+      <bpmn:incoming>F1</bpmn:incoming>
+      <bpmn:outgoing>F2</bpmn:outgoing>
+    </bpmn:receiveTask>
+    <!-- Not a literal, so a FEEL expression: evaluated once, when AwaitDelivery parks. -->
+    <bpmn:boundaryEvent id="WindowClosed" name="No delivery in the window" attachedToRef="AwaitDelivery">
+      <bpmn:outgoing>F3</bpmn:outgoing>
+      <bpmn:timerEventDefinition id="WindowClosed_Timer">
+        <bpmn:timeDuration>if payload.window = null then config.defaultWindow else payload.window</bpmn:timeDuration>
+      </bpmn:timerEventDefinition>
+    </bpmn:boundaryEvent>
+    <bpmn:sequenceFlow id="F2" sourceRef="AwaitDelivery" targetRef="Delivered"/>
+    <bpmn:endEvent id="Delivered" name="Delivered in time"><bpmn:incoming>F2</bpmn:incoming></bpmn:endEvent>
+    <bpmn:sequenceFlow id="F3" sourceRef="WindowClosed" targetRef="Late"/>
+    <bpmn:endEvent id="Late" name="Late"><bpmn:incoming>F3</bpmn:incoming></bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>

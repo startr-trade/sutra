@@ -125,8 +125,10 @@ fn an_unparseable_delay_is_a_load_error() {
     ));
     assert_eq!(e.code, "SUTRA.CONFIG.BPMN.RETRY_POLICY_INVALID", "{e}");
 
+    // Literal-shaped but wrong: still a load error. (`soon` used to be the example here; it
+    // parses as FEEL, so it now loads as an expression — see timer_expression_test.)
     let e = expect_err(&task_process(
-        r#"<q:retry maxAttempts="3" maxDelay="soon"/>"#,
+        r#"<q:retry maxAttempts="3" maxDelay="PT5X"/>"#,
     ));
     assert_eq!(e.code, "SUTRA.CONFIG.BPMN.RETRY_POLICY_INVALID", "{e}");
 }

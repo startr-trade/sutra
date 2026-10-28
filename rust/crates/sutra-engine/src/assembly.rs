@@ -67,6 +67,13 @@ pub(crate) struct DeploymentPlan {
     /// schedule-driven module is exactly that case), so the plan holds it in its own right.
     pub(crate) namespace: sutra_channels::Namespace,
     modules: Vec<Arc<ProcessModule>>,
+    /// The RESOLVED deployment configuration (`package.yaml` `properties:` with its env
+    /// references substituted) — what timer expressions read as `config.<key>`.
+    pub(crate) config: Arc<std::collections::BTreeMap<String, String>>,
+    /// Timer START events whose timer is a FEEL expression, resolved at plan time against
+    /// `config` (no instance exists to read anything else): `(process id, node id)` → the
+    /// literal definition the schedule row is armed with.
+    resolved_start_timers: HashMap<(String, String), sutra_bpmn::timer::TimerDefinition>,
     templates: Vec<(String, Vec<u8>)>,
     scripts: Vec<(String, Vec<u8>)>,
     decisions: Vec<(String, Vec<u8>)>,
@@ -157,6 +164,18 @@ impl DeploymentPlan {
         for module in &self.modules {
             for process in module.processes() {
                 for (node_id, timer) in process.timer_start_events() {
+                    // An expression start timer was resolved (or refused) at plan time.
+                    let timer = if timer.is_expression() {
+                        match self
+                            .resolved_start_timers
+                            .get(&(process.id.clone(), node_id.to_string()))
+                        {
+                            Some(resolved) => resolved,
+                            None => continue,
+                        }
+                    } else {
+                        timer
+                    };
                     let due_at = match timer.first_due_at(now) {
                         Ok(due) => due,
                         Err(rejection) => {
@@ -1028,6 +1047,13 @@ pub(crate) fn plan_deployment(
         }
     }
 
+    // The deployment configuration and the timer expressions that read it — resolved here,
+    // fail-closed, so an unset env reference or an undeclared `config.<key>` is a DEPLOY error,
+    // never an instance failure.
+    let config = Arc::new(resolve_deployment_config(d)?);
+    check_timer_config_declared(&dep, &modules, &config)?;
+    let resolved_start_timers = resolve_start_timer_expressions(&dep, &modules, &config)?;
+
     let templates = d
         .templates
         .iter()
@@ -1414,6 +1440,8 @@ pub(crate) fn plan_deployment(
         dep,
         namespace: sutra_channels::Namespace::new(&d.tenant, &d.module, &d.version),
         modules,
+        config,
+        resolved_start_timers,
         templates,
         scripts,
         decisions,
@@ -1429,6 +1457,110 @@ pub(crate) fn plan_deployment(
         coverage_fault,
         openapi_spec,
     })
+}
+
+/// Resolve `properties:` — each value's `env:NAME` / `${NAME}` / `${NAME:default}` references
+/// substituted from this engine's environment. A secret-store scheme is refused (the
+/// configuration is readable by every timer expression); an unset variable without a default
+/// fails the plan, so the deployment does not activate.
+fn resolve_deployment_config(
+    d: &LoadedDeployment,
+) -> Result<std::collections::BTreeMap<String, String>, Box<dyn std::error::Error>> {
+    let mut out = std::collections::BTreeMap::new();
+    for (key, raw) in &d.properties {
+        let value = sutra_envref_spi::resolve_env_only(raw).map_err(|e| {
+            sutra_loader::LoaderError::new(
+                sutra_loader::error::codes::DEPLOY_PROPERTY_UNRESOLVED,
+                format!(
+                    "deployment {}: property '{key}' ('{raw}') cannot be resolved: {e}",
+                    d.id
+                ),
+            )
+        })?;
+        out.insert(key.clone(), value);
+    }
+    Ok(out)
+}
+
+/// Every `config.<key>` a timer expression reads must be a declared property. Lint and
+/// packaging say so first; this is the deploy-time backstop for an archive built elsewhere.
+fn check_timer_config_declared(
+    dep: &DeploymentId,
+    modules: &[Arc<ProcessModule>],
+    config: &std::collections::BTreeMap<String, String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for module in modules {
+        for process in module.processes() {
+            for node in process.nodes() {
+                for site in process.node_timer_expressions(node) {
+                    let keys = sutra_bpmn::timer::timer_expression_config_keys(&site.expression)
+                        .unwrap_or_default();
+                    if let Some(key) = keys.iter().find(|k| !config.contains_key(*k)) {
+                        return Err(Box::new(sutra_loader::LoaderError::new(
+                            sutra_bpmn::codes::CONFIG_BPMN_TIMER_CONFIG_UNDECLARED,
+                            format!(
+                                "deployment {dep}: process '{}' node '{}' {} expression '{}' \
+                                 reads config.{key}, which package.yaml does not declare under \
+                                 properties:",
+                                process.id, site.node_id, site.site, site.expression
+                            ),
+                        )));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Evaluate every expression-valued timer START event against `config` alone and resolve it to
+/// the literal its schedule row is armed with. A failure refuses the deployment.
+fn resolve_start_timer_expressions(
+    dep: &DeploymentId,
+    modules: &[Arc<ProcessModule>],
+    config: &std::collections::BTreeMap<String, String>,
+) -> Result<HashMap<(String, String), sutra_bpmn::timer::TimerDefinition>, Box<dyn std::error::Error>>
+{
+    let mut out = HashMap::new();
+    let config_value = sutra_feel::FeelValue::Map(
+        config
+            .iter()
+            .map(|(k, v)| (k.clone(), sutra_feel::FeelValue::String(v.clone())))
+            .collect(),
+    );
+    let context: sutra_feel::FeelContext = std::iter::once((
+        sutra_bpmn::timer::TIMER_CONFIG_ROOT.to_string(),
+        config_value,
+    ))
+    .collect();
+    for module in modules {
+        for process in module.processes() {
+            for (node_id, timer) in process.timer_start_events() {
+                let sutra_bpmn::timer::TimerDefinition::Expression { form, expression } = timer
+                else {
+                    continue;
+                };
+                let resolved = sutra_feel::expressions::eval(expression, &context)
+                    .map_err(|e| format!("it did not evaluate: {}", e.message))
+                    .and_then(|value| {
+                        sutra_bpmn::timer::resolve_timer_expression_value(*form, &value)
+                    })
+                    .map_err(|reason| {
+                        sutra_loader::LoaderError::new(
+                            sutra_bpmn::codes::RUNTIME_TIMER_EXPRESSION_INVALID,
+                            format!(
+                                "deployment {dep}: timer start '{node_id}' of process '{}' \
+                                 <{}> expression '{expression}' could not be armed: {reason}",
+                                process.id,
+                                form.element_name()
+                            ),
+                        )
+                    })?;
+                out.insert((process.id.clone(), node_id.to_string()), resolved);
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// A store's migrations from the archive's in-memory `migrations/**` map. The packager
@@ -1962,6 +2094,12 @@ pub(crate) fn build_engine(
     // The module resolver reads the SHARED process registry (an `Arc` bump per lane, not a copy
     // of every deployed graph).
     let module_resolver_view = Arc::clone(&shared.processes);
+    // Each live deployment's resolved configuration, for timer expressions (`config.<key>`).
+    let config_map: HashMap<String, Arc<std::collections::BTreeMap<String, String>>> = active
+        .iter()
+        .chain(draining.iter())
+        .map(|plan| (plan.dep.value().to_string(), Arc::clone(&plan.config)))
+        .collect();
     let mut builder = TokenExecutor::builder(TaskRegistry::new())
         .with_feel()
         .with_templates(
@@ -1985,6 +2123,7 @@ pub(crate) fn build_engine(
         .with_module_resolver(move |deployment, id| {
             module_resolver_view.find_in_module(deployment, id)
         })
+        .with_deployment_config(move |deployment| config_map.get(deployment.value()).cloned())
         .with_outbound_channels(Arc::clone(&shared.outbound_channels))
         .with_emission_sink(Rc::clone(&sink) as Rc<dyn sutra_executor::EmissionSink>);
     // TEST-ONLY (P1-7 time-skipping test runtime): `now_override` is `None` on every production
@@ -2706,6 +2845,7 @@ mod archive_artifact_tests {
             coverages: Vec::new(),
             channels_yaml: None,
             datastores_yaml: None,
+            properties: Default::default(),
             binding_dir: std::path::PathBuf::new(),
         }
     }
@@ -2784,6 +2924,95 @@ mod archive_artifact_tests {
         assert!(registry.resolve("field-rules.srl", &dep.id).is_some());
         let other = DeploymentId::of("dep-0000000000000000000000a2").expect("valid deployment id");
         assert!(registry.resolve("field-rules.srl", &other).is_none());
+    }
+
+    /// A timer-started process whose start waits `config.startAfter` and whose catch waits
+    /// `config.window`.
+    fn deployment_with_timer_config(properties: &[(&str, &str)]) -> LoadedDeployment {
+        const FLOW: &str = r#"<?xml version="1.0"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0" targetNamespace="urn:sutra:module:timers:1.0.0">
+  <bpmn:process id="nightly" isExecutable="true">
+    <bpmn:startEvent id="Tick">
+      <bpmn:timerEventDefinition><bpmn:timeDuration>config.startAfter</bpmn:timeDuration></bpmn:timerEventDefinition>
+    </bpmn:startEvent>
+    <bpmn:intermediateCatchEvent id="Wait">
+      <bpmn:timerEventDefinition><bpmn:timeDuration>config.window</bpmn:timeDuration></bpmn:timerEventDefinition>
+    </bpmn:intermediateCatchEvent>
+    <bpmn:endEvent id="E"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="Tick" targetRef="Wait"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="Wait" targetRef="E"/>
+  </bpmn:process>
+</bpmn:definitions>"#;
+        let mut d = deployment_with_redactor("unused.hbs", "/card\n");
+        d.redactors = BTreeMap::new();
+        let module = Arc::new(
+            sutra_bpmn::BpmnModelLoader::new()
+                .load(FLOW.as_bytes())
+                .expect("the flow loads"),
+        );
+        d.processes.insert("nightly".to_string(), module);
+        d.properties = properties
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        d
+    }
+
+    #[test]
+    fn a_start_timer_expression_is_armed_from_the_resolved_configuration() {
+        let dep = deployment_with_timer_config(&[
+            ("startAfter", "${SUTRA_TEST_UNSET_START_AFTER:PT1H}"),
+            ("window", "PT10M"),
+        ]);
+        let plan = plan_deployment(&dep).expect("the configuration resolves");
+        assert_eq!(plan.config["startAfter"], "PT1H", "the env default applied");
+        let now = time::macros::datetime!(2026-10-28 12:00:00 UTC);
+        let schedules = plan.timer_schedules(now);
+        assert_eq!(schedules.len(), 1);
+        assert_eq!(schedules[0].kind, "DURATION");
+        assert_eq!(
+            schedules[0].spec, "PT1H",
+            "the RESOLVED literal is what the row stores"
+        );
+        assert_eq!(
+            schedules[0].next_due_at,
+            time::macros::datetime!(2026-10-28 13:00:00 UTC)
+        );
+    }
+
+    #[test]
+    fn an_unresolvable_or_undeclared_or_unusable_configuration_fails_the_plan() {
+        let message = |dep: LoadedDeployment| match plan_deployment(&dep) {
+            Ok(_) => panic!("the plan must fail"),
+            Err(e) => e.to_string(),
+        };
+        // An env reference with no value and no default.
+        let m = message(deployment_with_timer_config(&[
+            ("startAfter", "env:SUTRA_TEST_UNSET_START_AFTER"),
+            ("window", "PT10M"),
+        ]));
+        assert!(m.contains("SUTRA.DEPLOY.PROPERTY_UNRESOLVED"), "{m}");
+        // A key the expressions read but the package does not declare.
+        let m = message(deployment_with_timer_config(&[("startAfter", "PT1H")]));
+        assert!(
+            m.contains("SUTRA.CONFIG.BPMN.TIMER_CONFIG_UNDECLARED"),
+            "{m}"
+        );
+        assert!(m.contains("config.window"), "{m}");
+        // A start expression whose value is not a duration.
+        let m = message(deployment_with_timer_config(&[
+            ("startAfter", "soon"),
+            ("window", "PT10M"),
+        ]));
+        assert!(m.contains("SUTRA.RUNTIME.TIMER.EXPRESSION_INVALID"), "{m}");
+        assert!(m.contains("Tick"), "{m}");
+        // A secret-store reference is never resolved into the configuration.
+        let m = message(deployment_with_timer_config(&[
+            ("startAfter", "PT1H"),
+            ("window", "secret:WINDOW"),
+        ]));
+        assert!(m.contains("SUTRA.DEPLOY.PROPERTY_UNRESOLVED"), "{m}");
     }
 
     #[test]
@@ -2877,6 +3106,7 @@ mod projected_store_wiring_tests {
             coverages: Vec::new(),
             channels_yaml: None,
             datastores_yaml: None,
+            properties: Default::default(),
             binding_dir: std::path::PathBuf::new(),
         }
     }

@@ -1925,3 +1925,107 @@ async fn a_turn_loop_with_a_sync_call_parks_the_next_turn_as_a_new_wait() {
         Some("commit_complete")
     );
 }
+
+// ---- expression-valued timers on a synchronous call ------------------------------------------
+
+fn leak(text: String) -> &'static str {
+    Box::leak(text.into_boxed_str())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sync_calls_timeout_expression_sets_its_budget_from_the_armed_boundary() {
+    // The expression resolves to PT0.5S from the request; the call never answers, so the
+    // boundary fires at that budget (not at a default), exactly as the literal does.
+    let bpmn = leak(SINGLE.replace(
+        r#"<q:timeout duration="PT0.5S"/>"#,
+        r#"<q:timeout duration="if req.order = &quot;o-1&quot; then &quot;PT0.5S&quot; else null"/>"#,
+    ));
+    let caller = FakeCaller::new(|_| {
+        Box::pin(async {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            json("{}")
+        })
+    });
+    let rig = rig(bpmn, Arc::clone(&caller), None);
+    let began = std::time::Instant::now();
+    let outcome = rig
+        .handle
+        .dispatch(start("k-1"))
+        .await
+        .expect("handled failure");
+    let DispatchOutcome::DeadLettered { detail, .. } = &outcome else {
+        panic!("expected the timeout to fail the flow, got {outcome:?}");
+    };
+    assert!(detail.contains(TIMEOUT_CODE), "{detail}");
+    assert!(
+        began.elapsed() < Duration::from_secs(10),
+        "the budget came from the expression: {:?}",
+        began.elapsed()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sync_calls_retry_delay_expression_is_armed_inline() {
+    let bpmn = leak(RETRIED.replace(
+        r#"initialDelay="PT0.01S""#,
+        r#"initialDelay="&quot;PT0.01S&quot;""#,
+    ));
+    let caller = FakeCaller::new(|n| {
+        Box::pin(async move {
+            if n < 2 {
+                retryable("UPSTREAM_BUSY")
+            } else {
+                json(r#"{"v":3}"#)
+            }
+        })
+    });
+    let rig = rig(bpmn, Arc::clone(&caller), None);
+    let outcome = rig
+        .handle
+        .dispatch(start("k-1"))
+        .await
+        .expect("the third attempt answers");
+    assert_eq!(caller.calls(), 3);
+    assert_eq!(reply_json(&outcome), serde_json::json!({"a": {"v": 3}}));
+    assert!(trace(&rig).is_empty(), "{:?}", trace(&rig));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sync_call_whose_retry_delay_cannot_be_armed_takes_the_durable_path() {
+    // `missing` is null: the inline policy cannot be armed, so the call is not made inline. It
+    // goes out through the outbox and the instance parks for its answer or its timeout; the
+    // durable path evaluates the delay again only if a retry is ever armed.
+    // The durable path correlates the answer by alias, so this variant declares one.
+    let bpmn = leak(
+        RETRIED
+            .replace(r#"initialDelay="PT0.01S""#, r#"initialDelay="missing""#)
+            .replace(
+                r#"<q:source channel="svc-answers" name="a"/>"#,
+                r#"<q:source channel="svc-answers" name="a"/><q:alias name="aKey" expression="event.dedupKey"/>"#,
+            ),
+    );
+    let caller = FakeCaller::new(|_| Box::pin(async { json(r#"{"v":1}"#) }));
+    let rig = rig(bpmn, Arc::clone(&caller), None);
+    rig.handle
+        .dispatch(start("k-1"))
+        .await
+        .expect("the chain parks");
+    assert_eq!(caller.calls(), 0, "no inline call was made");
+    let observed = rig.observed.lock().unwrap();
+    assert!(
+        observed.trace.contains(&"commit_park".to_string()),
+        "{:?}",
+        observed.trace
+    );
+    let (snapshot, _, timers, emissions) = &observed.parks[0];
+    assert_eq!(snapshot.waiting_nodes, vec!["A".to_string()]);
+    assert!(
+        timers.iter().any(|t| t.node_id == "A#timeout"),
+        "{timers:?}"
+    );
+    assert_eq!(
+        emissions.len(),
+        1,
+        "the request is an outbox row: {emissions:?}"
+    );
+}

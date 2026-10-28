@@ -256,8 +256,12 @@ pub struct OnValidationBinding {
 /// boundary node (`<taskId>#timeout`) from it, so the executor sees ONE timer shape.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TimeoutBinding {
-    /// ISO-8601 duration (validated parseable at load time).
+    /// ISO-8601 duration (validated parseable at load time), or a FEEL expression when
+    /// [`Self::duration_expression`] is set.
     pub duration: String,
+    /// `true` when `@duration` is a FEEL expression, evaluated when the synthesized boundary is
+    /// armed (literal first, else FEEL).
+    pub duration_expression: bool,
 }
 
 /// Parsed `<q:retry>` — the per-task retry policy on a `serviceTask`: a REGISTERED-TASK
@@ -293,14 +297,19 @@ pub struct RetryBinding {
     /// explicit "never retry" and is legal (it documents the intent in the model).
     pub max_attempts: u32,
     /// `@initialDelay` — ISO-8601 duration before attempt 2; default `PT1S`. Validated
-    /// parseable at load.
+    /// parseable at load, unless it is a FEEL expression ([`Self::initial_delay_expression`]).
     pub initial_delay: String,
+    /// `true` when `@initialDelay` is a FEEL expression, evaluated each time a backoff is armed.
+    pub initial_delay_expression: bool,
     /// `@backoffCoefficient` — the geometric growth factor; default `2.0`. Must be ≥ 1.0
     /// (a shrinking curve would re-hammer a failing dependency; `1.0` is a fixed delay).
     pub backoff_coefficient: f64,
     /// `@maxDelay` — the ISO-8601 ceiling the growing delay clamps at; default `PT5M`.
-    /// Must be ≥ [`Self::initial_delay`].
+    /// Must be ≥ [`Self::initial_delay`] (checked at load when both are literals, else when the
+    /// backoff is armed).
     pub max_delay: String,
+    /// `true` when `@maxDelay` is a FEEL expression, evaluated each time a backoff is armed.
+    pub max_delay_expression: bool,
     /// `@nonRetryableCodes` — comma-separated classification codes that SKIP the remaining
     /// attempts and fail the instance immediately (Temporal's `nonRetryableErrorTypes`).
     /// A failure's classification code is the leading `CODE:` token of the task's failure

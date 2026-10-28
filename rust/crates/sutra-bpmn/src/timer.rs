@@ -92,7 +92,52 @@ pub enum TimerDefinition {
     Date(String),
     /// `<bpmn:timeCycle>` — fire repeatedly on an ISO-8601 repeating interval (START events only).
     Cycle(TimerCycleSpec),
+    /// A FEEL expression in place of the literal, evaluated when the timer is ARMED and resolved
+    /// through [`resolve_timer_expression_value`] into one of the three literal variants. Only
+    /// the resolved form is ever persisted, so the expression is never evaluated again for the
+    /// same arming (a resume or replay reads the stored due-at).
+    Expression {
+        /// Which literal form the result must take.
+        form: TimerExpressionForm,
+        /// The FEEL source, as authored.
+        expression: String,
+    },
 }
+
+/// The literal form a timer text stands for — what a FEEL expression in its place must resolve
+/// to (see [`resolve_timer_expression_value`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimerExpressionForm {
+    /// A duration: `<timeDuration>`, `<q:timeout duration>`, `<q:retry initialDelay|maxDelay>`.
+    Duration,
+    /// An absolute instant: `<timeDate>`.
+    Date,
+    /// A repeating interval: `<timeCycle>` (start events only for an expression).
+    Cycle,
+}
+
+impl TimerExpressionForm {
+    /// The element name used in diagnostics.
+    pub fn element_name(self) -> &'static str {
+        match self {
+            TimerExpressionForm::Duration => "timeDuration",
+            TimerExpressionForm::Date => "timeDate",
+            TimerExpressionForm::Cycle => "timeCycle",
+        }
+    }
+}
+
+/// How the loader classified one timer text (see [`classify_timer_text`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TimerTextClass {
+    /// A valid ISO-8601 literal of the expected form — scheduled exactly as before.
+    Literal,
+    /// Not a literal, but valid FEEL — evaluated when the timer is armed.
+    Expression,
+}
+
+/// The name a timer expression reads the deployment configuration through (`config.<key>`).
+pub const TIMER_CONFIG_ROOT: &str = "config";
 
 /// The `kind` discriminator persisted on a durable schedule row: `DURATION`.
 pub const TIMER_KIND_DURATION: &str = "DURATION";
@@ -110,7 +155,17 @@ impl TimerDefinition {
             TimerDefinition::Duration(_) => TIMER_KIND_DURATION,
             TimerDefinition::Date(_) => TIMER_KIND_DATE,
             TimerDefinition::Cycle(_) => TIMER_KIND_CYCLE,
+            TimerDefinition::Expression { form, .. } => match form {
+                TimerExpressionForm::Duration => TIMER_KIND_DURATION,
+                TimerExpressionForm::Date => TIMER_KIND_DATE,
+                TimerExpressionForm::Cycle => TIMER_KIND_CYCLE,
+            },
         }
+    }
+
+    /// True when this definition is a FEEL expression still to be resolved at arm time.
+    pub fn is_expression(&self) -> bool {
+        matches!(self, TimerDefinition::Expression { .. })
     }
 
     /// The authored specification text — what the BPMN element actually said. Round-trips through
@@ -131,6 +186,7 @@ impl TimerDefinition {
                 out.push_str(&c.interval);
                 out
             }
+            TimerDefinition::Expression { expression, .. } => expression.clone(),
         }
     }
 
@@ -161,6 +217,11 @@ impl TimerDefinition {
         match self {
             TimerDefinition::Duration(_) | TimerDefinition::Date(_) => Some(1),
             TimerDefinition::Cycle(c) => c.repeats,
+            // Unknown until resolved; only a resolved definition is ever persisted.
+            TimerDefinition::Expression { form, .. } => match form {
+                TimerExpressionForm::Cycle => None,
+                _ => Some(1),
+            },
         }
     }
 
@@ -180,6 +241,11 @@ impl TimerDefinition {
                 Some(start) => parse_timer_instant(start),
                 None => Ok(now + parse_timer_duration(&c.interval)?),
             },
+            TimerDefinition::Expression { expression, .. } => {
+                Err(TimerSpecRejection::Malformed(format!(
+                    "the timer expression '{expression}' must be resolved before it is scheduled"
+                )))
+            }
         }
     }
 }
@@ -378,6 +444,252 @@ pub fn parse_timer_cycle(input: &str) -> Result<TimerCycleSpec, TimerSpecRejecti
         start_at: start_at.map(format_instant),
         interval: interval_text.trim().to_owned(),
     })
+}
+
+// ---- expression-valued timers ----------------------------------------------------------------
+
+/// True when `text` LOOKS like an attempted ISO-8601 literal of `form` — the shape that keeps a
+/// typo a LOAD error instead of letting it parse as a FEEL name (`PT5X`) or as FEEL arithmetic
+/// (`2026-03-01` is `2022` in FEEL).
+///
+/// - duration: `P`/`p` followed by a digit or `T` (`PT5X`, `P1M`);
+/// - date: four digits, `-`, two digits, `-`, two digits (`2026-03-01`, a zone-less instant);
+/// - cycle: `R`/`r` followed by digits only, or by anything containing `/` (`R`, `R0/PT1H`,
+///   `Rx/PT1H`).
+pub fn is_literal_shaped(form: TimerExpressionForm, text: &str) -> bool {
+    let t = text.trim();
+    let b = t.as_bytes();
+    match form {
+        TimerExpressionForm::Duration => {
+            let rest = t.strip_prefix(['+', '-']).unwrap_or(t);
+            let rb = rest.as_bytes();
+            rb.len() >= 2
+                && matches!(rb[0], b'P' | b'p')
+                && (rb[1].is_ascii_digit() || matches!(rb[1], b'T' | b't'))
+        }
+        TimerExpressionForm::Date => {
+            b.len() >= 10
+                && b[..4].iter().all(u8::is_ascii_digit)
+                && b[4] == b'-'
+                && b[5..7].iter().all(u8::is_ascii_digit)
+                && b[7] == b'-'
+                && b[8..10].iter().all(u8::is_ascii_digit)
+        }
+        TimerExpressionForm::Cycle => {
+            let Some(rest) = t.strip_prefix(['R', 'r']) else {
+                return false;
+            };
+            // `R`, `R5`, or anything `R…` with a `/` in it (`Rx/PT1H`): a cycle written wrong.
+            rest.chars().all(|c| c.is_ascii_digit()) || rest.contains('/')
+        }
+    }
+}
+
+/// Parse a timer expression as FEEL, with the spaced-builtin name table so `date and time(…)`
+/// parses exactly as it will at evaluation time.
+pub fn parse_timer_expression(text: &str) -> Result<sutra_feel::FeelExpr, sutra_feel::FeelError> {
+    sutra_feel::expressions::parse_with_context_names(
+        text.trim(),
+        &std::collections::HashSet::from([TIMER_CONFIG_ROOT.to_string()]),
+    )
+}
+
+/// Validate a timer text as a literal of `form` — the exact check the loader has always run.
+pub fn validate_timer_literal(
+    form: TimerExpressionForm,
+    text: &str,
+) -> Result<(), TimerSpecRejection> {
+    match form {
+        TimerExpressionForm::Duration => parse_timer_duration(text).map(|_| ()),
+        TimerExpressionForm::Date => parse_timer_instant(text).map(|_| ()),
+        TimerExpressionForm::Cycle => parse_timer_cycle(text).map(|_| ()),
+    }
+}
+
+/// Classify one timer text: **literal first, else FEEL**.
+///
+/// 1. A valid literal of `form` is [`TimerTextClass::Literal`].
+/// 2. A literal-shaped text ([`is_literal_shaped`]) that fails keeps the literal's rejection.
+/// 3. Anything else that parses as FEEL is [`TimerTextClass::Expression`].
+/// 4. Anything that is neither keeps the literal's rejection, with the FEEL parse error added to
+///    the reason (the rejection KIND is unchanged, so the loader's diagnostic code is too).
+pub fn classify_timer_text(
+    form: TimerExpressionForm,
+    text: &str,
+) -> Result<TimerTextClass, TimerSpecRejection> {
+    let literal = match validate_timer_literal(form, text) {
+        Ok(()) => return Ok(TimerTextClass::Literal),
+        Err(rejection) => rejection,
+    };
+    if text.trim().is_empty() || is_literal_shaped(form, text) {
+        return Err(literal);
+    }
+    match parse_timer_expression(text) {
+        Ok(_) => Ok(TimerTextClass::Expression),
+        Err(feel) => {
+            let reason = format!(
+                "{}; it is not a FEEL expression either ({})",
+                literal.reason(),
+                feel.message
+            );
+            Err(match literal {
+                TimerSpecRejection::UnsupportedForm(_) => {
+                    TimerSpecRejection::UnsupportedForm(reason)
+                }
+                TimerSpecRejection::Malformed(_) => TimerSpecRejection::Malformed(reason),
+            })
+        }
+    }
+}
+
+/// The root names a timer expression reads (`payload` for `payload.window`, `config` for
+/// `config.retryDelay`), deduplicated in source order. Used for the start-timer scope check.
+pub fn timer_expression_roots(text: &str) -> Result<Vec<String>, sutra_feel::FeelError> {
+    let expr = parse_timer_expression(text)?;
+    let mut roots: Vec<String> = Vec::new();
+    for path in sutra_feel::paths::extract(&expr) {
+        let root = path.root().to_string();
+        if !roots.contains(&root) {
+            roots.push(root);
+        }
+    }
+    Ok(roots)
+}
+
+/// The `config.<key>` keys a timer expression reads, deduplicated in source order.
+pub fn timer_expression_config_keys(text: &str) -> Result<Vec<String>, sutra_feel::FeelError> {
+    let expr = parse_timer_expression(text)?;
+    let mut keys: Vec<String> = Vec::new();
+    for path in sutra_feel::paths::extract(&expr) {
+        if path.root() == TIMER_CONFIG_ROOT {
+            if let Some(key) = path.segments.get(1) {
+                if !keys.contains(key) {
+                    keys.push(key.clone());
+                }
+            }
+        }
+    }
+    Ok(keys)
+}
+
+/// A short, human-readable rendering of a FEEL result for a diagnostic.
+fn describe_feel_value(value: &sutra_feel::FeelValue) -> String {
+    use sutra_feel::FeelValue as V;
+    match value {
+        V::Null => "null".to_owned(),
+        V::Boolean(b) => format!("the boolean {b}"),
+        V::Number(n) => format!("the number {n}"),
+        V::String(s) => format!("the string \"{s}\""),
+        V::Instant(..) => "a date and time".to_owned(),
+        V::Date(..) => "a date".to_owned(),
+        V::Time(..) => "a time".to_owned(),
+        V::Duration(sutra_feel::FeelDuration::YearsMonths(_)) => {
+            "a years-and-months duration".to_owned()
+        }
+        V::Duration(sutra_feel::FeelDuration::DaysTime(_)) => "a days-and-time duration".to_owned(),
+        V::List(_) => "a list".to_owned(),
+        V::Map(_) => "a context".to_owned(),
+        V::Function(_) | V::Invocable(_) => "a function".to_owned(),
+        V::Range(_) => "a range".to_owned(),
+    }
+}
+
+/// Turn a FEEL result into a non-negative duration: an ISO-8601 duration string (under the
+/// literal rules, so a calendar `P1M` is refused) or a FEEL days-and-time duration ≥ 0.
+pub fn duration_from_feel_value(
+    value: &sutra_feel::FeelValue,
+) -> Result<std::time::Duration, String> {
+    use sutra_feel::FeelValue as V;
+    match value {
+        V::String(s) => parse_timer_duration(s).map_err(|r| {
+            format!("it returned the string \"{s}\", which is not a usable duration: {r}")
+        }),
+        V::Duration(sutra_feel::FeelDuration::DaysTime(d)) => std::time::Duration::try_from(*d)
+            .map_err(|_| {
+                format!(
+                    "it returned the negative duration {d}; a timer cannot wait a negative time"
+                )
+            }),
+        V::Duration(sutra_feel::FeelDuration::YearsMonths(_)) => Err(
+            "it returned a years-and-months duration, which has no exact length; return a \
+             days-and-time duration or compute a date and time instead"
+                .to_owned(),
+        ),
+        other => Err(format!(
+            "it returned {}; a duration timer needs an ISO-8601 duration string or a FEEL \
+             days-and-time duration",
+            describe_feel_value(other)
+        )),
+    }
+}
+
+/// Turn a FEEL result into an absolute instant: an RFC 3339 string with a zone, or a FEEL date
+/// and time that carries an offset or zone. A zone-less value is refused, as the literal is.
+pub fn instant_from_feel_value(value: &sutra_feel::FeelValue) -> Result<OffsetDateTime, String> {
+    use sutra_feel::FeelValue as V;
+    match value {
+        V::String(s) => parse_timer_instant(s).map_err(|r| {
+            format!("it returned the string \"{s}\", which is not a usable instant: {r}")
+        }),
+        V::Instant(at, Some(_)) => Ok(*at),
+        V::Instant(_, None) => Err(
+            "it returned a date and time with no offset or zone; \"which clock?\" is not a \
+             question a durable timer may guess at"
+                .to_owned(),
+        ),
+        other => Err(format!(
+            "it returned {}; a timeDate timer needs an ISO-8601 instant string or a FEEL date \
+             and time with a zone",
+            describe_feel_value(other)
+        )),
+    }
+}
+
+/// Resolve a FEEL result into the literal [`TimerDefinition`] it stands for. The returned
+/// definition is what gets scheduled and persisted.
+pub fn resolve_timer_expression_value(
+    form: TimerExpressionForm,
+    value: &sutra_feel::FeelValue,
+) -> Result<TimerDefinition, String> {
+    match form {
+        TimerExpressionForm::Duration => {
+            let d = duration_from_feel_value(value)?;
+            // An ISO string result is kept as written (it is what an operator reads on a
+            // schedule row); a FEEL duration is rendered.
+            Ok(TimerDefinition::Duration(match value {
+                sutra_feel::FeelValue::String(s) => s.trim().to_string(),
+                _ => format_duration(d),
+            }))
+        }
+        TimerExpressionForm::Date => {
+            let at = instant_from_feel_value(value)?;
+            Ok(TimerDefinition::Date(format_instant(at)))
+        }
+        TimerExpressionForm::Cycle => match value {
+            sutra_feel::FeelValue::String(s) => parse_timer_cycle(s)
+                .map(TimerDefinition::Cycle)
+                .map_err(|r| {
+                    format!("it returned the string \"{s}\", which is not a usable cycle: {r}")
+                }),
+            other => Err(format!(
+                "it returned {}; a timeCycle timer needs an ISO-8601 repeating-interval string \
+                 (R/PT1H, R5/PT1H, R/<start>/PT1H)",
+                describe_feel_value(other)
+            )),
+        },
+    }
+}
+
+/// Render a duration as the ISO-8601 text a persisted definition carries (`PT<seconds>S`, with
+/// a fraction only when there is one).
+pub fn format_duration(d: std::time::Duration) -> String {
+    let nanos = d.subsec_nanos();
+    if nanos == 0 {
+        format!("PT{}S", d.as_secs())
+    } else {
+        let frac = format!("{nanos:09}");
+        format!("PT{}.{}S", d.as_secs(), frac.trim_end_matches('0'))
+    }
 }
 
 #[cfg(test)]

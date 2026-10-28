@@ -281,6 +281,9 @@ instead. Because a modelled outcome always beats a policy, a channel-call `<q:re
 route-less `<q:timeout>` form — a timer boundary with drawn outgoing flows alongside a retry
 policy is a load error.
 
+`@initialDelay` and `@maxDelay` may be FEEL expressions instead of literals, for example
+`initialDelay="config.retryDelay"`. They are evaluated each time a backoff is armed.
+
 Full treatment, including the re-drive's fresh-idempotency-key contract and what exhaustion does:
 [Retries, history, and schedules](retries-history-schedules.md#qretry--a-per-task-retry-policy).
 
@@ -297,6 +300,10 @@ Full treatment, including the re-drive's fresh-idempotency-key contract and what
 Synthesizes a timer boundary on the call, so a counterpart that never answers cannot park the
 instance forever. Without a `<q:retry>` alongside it, a fired route-less timeout is a catchable
 BPMN error; with one, it is a retryable task failure first.
+
+`@duration` may also be a FEEL expression, such as `duration="request.budget"` or
+`duration="config.callTimeout"`. It is evaluated when the call parks. See
+[Timer intervals from FEEL](retries-history-schedules.md#timer-intervals-from-feel).
 
 ## `q:stream` — stream a channel-call answer
 

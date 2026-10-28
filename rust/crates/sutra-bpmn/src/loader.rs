@@ -1221,6 +1221,21 @@ fn extract_timer_definition(
         // per-instance state and a snapshot format change. Rejecting it here keeps the engine
         // honest instead of silently firing forever on a bounded spec.
         if allow_cycle_on_boundary {
+            // A recurring boundary re-arms itself from its spec on every fire, so an expression
+            // there would be re-evaluated per fire against moving state: literal only.
+            if crate::timer::classify_timer_text(crate::timer::TimerExpressionForm::Cycle, &cycle)
+                == Ok(crate::timer::TimerTextClass::Expression)
+            {
+                return Err(err(
+                    codes::DISPATCH_TIMER_UNSUPPORTED,
+                    format!(
+                        "<{host_kind}> {host_id} declares a FEEL expression ('{cycle}') as the \
+                         <bpmn:timeCycle> of a non-interrupting boundary. A recurring boundary \
+                         takes an unbounded literal cycle only (R/<interval>); expression-valued \
+                         timers are supported on timeDuration and timeDate boundaries."
+                    ),
+                ));
+            }
             let spec = crate::timer::parse_timer_cycle(&cycle)
                 .map_err(|r| classify(r, codes::DISPATCH_TIMER_CYCLE_INVALID))?;
             if spec.repeats.is_some() {
@@ -1252,11 +1267,31 @@ fn extract_timer_definition(
                 ),
             ));
         }
+        if let Some(expression) = timer_expression(
+            crate::timer::TimerExpressionForm::Cycle,
+            &cycle,
+            host_id,
+            host_kind,
+        )
+        .map_err(|r| classify(r, codes::DISPATCH_TIMER_CYCLE_INVALID))?
+        {
+            return expression;
+        }
         let spec = crate::timer::parse_timer_cycle(&cycle)
             .map_err(|r| classify(r, codes::DISPATCH_TIMER_CYCLE_INVALID))?;
         return Ok(crate::timer::TimerDefinition::Cycle(spec));
     }
     if let Some(date) = date {
+        if let Some(expression) = timer_expression(
+            crate::timer::TimerExpressionForm::Date,
+            &date,
+            host_id,
+            host_kind,
+        )
+        .map_err(|r| classify(r, codes::DISPATCH_TIMER_DATE_INVALID))?
+        {
+            return expression;
+        }
         crate::timer::parse_timer_instant(&date)
             .map_err(|r| classify(r, codes::DISPATCH_TIMER_DATE_INVALID))?;
         // A date in the PAST is legal by design — it is simply already due and fires on the
@@ -1279,9 +1314,79 @@ fn extract_timer_definition(
             ),
         )
     })?;
+    if let Some(expression) = timer_expression(
+        crate::timer::TimerExpressionForm::Duration,
+        &duration,
+        host_id,
+        host_kind,
+    )
+    .map_err(|r| classify(r, codes::DISPATCH_TIMER_DURATION_INVALID))?
+    {
+        return expression;
+    }
     crate::timer::parse_timer_duration(&duration)
         .map_err(|r| classify(r, codes::DISPATCH_TIMER_DURATION_INVALID))?;
     Ok(crate::timer::TimerDefinition::Duration(duration))
+}
+
+/// Literal first, else FEEL ([`crate::timer::classify_timer_text`]) for one timer body.
+///
+/// `Ok(None)`: a literal — the caller validates and builds it exactly as before.
+/// `Ok(Some(..))`: an expression (or the start-scope error it violates).
+/// `Err`: neither — the literal's own rejection, which the caller maps to its usual code.
+#[allow(clippy::type_complexity)]
+fn timer_expression(
+    form: crate::timer::TimerExpressionForm,
+    text: &str,
+    host_id: &str,
+    host_kind: &str,
+) -> Result<
+    Option<Result<crate::timer::TimerDefinition, SutraError>>,
+    crate::timer::TimerSpecRejection,
+> {
+    match crate::timer::classify_timer_text(form, text)? {
+        crate::timer::TimerTextClass::Literal => Ok(None),
+        crate::timer::TimerTextClass::Expression => {
+            if host_kind == "startEvent" {
+                if let Err(e) = check_start_timer_scope(text, host_id) {
+                    return Ok(Some(Err(e)));
+                }
+            }
+            Ok(Some(Ok(crate::timer::TimerDefinition::Expression {
+                form,
+                expression: text.trim().to_string(),
+            })))
+        }
+    }
+}
+
+/// A start-timer expression may read the deployment configuration only: no instance exists
+/// when its schedule is armed.
+fn check_start_timer_scope(text: &str, host_id: &str) -> Result<(), SutraError> {
+    let roots = crate::timer::timer_expression_roots(text).unwrap_or_default();
+    let foreign: Vec<&str> = roots
+        .iter()
+        .map(String::as_str)
+        .filter(|r| *r != crate::timer::TIMER_CONFIG_ROOT)
+        .collect();
+    if foreign.is_empty() {
+        return Ok(());
+    }
+    Err(err(
+        codes::CONFIG_BPMN_TIMER_START_EXPRESSION_SCOPE,
+        format!(
+            "<startEvent> {host_id} timer expression '{}' reads {}. A start timer is armed when \
+             the deployment activates, before any instance exists, so its expression may read \
+             the deployment configuration only (config.<key>, declared under properties: in \
+             package.yaml).",
+            text.trim(),
+            foreign
+                .iter()
+                .map(|r| format!("'{r}'"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    ))
 }
 
 fn validate_duration(duration: &str, host_id: &str, host_kind: &str) -> Result<(), SutraError> {
@@ -2159,8 +2264,29 @@ fn parse_timeout(ext: &XmlElement, host_id: &str) -> Result<Option<TimeoutBindin
             ),
         ));
     }
-    validate_duration(&duration, host_id, "q:timeout")?;
-    Ok(Some(TimeoutBinding { duration }))
+    let duration_expression = match crate::timer::classify_timer_text(
+        crate::timer::TimerExpressionForm::Duration,
+        &duration,
+    ) {
+        Ok(crate::timer::TimerTextClass::Expression) => true,
+        Ok(crate::timer::TimerTextClass::Literal) => false,
+        Err(rejection) => {
+            return Err(err(
+                codes::DISPATCH_TIMER_DURATION_INVALID,
+                format!(
+                    "<q:timeout> {host_id} timer duration is invalid: {}",
+                    rejection.reason()
+                ),
+            ))
+        }
+    };
+    if !duration_expression {
+        validate_duration(&duration, host_id, "q:timeout")?;
+    }
+    Ok(Some(TimeoutBinding {
+        duration,
+        duration_expression,
+    }))
 }
 
 /// The `<q:retry initialDelay>` default — one second before the second attempt.
@@ -2203,33 +2329,49 @@ fn parse_retry(ext: &XmlElement, host_id: &str) -> Result<Option<RetryBinding>, 
         attr_trimmed(r, "initialDelay").unwrap_or_else(|| RETRY_DEFAULT_INITIAL_DELAY.to_string());
     let max_delay =
         attr_trimmed(r, "maxDelay").unwrap_or_else(|| RETRY_DEFAULT_MAX_DELAY.to_string());
-    let initial = parse_iso8601_duration(&initial_delay).map_err(|reason| {
-        err(
-            codes::CONFIG_BPMN_RETRY_POLICY_INVALID,
-            format!(
-                "<q:retry> on node {host_id} @initialDelay '{initial_delay}' is not a valid \
-                 ISO-8601 duration: {reason}"
-            ),
-        )
-    })?;
-    let ceiling = parse_iso8601_duration(&max_delay).map_err(|reason| {
-        err(
-            codes::CONFIG_BPMN_RETRY_POLICY_INVALID,
-            format!(
-                "<q:retry> on node {host_id} @maxDelay '{max_delay}' is not a valid ISO-8601 \
-                 duration: {reason}"
-            ),
-        )
-    })?;
-    if ceiling < initial {
-        return Err(err(
-            codes::CONFIG_BPMN_RETRY_POLICY_INVALID,
-            format!(
-                "<q:retry> on node {host_id} declares @maxDelay '{max_delay}' below \
+    // Literal first, else FEEL: a literal is validated exactly as before; an expression is
+    // evaluated each time a backoff is armed.
+    let retry_delay = |raw: &str, which: &str| -> Result<Option<std::time::Duration>, SutraError> {
+        let invalid = |reason: &str| {
+            err(
+                codes::CONFIG_BPMN_RETRY_POLICY_INVALID,
+                format!(
+                    "<q:retry> on node {host_id} @{which} '{raw}' is not a valid ISO-8601 \
+                     duration: {reason}"
+                ),
+            )
+        };
+        let reason = match parse_iso8601_duration(raw) {
+            Ok(d) => return Ok(Some(d)),
+            Err(reason) => reason,
+        };
+        let form = crate::timer::TimerExpressionForm::Duration;
+        if raw.trim().is_empty() || crate::timer::is_literal_shaped(form, raw) {
+            return Err(invalid(&reason));
+        }
+        match crate::timer::parse_timer_expression(raw) {
+            Ok(_) => Ok(None),
+            Err(feel) => Err(invalid(&format!(
+                "{reason}; it is not a FEEL expression either ({})",
+                feel.message
+            ))),
+        }
+    };
+    let initial = retry_delay(&initial_delay, "initialDelay")?;
+    let ceiling = retry_delay(&max_delay, "maxDelay")?;
+    let initial_delay_expression = initial.is_none();
+    let max_delay_expression = ceiling.is_none();
+    if let (Some(initial), Some(ceiling)) = (initial, ceiling) {
+        if ceiling < initial {
+            return Err(err(
+                codes::CONFIG_BPMN_RETRY_POLICY_INVALID,
+                format!(
+                    "<q:retry> on node {host_id} declares @maxDelay '{max_delay}' below \
                  @initialDelay '{initial_delay}'; the ceiling clamps the growing delay, so it \
                  can never be the smaller of the two."
-            ),
-        ));
+                ),
+            ));
+        }
     }
 
     let backoff_coefficient = match attr_trimmed(r, "backoffCoefficient") {
@@ -2278,8 +2420,10 @@ fn parse_retry(ext: &XmlElement, host_id: &str) -> Result<Option<RetryBinding>, 
     Ok(Some(RetryBinding {
         max_attempts,
         initial_delay,
+        initial_delay_expression,
         backoff_coefficient,
         max_delay,
+        max_delay_expression,
         non_retryable_codes,
     }))
 }
@@ -3033,9 +3177,14 @@ fn synthesize_timeout_boundaries(
             error_code: None,
             escalation_code: None,
             interrupting: true,
-            timer: Some(crate::timer::TimerDefinition::Duration(
-                timeout.duration.clone(),
-            )),
+            timer: Some(if timeout.duration_expression {
+                crate::timer::TimerDefinition::Expression {
+                    form: crate::timer::TimerExpressionForm::Duration,
+                    expression: timeout.duration.clone(),
+                }
+            } else {
+                crate::timer::TimerDefinition::Duration(timeout.duration.clone())
+            }),
         });
     }
     nodes.extend(synthesized);

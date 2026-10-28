@@ -72,6 +72,10 @@ pub struct ArchiveManifest {
     /// every audit routing change is a new, lineage-tracked deployment version. `None` ⇒ no default
     /// (absent from the serialization, so existing deploymentIds are unchanged).
     pub audit: Option<ProcessAudit>,
+    /// `properties` — the deployment configuration, as UNRESOLVED text (see
+    /// [`crate::properties`]). Identity-bearing like `audit`; emitted only when non-empty, so a
+    /// manifest without properties keeps its exact bytes and deploymentId.
+    pub properties: BTreeMap<String, String>,
     /// `artifacts[]` — EVERY entry in the archive except `manifest.yaml` itself.
     pub artifacts: Vec<ArtifactEntry>,
 }
@@ -92,6 +96,7 @@ impl ArchiveManifest {
             out.push_str(&format!("  sink: {}\n", quote(&audit.sink)));
             out.push_str(&format!("  capture: {}\n", quote(capture)));
         }
+        crate::properties::push_properties(&mut out, &self.properties);
         if self.labels.is_empty() {
             out.push_str("labels: {}\n");
         } else {
@@ -125,13 +130,14 @@ impl ArchiveManifest {
             .as_mapping()
             .ok_or_else(|| invalid("manifest.yaml must be a YAML mapping".to_string()))?;
 
-        const KNOWN_KEYS: [&str; 7] = [
+        const KNOWN_KEYS: [&str; 8] = [
             "manifestVersion",
             "engine",
             "labels",
             "supersedes",
             "entryProcesses",
             "audit",
+            "properties",
             "artifacts",
         ];
         for key in root.keys() {
@@ -212,6 +218,11 @@ impl ArchiveManifest {
             None
         };
 
+        let properties = match root.get(serde_yaml::Value::from("properties")) {
+            Some(value) => crate::properties::parse_properties(value, invalid)?,
+            None => BTreeMap::new(),
+        };
+
         let mut artifacts = Vec::new();
         let mut seen_paths = std::collections::BTreeSet::new();
         if let Some(value) = root.get(serde_yaml::Value::from("artifacts")) {
@@ -264,6 +275,7 @@ impl ArchiveManifest {
             supersedes,
             entry_processes,
             audit,
+            properties,
             artifacts,
         })
     }
@@ -487,16 +499,28 @@ pub fn read_archive_file(path: &Path) -> Result<LoadedArchive, LoaderError> {
 /// synthetic manifest supplies the audit default (none) plus the opaque tenant/module/version
 /// `labels`. The one hard prerequisite for building the model still rejects: a `.bpmn` entry that
 /// fails to parse returns its parse error (there is no process model to lint without it).
+///
+/// A `package.yaml` among the entries is not part of the archive interior: it is read only for
+/// its `properties:` (the `config.<key>` names timer expressions may read) and left out of the
+/// model. An unparseable one contributes nothing; the package lint reports it.
 pub fn deployment_from_entries(
     entries: &BTreeMap<String, Vec<u8>>,
     labels: BTreeMap<String, String>,
 ) -> Result<LoadedDeployment, LoaderError> {
+    let mut entries = entries.clone();
+    let properties = entries
+        .remove(crate::package::PACKAGE_FILE_NAME)
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .and_then(|text| crate::package::PackageConfig::parse(&text).ok())
+        .map(|config| config.properties)
+        .unwrap_or_default();
     let manifest = ArchiveManifest {
         labels,
+        properties,
         ..ArchiveManifest::default()
     };
     let id = deployment_id_of_manifest(manifest.to_yaml().as_bytes());
-    parse_deployment(&id, &manifest, entries)
+    parse_deployment(&id, &manifest, &entries)
 }
 
 fn read_archive_internal(
@@ -779,6 +803,7 @@ fn parse_deployment(
         coverages: Vec::new(),
         channels_yaml,
         datastores_yaml,
+        properties: manifest.properties.clone(),
         // No directory backs a sealed archive; migrations travel in-memory above.
         binding_dir: PathBuf::new(),
     };
@@ -853,6 +878,7 @@ mod tests {
                 sink: "sql".to_string(),
                 capture: AuditCapture::Payload,
             }),
+            properties: BTreeMap::from([("retryDelay".to_string(), "${RETRY:PT5S}".to_string())]),
             artifacts: vec![ArtifactEntry {
                 path: "bpmn/p.bpmn".to_string(),
                 sha256: "a".repeat(64),

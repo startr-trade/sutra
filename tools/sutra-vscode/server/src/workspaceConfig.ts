@@ -146,8 +146,9 @@ const DEPLOYMENT_TOP_DIRS = [
   'coverage',
 ] as const;
 
-/** The archive-interior top-level single files the loader recognises. */
-const DEPLOYMENT_TOP_FILES = ['channels.yaml', 'datastores.yaml'] as const;
+/** The top-level single files the loader recognises: the two archive-interior YAMLs, plus
+ *  `package.yaml`, whose `properties:` declare the `config.<key>` names timer expressions read. */
+const DEPLOYMENT_TOP_FILES = ['channels.yaml', 'datastores.yaml', 'package.yaml'] as const;
 
 /** Bounds so a pathological workspace never wedges the editor (best-effort gather). */
 const MAX_FILE_BYTES = 512 * 1024; // skip any single file larger than this

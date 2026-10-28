@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0"
+                  targetNamespace="urn:sutra:module:timers:1.0.0" id="Definitions_scheduled">
+  <!-- A timer START event armed from the deployment configuration: config.startAfter after the
+       deployment activates, the process runs once. -->
+  <bpmn:process id="te-scheduled" isExecutable="true">
+    <bpmn:extensionElements><q:audit capture="metadata"/></bpmn:extensionElements>
+    <bpmn:startEvent id="Tick">
+      <bpmn:timerEventDefinition><bpmn:timeDuration>config.startAfter</bpmn:timeDuration></bpmn:timerEventDefinition>
+    </bpmn:startEvent>
+    <bpmn:endEvent id="TickDone"/>
+    <bpmn:sequenceFlow id="t1" sourceRef="Tick" targetRef="TickDone"/>
+  </bpmn:process>
+</bpmn:definitions>

@@ -1,0 +1,29 @@
+# Channels for the window module, 1.0.0 — wait for a delivery, for as long as the order says.
+#
+#   POST /channels/orders             order-placed   { orderId, window? }  starts a delivery window
+#   POST /channels/orders/delivered   delivered      { orderId }           answers AwaitDelivery
+#
+# Every delivery is correlated to its instance by the start event's <q:alias> on orderId.
+
+channels:
+  - name: order-placed
+    transport: http
+    bind: "POST /channels/orders"
+    codec: json
+    cloudevents-mode: none
+    auth:
+      scheme: apikey
+      apikey:
+        value: env:WINDOW_API_KEY
+        header: X-Api-Key
+
+  - name: delivered
+    transport: http
+    bind: "POST /channels/orders/delivered"
+    codec: json
+    cloudevents-mode: none
+    auth:
+      scheme: apikey
+      apikey:
+        value: env:WINDOW_API_KEY
+        header: X-Api-Key

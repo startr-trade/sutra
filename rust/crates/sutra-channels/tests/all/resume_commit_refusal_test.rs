@@ -672,3 +672,68 @@ fn a_store_error_on_a_timer_resume_leaves_the_instance_for_the_retry() {
     );
     assert_eq!(rig.bridge.store.borrow().reparks, 1);
 }
+
+// ---- an expression timer that cannot be armed on a resume (expression-valued timers) ---------
+
+const TIMER_EXPRESSION_INVALID: &str = "SUTRA.RUNTIME.TIMER.EXPRESSION_INVALID";
+
+/// S → Wait (PT10S) → Work → Again (timer catch whose duration is the unset `missing`) → E.
+fn null_timer_after_a_resume() -> String {
+    definitions(
+        r#"<bpmn:startEvent id="S">
+      <bpmn:extensionElements><q:source channel="start-in" name="req"/></bpmn:extensionElements>
+    </bpmn:startEvent>
+    <bpmn:intermediateCatchEvent id="Wait">
+      <bpmn:timerEventDefinition><bpmn:timeDuration>PT10S</bpmn:timeDuration></bpmn:timerEventDefinition>
+    </bpmn:intermediateCatchEvent>
+    <bpmn:serviceTask id="Work" implementation="${work}"/>
+    <bpmn:intermediateCatchEvent id="Again">
+      <bpmn:timerEventDefinition><bpmn:timeDuration>missing</bpmn:timeDuration></bpmn:timerEventDefinition>
+    </bpmn:intermediateCatchEvent>
+    <bpmn:endEvent id="E"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="S" targetRef="Wait"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="Wait" targetRef="Work"/>
+    <bpmn:sequenceFlow id="f3" sourceRef="Work" targetRef="Again"/>
+    <bpmn:sequenceFlow id="f4" sourceRef="Again" targetRef="E"/>"#,
+    )
+}
+
+#[test]
+fn a_timer_expression_that_cannot_be_armed_on_a_resume_fails_the_instance_once() {
+    let rig = rig(&null_timer_after_a_resume());
+    start(&rig);
+    assert_eq!(rig.bridge.store.borrow().timers, ["Wait"]);
+
+    let err = fire(&rig, "Wait").expect_err("the next timer cannot be armed");
+    assert_eq!(err.code, TIMER_EXPRESSION_INVALID, "{err:?}");
+    {
+        let store = rig.bridge.store.borrow();
+        assert_eq!(store.failed.len(), 1, "one FAILED step: {:?}", store.failed);
+        assert_eq!(store.failed[0].0, TIMER_EXPRESSION_INVALID);
+        assert!(
+            store.failed[0].1.contains("Again") && store.failed[0].1.contains("null"),
+            "the cause names the timer and the result: {}",
+            store.failed[0].1
+        );
+        assert_eq!(store.reparks, 0, "nothing was re-parked");
+        assert!(store.timers.is_empty(), "no timer row is left to refire");
+        assert_eq!(
+            store.snapshot.as_ref().map(|s| s.status.as_str()),
+            Some("FAILED")
+        );
+    }
+    assert_eq!(
+        *rig.terminal.failed.borrow(),
+        [TIMER_EXPRESSION_INVALID],
+        "one INSTANCE_FAILED event"
+    );
+    assert_eq!(rig.work.get(), 1);
+
+    // A second fire of the same row runs nothing and fails nothing again: no silent default,
+    // no retry loop.
+    let again = fire(&rig, "Wait").expect_err("a FAILED instance is never resumed");
+    assert_eq!(again.code, INSTANCE_FAILED, "{again:?}");
+    assert_eq!(rig.work.get(), 1);
+    assert_eq!(rig.bridge.store.borrow().failed.len(), 1);
+    assert_eq!(rig.terminal.failed.borrow().len(), 1);
+}

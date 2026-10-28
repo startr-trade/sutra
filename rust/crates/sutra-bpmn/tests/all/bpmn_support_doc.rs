@@ -201,7 +201,8 @@ fn row(kind: NodeKind) -> Row {
             notes: "The process entry point. Triggered EITHER by an inbound message on one of its \
                     `<q:source channel>` channels OR by a timer schedule — never both; a start \
                     declaring both trigger contracts is rejected at load. A timer start arms a \
-                    durable schedule row at activation and fires with EMPTY variables.",
+                    durable schedule row at activation and fires with EMPTY variables; its \
+                    timer may be a FEEL expression over `config.<key>` only, resolved then.",
         },
         EndEvent => Row {
             xml: "`<endEvent>`",
@@ -255,7 +256,8 @@ fn row(kind: NodeKind) -> Row {
             wait: Wait::Yes,
             notes: "Parks a durable TIMER `waiting_event` row due at the resolved instant. \
                     `<timeDuration>` and `<timeDate>` only — `<timeCycle>` is rejected here (a \
-                    token cannot park at a node that fires repeatedly).",
+                    token cannot park at a node that fires repeatedly). Either may be a FEEL \
+                    expression instead of a literal, evaluated when the token arrives.",
         },
         BoundaryEvent => Row {
             xml: "`<boundaryEvent>`",
@@ -264,7 +266,9 @@ fn row(kind: NodeKind) -> Row {
             notes: "Attached to an activity. `BoundaryKind`: Error, Compensation, Escalation, \
                     Cancel, Timer. A timer boundary needs a wait-capable host (channel-call \
                     serviceTask / userTask) — it fires when the host's park outlives the \
-                    duration. `@cancelActivity=\"false\"` makes it non-interrupting.",
+                    duration. `@cancelActivity=\"false\"` makes it non-interrupting. A \
+                    `<timeDuration>` / `<timeDate>` may be a FEEL expression, evaluated when the \
+                    host parks.",
         },
         ServiceTask => Row {
             xml: "`<serviceTask implementation=\"…\">`",
@@ -538,6 +542,12 @@ fn render() -> String {
          message binding, correlation, retry, store and audit contracts. `xsd/q.xsd` is\n\
          authoritative for its exact shape — read it, not a design doc, when you need the\n\
          attributes an element supports.\n\n\
+         Every timer text — a `<timeDuration>`, `<timeDate>` or `<timeCycle>` body, a\n\
+         `<q:timeout duration>` and the `<q:retry>` delays — is a literal when it parses as one\n\
+         and a FEEL expression otherwise, evaluated once when the timer is armed against the\n\
+         instance variables plus `config` (the `package.yaml` `properties:`). A result that is\n\
+         not a usable interval fails the instance once with\n\
+         `SUTRA.RUNTIME.TIMER.EXPRESSION_INVALID`.\n\n\
          One of those contracts changes what a transport does, so it is stated here: a process's\n\
          `<q:audit capture>` is `none`, `metadata` (the default), `payload` (events carry the\n\
          redacted variable snapshot) or `media` (metadata-level events, every request the process\n\

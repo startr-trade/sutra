@@ -120,7 +120,9 @@ fn timer_boundary_parses_with_a_date() {
 /// one. Keeping the two apart is the whole point of the three-way diagnostic split.
 #[test]
 fn an_unparseable_time_date_is_date_invalid() {
-    for bad in ["x", "", "2026-03-01", "2026-03-01T09:30:00", "tomorrow"] {
+    // `x` and `tomorrow` used to be here: they are not literal-shaped and they parse as FEEL,
+    // so since expression-valued timers they load as expressions (timer_expression_test).
+    for bad in ["", "2026-03-01", "2026-03-01T09:30:00", "2026-03-01 09:30"] {
         let bpmn = defs(&format!(
             r#"
             <bpmn:startEvent id="S"/>

@@ -49,11 +49,15 @@
 //!   minContract: 1        #   minimum engine-contract level (default 1)
 //! entryProcesses:         # optional override of the derived entry-process index —
 //!   - transfer            #   every named id must be a process the package defines;
-//! ```                     #   omitted = derived (processes with channel-subscribed
-//!                         #   start events), sorted by process id
+//! properties:             # optional deployment configuration, read by timer
+//!   window: "${WINDOW:PT10S}"  # expressions as config.<key>; literals or env refs,
+//! ```                     #   sealed unresolved (see [`crate::properties`])
+//!
+//! `entryProcesses` omitted = derived (processes with channel-subscribed start events),
+//! sorted by process id.
 //!
 //! `package.yaml` itself does not travel: its content is absorbed into the archive's
-//! `manifest.yaml` (labels, `engine.minContract`, `entryProcesses`).
+//! `manifest.yaml` (labels, `engine.minContract`, `entryProcesses`, `audit`, `properties`).
 //!
 //! # Library surface
 //!
@@ -188,6 +192,9 @@ pub struct PackageConfig {
     /// `manifest.yaml`. Identity-bearing: changing it remints the deploymentId (consistent with a
     /// process/node `<q:audit>` change, which already does via the `.bpmn` artifact hash).
     pub audit: Option<ProcessAudit>,
+    /// `properties:` — the deployment configuration (key → UNRESOLVED text), sealed into the
+    /// manifest and read by timer expressions as `config.<key>` (see [`crate::properties`]).
+    pub properties: BTreeMap<String, String>,
 }
 
 impl PackageConfig {
@@ -205,13 +212,13 @@ impl PackageConfig {
             .as_mapping()
             .ok_or_else(|| invalid("package.yaml must be a YAML mapping".to_string()))?;
 
-        const KNOWN_KEYS: [&str; 4] = ["labels", "engine", "entryProcesses", "audit"];
+        const KNOWN_KEYS: [&str; 5] = ["labels", "engine", "entryProcesses", "audit", "properties"];
         for key in root.keys() {
             let name = key.as_str().unwrap_or("<non-string>");
             if !KNOWN_KEYS.contains(&name) {
                 return Err(invalid(format!(
                     "package.yaml declares unknown key '{name}' (the schema is \
-                     closed: labels, engine, entryProcesses)"
+                     closed: labels, engine, entryProcesses, audit, properties)"
                 )));
             }
         }
@@ -304,11 +311,17 @@ impl PackageConfig {
             None
         };
 
+        let properties = match root.get(serde_yaml::Value::from("properties")) {
+            Some(value) => crate::properties::parse_properties(value, invalid)?,
+            None => BTreeMap::new(),
+        };
+
         Ok(PackageConfig {
             labels,
             engine_min_contract,
             entry_processes,
             audit,
+            properties,
         })
     }
 
@@ -344,6 +357,7 @@ impl PackageConfig {
             out.push_str(&format!("  sink: {}\n", quote(&audit.sink)));
             out.push_str(&format!("  capture: {}\n", quote(capture)));
         }
+        crate::properties::push_properties(&mut out, &self.properties);
         out
     }
 
@@ -512,6 +526,7 @@ fn scan_package_dir(package_dir: &Path) -> Result<ScannedPackage, LoaderError> {
         coverages: Vec::new(),
         channels_yaml: scanner::read_optional(&package_dir.join("channels.yaml"))?,
         datastores_yaml: scanner::read_optional(&package_dir.join("datastores.yaml"))?,
+        properties: config.properties.clone(),
         binding_dir: package_dir.to_path_buf(),
     };
 
@@ -630,6 +645,7 @@ fn package_dir_deployment(
             .unwrap_or(ENGINE_MIN_CONTRACT),
         entry_processes,
         scanned.config.audit.clone(),
+        scanned.config.properties.clone(),
         options.schema_emitter.as_deref(),
     )
 }
@@ -682,6 +698,7 @@ fn seal_deployment(
     engine_min_contract: u64,
     entry_processes: Vec<String>,
     audit: Option<ProcessAudit>,
+    properties: BTreeMap<String, String>,
     schema_emitter: Option<&dyn CompiledSchemaEmitter>,
 ) -> Result<(ArchiveManifest, Vec<u8>), LoaderError> {
     let mut entries: BTreeMap<String, Vec<u8>> = BTreeMap::new();
@@ -767,6 +784,7 @@ fn seal_deployment(
         supersedes: Vec::new(),
         entry_processes,
         audit,
+        properties,
         artifacts: entries
             .iter()
             .map(|(path, bytes)| ArtifactEntry {
@@ -857,6 +875,10 @@ mod tests {
                 sink: "jsonl".to_string(),
                 capture: AuditCapture::Payload,
             }),
+            properties: BTreeMap::from([
+                ("listenWindow".to_string(), "PT10M".to_string()),
+                ("retryDelay".to_string(), "${RETRY_DELAY:PT30S}".to_string()),
+            ]),
         };
         let yaml = config.to_yaml();
         assert_eq!(PackageConfig::parse(&yaml).unwrap(), config);

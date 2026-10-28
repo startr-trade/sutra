@@ -1,0 +1,50 @@
+# Channels for the timer-expressions conformance suite.
+#
+#   POST /channels/te/catch    { id, wait }     a timer catch waits `payload.wait`
+#   POST /channels/te/listen   { id, window }   a receive task listens for `payload.window`
+#   POST /channels/te/status   { id }           answers the receive task
+#   POST /channels/te/retry    { id }           a channel-call retried after `config.retryDelay`
+#   POST /channels/te/null     { id }           a timer whose expression is null
+#
+# te-down is an outbound channel nobody listens on: every request times out.
+
+channels:
+  - name: te-catch
+    transport: http
+    bind: "POST /channels/te/catch"
+    codec: json
+    cloudevents-mode: none
+    auth: { scheme: apikey, apikey: { value: env:TE_API_KEY, header: X-Api-Key } }
+
+  - name: te-listen
+    transport: http
+    bind: "POST /channels/te/listen"
+    codec: json
+    cloudevents-mode: none
+    auth: { scheme: apikey, apikey: { value: env:TE_API_KEY, header: X-Api-Key } }
+
+  - name: te-status
+    transport: http
+    bind: "POST /channels/te/status"
+    codec: json
+    cloudevents-mode: none
+    auth: { scheme: apikey, apikey: { value: env:TE_API_KEY, header: X-Api-Key } }
+
+  - name: te-retry
+    transport: http
+    bind: "POST /channels/te/retry"
+    codec: json
+    cloudevents-mode: none
+    auth: { scheme: apikey, apikey: { value: env:TE_API_KEY, header: X-Api-Key } }
+
+  - name: te-null
+    transport: http
+    bind: "POST /channels/te/null"
+    codec: json
+    cloudevents-mode: none
+    auth: { scheme: apikey, apikey: { value: env:TE_API_KEY, header: X-Api-Key } }
+
+  - name: te-down
+    direction: outbound
+    transport: http
+    bind: "http://127.0.0.1:9/never"

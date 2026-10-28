@@ -239,10 +239,201 @@ Two rules keep cycles honest:
 A start event carrying both a `<q:source>` and a timer definition is a load error — a start is
 triggered by a message or by a clock, never ambiguously by both.
 
+## Timer intervals from FEEL {#timer-intervals-from-feel}
+
+*Since 0.6.4.* Every interval above can be computed instead of written down. That covers the body
+of a `<timeDuration>`, `<timeDate>` or `<timeCycle>`, a `<q:timeout duration>`, and a
+`<q:retry initialDelay>` or `maxDelay`. The rule is **literal first, else FEEL**:
+
+| The text | What it is |
+|---|---|
+| parses as an ISO-8601 literal of its form (`PT30M`, `2026-12-31T23:59:00Z`, `R3/PT12H`) | that literal, exactly as before |
+| looks like a literal but is written wrong (`PT5X`, `P1M`, `2026-03-01`, `R0/PT1H`) | a load error, with the same code as before |
+| anything else that parses as FEEL (`payload.window`, `config.retryDelay`) | an expression |
+| anything else | a load error |
+
+An expression is evaluated **once, when its timer is armed**:
+
+| Timer | Armed when | The expression can read |
+|---|---|---|
+| intermediate catch (also an event-based gateway arm) | the token arrives | the instance's variables and `config` |
+| boundary (`timeDuration`, `timeDate`) | the host activity parks | the instance's variables and `config` |
+| `<q:timeout>` | the call parks (it is a boundary) | the instance's variables and `config` |
+| `<q:retry>` delays | each failed attempt arms its backoff | the instance's variables and `config` |
+| start event (`timeDuration`, `timeDate`, `timeCycle`) | the deployment activates | `config` only |
+
+The instance's variables are whatever the instance holds at that moment: the payload, a DMN
+decision's output, a value read from a store. `config` holds the deployment's
+[`properties:`](deployment-packages.md#properties--deployment-configuration), all as strings. A
+start event has no instance yet, so its expression may read `config` and nothing else.
+
+What the expression must return:
+
+| Form | Accepted |
+|---|---|
+| duration | an ISO-8601 duration string, or a FEEL days-and-time duration (`duration("PT" + string(n) + "S")`) |
+| date | an instant string with a zone, or a FEEL `date and time` with an offset or zone |
+| cycle | a repeating-interval string (`R/PT1H`) |
+
+A null, a number, a negative or calendar-length duration (`P1M`), an instant with no zone, or
+any other value fails the instance **once** with `SUTRA.RUNTIME.TIMER.EXPRESSION_INVALID`. It
+gets no default and no retry: `<q:retry>` does not count the failure, and an error boundary does
+not catch it. If the timer is armed by the request that starts the instance, the request is
+refused with that code and nothing is stored. On a start event, the deployment refuses to
+activate.
+
+Only the instant the expression resolves to is stored: the wait row's due time, the retry
+backoff, the schedule row's spec. A resume, a replay, a restart or a replica hand-off reads that
+instant and never evaluates the expression again. A loop that comes back to the timer arms it
+again, so the expression is evaluated again.
+
+### Walkthrough: a delivery window
+
+`examples/delivery-window` waits at a receive task for a delivery and flags the order late when
+the window closes. The order can name its own window. Otherwise the window is the deployment's
+default:
+
+```
+POST /channels/orders             { orderId, window? }
+  AwaitDelivery   receive task, answered on POST /channels/orders/delivered { orderId }
+                  boundary WindowClosed: payload.window, else config.defaultWindow
+  -> Delivered    a delivery inside the window
+  -> Late         the window closed first
+```
+
+```xml
+<bpmn:boundaryEvent id="WindowClosed" name="No delivery in the window" attachedToRef="AwaitDelivery">
+  <bpmn:outgoing>F3</bpmn:outgoing>
+  <bpmn:timerEventDefinition id="WindowClosed_Timer">
+    <bpmn:timeDuration>if payload.window = null then config.defaultWindow else payload.window</bpmn:timeDuration>
+  </bpmn:timerEventDefinition>
+</bpmn:boundaryEvent>
+```
+
+```yaml
+# package.yaml
+properties:
+  defaultWindow: "${DEFAULT_WINDOW:PT10S}"
+```
+
+The example's `compose.yaml` gives the engine `DEFAULT_WINDOW=PT8S`.
+
+**Prerequisites:** [Before you try a walkthrough](../whats-new-0-6.md#before-you-try-a-walkthrough),
+with an engine image and a `sutra` CLI of **0.6.4 or later**.
+
+**1. Start the stack and deploy the package.** The `timers` helper lists the timer rows, with
+how many seconds after arming each one is due:
+
+```bash
+C=examples/delivery-window/deploy/compose.yaml
+docker compose -f $C up -d --wait
+sutra package examples/delivery-window/deployments-src/default--window--1.0.0 \
+    --out examples/delivery-window/deploy/deployments 2>/dev/null
+PORT=$(docker compose -f $C port engine 8080 | cut -d: -f2)
+H=(-H 'Content-Type: application/json' -H 'X-Api-Key: dev-only-window-key')
+until curl -sf "http://127.0.0.1:$PORT/sutra/deployments" | grep -q '"phase":"Active"'; do sleep 1; done
+send() { curl -s -w " HTTP %{http_code}\n" -X POST "http://127.0.0.1:$PORT/channels/orders$1" "${H[@]}" -d "$2"; }
+timers() {
+  docker compose -f $C exec -T engine-db psql -U postgres -d sutra -At -c \
+    "select node_id, status, extract(epoch from timer_due_at - created_at)::int as seconds
+       from waiting_event where kind = 'TIMER' order by created_at"
+}
+id_of() { curl -s "http://127.0.0.1:$PORT/admin/instances/by-alias/orderId/$1" | python3 -c 'import json,sys; print(json.load(sys.stdin)["instanceId"])'; }
+status_of() { curl -s "http://127.0.0.1:$PORT/sutra/instances/$1" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["status"], d.get("failureCode") or "")'; }
+```
+
+```text
+packaged examples/delivery-window/deploy/deployments/default--window--1.0.0.sutra (deploymentId dep-99c53c0c698e17b631a9fdcf)
+```
+
+**2. An order with its own window.** The boundary is due 3 seconds after the receive task
+parked. Nothing is delivered, so after 5 seconds the instance has taken the `Late` path:
+
+```bash
+send "" '{"orderId":"o-1","window":"PT3S"}'
+O1=$(id_of o-1)
+timers
+sleep 5
+status_of $O1
+curl -s "http://127.0.0.1:$PORT/admin/instances/$O1/history" | python3 -c '
+import json, sys
+for e in json.load(sys.stdin)["events"]:
+    if e["eventType"] == "NODE_LEFT": print(e["nodeId"])'
+```
+
+```text
+ HTTP 200
+WindowClosed|WAITING|3
+COMPLETED
+Start
+AwaitDelivery
+Late
+```
+
+**3. An order without one.** The window is `config.defaultWindow`: `PT8S`, from the engine's
+environment. A delivery inside it completes the instance on the normal path:
+
+```bash
+send "" '{"orderId":"o-2"}'
+O2=$(id_of o-2)
+timers
+send /delivered '{"orderId":"o-2"}'
+status_of $O2
+```
+
+```text
+ HTTP 200
+WindowClosed|RESOLVED|3
+WindowClosed|WAITING|8
+ HTTP 200
+COMPLETED
+```
+
+**4. A window that is not a duration.** The expression returns the string `"soon"` when the
+receive task parks. The request is refused and nothing is stored:
+
+```bash
+send "" '{"orderId":"o-3","window":"soon"}'
+```
+
+```text
+{"type":"urn:bpm:diag:SUTRA.RUNTIME.TIMER.EXPRESSION_INVALID","title":"SUTRA.RUNTIME.TIMER.EXPRESSION_INVALID","status":500,"detail":"timer 'WindowClosed' <timeDuration> expression 'if payload.window = null then config.defaultWindow else payload.window' could not be armed: it returned the string \"soon\", which is not a usable duration: 'soon' is not an ISO-8601 duration (must start with 'P')","code":"SUTRA.RUNTIME.TIMER.EXPRESSION_INVALID","attributes":{"incident":"SUTRA.INBOUND.NON_IDEMPOTENT_FAILURE"}} HTTP 500
+```
+
+When the timer is armed later in an instance's life (after a first wait, say), the same failure
+leaves the instance FAILED, with this code as its `failureCode`.
+
+**5. Change the default without touching the archive.** Restart the engine with a different
+`DEFAULT_WINDOW`. The archive and its deploymentId stay the same; new orders get the new window:
+
+```bash
+docker compose -f $C stop engine
+DEFAULT_WINDOW=PT20S docker compose -f $C up -d --wait engine
+PORT=$(docker compose -f $C port engine 8080 | cut -d: -f2)
+until curl -sf "http://127.0.0.1:$PORT/sutra/deployments" | grep -q '"phase":"Active"'; do sleep 1; done
+send "" '{"orderId":"o-4"}'
+timers
+```
+
+```text
+ HTTP 200
+WindowClosed|RESOLVED|3
+WindowClosed|RESOLVED|8
+WindowClosed|WAITING|20
+```
+
+**6. Clean up:**
+
+```bash
+docker compose -p sutra-delivery-window down -v
+```
+
 ## Next
 
 - **[The q: namespace](q-namespace.md#qretry--per-task-retry-policies)** — `<q:retry>` in the
   vocabulary table alongside `<q:timeout>`.
+- **[Deployment packages](deployment-packages.md#properties--deployment-configuration)** — the
+  `properties:` a timer expression reads as `config.<key>`.
 - **[Testing time](testing-time.md)** — proving a `PT24H` timer or an `R3/PT12H` schedule in
   wall-clock seconds.
 - **[Instance migration](../operating/instance-migration.md)** — what to do with an instance that

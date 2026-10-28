@@ -549,6 +549,20 @@ impl Node {
     }
 }
 
+/// One FEEL timer expression in a process ([`ProcessDefinition::node_timer_expressions`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TimerExpressionSite {
+    /// The node that declares it (a synthesized `<taskId>#timeout` boundary for `<q:timeout>`).
+    pub node_id: String,
+    /// Where it sits: `timeDuration`, `timeDate`, `timeCycle`, `q:retry@initialDelay`,
+    /// `q:retry@maxDelay`.
+    pub site: &'static str,
+    /// The FEEL source.
+    pub expression: String,
+    /// True on a timer start event, where only `config` is in scope.
+    pub on_start_event: bool,
+}
+
 /// Engine-internal representation of a single `<bpmn:process>` — indexed by node id, with
 /// sequence flows pre-grouped by source/target. Built once at module load and immutable.
 #[derive(Debug, Clone, PartialEq)]
@@ -816,6 +830,51 @@ impl ProcessDefinition {
                 _ => None,
             })
             .collect()
+    }
+
+    /// Every FEEL timer expression declared on `node` (its timer definition and its `<q:retry>`
+    /// delays). A `<q:timeout>` expression shows up on its synthesized `<taskId>#timeout`
+    /// boundary, which is a node of its own. Lint uses this for the `config.<key>` check.
+    pub fn node_timer_expressions(&self, node: &Node) -> Vec<TimerExpressionSite> {
+        let mut out = Vec::new();
+        let (timer, on_start) = match node {
+            Node::TimerCatchEvent { timer, .. } => (Some(timer), false),
+            Node::BoundaryEvent { timer, .. } => (timer.as_ref(), false),
+            Node::StartEvent { timer, .. } => (timer.as_ref(), true),
+            _ => (None, false),
+        };
+        if let Some(crate::timer::TimerDefinition::Expression { form, expression }) = timer {
+            out.push(TimerExpressionSite {
+                node_id: node.id().to_string(),
+                site: form.element_name(),
+                expression: expression.clone(),
+                on_start_event: on_start,
+            });
+        }
+        if let Some(retry) = self.retry_policy(node.id()) {
+            for (is_expression, text, site) in [
+                (
+                    retry.initial_delay_expression,
+                    &retry.initial_delay,
+                    "q:retry@initialDelay",
+                ),
+                (
+                    retry.max_delay_expression,
+                    &retry.max_delay,
+                    "q:retry@maxDelay",
+                ),
+            ] {
+                if is_expression {
+                    out.push(TimerExpressionSite {
+                        node_id: node.id().to_string(),
+                        site,
+                        expression: text.clone(),
+                        on_start_event: false,
+                    });
+                }
+            }
+        }
+        out
     }
 
     /// EVERY start event that handles an inbound arriving on `channel` carrying codec

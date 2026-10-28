@@ -36,7 +36,9 @@ pub use loader::BpmnModelLoader;
 pub use model::{
     BpmnDataSpelling, BpmnImport, CoveragePath, DataMapping, DeclaredVariable, FieldType, Node,
     PredicateAlways, PredicateUnavailable, ProcessAudit, ProcessDefinition, ProcessModule,
-    SequenceFlow, ShadowedBpmnVariable, SourcePredicate, DEFAULT_LOOP_ITEM_VARIABLE,
-    LOOP_COUNTER_VARIABLE,
+    SequenceFlow, ShadowedBpmnVariable, SourcePredicate, TimerExpressionSite,
+    DEFAULT_LOOP_ITEM_VARIABLE, LOOP_COUNTER_VARIABLE,
 };
-pub use timer::{TimerCycleSpec, TimerDefinition, TimerSpecRejection};
+pub use timer::{
+    TimerCycleSpec, TimerDefinition, TimerExpressionForm, TimerSpecRejection, TimerTextClass,
+};

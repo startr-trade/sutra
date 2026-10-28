@@ -279,6 +279,11 @@ pub mod codes {
     /// closed schema (labels / engine.minContract / entryProcesses), or the
     /// directory itself cannot be scanned as a deployment package.
     pub const DEPLOY_PACKAGE_CONFIG_INVALID: &str = "SUTRA.DEPLOY.PACKAGE.CONFIG_INVALID";
+    /// A `package.yaml` `properties:` value could not be resolved when the deployment was
+    /// planned: an `env:NAME` / `${NAME}` reference to an unset variable with no default, or a
+    /// secret-store reference (the deployment configuration is readable by every timer
+    /// expression, so it never carries a secret). The deployment does not activate.
+    pub const DEPLOY_PROPERTY_UNRESOLVED: &str = "SUTRA.DEPLOY.PROPERTY_UNRESOLVED";
     /// A multi-process file is only partially shadowed/inherited — the effective process
     /// set cannot be materialised into archive files without duplicating a process id.
     pub const DEPLOY_BPMN_PARTIAL_SHADOW: &str = "SUTRA.DEPLOY.BPMN.PARTIAL_SHADOW";

@@ -10,3 +10,5 @@ publish.workspace = true
 quick-xml = { workspace = true }
 regex = { workspace = true }
 time = { workspace = true }
+# Parse-only: the loader decides whether a timer text is a FEEL expression (it never evaluates).
+sutra-feel = { path = "../sutra-feel" }

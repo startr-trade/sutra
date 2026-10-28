@@ -112,3 +112,18 @@ pub const DISPATCH_TIMER_CYCLE_INVALID: &str = "SUTRA.DISPATCH.TIMER.CYCLE_INVAL
 /// `timerEventDefinition` declaring more than one of `timeDuration`/`timeDate`/`timeCycle`, a
 /// non-interrupting timer boundary, or a timer boundary on a non-wait-capable host.
 pub const DISPATCH_TIMER_UNSUPPORTED: &str = "SUTRA.DISPATCH.TIMER.UNSUPPORTED";
+
+// ---- expression-valued timers ----------------------------------------------------------------
+
+/// A timer START event's FEEL expression names something other than `config`. No instance
+/// exists when a start schedule is armed, so the deployment configuration is the only context a
+/// start-timer expression can read.
+pub const CONFIG_BPMN_TIMER_START_EXPRESSION_SCOPE: &str =
+    "SUTRA.CONFIG.BPMN.TIMER_START_EXPRESSION_SCOPE";
+/// A timer expression reads `config.<key>`, but the deployment's `package.yaml` declares no such
+/// key under `properties:`. Raised by lint, by packaging and when the deployment is planned.
+pub const CONFIG_BPMN_TIMER_CONFIG_UNDECLARED: &str = "SUTRA.CONFIG.BPMN.TIMER_CONFIG_UNDECLARED";
+/// A timer expression did not produce a usable interval when the timer was armed: null, a value
+/// of the wrong type, an unparseable string, a negative or calendar-length duration, or a
+/// zone-less instant. The instance fails once; a start timer fails its deployment's activation.
+pub const RUNTIME_TIMER_EXPRESSION_INVALID: &str = "SUTRA.RUNTIME.TIMER.EXPRESSION_INVALID";

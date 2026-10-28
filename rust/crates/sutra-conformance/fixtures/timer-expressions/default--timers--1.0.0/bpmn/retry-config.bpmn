@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0"
+                  targetNamespace="urn:sutra:module:timers:1.0.0" id="Definitions_retry">
+  <!-- A channel-call nobody answers: its route-less q:timeout (PT1S) is a retryable failure, and
+       the backoff before the second attempt is config.retryDelay. Two attempts, then FAILED. -->
+  <bpmn:process id="te-retry-config" isExecutable="true">
+    <bpmn:extensionElements><q:audit capture="metadata"/></bpmn:extensionElements>
+    <bpmn:startEvent id="RetryStart">
+      <bpmn:extensionElements>
+        <q:source channel="te-retry"/>
+        <q:alias name="retryId" expression="payload.id" unique="true"/>
+      </bpmn:extensionElements>
+    </bpmn:startEvent>
+    <bpmn:serviceTask id="RetryCall" implementation="channel:te-down">
+      <bpmn:extensionElements>
+        <q:alias name="retryCallKey" expression="payload.id"/>
+        <q:timeout duration="PT1S"/>
+        <q:retry maxAttempts="2" initialDelay="config.retryDelay" maxDelay="PT1M"/>
+      </bpmn:extensionElements>
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="RetryDone"/>
+    <bpmn:sequenceFlow id="r1" sourceRef="RetryStart" targetRef="RetryCall"/>
+    <bpmn:sequenceFlow id="r2" sourceRef="RetryCall" targetRef="RetryDone"/>
+  </bpmn:process>
+</bpmn:definitions>

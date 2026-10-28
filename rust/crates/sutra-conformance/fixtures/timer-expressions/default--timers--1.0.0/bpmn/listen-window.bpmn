@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0"
+                  targetNamespace="urn:sutra:module:timers:1.0.0" id="Definitions_listen">
+  <!-- The listen-window pattern with the window taken from the request: a receive task with an
+       interrupting timer boundary whose duration is payload.window. -->
+  <bpmn:process id="te-listen-window" isExecutable="true">
+    <bpmn:extensionElements><q:audit capture="metadata"/></bpmn:extensionElements>
+    <bpmn:startEvent id="ListenStart">
+      <bpmn:extensionElements>
+        <q:source channel="te-listen"/>
+        <q:alias name="listenId" expression="payload.id" unique="true" onConflict="correlate"/>
+      </bpmn:extensionElements>
+    </bpmn:startEvent>
+    <bpmn:receiveTask id="Listen" name="Wait for a status">
+      <bpmn:extensionElements><q:source channel="te-status" name="status"/></bpmn:extensionElements>
+    </bpmn:receiveTask>
+    <bpmn:boundaryEvent id="ListenTimeout" name="No status in payload.window" attachedToRef="Listen">
+      <bpmn:timerEventDefinition><bpmn:timeDuration>payload.window</bpmn:timeDuration></bpmn:timerEventDefinition>
+    </bpmn:boundaryEvent>
+    <bpmn:endEvent id="ListenDone"/>
+    <bpmn:endEvent id="ListenTimedOut"/>
+    <bpmn:sequenceFlow id="l1" sourceRef="ListenStart" targetRef="Listen"/>
+    <bpmn:sequenceFlow id="l2" sourceRef="Listen" targetRef="ListenDone"/>
+    <bpmn:sequenceFlow id="l3" sourceRef="ListenTimeout" targetRef="ListenTimedOut"/>
+  </bpmn:process>
+</bpmn:definitions>

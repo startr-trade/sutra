@@ -75,6 +75,40 @@ pub fn resolve_value_with(value: &str, registry: &ResolverRegistry) -> Result<St
     resolve_placeholders_with(value, registry)
 }
 
+/// Resolve a NON-SECRET configuration value: the environment forms only — a whole value
+/// `env:NAME`, and `${NAME}` / `${NAME:default}` placeholders. Any other registered scheme
+/// (`secret:`, a vendor secret store), whole-value or inside a placeholder, is refused: the
+/// caller exposes the result somewhere a secret must never reach (the deployment configuration a
+/// timer expression reads). Text with neither form passes through unchanged.
+pub fn resolve_env_only(value: &str) -> Result<String, EnvRefError> {
+    let full = default_registry();
+    let refuse = |scheme: &str| {
+        EnvRefError(format!(
+            "'{value}' references the '{scheme}:' secret scheme; only env:NAME and ${{NAME}} / \
+             ${{NAME:default}} references are allowed in a non-secret configuration value"
+        ))
+    };
+    let mut env_only = ResolverRegistry::new();
+    env_only.register(Arc::new(EnvResolver));
+    if let Some((scheme, _)) = split_scheme(value) {
+        if scheme != "env" && full.get(scheme).is_some() {
+            return Err(refuse(scheme));
+        }
+    }
+    let mut rest = value;
+    while let Some(start) = rest.find("${") {
+        let after = &rest[start + 2..];
+        let inner = after.split('}').next().unwrap_or_default();
+        if let Some((scheme, _)) = split_scheme(inner) {
+            if scheme != "env" && full.get(scheme).is_some() {
+                return Err(refuse(scheme));
+            }
+        }
+        rest = after;
+    }
+    resolve_value_with(value, &env_only)
+}
+
 /// `true` when `value` contains at least one `${…}` placeholder token — the
 /// `SecretRefs.hasEnvToken` detector (a value with no token needs no substitution).
 pub fn has_env_token(value: &str) -> bool {
@@ -517,5 +551,33 @@ mod tests {
             resolve_value_with("amqp://svc:${aws-secrets:prod-db}@host/q", &registry).unwrap(),
             "amqp://svc:stub::prod-db@host/q"
         );
+    }
+
+    #[test]
+    fn env_only_resolution_takes_env_forms_and_refuses_secret_schemes() {
+        std::env::set_var("SUTRA_ENVONLY_TEST_WINDOW", "PT7S");
+        assert_eq!(
+            resolve_env_only("env:SUTRA_ENVONLY_TEST_WINDOW").unwrap(),
+            "PT7S"
+        );
+        assert_eq!(
+            resolve_env_only("${SUTRA_ENVONLY_TEST_WINDOW}").unwrap(),
+            "PT7S"
+        );
+        assert_eq!(
+            resolve_env_only("${SUTRA_ENVONLY_TEST_UNSET:PT30S}").unwrap(),
+            "PT30S"
+        );
+        assert_eq!(resolve_env_only("PT1M").unwrap(), "PT1M");
+        assert!(resolve_env_only("env:SUTRA_ENVONLY_TEST_UNSET").is_err());
+        assert!(resolve_env_only("${SUTRA_ENVONLY_TEST_UNSET}").is_err());
+        assert!(resolve_env_only("secret:API_TOKEN")
+            .unwrap_err()
+            .0
+            .contains("secret"));
+        assert!(resolve_env_only("x-${secret:PASS:dflt}")
+            .unwrap_err()
+            .0
+            .contains("secret"));
     }
 }

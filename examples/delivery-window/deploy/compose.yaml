@@ -1,0 +1,58 @@
+# Run the delivery-window example locally: engine + PostgreSQL. Nothing needs a real key.
+#
+#   docker compose -f examples/delivery-window/deploy/compose.yaml up -d
+#   sutra package examples/delivery-window/deployments-src/default--window--1.0.0 \
+#        --out examples/delivery-window/deploy/deployments
+#
+# The engine watches ./deployments and activates the archive without a restart. The project name
+# is explicit so this stack can never collide with another one that would default to `deploy`.
+
+name: sutra-delivery-window
+
+services:
+  engine:
+    # 0.6.4 or later. Override with SUTRA_ENGINE_IMAGE to run a locally built tag.
+    image: ${SUTRA_ENGINE_IMAGE:-ghcr.io/startr-trade/sutra:0.6.4}
+    environment:
+      SUTRA_DEPLOYMENTS_DIR: /deployments
+      SUTRA_HTTP_PORT: "8080"
+      SUTRA_DATASOURCE_URL: postgres://engine-db:5432/sutra
+      # A plain login role, not the postgres superuser — see engine-db-init.sh.
+      SUTRA_DATASOURCE_USERNAME: ${ENGINE_DB_USER:-sutra_engine}
+      SUTRA_DATASOURCE_PASSWORD: ${ENGINE_DB_PASSWORD:-sutra-dev-only}
+
+      # The SQL audit sink: GET /admin/instances/{id}/history reads it.
+      SUTRA_AUDIT_SQL: "true"
+      # DEV ONLY: /admin/* without authentication. Never in anything real.
+      SUTRA_ADMIN_OIDC_DEV_DISABLED: "true"
+
+      # --- what the package names --------------------------------------------------------------
+      WINDOW_API_KEY: ${WINDOW_API_KEY:-dev-only-window-key}
+      # The deployment configuration the package reads as config.defaultWindow (its
+      # properties: say "${DEFAULT_WINDOW:PT10S}"). Change it here, restart the engine, and
+      # every order without its own window gets the new one; the archive does not change.
+      DEFAULT_WINDOW: ${DEFAULT_WINDOW:-PT8S}
+    volumes:
+      - ./deployments:/deployments:ro
+    ports:
+      # Dynamic host port, loopback only: `docker compose -f … port engine 8080` shows it.
+      - "127.0.0.1::8080"
+    depends_on:
+      engine-db:
+        condition: service_healthy
+
+  engine-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: sutra
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_BOOTSTRAP_PASSWORD:-bootstrap-dev-only}
+      ENGINE_DB_USER: ${ENGINE_DB_USER:-sutra_engine}
+      ENGINE_DB_PASSWORD: ${ENGINE_DB_PASSWORD:-sutra-dev-only}
+    volumes:
+      - ./engine-db-init.sh:/docker-entrypoint-initdb.d/10-engine-role.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d sutra"]
+      interval: 2s
+      timeout: 3s
+      retries: 30

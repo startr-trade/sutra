@@ -34,6 +34,20 @@ vulnerabilities:
   - id: GHSA-xgp8-3hg3-c2mh
     statement: "Same chain as GHSA-82j2-j2ch-gfr8: rustls-webpki via tiberius, no reachable fix."
     expired_at: 2026-11-09
+  # rustls 0.21.12 itself, on the same chain (tiberius 0.12.3 -> tokio-rustls 0.24 -> rustls
+  # 0.21). Fixed only in rustls 0.23.46+, which tokio-rustls 0.24 cannot take. Published after
+  # 0.6.3; triaged 2026-10-28 with the rest of the chain. NOTE: tiberius 0.13.0 has since been
+  # published; whether it reaches rustls 0.23 is the renewal check for this whole block, and the
+  # upgrade (an mssql-path dependency change) is a separate landing.
+  - id: GHSA-c8m5-c952-6cm4
+    statement: "rustls 0.21.12 via tiberius 0.12.3 -> tokio-rustls ^0.24; fix is 0.23.46+, unreachable on this chain (tiberius 0.13 upgrade pending re-triage). mssql is not a default feature, so this is absent from the released binary."
+    expired_at: 2026-11-09
+  - id: GHSA-h2v8-394m-p7vv
+    statement: "Same chain as GHSA-c8m5-c952-6cm4: rustls 0.21.12 via tiberius, no reachable fix."
+    expired_at: 2026-11-09
+  - id: GHSA-w44r-93j7-qv28
+    statement: "Same chain as GHSA-c8m5-c952-6cm4: rustls 0.21.12 via tiberius, no reachable fix."
+    expired_at: 2026-11-09
 
   # ---- Debian packages in the distroless/cc-debian12 base --------------------------------
   # Every one of these reports an EMPTY fixed-version field: Debian has published no patched

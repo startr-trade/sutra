@@ -554,15 +554,25 @@
     </xsd:annotation>
   </xsd:element>
 
+  <!-- A timer interval: literal first, else FEEL. A text that parses as an ISO-8601 duration is
+       that literal; any other text is a FEEL expression whose result (an ISO-8601 duration
+       string or a FEEL days-and-time duration) is taken when the timer is armed. The union
+       widens xsd:duration, so every document valid before stays valid. -->
+  <xsd:simpleType name="DurationOrExpression">
+    <xsd:union memberTypes="xsd:duration xsd:string"/>
+  </xsd:simpleType>
+
   <xsd:complexType name="RetryType">
     <!-- Total attempts INCLUDING the first; 1 is an explicit "never retry". Required with no
          default: an unbounded task retry is the failure mode this policy exists to remove. -->
     <xsd:attribute name="maxAttempts" type="xsd:positiveInteger" use="required"/>
-    <xsd:attribute name="initialDelay" type="xsd:duration" default="PT1S"/>
+    <!-- An ISO-8601 duration, or a FEEL expression evaluated each time a backoff is armed
+         (instance variables plus config.<key> from package.yaml properties). -->
+    <xsd:attribute name="initialDelay" type="q:DurationOrExpression" default="PT1S"/>
     <!-- Must be >= 1.0; 1.0 is a fixed delay. Below 1 would SHRINK the wait on each failure. -->
     <xsd:attribute name="backoffCoefficient" type="xsd:decimal" default="2.0"/>
     <!-- The ceiling the growing delay clamps at; must be >= @initialDelay. -->
-    <xsd:attribute name="maxDelay" type="xsd:duration" default="PT5M"/>
+    <xsd:attribute name="maxDelay" type="q:DurationOrExpression" default="PT5M"/>
     <!-- Comma-separated classification codes that fail immediately instead of retrying. -->
     <xsd:attribute name="nonRetryableCodes" type="xsd:string"/>
   </xsd:complexType>

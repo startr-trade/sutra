@@ -1,0 +1,14 @@
+# Deployment package — one standalone authoring unit. `sutra package <this dir>` seals it
+# into one content-addressed .sutra archive. Labels are opaque selectors: tenant is a label,
+# not a resource scope.
+labels:
+  "module": "window"
+  "tenant": "default"
+  "version": "1.0.0"
+engine:
+  minContract: 1
+# The deployment configuration. A timer expression reads each entry as config.<key>. The value
+# sealed into the archive is this text; the engine resolves the env reference when it activates
+# the deployment, so the same archive can run with a different window in each environment.
+properties:
+  defaultWindow: "${DEFAULT_WINDOW:PT10S}"

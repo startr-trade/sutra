@@ -31,6 +31,7 @@ pub mod error;
 pub mod lint;
 pub mod overlay;
 pub mod package;
+pub mod properties;
 pub mod scanner;
 pub mod selector;
 

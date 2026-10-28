@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0"
+                  targetNamespace="urn:sutra:module:timers:1.0.0" id="Definitions_catch_wait">
+  <!-- A timer catch whose duration is a flow variable: payload.wait. -->
+  <bpmn:process id="te-catch-wait" isExecutable="true">
+    <bpmn:extensionElements><q:audit capture="metadata"/></bpmn:extensionElements>
+    <bpmn:startEvent id="CatchStart">
+      <bpmn:extensionElements>
+        <q:source channel="te-catch"/>
+        <q:alias name="catchId" expression="payload.id" unique="true"/>
+      </bpmn:extensionElements>
+    </bpmn:startEvent>
+    <bpmn:intermediateCatchEvent id="CatchWait" name="Wait payload.wait">
+      <bpmn:timerEventDefinition><bpmn:timeDuration>payload.wait</bpmn:timeDuration></bpmn:timerEventDefinition>
+    </bpmn:intermediateCatchEvent>
+    <bpmn:endEvent id="CatchDone"/>
+    <bpmn:sequenceFlow id="c1" sourceRef="CatchStart" targetRef="CatchWait"/>
+    <bpmn:sequenceFlow id="c2" sourceRef="CatchWait" targetRef="CatchDone"/>
+  </bpmn:process>
+</bpmn:definitions>

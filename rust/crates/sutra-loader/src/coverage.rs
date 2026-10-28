@@ -402,6 +402,7 @@ mod tests {
             coverages,
             channels_yaml: None,
             datastores_yaml: None,
+            properties: Default::default(),
             binding_dir: PathBuf::new(),
         }
     }

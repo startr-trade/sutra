@@ -112,6 +112,10 @@ pub struct LoadedDeployment {
     pub channels_yaml: Option<String>,
     /// Raw `datastores.yaml` (binding-side) — parsed by sutra-datastore.
     pub datastores_yaml: Option<String>,
+    /// The deployment configuration (`package.yaml` `properties:`, sealed into the manifest):
+    /// key → UNRESOLVED text. The engine resolves env references when it plans the deployment;
+    /// timer expressions read the result as `config.<key>`.
+    pub properties: BTreeMap<String, String>,
     /// The binding's version directory (`tenants/<t>/modules/<m>/<v>/`) — the base against
     /// which relative declarations (e.g. a store's `sql.migrations` folder) resolve.
     pub binding_dir: PathBuf,

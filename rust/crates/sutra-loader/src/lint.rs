@@ -531,6 +531,7 @@ pub fn validate_deployment_with_manifests(
     check_store_structures(deployment, &stores, &dep_label, out);
     check_node_references(deployment, &definitions, &dep_label, out);
     check_feel_sites(deployment, &dep_label, out);
+    check_timer_config_keys(deployment, &dep_label, out);
     check_template_inputs(deployment, &definitions, &dep_label, out);
     check_transient_reads(deployment, &dep_label, out);
     check_never_initialized(deployment, &dep_label, out);
@@ -3623,6 +3624,63 @@ fn check_feel_sites(deployment: &LoadedDeployment, dep_label: &str, out: &mut Ve
     }
 }
 
+/// Every `config.<key>` a timer expression reads must be declared under `properties:` in
+/// `package.yaml` — otherwise it would evaluate to null when the timer is armed, and a start
+/// timer would refuse to activate. Caught here so `sutra lint` and `sutra package` say so first.
+fn check_timer_config_keys(
+    deployment: &LoadedDeployment,
+    dep_label: &str,
+    out: &mut Vec<LintDiagnostic>,
+) {
+    let mut seen = BTreeSet::new();
+    for module in deployment.processes.values() {
+        for process in module.processes() {
+            if !seen.insert(process.id.clone()) {
+                continue;
+            }
+            visit_nodes(process, &mut |owner, node| {
+                for site in owner.node_timer_expressions(node) {
+                    let Ok(keys) =
+                        sutra_bpmn::timer::timer_expression_config_keys(&site.expression)
+                    else {
+                        continue; // the loader already refused an unparseable expression
+                    };
+                    for key in keys {
+                        if deployment.properties.contains_key(&key) {
+                            continue;
+                        }
+                        out.push(
+                            LintDiagnostic::error(
+                                sutra_bpmn::codes::CONFIG_BPMN_TIMER_CONFIG_UNDECLARED,
+                                format!(
+                                    "deployment {dep_label}: process '{}' node '{}' {} expression \
+                                     '{}' reads config.{key}, but package.yaml declares no \
+                                     property '{key}' (declared: {}). Add it under properties:.",
+                                    process.id,
+                                    site.node_id,
+                                    site.site,
+                                    site.expression,
+                                    if deployment.properties.is_empty() {
+                                        "none".to_string()
+                                    } else {
+                                        deployment
+                                            .properties
+                                            .keys()
+                                            .cloned()
+                                            .collect::<Vec<_>>()
+                                            .join(", ")
+                                    }
+                                ),
+                            )
+                            .at_node(&process.id, &site.node_id),
+                        );
+                    }
+                }
+            });
+        }
+    }
+}
+
 fn check_feel_pure(
     expression: &str,
     site: &str,
@@ -6320,6 +6378,7 @@ mod tests {
             coverages: Vec::new(),
             channels_yaml: None,
             datastores_yaml: None,
+            properties: Default::default(),
             binding_dir: PathBuf::new(),
         }
     }
@@ -6650,6 +6709,7 @@ mod tests {
             coverages,
             channels_yaml: None,
             datastores_yaml: None,
+            properties: Default::default(),
             binding_dir: PathBuf::new(),
         }
     }

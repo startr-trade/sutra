@@ -29,6 +29,8 @@ mod lint_store_structure_test;
 mod lint_stream_test;
 #[path = "all/lint_template_fields_test.rs"]
 mod lint_template_fields_test;
+#[path = "all/lint_timer_config_test.rs"]
+mod lint_timer_config_test;
 #[path = "all/lint_transient_test.rs"]
 mod lint_transient_test;
 #[path = "all/lint_variable_nav_test.rs"]

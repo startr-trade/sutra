@@ -16,3 +16,5 @@ mod q_extensions_test;
 mod retry_policy_test;
 #[path = "all/timer_channel_call_test.rs"]
 mod timer_channel_call_test;
+#[path = "all/timer_expression_test.rs"]
+mod timer_expression_test;

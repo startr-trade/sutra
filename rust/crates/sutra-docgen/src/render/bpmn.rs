@@ -266,6 +266,13 @@ fn timer_label(timer: &sutra_bpmn::timer::TimerDefinition) -> &'static str {
         sutra_bpmn::timer::TimerDefinition::Duration(_) => "duration",
         sutra_bpmn::timer::TimerDefinition::Date(_) => "date",
         sutra_bpmn::timer::TimerDefinition::Cycle(_) => "cycle",
+        // An expression-valued timer: the word says which form it resolves to and that its value
+        // is computed when the timer is armed.
+        sutra_bpmn::timer::TimerDefinition::Expression { form, .. } => match form {
+            sutra_bpmn::timer::TimerExpressionForm::Duration => "duration expression",
+            sutra_bpmn::timer::TimerExpressionForm::Date => "date expression",
+            sutra_bpmn::timer::TimerExpressionForm::Cycle => "cycle expression",
+        },
     }
 }
 

@@ -220,3 +220,33 @@ fn call_log_load_packages_one_archive() {
         "{paths:?}"
     );
 }
+
+#[test]
+fn delivery_window_packages_its_properties_unresolved() {
+    let dir = package_dir("delivery-window", "default--window--1.0.0");
+    assert_lint_clean(&dir);
+    seal_twice(&dir);
+
+    let out = tempfile::tempdir().expect("tempdir");
+    let outcome = assemble_dir(&dir, out.path(), &PackageOptions::default()).expect("packages");
+    let archive = &outcome.archives[0];
+    // The env reference is sealed as written; the engine resolves it at activation.
+    assert_eq!(
+        archive
+            .manifest
+            .properties
+            .get("defaultWindow")
+            .map(String::as_str),
+        Some("${DEFAULT_WINDOW:PT10S}")
+    );
+    let loaded = read_archive_file(&archive.file_path).expect("round-trips");
+    let process = loaded.deployment.processes["delivery-window"]
+        .process("delivery-window")
+        .unwrap()
+        .clone();
+    let window = process.node("WindowClosed").unwrap();
+    assert!(
+        matches!(window, sutra_bpmn::Node::BoundaryEvent { timer: Some(t), .. } if t.is_expression()),
+        "the window is an expression timer: {window:?}"
+    );
+}

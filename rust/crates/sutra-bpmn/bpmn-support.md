@@ -22,7 +22,7 @@ parks iff its inner/wrapped flow does.
 
 | BPMN 2.0 XML | `Node` variant | Wait state | Notes |
 |---|---|---|---|
-| `<startEvent>` (± `<timerEventDefinition>`) | `StartEvent` | no | The process entry point. Triggered EITHER by an inbound message on one of its `<q:source channel>` channels OR by a timer schedule — never both; a start declaring both trigger contracts is rejected at load. A timer start arms a durable schedule row at activation and fires with EMPTY variables. |
+| `<startEvent>` (± `<timerEventDefinition>`) | `StartEvent` | no | The process entry point. Triggered EITHER by an inbound message on one of its `<q:source channel>` channels OR by a timer schedule — never both; a start declaring both trigger contracts is rejected at load. A timer start arms a durable schedule row at activation and fires with EMPTY variables; its timer may be a FEEL expression over `config.<key>` only, resolved then. |
 | `<endEvent>` | `EndEvent` | no | Ends this token's path; other live tokens keep running. |
 | `<endEvent>` + `<terminateEventDefinition>` | `TerminateEndEvent` | no | Ends the whole instance, not just this token. |
 | `<endEvent>` + `<errorEventDefinition>` | `ErrorEvent` | no | Throws a BPMN error for a boundary / event sub-process to catch. An empty code means "any error". |
@@ -30,8 +30,8 @@ parks iff its inner/wrapped flow does.
 | `<intermediateThrowEvent>` / `<implicitThrowEvent>` | `IntermediateThrowEvent` | no | Emit-and-continue. `ThrowKind` selects the flavour: none, compensate, message, signal, escalation, link. A message throw requires `<q:send>`. |
 | `<intermediateCatchEvent>` + `<linkEventDefinition>` | `LinkCatchEvent` | no | The synchronous goto target of a link throw — a jump, not a park. Each link name must have exactly one catch. |
 | `<intermediateCatchEvent>` + `<messageEventDefinition>` | `MessageCatchEvent` | **yes** | Parks until a correlated inbound arrives on one of its channels. Correlation is by `<q:alias>`. |
-| `<intermediateCatchEvent>` + `<timerEventDefinition>` | `TimerCatchEvent` | **yes** | Parks a durable TIMER `waiting_event` row due at the resolved instant. `<timeDuration>` and `<timeDate>` only — `<timeCycle>` is rejected here (a token cannot park at a node that fires repeatedly). |
-| `<boundaryEvent>` | `BoundaryEvent` | no | Attached to an activity. `BoundaryKind`: Error, Compensation, Escalation, Cancel, Timer. A timer boundary needs a wait-capable host (channel-call serviceTask / userTask) — it fires when the host's park outlives the duration. `@cancelActivity="false"` makes it non-interrupting. |
+| `<intermediateCatchEvent>` + `<timerEventDefinition>` | `TimerCatchEvent` | **yes** | Parks a durable TIMER `waiting_event` row due at the resolved instant. `<timeDuration>` and `<timeDate>` only — `<timeCycle>` is rejected here (a token cannot park at a node that fires repeatedly). Either may be a FEEL expression instead of a literal, evaluated when the token arrives. |
+| `<boundaryEvent>` | `BoundaryEvent` | no | Attached to an activity. `BoundaryKind`: Error, Compensation, Escalation, Cancel, Timer. A timer boundary needs a wait-capable host (channel-call serviceTask / userTask) — it fires when the host's park outlives the duration. `@cancelActivity="false"` makes it non-interrupting. A `<timeDuration>` / `<timeDate>` may be a FEEL expression, evaluated when the host parks. |
 | `<serviceTask implementation="…">` | `ServiceTask` | **when** `@implementation` starts with `channel:` | Routed on `@implementation` by task-kind precedence. A `channel:`-prefixed implementation is a channel call: it parks until the correlated response (or its `<q:timeout>` boundary). Anything else is a registered task or a template, and runs inline. |
 | `<serviceTask>` with data associations, no `@implementation` | `DataTask` | no | Declarative: its store reads, FEEL assignments and store writes ARE its behaviour. No registered task is resolved. |
 | `<scriptTask>` + `<script>` | `ScriptTask` | no | `<bpmn:script>` names a file in the module's `scripts/` folder (SRL). |
@@ -101,6 +101,13 @@ Node types are only half the model; the `q:` namespace (`urn:sutra:q:1.0`) carri
 message binding, correlation, retry, store and audit contracts. `xsd/q.xsd` is
 authoritative for its exact shape — read it, not a design doc, when you need the
 attributes an element supports.
+
+Every timer text — a `<timeDuration>`, `<timeDate>` or `<timeCycle>` body, a
+`<q:timeout duration>` and the `<q:retry>` delays — is a literal when it parses as one
+and a FEEL expression otherwise, evaluated once when the timer is armed against the
+instance variables plus `config` (the `package.yaml` `properties:`). A result that is
+not a usable interval fails the instance once with
+`SUTRA.RUNTIME.TIMER.EXPRESSION_INVALID`.
 
 One of those contracts changes what a transport does, so it is stated here: a process's
 `<q:audit capture>` is `none`, `metadata` (the default), `payload` (events carry the

@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0"
+                  targetNamespace="urn:sutra:module:timers:1.0.0" id="Definitions_null">
+  <!-- A first literal wait, then a timer whose expression reads a field the request never has:
+       it is null when armed, so the instance fails once. -->
+  <bpmn:process id="te-null-timer" isExecutable="true">
+    <bpmn:extensionElements><q:audit capture="metadata"/></bpmn:extensionElements>
+    <bpmn:startEvent id="NullStart">
+      <bpmn:extensionElements>
+        <q:source channel="te-null"/>
+        <q:alias name="nullId" expression="payload.id" unique="true"/>
+      </bpmn:extensionElements>
+    </bpmn:startEvent>
+    <bpmn:intermediateCatchEvent id="NullFirst">
+      <bpmn:timerEventDefinition><bpmn:timeDuration>PT1S</bpmn:timeDuration></bpmn:timerEventDefinition>
+    </bpmn:intermediateCatchEvent>
+    <bpmn:intermediateCatchEvent id="NullWait">
+      <bpmn:timerEventDefinition><bpmn:timeDuration>payload.missing</bpmn:timeDuration></bpmn:timerEventDefinition>
+    </bpmn:intermediateCatchEvent>
+    <bpmn:endEvent id="NullDone"/>
+    <bpmn:sequenceFlow id="n1" sourceRef="NullStart" targetRef="NullFirst"/>
+    <bpmn:sequenceFlow id="n2" sourceRef="NullFirst" targetRef="NullWait"/>
+    <bpmn:sequenceFlow id="n3" sourceRef="NullWait" targetRef="NullDone"/>
+  </bpmn:process>
+</bpmn:definitions>

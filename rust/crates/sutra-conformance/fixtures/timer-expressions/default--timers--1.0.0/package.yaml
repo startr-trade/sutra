@@ -1,0 +1,13 @@
+# Deployment package for the expression-valued timer conformance suite. Each process exercises
+# one timer kind whose interval is a FEEL expression: a flow variable, or the deployment
+# configuration below (`config.<key>`). The env references take the suite's values; the
+# defaults are deliberately long, so a test only passes when the configuration was applied.
+labels:
+  "module": "timers"
+  "tenant": "default"
+  "version": "1.0.0"
+engine:
+  minContract: 1
+properties:
+  retryDelay: "${TE_RETRY_DELAY:PT30S}"
+  startAfter: "${TE_START_AFTER:PT1H}"

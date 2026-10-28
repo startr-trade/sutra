@@ -59,6 +59,27 @@ row-level-security partitioning (`tenant_id`) — never a resource-tree dimensio
 simply every process in the package deployed under its labels. The *authoring* tree may still be
 layered — see [Composing a package from layers](#composing-a-package-from-layers).
 
+### `properties:` — deployment configuration {#properties--deployment-configuration}
+
+```yaml
+properties:
+  defaultWindow: "${DEFAULT_WINDOW:PT10S}"   # an env reference with a default
+  callTimeout: "env:CALL_TIMEOUT"            # a whole-value env reference
+  startAfter: "PT1H"                         # a literal
+```
+
+`properties:` is a flat map of keys to text. A timer expression reads it as `config.<key>`
+(see [Timer intervals from FEEL](retries-history-schedules.md#timer-intervals-from-feel)). The
+archive seals the text **as written**, so the same archive runs in every environment. The engine
+resolves `env:NAME`, `${NAME}` and `${NAME:default}` from its own environment when it activates
+the deployment. A reference with no value and no default refuses the deployment
+(`SUTRA.DEPLOY.PROPERTY_UNRESOLVED`). Keys are letters, digits and `_`. Values are strings, so
+use `number(config.x)` for arithmetic. Secret references (`secret:KEY`, `${secret:KEY}`, a secret
+store) are refused, because every timer expression and the audit trail can read the
+configuration. Editing a property changes the deploymentId, the same as an `audit:` change.
+Changing the environment does not, and takes effect when the engine next activates the
+deployment.
+
 ## Composing a package from layers
 
 When one process is deployed several ways — the same flow bound to HTTP for one tenant and to a

@@ -53,6 +53,9 @@ type CondEval = dyn Fn(&str, &Variables) -> Result<bool, ExecError>;
 type ValEval = dyn Fn(&str, &Variables) -> Result<FeelValue, ExecError>;
 type ProcessResolver = dyn Fn(&str) -> Result<Option<Arc<ProcessDefinition>>, ExecError>;
 type ModuleResolver = dyn Fn(&DeploymentId, &str) -> Option<Arc<ProcessDefinition>>;
+/// The resolved deployment configuration (`package.yaml` `properties:`) of one deployment — what
+/// a timer expression reads as `config.<key>`.
+type DeploymentConfigResolver = dyn Fn(&DeploymentId) -> Option<Arc<BTreeMap<String, String>>>;
 
 /// A FEEL condition evaluator backed by `sutra-feel`'s boolean evaluation.
 pub fn feel_condition_evaluator() -> impl Fn(&str, &Variables) -> Result<bool, ExecError> {
@@ -196,6 +199,9 @@ pub struct TokenExecutor {
     listeners: Vec<Rc<dyn ExecutionListener>>,
     process_resolver: Option<Box<ProcessResolver>>,
     module_resolver: Option<Box<ModuleResolver>>,
+    /// Per-deployment configuration for timer expressions (`config.<key>`). `None` = every
+    /// deployment has an empty configuration.
+    deployment_config: Option<Box<DeploymentConfigResolver>>,
     emissions: Option<Rc<dyn EmissionSink>>,
     auth_resolvers: Option<Box<AuthRefResolverRegistry>>,
     template_engines: TemplateEngineRegistry,
@@ -249,6 +255,7 @@ impl TokenExecutor {
                 default_audit_sink: None,
                 process_resolver: None,
                 module_resolver: None,
+                deployment_config: None,
                 emissions: None,
                 auth_resolvers: None,
                 template_engines: TemplateEngineRegistry::new(),
@@ -1295,7 +1302,7 @@ impl TokenExecutor {
                 // A live token reaching a timer catch always arms it afresh — reaching it again
                 // (a loop) is a new wait with its own due-at, never the spent one.
                 state.park_fresh(id);
-                let due_at = self.compute_due_at(timer, id)?;
+                let due_at = self.compute_due_at(timer, id, state)?;
                 self.record_timer_wait(id, due_at, state);
                 left_handled = true;
             }
@@ -1456,7 +1463,7 @@ impl TokenExecutor {
                     // A timer arm needs its durable row; a message arm is satisfied by a relay
                     // and needs none.
                     if let Ok(Node::TimerCatchEvent { timer, .. }) = state.process.node(&target) {
-                        let due_at = self.compute_due_at(timer, &target)?;
+                        let due_at = self.compute_due_at(timer, &target, state)?;
                         self.record_timer_wait(&target, due_at, state);
                     }
                 }
@@ -1839,7 +1846,7 @@ impl TokenExecutor {
                 ),
             )));
         }
-        let due_at = self.compute_retry_due_at(id, policy, attempt)?;
+        let due_at = self.compute_retry_due_at(id, policy, attempt, state)?;
         Ok(RetryDisposition::Park { due_at, attempt })
     }
 
@@ -1857,23 +1864,56 @@ impl TokenExecutor {
         id: &str,
         policy: &sutra_bpmn::qbindings::RetryBinding,
         attempt: u32,
+        state: &ExecutionState<'_>,
     ) -> Result<String, Signal> {
-        let parse = |raw: &str, which: &str| -> Result<f64, Signal> {
-            sutra_bpmn::duration::parse_iso8601_duration(raw)
+        // A FEEL delay is evaluated now, at the arming of this backoff, against the instance
+        // variables plus `config`; the due-at below is what persists.
+        let vars = if policy.initial_delay_expression || policy.max_delay_expression {
+            let ctx = state.ctx.borrow();
+            self.timer_variables(&state.deployment, &ctx.variables)
+        } else {
+            Variables::new()
+        };
+        let parse = |raw: &str, is_expression: bool, which: &str| -> Result<f64, Signal> {
+            self.retry_delay(raw, is_expression, &vars)
                 .map(|d| d.as_millis() as f64)
                 .map_err(|reason| {
-                    fatal_diag(
-                        codes::RUNTIME_UNEXPECTED,
-                        format!(
-                            "<q:retry> on node '{id}' has an unparseable @{which} '{raw}' at \
-                             runtime ({reason}); the loader validates it, so this is an \
-                             engine-internal inconsistency."
-                        ),
-                    )
+                    if is_expression {
+                        fatal_diag(
+                            sutra_bpmn::codes::RUNTIME_TIMER_EXPRESSION_INVALID,
+                            format!(
+                                "<q:retry> on node '{id}' @{which} expression '{raw}' could not \
+                                 be armed: {reason}"
+                            ),
+                        )
+                    } else {
+                        fatal_diag(
+                            codes::RUNTIME_UNEXPECTED,
+                            format!(
+                                "<q:retry> on node '{id}' has an unparseable @{which} '{raw}' at \
+                                 runtime ({reason}); the loader validates it, so this is an \
+                                 engine-internal inconsistency."
+                            ),
+                        )
+                    }
                 })
         };
-        let initial_ms = parse(&policy.initial_delay, "initialDelay")?;
-        let ceiling_ms = parse(&policy.max_delay, "maxDelay")?;
+        let initial_ms = parse(
+            &policy.initial_delay,
+            policy.initial_delay_expression,
+            "initialDelay",
+        )?;
+        let ceiling_ms = parse(&policy.max_delay, policy.max_delay_expression, "maxDelay")?;
+        if ceiling_ms < initial_ms {
+            return Err(fatal_diag(
+                sutra_bpmn::codes::RUNTIME_TIMER_EXPRESSION_INVALID,
+                format!(
+                    "<q:retry> on node '{id}' resolved @maxDelay ({ceiling_ms} ms) below \
+                     @initialDelay ({initial_ms} ms); the ceiling clamps the growing delay, so it \
+                     can never be the smaller of the two"
+                ),
+            ));
+        }
         let grown = initial_ms
             * policy
                 .backoff_coefficient
@@ -2124,7 +2164,7 @@ impl TokenExecutor {
                 {
                     continue;
                 }
-                let due_at = self.compute_due_at(timer, boundary_id)?;
+                let due_at = self.compute_due_at(timer, boundary_id, state)?;
                 fresh.push((boundary_id.clone(), due_at));
             }
         }
@@ -2254,11 +2294,23 @@ impl TokenExecutor {
     ///
     /// A repeating `<timeCycle>` never reaches here: the loader admits it on START events only,
     /// where deployment activation (not a parked token) owns the schedule.
+    ///
+    /// A FEEL-expression timer is evaluated HERE, once per arming, against the instance variables
+    /// plus `config` ([`Self::resolve_timer`]); only the resulting instant is recorded, so a resume
+    /// or replay never evaluates it again.
     fn compute_due_at(
         &self,
         timer: &sutra_bpmn::timer::TimerDefinition,
         node_id: &str,
+        state: &ExecutionState<'_>,
     ) -> Result<String, Signal> {
+        let resolved;
+        let timer = if timer.is_expression() {
+            resolved = self.resolve_timer(timer, node_id, state)?;
+            &resolved
+        } else {
+            timer
+        };
         let now = time::OffsetDateTime::parse(
             &(self.now_supplier)(),
             &time::format_description::well_known::Rfc3339,
@@ -2276,6 +2328,118 @@ impl TokenExecutor {
         // UTC-normalised: an offset-bearing `<timeDate>` renders as the instant it names, so
         // every due-at string in the system is directly comparable.
         Ok(sutra_bpmn::timer::format_instant(due))
+    }
+
+    /// The variables a timer expression evaluates against: the instance scope with `config`
+    /// bound to the deployment configuration (which shadows an instance variable of that name,
+    /// in timer expressions only).
+    fn timer_variables(&self, deployment: &DeploymentId, variables: &Variables) -> Variables {
+        let mut vars = variables.clone();
+        vars.insert(
+            sutra_bpmn::timer::TIMER_CONFIG_ROOT,
+            self.deployment_config_value(deployment),
+        );
+        vars
+    }
+
+    /// The deployment configuration as the FEEL context `config` (string entries).
+    pub fn deployment_config_value(&self, deployment: &DeploymentId) -> FeelValue {
+        let map = self
+            .deployment_config
+            .as_ref()
+            .and_then(|resolver| resolver(deployment))
+            .map(|config| {
+                config
+                    .iter()
+                    .map(|(k, v)| (k.clone(), FeelValue::String(v.clone())))
+                    .collect()
+            })
+            .unwrap_or_default();
+        FeelValue::Map(map)
+    }
+
+    /// Evaluate one timer expression and resolve it to a literal definition, or fail with
+    /// `SUTRA.RUNTIME.TIMER.EXPRESSION_INVALID` (terminal: the instance fails once).
+    fn resolve_timer(
+        &self,
+        timer: &sutra_bpmn::timer::TimerDefinition,
+        node_id: &str,
+        state: &ExecutionState<'_>,
+    ) -> Result<sutra_bpmn::timer::TimerDefinition, Signal> {
+        let sutra_bpmn::timer::TimerDefinition::Expression { form, expression } = timer else {
+            return Ok(timer.clone());
+        };
+        let vars = {
+            let ctx = state.ctx.borrow();
+            self.timer_variables(&state.deployment, &ctx.variables)
+        };
+        self.evaluate_timer_expression(*form, expression, &vars)
+            .map_err(|reason| {
+                fatal_diag(
+                    sutra_bpmn::codes::RUNTIME_TIMER_EXPRESSION_INVALID,
+                    format!(
+                        "timer '{node_id}' <{}> expression '{expression}' could not be armed: \
+                         {reason}",
+                        form.element_name()
+                    ),
+                )
+            })
+    }
+
+    /// Evaluate `expression` against `vars` and resolve the result for `form`.
+    fn evaluate_timer_expression(
+        &self,
+        form: sutra_bpmn::timer::TimerExpressionForm,
+        expression: &str,
+        vars: &Variables,
+    ) -> Result<sutra_bpmn::timer::TimerDefinition, String> {
+        let value = (self.value_evaluator)(expression, vars)
+            .map_err(|e| format!("it did not evaluate: {e}"))?;
+        sutra_bpmn::timer::resolve_timer_expression_value(form, &value)
+    }
+
+    /// Resolve one `<q:retry>` delay attribute to a duration: the literal, or its FEEL
+    /// expression evaluated against `vars` (which must already carry `config`).
+    fn retry_delay(
+        &self,
+        raw: &str,
+        is_expression: bool,
+        vars: &Variables,
+    ) -> Result<std::time::Duration, String> {
+        if is_expression {
+            let value = (self.value_evaluator)(raw, vars)
+                .map_err(|e| format!("it did not evaluate: {e}"))?;
+            sutra_bpmn::timer::duration_from_feel_value(&value)
+        } else {
+            sutra_bpmn::duration::parse_iso8601_duration(raw)
+        }
+    }
+
+    /// The `(initialDelay, maxDelay)` of a `<q:retry>` policy, with any FEEL expression evaluated
+    /// against `variables` plus the deployment's `config` — for the channel layer's synchronous
+    /// retries, which arm their policy when the call is issued. `Err` carries the reason; the
+    /// caller then takes the durable path, where the executor fails the instance if a retry is
+    /// ever armed.
+    pub fn resolve_retry_delays(
+        &self,
+        deployment: &DeploymentId,
+        policy: &sutra_bpmn::qbindings::RetryBinding,
+        variables: &Variables,
+    ) -> Result<(std::time::Duration, std::time::Duration), String> {
+        let vars = self.timer_variables(deployment, variables);
+        let initial = self.retry_delay(
+            &policy.initial_delay,
+            policy.initial_delay_expression,
+            &vars,
+        )?;
+        let ceiling = self.retry_delay(&policy.max_delay, policy.max_delay_expression, &vars)?;
+        if ceiling < initial {
+            return Err(format!(
+                "maxDelay ({ceiling:?}) is below initialDelay ({initial:?}); the ceiling clamps \
+                 the growing delay, so it can never be the smaller of the two"
+            ));
+        }
+        Ok((initial, ceiling))
     }
 
     /// The input context a task sees: declared inputs only (present ones),
@@ -4509,6 +4673,16 @@ impl Builder {
         resolver: impl Fn(&DeploymentId, &str) -> Option<Arc<ProcessDefinition>> + 'static,
     ) -> Builder {
         self.executor.module_resolver = Some(Box::new(resolver));
+        self
+    }
+
+    /// Wire the per-deployment configuration a timer expression reads as `config.<key>` (the
+    /// resolved `properties:` of the deployment's `package.yaml`).
+    pub fn with_deployment_config(
+        mut self,
+        resolver: impl Fn(&DeploymentId) -> Option<Arc<BTreeMap<String, String>>> + 'static,
+    ) -> Builder {
+        self.executor.deployment_config = Some(Box::new(resolver));
         self
     }
 
