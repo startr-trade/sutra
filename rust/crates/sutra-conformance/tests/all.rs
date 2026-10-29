@@ -38,6 +38,8 @@ mod tc_outbox_relay;
 mod tc_shard_lanes;
 #[path = "all/tc_timer_expressions.rs"]
 mod tc_timer_expressions;
+#[path = "all/tc_wait_race.rs"]
+mod tc_wait_race;
 
 // Tier-3. Both k8s suites deploy the SAME slot (`default--money-transfer--1.0.0`) — the richest
 // public example the shared scenario can host unchanged. That is safe because tier-3 runs serially

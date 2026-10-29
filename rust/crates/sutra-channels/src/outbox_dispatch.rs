@@ -41,6 +41,24 @@ use crate::SendOutcome;
 
 // ---- retry policy (exact backoff arithmetic) -----------------------------------------------
 
+/// A [`Diagnostic`] attribute a sink sets on a `RetryableFailure` to bound how many delivery
+/// attempts that kind of failure is retried for (the value is the attempt count, as a decimal).
+/// Once a row's attempt number reaches it, the failure is treated as permanent: the row takes the
+/// poison posture (deferred to the policy's max delay, kept, visible, redriven), exactly as a
+/// `PermanentFailure` would. Absent, a retryable failure follows the ordinary backoff.
+pub const BOUNDED_RETRY_ATTR: &str = "sutra.boundedRetryAttempts";
+
+/// Whether the attempt just made (number `attempt_count + 1`) used up the bound a sink set
+/// through [`BOUNDED_RETRY_ATTR`]. An unparsable or non-positive bound is ignored.
+fn bounded_retry_spent(diagnostic: &Diagnostic, attempt_count: i32) -> bool {
+    diagnostic
+        .attributes
+        .get(BOUNDED_RETRY_ATTR)
+        .and_then(|v| v.parse::<i32>().ok())
+        .filter(|bound| *bound >= 1)
+        .is_some_and(|bound| attempt_count.saturating_add(1) >= bound)
+}
+
 /// Exponential backoff with optional full jitter — the canonical replica-friendly retry
 /// curve (`now + min(base * 2^attempt, max)`, uniform `[0, computed)` jitter when
 /// enabled) so concurrent dispatchers don't synchronise their retry waves. The default
@@ -1179,6 +1197,14 @@ impl OutboxDispatcher {
         }
         match sink.send(&message).await {
             SendOutcome::Delivered => true,
+            // A sink that bounds its own retries: past the bound, the row takes the poison
+            // posture instead of growing the backoff further.
+            SendOutcome::RetryableFailure(diagnostic)
+                if bounded_retry_spent(&diagnostic, row.attempt_count) =>
+            {
+                self.poison(deployment, row, &diagnostic).await;
+                false
+            }
             SendOutcome::RetryableFailure(diagnostic) => {
                 self.defer_backoff(deployment, row, &diagnostic).await;
                 false
@@ -1635,7 +1661,7 @@ struct SignalInner {
     /// Entries this process delivered and deleted recently. A claim whose query read a row
     /// just before its delete committed must not hand it out again; remembering the id for a
     /// while closes that window.
-    finished: std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
+    finished: std::sync::Mutex<FinishedMemory>,
     handoff: std::sync::Mutex<
         Option<tokio::sync::mpsc::UnboundedSender<(DeploymentId, ClaimedOutboxRow)>>,
     >,
@@ -1715,16 +1741,11 @@ impl OutboxSignal {
     /// The rows were delivered and their delete committed: release them, and remember them for
     /// [`FINISHED_MEMORY`] so a claim that raced the delete cannot deliver them again.
     fn finished(&self, entry_ids: &[String]) {
-        {
-            let now = std::time::Instant::now();
-            let mut finished = self.inner.finished.lock().expect("outbox signal lock");
-            if finished.len() > 4096 {
-                finished.retain(|_, at| now.duration_since(*at) < FINISHED_MEMORY);
-            }
-            for id in entry_ids {
-                finished.insert(id.clone(), now);
-            }
-        }
+        self.inner
+            .finished
+            .lock()
+            .expect("outbox signal lock")
+            .remember(entry_ids, std::time::Instant::now());
         self.release(entry_ids);
     }
 
@@ -1740,16 +1761,14 @@ impl OutboxSignal {
 
     /// Mark a claimed row in flight; `false` if it already was (a hand-off owns it).
     fn claim_inflight(&self, entry_id: &str) -> bool {
-        if let Some(at) = self
+        if self
             .inner
             .finished
             .lock()
             .expect("outbox signal lock")
-            .get(entry_id)
+            .recently_finished(entry_id, std::time::Instant::now())
         {
-            if at.elapsed() < FINISHED_MEMORY {
-                return false;
-            }
+            return false;
         }
         let fresh = self
             .inner
@@ -1804,6 +1823,52 @@ pub const HANDOFF_GRACE: std::time::Duration = std::time::Duration::from_secs(30
 
 /// How long a delivered-and-deleted entry id is remembered (see `OutboxSignal::finished`).
 const FINISHED_MEMORY: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The ids of entries delivered and deleted within the last [`FINISHED_MEMORY`], with the
+/// instant each was remembered. Entries are remembered in time order, so expiry pops from the
+/// front of `order`: each call does work proportional to what it adds and what expired, never to
+/// the size of the memory (which holds a minute of deliveries — tens of thousands of ids at a
+/// few hundred settles a second).
+#[derive(Default)]
+struct FinishedMemory {
+    at: std::collections::HashMap<String, std::time::Instant>,
+    order: std::collections::VecDeque<(std::time::Instant, String)>,
+}
+
+impl FinishedMemory {
+    fn remember(&mut self, entry_ids: &[String], now: std::time::Instant) {
+        self.expire(now);
+        for id in entry_ids {
+            self.at.insert(id.clone(), now);
+            self.order.push_back((now, id.clone()));
+        }
+    }
+
+    fn recently_finished(&self, entry_id: &str, now: std::time::Instant) -> bool {
+        self.at
+            .get(entry_id)
+            .is_some_and(|at| now.saturating_duration_since(*at) < FINISHED_MEMORY)
+    }
+
+    /// Forget what is older than [`FINISHED_MEMORY`]. An id remembered again later keeps its
+    /// newer instant: the older queue entry only removes it when the instants match.
+    fn expire(&mut self, now: std::time::Instant) {
+        while let Some((at, _)) = self.order.front() {
+            if now.saturating_duration_since(*at) < FINISHED_MEMORY {
+                break;
+            }
+            let (at, id) = self.order.pop_front().expect("front exists");
+            if self.at.get(&id) == Some(&at) {
+                self.at.remove(&id);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.at.len()
+    }
+}
 
 /// The most claims one deployment gets per claimer round (a round ends early when a claim comes
 /// back short of a full batch).
@@ -2429,6 +2494,98 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains(codes::OUTBOUND_SEND_FAILED));
+    }
+
+    #[test]
+    fn finished_memory_expires_in_time_order_and_keeps_a_re_remembered_id() {
+        let t = std::time::Instant::now();
+        let ids = |r: std::ops::Range<u32>| r.map(|i| format!("e{i}")).collect::<Vec<_>>();
+        let mut memory = FinishedMemory::default();
+        memory.remember(&ids(0..3), t);
+        memory.remember(&ids(3..5), t + std::time::Duration::from_secs(30));
+        assert!(memory.recently_finished("e0", t + std::time::Duration::from_secs(59)));
+        assert!(!memory.recently_finished("e9", t));
+        // e1 is delivered again later: its newer instant must survive e1's first expiry.
+        memory.remember(&ids(1..2), t + std::time::Duration::from_secs(45));
+        memory.remember(&[], t + std::time::Duration::from_secs(61));
+        assert!(!memory.recently_finished("e0", t + std::time::Duration::from_secs(61)));
+        assert!(memory.recently_finished("e1", t + std::time::Duration::from_secs(61)));
+        assert!(memory.recently_finished("e3", t + std::time::Duration::from_secs(61)));
+        assert_eq!(memory.len(), 3, "e0 and e2 forgotten; e1, e3, e4 kept");
+        memory.remember(&[], t + std::time::Duration::from_secs(200));
+        assert_eq!(memory.len(), 0);
+        assert!(memory.order.is_empty());
+    }
+
+    /// A sink-bounded retryable failure backs off like any other until its bound, then takes the
+    /// poison posture (kept at the max-delay horizon, diagnostic attached) instead of retrying on.
+    #[tokio::test]
+    async fn bounded_retryable_failure_backs_off_then_poisons_at_its_bound() {
+        let bounded = || {
+            SendOutcome::RetryableFailure(
+                Diagnostic::error(codes::OUTBOUND_SEND_FAILED, "not parked yet")
+                    .with_attribute(BOUNDED_RETRY_ATTR, "3"),
+            )
+        };
+        // Attempt 2 of 3 (attempt_count 1 failed before): ordinary backoff.
+        let store = Arc::new(InMemoryRows::default());
+        store.enqueue(row("e1", "http://reply.example/cb", 1), t0());
+        let d = dispatcher(
+            Arc::clone(&store),
+            Arc::new(FixedSink::always("http", bounded())),
+            10,
+        );
+        d.dispatch_deployment(&dep()).await;
+        let (deferred, due, _) = &store.snapshot()[0];
+        assert_eq!(deferred.attempt_count, 2);
+        assert_eq!(
+            *due,
+            t0() + time::Duration::seconds(4),
+            "attempt 2 → base << 2"
+        );
+
+        // Attempt 3 of 3: the bound is spent → poison horizon, never dropped.
+        let store = Arc::new(InMemoryRows::default());
+        store.enqueue(row("e1", "http://reply.example/cb", 2), t0());
+        let d = dispatcher(
+            Arc::clone(&store),
+            Arc::new(FixedSink::always("http", bounded())),
+            10,
+        );
+        d.dispatch_deployment(&dep()).await;
+        let rows = store.snapshot();
+        assert_eq!(rows.len(), 1, "a spent bound poisons; the row is kept");
+        let (_, due, diag) = &rows[0];
+        assert_eq!(
+            *due,
+            t0() + time::Duration::seconds(300),
+            "max-delay horizon"
+        );
+        assert!(diag.as_deref().unwrap().contains("not parked yet"));
+    }
+
+    #[test]
+    fn bounded_retry_is_spent_only_at_the_bound_and_ignores_bad_values() {
+        let with = |v: &str| {
+            Diagnostic::error(codes::OUTBOUND_SEND_FAILED, "x")
+                .with_attribute(BOUNDED_RETRY_ATTR, v)
+        };
+        assert!(!bounded_retry_spent(&with("8"), 0));
+        assert!(!bounded_retry_spent(&with("8"), 6));
+        assert!(bounded_retry_spent(&with("8"), 7));
+        assert!(bounded_retry_spent(&with("1"), 0));
+        assert!(
+            !bounded_retry_spent(&with("0"), 50),
+            "non-positive bound ignored"
+        );
+        assert!(
+            !bounded_retry_spent(&with("many"), 50),
+            "unparsable bound ignored"
+        );
+        assert!(!bounded_retry_spent(
+            &Diagnostic::error(codes::OUTBOUND_SEND_FAILED, "x"),
+            50
+        ));
     }
 
     #[tokio::test]

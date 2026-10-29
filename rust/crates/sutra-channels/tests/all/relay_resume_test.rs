@@ -264,6 +264,15 @@ fn an_uncorrelated_relay_is_rejected_and_leaves_the_instance_parked() {
     let engine = engine_with_bridge(Rc::clone(&bridge));
     let d = expect_err(drive(engine.dispatch(&inbound("relay-in", b"K-100"))));
     assert_eq!(d.code, "SUTRA.RUNTIME.RELAY.CORRELATION_NOT_FOUND");
+    // Marked wait-pending: the instance may simply not have parked yet, and nothing ran, so a
+    // sender that can retry (the in-process local sink) holds the delivery instead of dropping it.
+    assert_eq!(
+        d.attributes
+            .get(sutra_channels::WAIT_PENDING_ATTR)
+            .map(String::as_str),
+        Some("true"),
+        "{d:?}"
+    );
     assert!(!*bridge.resume_committed.borrow(), "no resume ran");
 }
 
@@ -514,6 +523,10 @@ fn a_relay_to_a_retained_terminal_instance_is_told_it_is_finished_not_merely_unp
             d.message.contains("already reached") && d.message.contains("not resumable"),
             "the message must read as finished, not as try-later: {}",
             d.message
+        );
+        assert!(
+            !d.attributes.contains_key(sutra_channels::WAIT_PENDING_ATTR),
+            "a finished instance will never park again: not wait-pending"
         );
         // Nothing was executed and no step committed, so the claim still has to go back.
         assert_eq!(*bridge.releases.borrow(), ["inst-1".to_string()]);

@@ -88,21 +88,21 @@ RATE=100 DURATION=60s tools/sutra-load-test/relay-bench.sh
 [relay-bench] building the sink
 [relay-bench] warm-up 10/s x 10s
 [relay-bench] measured run 100/s x 60s
-| offered | sent | settled | dup | drained | settles/s | settle p50 | settle p99 | intake p50 | intake p99 | commits/settle | WAL flushes/settle | WAL KB/settle | WAL fsync busy | engine CPU (cores) | engine env |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| 100/s x 60s | 5166 | 5167 | 0 | yes | 70.4 | 6657 ms | 13212 ms | 6638 ms | 10001 ms | 16.0 | 3.02 | 10.2 | 64% | 0.29 | `defaults` |
+| offered | sent | settled | dup | drained | settles/s | settle p50 | settle p99 | intake p50 | intake p99 | commits/settle | WAL flushes/settle | WAL KB/settle | WAL fsync busy | engine CPU (cores) | PG CPU (cores) | CPU ms/settle (engine+PG) | engine env |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 100/s x 60s | 5167 | 5167 | 0 | yes | 70.1 | 6729 ms | 13395 ms | 6708 ms | 10001 ms | 16.0 | 3.01 | 10.2 | 63% | 0.24 | 0.25 | 7.09 | `defaults` |
 ```
 
 ```text
 Top statements by calls (calls | total ms | query):
-72548 | 26 | BEGIN
-72548 | 24 | COMMIT
-46799 | 162 | SELECT set_config('sutra.deployment_id', $1, true)
-25749 | 131 | SELECT set_config('synchronous_commit', 'off', true), set_config('sutra.deployment_id', $1, true)
-15501 | 388 | INSERT INTO outbox_entry (entry_id, deployment_id, instance_id, body, content_type, destination, headers_json,
-15400 | 307 | DELETE FROM outbox_entry WHERE deployment_id = $1 AND entry_id = ANY($2)
-10334 | 355 | INSERT INTO alias_index (deployment_id, instance_id, alias_name, alias_value, unique_alias, live) VALUES ($1, 
-10334 | 135 | SELECT store_value, rev FROM data_store WHERE store_name = $1 AND store_key = $2
+72550 | 30 | BEGIN
+72550 | 24 | COMMIT
+46805 | 187 | SELECT set_config($1, $2, $3)
+25745 | 140 | SELECT set_config($1, $2, $3), set_config($4, $5, $6)
+15501 | 402 | INSERT INTO outbox_entry (entry_id, deployment_id, instance_id, body, content_type, destination, headers_json,
+15396 | 332 | DELETE FROM outbox_entry WHERE deployment_id = $1 AND entry_id = ANY($2)
+10334 | 118 | SELECT instance_id FROM alias_index WHERE deployment_id = $1 AND alias_name = $2 AND alias_value = $3 AND live
+10334 | 144 | SELECT store_value, rev FROM data_store WHERE store_name = $1 AND store_key = $2
 ```
 
 One lane executes one step at a time, so its commits never share a flush; on this disk that caps
@@ -121,9 +121,9 @@ RATE=100 DURATION=60s ENGINE_ENV="SUTRA_ENGINE_SHARDS=8" tools/sutra-load-test/r
 ```text
 [relay-bench] warm-up 10/s x 10s
 [relay-bench] measured run 100/s x 60s
-| offered | sent | settled | dup | drained | settles/s | settle p50 | settle p99 | intake p50 | intake p99 | commits/settle | WAL flushes/settle | WAL KB/settle | WAL fsync busy | engine CPU (cores) | engine env |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| 100/s x 60s | 6001 | 6001 | 0 | yes | 99.9 | 19 ms | 46 ms | 5 ms | 14 ms | 15.9 | 2.90 | 10.2 | 87% | 0.43 | `SUTRA_ENGINE_SHARDS=8` |
+| offered | sent | settled | dup | drained | settles/s | settle p50 | settle p99 | intake p50 | intake p99 | commits/settle | WAL flushes/settle | WAL KB/settle | WAL fsync busy | engine CPU (cores) | PG CPU (cores) | CPU ms/settle (engine+PG) | engine env |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 100/s x 60s | 6001 | 6001 | 0 | yes | 99.8 | 20 ms | 72 ms | 5 ms | 26 ms | 15.9 | 2.81 | 10.2 | 87% | 0.35 | 0.37 | 7.31 | `SUTRA_ENGINE_SHARDS=8` |
 ```
 
 Then the target rate:
@@ -137,9 +137,9 @@ RATE=500 DURATION=60s \
 ```text
 [relay-bench] warm-up 10/s x 10s
 [relay-bench] measured run 500/s x 60s
-| offered | sent | settled | dup | drained | settles/s | settle p50 | settle p99 | intake p50 | intake p99 | commits/settle | WAL flushes/settle | WAL KB/settle | WAL fsync busy | engine CPU (cores) | engine env |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| 500/s x 60s | 30001 | 30001 | 0 | yes | 499.0 | 36 ms | 250 ms | 9 ms | 51 ms | 13.8 | 0.57 | 10.1 | 90% | 2.66 | `SUTRA_ENGINE_SHARDS=32 SUTRA_DATASOURCE_MAX_CONNECTIONS=40` |
+| offered | sent | settled | dup | drained | settles/s | settle p50 | settle p99 | intake p50 | intake p99 | commits/settle | WAL flushes/settle | WAL KB/settle | WAL fsync busy | engine CPU (cores) | PG CPU (cores) | CPU ms/settle (engine+PG) | engine env |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 500/s x 60s | 30001 | 30001 | 0 | yes | 499.1 | 31 ms | 185 ms | 8 ms | 52 ms | 14.1 | 0.57 | 10.2 | 89% | 1.79 | 2.01 | 7.69 | `SUTRA_ENGINE_SHARDS=32 SUTRA_DATASOURCE_MAX_CONNECTIONS=40` |
 ```
 
 Read the columns this way:
@@ -153,10 +153,15 @@ Read the columns this way:
 | `WAL flushes/settle` | disk flushes per order — below 1 means commits share flushes |
 | `WAL fsync busy` | share of the run the disk spent flushing |
 | `engine CPU` | cores the engine used |
+| `PG CPU` | cores PostgreSQL's backends used (*since 0.6.6*) |
+| `CPU ms/settle` | engine plus PostgreSQL CPU time per order, in milliseconds — the number to watch when the host, not the disk, is the limit (*since 0.6.6*) |
 
 When `WAL fsync busy` is near 100% and adding lanes no longer raises `settles/s`, the disk is the
 limit: a faster disk, or PostgreSQL's `commit_delay` (which makes a flush wait a few microseconds
-for more commits to join it, still durable), are what move it next.
+for more commits to join it, still durable), are what move it next. When the disk is not busy but
+every core is, the CPU is the limit: `CPU ms/settle` times the rate you want is the core count it
+takes. 0.6.6 cut it by about a fifth on this workload: with `SUTRA_OUTBOX_WORKERS=32
+SUTRA_OUTBOX_TICK_INTERVAL=PT0.01S` added to the last run, 8.05 ms on 0.6.5 and 6.33 ms on 0.6.6.
 
 ## The settings
 

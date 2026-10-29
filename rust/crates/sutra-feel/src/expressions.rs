@@ -84,15 +84,87 @@ pub fn eval_with_uri(
     context: &FeelContext,
     source_uri: &str,
 ) -> Result<FeelValue, FeelError> {
+    if let Some(parsed) = cached_parse(expression, source_uri) {
+        return evaluator::eval_with_positions(&parsed.expr, context, &parsed.positions);
+    }
     let positions = FeelSourcePositions::new(expression, source_uri);
     let tokens = FeelLexer::new(expression, &positions).tokenize()?;
-    let tokens = if crate::lexer::needs_name_resolution(&tokens) {
-        crate::lexer::resolve_names(tokens, &known_names(context))
-    } else {
-        tokens
-    };
+    if crate::lexer::needs_name_resolution(&tokens) {
+        // The parse depends on the context's names here, so it is not reusable across contexts.
+        let tokens = crate::lexer::resolve_names(tokens, &known_names(context));
+        let expr = FeelParser::new(tokens, &positions).parse()?;
+        return evaluator::eval_with_positions(&expr, context, &positions);
+    }
     let expr = FeelParser::new(tokens, &positions).parse()?;
-    evaluator::eval_with_positions(&expr, context, &positions)
+    let parsed = remember_parse(expression, source_uri, ParsedExpression { positions, expr });
+    evaluator::eval_with_positions(&parsed.expr, context, &parsed.positions)
+}
+
+/// An expression parsed once, with the source positions its diagnostics map through.
+struct ParsedExpression {
+    positions: FeelSourcePositions,
+    expr: FeelExpr,
+}
+
+/// How many parsed expressions one thread keeps (see [`cached_parse`]).
+const PARSED_EXPRESSIONS_PER_THREAD: usize = 4096;
+
+thread_local! {
+    /// Expressions this thread has parsed for [`eval_with_uri`], by source URI and then by text.
+    static PARSED_EXPRESSIONS: std::cell::RefCell<ParseCache> =
+        std::cell::RefCell::new(ParseCache::default());
+}
+
+#[derive(Default)]
+struct ParseCache {
+    by_uri: std::collections::HashMap<
+        String,
+        std::collections::HashMap<String, std::rc::Rc<ParsedExpression>>,
+    >,
+    len: usize,
+}
+
+/// The parse of `expression` (under `source_uri`) when this thread already made it. Lexing and
+/// parsing are pure functions of the text and the URI — only the "names with spaces" pass reads
+/// the context, and an expression that needs it is never cached — so a cached parse evaluates
+/// exactly as a fresh one: same value, same error, same positions. A lane evaluating the same
+/// model expressions for every instance then parses each once instead of per evaluation.
+fn cached_parse(expression: &str, source_uri: &str) -> Option<std::rc::Rc<ParsedExpression>> {
+    PARSED_EXPRESSIONS.with(|cache| {
+        cache
+            .borrow()
+            .by_uri
+            .get(source_uri)
+            .and_then(|by_text| by_text.get(expression))
+            .cloned()
+    })
+}
+
+/// Keep a successful parse for [`cached_parse`]. Bounded: when the cache holds
+/// [`PARSED_EXPRESSIONS_PER_THREAD`] parses it is emptied and refills from use (a caller that
+/// builds expression text dynamically cannot grow it without limit).
+fn remember_parse(
+    expression: &str,
+    source_uri: &str,
+    parsed: ParsedExpression,
+) -> std::rc::Rc<ParsedExpression> {
+    let parsed = std::rc::Rc::new(parsed);
+    PARSED_EXPRESSIONS.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.len >= PARSED_EXPRESSIONS_PER_THREAD {
+            cache.by_uri.clear();
+            cache.len = 0;
+        }
+        let previous = cache
+            .by_uri
+            .entry(source_uri.to_owned())
+            .or_default()
+            .insert(expression.to_owned(), std::rc::Rc::clone(&parsed));
+        if previous.is_none() {
+            cache.len += 1;
+        }
+    });
+    parsed
 }
 
 /// Same as [`eval`] but with a custom-type resolver in scope — used by `sutra-dmn`'s DRG so

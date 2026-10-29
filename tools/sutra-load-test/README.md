@@ -43,7 +43,8 @@ on the repository's disk, the callback sink, and the engine binary with the `fix
 package — an HTTP intake with a light validator and two data-store reads, a `local://` forward to
 a second process, its answer relayed back over a second local channel, and an HTTP callback to
 the sink. It reports settles/s, settle latency (callback received minus intake sent), commits and
-WAL flushes per settle, WAL fsync busy time and engine CPU, plus the top statements.
+WAL flushes per settle, WAL fsync busy time, engine and PostgreSQL CPU, CPU milliseconds per
+settle (engine + PostgreSQL), plus the top statements.
 
 ```bash
 (cd rust && cargo build --profile release-it -p sutra-dist -p sutra-cli)

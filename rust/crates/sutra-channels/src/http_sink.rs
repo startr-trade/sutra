@@ -39,6 +39,37 @@ const DEFAULT_CONTENT_TYPE: &str = "application/octet-stream";
 
 type HttpsConnector = hyper_rustls::HttpsConnector<HttpConnector>;
 
+/// The TLS configuration every outbound HTTPS client in the process starts from: rustls with the
+/// ring provider and the platform's native root certificates. The root store is read from disk
+/// (the CA bundle) ONCE per process and every later call clones the loaded configuration, so
+/// building a client — one per execution lane, per sink, per inline caller — opens no file. A
+/// process short of file descriptors therefore cannot fail a client build halfway through its
+/// life; only the very first load can fail, and a failed load is not cached (the next call tries
+/// again).
+///
+/// ring is named explicitly: the build links rustls with more than one provider (the SQL Server
+/// driver adds aws-lc-rs), and then rustls has no implicit default.
+pub fn shared_client_tls_config() -> std::io::Result<rustls::ClientConfig> {
+    use hyper_rustls::ConfigBuilderExt;
+    static SHARED: std::sync::Mutex<Option<std::sync::Arc<rustls::ClientConfig>>> =
+        std::sync::Mutex::new(None);
+    let mut shared = SHARED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(config) = shared.as_ref() {
+        return Ok(rustls::ClientConfig::clone(config));
+    }
+    let config = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .map_err(std::io::Error::other)?
+    .with_native_roots()?
+    .with_no_client_auth();
+    *shared = Some(std::sync::Arc::new(config.clone()));
+    Ok(config)
+}
+
 /// One shared hyper client per sink instance — connection-pooling, `http` and `https`
 /// schemes (rustls, native roots).
 pub struct HttpSink {
@@ -63,12 +94,7 @@ impl HttpSink {
         http.set_connect_timeout(Some(connect_timeout));
         http.enforce_http(false); // the rustls wrapper decides per-scheme
         let https = hyper_rustls::HttpsConnectorBuilder::new()
-            // ring, named explicitly: the build links rustls with more than one provider (the
-            // SQL Server driver adds aws-lc-rs), and then rustls has no implicit default.
-            .with_provider_and_native_roots(std::sync::Arc::new(
-                rustls::crypto::ring::default_provider(),
-            ))
-            .expect("native TLS root store")
+            .with_tls_config(shared_client_tls_config().expect("native TLS root store"))
             .https_or_http()
             .enable_http1()
             .wrap_connector(http);

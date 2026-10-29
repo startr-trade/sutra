@@ -47,12 +47,10 @@ impl HttpInlineCaller {
         http.set_connect_timeout(Some(connect_timeout));
         http.enforce_http(false); // the rustls wrapper decides per scheme
         let https = hyper_rustls::HttpsConnectorBuilder::new()
-            // ring, named explicitly: the build links rustls with more than one provider (the
-            // SQL Server driver adds aws-lc-rs), and then rustls has no implicit default.
-            .with_provider_and_native_roots(std::sync::Arc::new(
-                rustls::crypto::ring::default_provider(),
-            ))
-            .expect("native TLS root store")
+            // The process-wide configuration: the CA bundle is read once, not per client.
+            .with_tls_config(
+                sutra_channels::shared_client_tls_config().expect("native TLS root store"),
+            )
             .https_or_http()
             .enable_http1()
             .wrap_connector(http);
@@ -245,6 +243,64 @@ mod tests {
             outbox_key: "ob-key-9".to_string(),
             traceparent: Some("00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01".into()),
         }
+    }
+
+    /// Building HTTP clients after the process has run out of file descriptors: the CA bundle was
+    /// read once, by the first client, so every later client (one per execution lane, sink and
+    /// inline caller) builds without opening it. Before the shared configuration, each build read
+    /// the bundle, and a build under EMFILE panicked ("native TLS root store").
+    ///
+    /// The fd exhaustion runs in a child process (this same test binary, re-executed for this one
+    /// test under a low `ulimit -n`), so no other test in this binary ever sees it.
+    #[test]
+    fn clients_built_after_the_process_runs_out_of_file_descriptors_reuse_the_loaded_roots() {
+        const CHILD: &str = "SUTRA_TEST_FD_EXHAUSTION_CHILD";
+        const NAME: &str = "inline::tests::\
+            clients_built_after_the_process_runs_out_of_file_descriptors_reuse_the_loaded_roots";
+        if std::env::var_os(CHILD).is_none() {
+            let exe = std::env::current_exe().expect("test binary path");
+            let output = std::process::Command::new("sh")
+                .arg("-c")
+                .arg("ulimit -n 256 && exec \"$0\" \"$@\"")
+                .arg(exe)
+                .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1")
+                .output()
+                .expect("re-run this test in a child process");
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(output.status.success(), "child failed:\n{text}");
+            assert!(text.contains("1 passed"), "the child ran the test:\n{text}");
+            return;
+        }
+
+        // The first client loads the roots.
+        let _first = HttpInlineCaller::new();
+        // Now use up every descriptor the process may open.
+        let mut held = Vec::new();
+        loop {
+            match std::fs::File::open("/dev/null") {
+                Ok(file) => held.push(file),
+                Err(e) if e.raw_os_error() == Some(24) => break,
+                Err(e) => panic!("unexpected open error: {e}"),
+            }
+        }
+        // The condition is real: reading the bundle fresh fails here.
+        assert!(
+            hyper_rustls::HttpsConnectorBuilder::new()
+                .with_provider_and_native_roots(Arc::new(rustls::crypto::ring::default_provider()))
+                .is_err(),
+            "a fresh read of the CA bundle must fail under EMFILE"
+        );
+        // Every later client still builds.
+        for _ in 0..32 {
+            let _caller = HttpInlineCaller::new();
+            let _sink = sutra_channels::HttpSink::new();
+        }
+        drop(held);
     }
 
     #[tokio::test]

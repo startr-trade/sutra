@@ -2829,3 +2829,55 @@ fn parse_with_context_names_still_resolves_caller_names() {
         ["Existing Loans".to_string()].into_iter().collect();
     assert!(expressions::parse_with_context_names("Existing Loans > 2", &names).is_ok());
 }
+
+#[test]
+fn an_expression_evaluated_again_reads_the_new_context_and_keeps_its_error_positions() {
+    // Every call after the first reuses this thread's parse of the same text and URI.
+    for n in [1i64, 5, 40] {
+        let value =
+            expressions::eval_with_uri("a + 1", &ctx(vec![("a", FeelValue::from(n))]), "t.bpmn")
+                .expect("evaluates");
+        assert_eq!(value, FeelValue::from(n + 1));
+    }
+    // A names-with-spaces expression depends on the context's names: never reused across them.
+    let spaced = "monthly salary * 12";
+    let with = ctx(vec![("monthly salary", FeelValue::from(10i64))]);
+    assert_eq!(
+        expressions::eval_with_uri(spaced, &with, "t.bpmn").unwrap(),
+        FeelValue::from(120i64)
+    );
+    let without = ctx(vec![
+        ("monthly", FeelValue::from(2i64)),
+        ("salary", FeelValue::from(3i64)),
+    ]);
+    let other = expressions::eval_with_uri(spaced, &without, "t.bpmn");
+    let fresh = {
+        // The same evaluation on a thread that never saw the expression.
+        let without = without.clone();
+        std::thread::spawn(move || expressions::eval_with_uri(spaced, &without, "t.bpmn"))
+            .join()
+            .unwrap()
+    };
+    assert_eq!(format!("{other:?}"), format!("{fresh:?}"));
+    // A runtime error reports the same position whether the parse was fresh or reused.
+    let first = expressions::eval_with_uri("1 + {} ", &ctx(vec![]), "t.bpmn");
+    let again = expressions::eval_with_uri("1 + {} ", &ctx(vec![]), "t.bpmn");
+    assert_eq!(format!("{first:?}"), format!("{again:?}"));
+}
+
+#[test]
+fn matches_with_a_reused_pattern_answers_each_input_and_still_rejects_a_bad_pattern() {
+    // Calls after the first reuse this thread's compiled pattern.
+    for (input, expected) in [("abc-123", true), ("abc-x", false), ("zz-9", true)] {
+        let value = expressions::eval(
+            r#"matches(s, "^[a-z]+-[0-9]+$")"#,
+            &ctx(vec![("s", FeelValue::String(input.to_string()))]),
+        )
+        .expect("evaluates");
+        assert_eq!(value, FeelValue::Boolean(expected), "{input}");
+    }
+    let first = expressions::eval(r#"matches("a", "(")"#, &ctx(vec![]));
+    let again = expressions::eval(r#"matches("a", "(")"#, &ctx(vec![]));
+    assert!(first.is_err(), "{first:?}");
+    assert_eq!(format!("{first:?}"), format!("{again:?}"));
+}

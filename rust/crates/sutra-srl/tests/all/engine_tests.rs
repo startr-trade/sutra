@@ -214,3 +214,25 @@ fn multiple_reports_accumulate_in_order() {
         &FeelValue::String("B".to_string())
     );
 }
+
+#[test]
+fn a_ruleset_evaluated_again_reads_its_new_input_and_reports_the_same_errors() {
+    // The second and third evaluations reuse this thread's parse of the same source text.
+    let src = r#"rule "double" when true then set(out, x * 2); end"#;
+    for x in [1i64, 7, 21] {
+        let mut input = FeelContext::new();
+        input.insert("x".to_string(), FeelValue::from(x));
+        assert_eq!(eval(src, &input).get("out"), Some(&FeelValue::from(x * 2)));
+    }
+    let broken = r#"rule "r" when true then set(out, ; end"#;
+    let first = SrlRuleEngine::new()
+        .evaluate("t.srl", broken.as_bytes(), &empty())
+        .expect_err("parse error");
+    let again = SrlRuleEngine::new()
+        .evaluate("t.srl", broken.as_bytes(), &empty())
+        .expect_err("still a parse error, never a cached success");
+    assert_eq!(
+        (first.code, first.line, first.column),
+        (again.code, again.line, again.column)
+    );
+}

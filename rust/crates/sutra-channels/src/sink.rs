@@ -248,8 +248,9 @@ impl MessageSink for LocalDeliverySink {
             };
             // Mirror `EngineIntake::deliver`: Ok ⇒ delivered (first-observer owns it); an
             // unavailable engine actor ⇒ retryable (a later tick redelivers, inbox dedup
-            // absorbs it); every reject diagnostic ⇒ permanent (poison isolation).
-            match self.engine.dispatch_continuation(inbound).await {
+            // absorbs it); every reject diagnostic ⇒ permanent (poison isolation) — except a
+            // target that is not parked at its wait yet, which is held and retried.
+            match self.dispatch_until_parked(inbound).await {
                 Ok(_) => SendOutcome::Delivered,
                 Err(diagnostic) if is_engine_unavailable(&diagnostic) => {
                     SendOutcome::RetryableFailure(diagnostic)
@@ -273,9 +274,61 @@ impl MessageSink for LocalDeliverySink {
                 {
                     SendOutcome::RetryableFailure(diagnostic)
                 }
+                // The target has not parked at the wait yet (the sender's step committed before
+                // the receiver's did). Retried with the outbox's backoff, for a bounded number of
+                // attempts; after that the row takes the ordinary poison posture (kept, visible,
+                // redriven at the horizon), so nothing is lost either way.
+                Err(diagnostic) if is_wait_pending(&diagnostic) => {
+                    SendOutcome::RetryableFailure(diagnostic.with_attribute(
+                        crate::outbox_dispatch::BOUNDED_RETRY_ATTR,
+                        WAIT_PENDING_MAX_ATTEMPTS.to_string(),
+                    ))
+                }
                 Err(diagnostic) => SendOutcome::PermanentFailure(diagnostic),
             }
         })
+    }
+}
+
+/// How long the `local` sink holds a delivery whose target is not parked at its wait yet before
+/// handing it back to the outbox: one re-dispatch after each of these pauses (155 ms in all). The
+/// race this covers is one step of the receiving instance — milliseconds — so most deliveries go
+/// through on the first or second pause without ever touching the outbox's backoff.
+#[cfg(feature = "transport")]
+const WAIT_PENDING_PAUSES_MS: [u64; 5] = [5, 10, 20, 40, 80];
+
+/// Outbox attempts a wait-pending delivery is retried for before it takes the poison posture.
+/// With the default backoff (base 1 s, doubling, full jitter) the eight attempts span up to about
+/// four minutes.
+#[cfg(feature = "transport")]
+const WAIT_PENDING_MAX_ATTEMPTS: i32 = 8;
+
+#[cfg(feature = "transport")]
+fn is_wait_pending(diagnostic: &Diagnostic) -> bool {
+    diagnostic
+        .attributes
+        .get(crate::dispatch::WAIT_PENDING_ATTR)
+        .is_some_and(|v| v == "true")
+}
+
+#[cfg(feature = "transport")]
+impl LocalDeliverySink {
+    /// Dispatch, and while the engine answers that the target is not parked at its wait yet,
+    /// pause and dispatch the same message again ([`WAIT_PENDING_PAUSES_MS`]). Safe to repeat: a
+    /// wait-pending refusal executed nothing and wrote no inbox record. Returns the last answer.
+    async fn dispatch_until_parked(
+        &self,
+        inbound: InboundMessage,
+    ) -> Result<crate::DispatchOutcome, Diagnostic> {
+        for pause in WAIT_PENDING_PAUSES_MS {
+            match self.engine.dispatch_continuation(inbound.clone()).await {
+                Err(diagnostic) if is_wait_pending(&diagnostic) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(pause)).await;
+                }
+                answer => return answer,
+            }
+        }
+        self.engine.dispatch_continuation(inbound).await
     }
 }
 

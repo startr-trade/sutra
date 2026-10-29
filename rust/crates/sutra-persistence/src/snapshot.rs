@@ -426,7 +426,14 @@ impl InstanceSnapshot {
     /// A decrypted `sutra.enc.` plaintext goes through the same gate as a plaintext value: at v4 the
     /// ciphertext envelope carries the TAGGED form, so an encrypted variable restores typed too.
     pub fn read_encrypted(bytes: &[u8], crypto: Option<&SnapshotCrypto>) -> Result<Self, String> {
-        let map = Self::raw_map(bytes)?;
+        Self::from_raw(&RawSnapshot::parse(bytes)?, crypto)
+    }
+
+    /// [`read_encrypted`](Self::read_encrypted) over an already-parsed [`RawSnapshot`] — for a
+    /// caller that first reads `sutra.keyId` ([`RawSnapshot::key_id`]) to pick the cipher, so the
+    /// bytes are parsed once rather than once per question.
+    pub fn from_raw(raw: &RawSnapshot, crypto: Option<&SnapshotCrypto>) -> Result<Self, String> {
+        let map = &raw.map;
         let typed = map
             .get(K_SNAPSHOT_VERSION)
             .map(|v| v.trim().parse::<u32>().unwrap_or(FORMAT_VERSION))
@@ -452,7 +459,7 @@ impl InstanceSnapshot {
         let mut coverage = BTreeMap::new();
         let mut retry_attempts = BTreeMap::new();
         let mut retry_backoff = BTreeMap::new();
-        for (key, value) in &map {
+        for (key, value) in map {
             if let Some(name) = key.strip_prefix(K_VAR_PREFIX) {
                 variables.insert(name.to_owned(), decode_value(value));
             } else if let Some(name) = key.strip_prefix(K_ENC_PREFIX) {
@@ -955,12 +962,12 @@ impl InstanceSnapshot {
     /// plaintext snapshot. Read WITHOUT decrypting so the load path can rebuild the cipher from its
     /// [`KeyProvider`](sutra_crypto::KeyProvider) before calling [`read_encrypted`](Self::read_encrypted).
     pub fn peek_key_id(bytes: &[u8]) -> Result<Option<String>, String> {
-        Ok(Self::raw_map(bytes)?.get(K_KEY_ID).cloned())
+        Ok(RawSnapshot::parse(bytes)?.key_id().map(str::to_owned))
     }
 
     /// Parse the raw properties key/value map (last-write-wins), without any decode/decrypt — the
     /// shared front half of [`read_encrypted`](Self::read_encrypted) / [`peek`](Self::peek).
-    fn raw_map(bytes: &[u8]) -> Result<BTreeMap<String, String>, String> {
+    pub(crate) fn raw_map(bytes: &[u8]) -> Result<BTreeMap<String, String>, String> {
         let mut map = BTreeMap::new();
         for (k, v) in props::read_lines(bytes)? {
             map.insert(k, v);
@@ -1073,6 +1080,27 @@ fn string_variables(variables: BTreeMap<String, String>) -> BTreeMap<String, Sna
         .into_iter()
         .map(|(name, value)| (name, SnapshotValue::String(value)))
         .collect()
+}
+
+/// A snapshot's raw key/value map, parsed once and not yet decoded or decrypted: what a loader
+/// needs to read `sutra.keyId` (to choose the cipher) and then decode
+/// ([`InstanceSnapshot::from_raw`]) without parsing the bytes twice.
+pub struct RawSnapshot {
+    map: BTreeMap<String, String>,
+}
+
+impl RawSnapshot {
+    /// Parse snapshot bytes (last-write-wins per key), exactly as every reader does.
+    pub fn parse(bytes: &[u8]) -> Result<RawSnapshot, String> {
+        Ok(RawSnapshot {
+            map: InstanceSnapshot::raw_map(bytes)?,
+        })
+    }
+
+    /// The `sutra.keyId` the snapshot was encrypted under, if any.
+    pub fn key_id(&self) -> Option<&str> {
+        self.map.get(K_KEY_ID).map(String::as_str)
+    }
 }
 
 #[cfg(test)]

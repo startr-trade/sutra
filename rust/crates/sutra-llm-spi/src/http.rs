@@ -85,12 +85,10 @@ impl JsonHttpClient {
         http.set_connect_timeout(Some(connect_timeout));
         http.enforce_http(false);
         let https = hyper_rustls::HttpsConnectorBuilder::new()
-            // ring, named explicitly: the build links rustls with more than one provider (the
-            // SQL Server driver adds aws-lc-rs), and then rustls has no implicit default.
-            .with_provider_and_native_roots(std::sync::Arc::new(
-                rustls::crypto::ring::default_provider(),
-            ))
-            .expect("native TLS root store")
+            // The process-wide configuration: the CA bundle is read once, not per client.
+            .with_tls_config(
+                sutra_channels::shared_client_tls_config().expect("native TLS root store"),
+            )
             .https_or_http()
             .enable_http1()
             .wrap_connector(http);

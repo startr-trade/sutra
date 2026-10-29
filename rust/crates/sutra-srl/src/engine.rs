@@ -27,6 +27,42 @@ use crate::parser;
 /// the ruleset fresh and runs an independent agenda.
 ///
 /// [`evaluate`]: SrlRuleEngine::evaluate
+/// How many distinct rulesets one thread keeps parsed (see [`parsed_ruleset`]).
+const PARSED_RULESETS_PER_THREAD: usize = 256;
+
+thread_local! {
+    /// Rulesets this thread has parsed, by source text, with the source positions their FEEL
+    /// eval errors are mapped through.
+    static PARSED_RULESETS: std::cell::RefCell<
+        std::collections::HashMap<String, std::rc::Rc<(crate::ast::Ruleset, FeelSourcePositions)>>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// The parsed form of `src`, parsed once per thread. Parsing is a pure function of the source
+/// text, so a cached ruleset evaluates exactly as a fresh parse would; a validator evaluated on
+/// every message then pays for its parse once instead of per message. A parse error is not
+/// cached (it is returned again by the next fresh parse). The cache is bounded: when it holds
+/// [`PARSED_RULESETS_PER_THREAD`] rulesets it is emptied and refills from use.
+fn parsed_ruleset(
+    src: &str,
+) -> Result<std::rc::Rc<(crate::ast::Ruleset, FeelSourcePositions)>, SrlError> {
+    if let Some(hit) = PARSED_RULESETS.with(|cache| cache.borrow().get(src).cloned()) {
+        return Ok(hit);
+    }
+    let ruleset = parser::parse(src)?;
+    // Positions over the same source so FEEL eval-error offsets compose onto `.srl` line/col.
+    let positions = FeelSourcePositions::new(src, "srl:inline");
+    let parsed = std::rc::Rc::new((ruleset, positions));
+    PARSED_RULESETS.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.len() >= PARSED_RULESETS_PER_THREAD {
+            cache.clear();
+        }
+        cache.insert(src.to_owned(), std::rc::Rc::clone(&parsed));
+    });
+    Ok(parsed)
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SrlRuleEngine;
 
@@ -65,10 +101,8 @@ impl SrlRuleEngine {
             column: 1,
             construct: None,
         })?;
-        let ruleset = parser::parse(src)?;
-
-        // Positions over the same source so FEEL eval-error offsets compose onto `.srl` line/col.
-        let positions = FeelSourcePositions::new(src, "srl:inline");
+        let parsed = parsed_ruleset(src)?;
+        let (ruleset, positions) = (&parsed.0, &parsed.1);
 
         // Agenda: stable sort by (-salience, decl_index). No HashMap in the fire path.
         let mut agenda: Vec<&Rule> = ruleset.rules.iter().collect();
@@ -91,7 +125,7 @@ impl SrlRuleEngine {
             }
 
             let fires = eval_boolean(&rule.condition, &working)
-                .map_err(|e| wrap_eval_error(&e, rule.condition_span.0, &positions))?;
+                .map_err(|e| wrap_eval_error(&e, rule.condition_span.0, positions))?;
             if !fires {
                 continue;
             }
@@ -104,7 +138,7 @@ impl SrlRuleEngine {
                         expr_span,
                     } => {
                         let value = eval(expr, &working)
-                            .map_err(|e| wrap_eval_error(&e, expr_span.0, &positions))?;
+                            .map_err(|e| wrap_eval_error(&e, expr_span.0, positions))?;
                         working.insert(target.clone(), value.clone());
                         output.insert(target.clone(), value);
                     }
@@ -116,15 +150,15 @@ impl SrlRuleEngine {
                     } => {
                         let code_s = coerce_string(
                             eval(code, &working)
-                                .map_err(|e| wrap_eval_error(&e, arg_spans[0].0, &positions))?,
+                                .map_err(|e| wrap_eval_error(&e, arg_spans[0].0, positions))?,
                         );
                         let path_s = coerce_string(
                             eval(path, &working)
-                                .map_err(|e| wrap_eval_error(&e, arg_spans[1].0, &positions))?,
+                                .map_err(|e| wrap_eval_error(&e, arg_spans[1].0, positions))?,
                         );
                         let message_s = coerce_string(
                             eval(message, &working)
-                                .map_err(|e| wrap_eval_error(&e, arg_spans[2].0, &positions))?,
+                                .map_err(|e| wrap_eval_error(&e, arg_spans[2].0, positions))?,
                         );
                         issues.push(issue_map(code_s, path_s, message_s));
                     }

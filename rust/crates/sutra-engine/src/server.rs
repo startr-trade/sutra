@@ -836,13 +836,36 @@ async fn init_engine_db(
     // poller and the sweepers — so neither side can take the other's connections. Sizes are
     // `sutra.datasource.max-connections` (default 8, the pre-0.6.5 size) and
     // `sutra.datasource.dispatch-max-connections` (default 2).
-    let pool = PgPoolOptions::new()
-        .max_connections(config.datasource_pools.max_connections)
+    let pool = engine_pool_options(config.datasource_pools.max_connections)
         .connect_lazy_with(options.clone());
-    let dispatch = PgPoolOptions::new()
-        .max_connections(config.datasource_pools.dispatch_max_connections)
+    let dispatch = engine_pool_options(config.datasource_pools.dispatch_max_connections)
         .connect_lazy_with(options);
     Ok((pool, dispatch))
+}
+
+/// A pooled connection idle at least this long is pinged before it is handed out.
+const POOL_IDLE_PING_AFTER: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Pool options for the engine's own datasource pools. The pool already pings every connection
+/// when it is RETURNED (sqlx does so unconditionally, and closes one that fails), so a connection
+/// handed out moments after its return is known good; pinging it again on acquire — sqlx's
+/// default — costs a round trip on every transaction (a dozen per settle in a relay) and buys
+/// nothing. Only a connection that sat idle for [`POOL_IDLE_PING_AFTER`] or more, long enough for
+/// the server or a proxy to have dropped it, is pinged before use, and replaced if the ping fails.
+/// A transaction on a connection that failed in between still fails and rolls back, exactly as
+/// one whose connection breaks mid-statement always has.
+fn engine_pool_options(max_connections: u32) -> PgPoolOptions {
+    PgPoolOptions::new()
+        .max_connections(max_connections)
+        .test_before_acquire(false)
+        .before_acquire(|conn, meta| {
+            Box::pin(async move {
+                if meta.idle_for < POOL_IDLE_PING_AFTER {
+                    return Ok(true);
+                }
+                Ok(sqlx::Connection::ping(conn).await.is_ok())
+            })
+        })
 }
 
 /// Blocking-thread body: dedicated connection + the ordered `V<number>__*.sql` runner.

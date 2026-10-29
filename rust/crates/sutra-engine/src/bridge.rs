@@ -55,7 +55,7 @@ use sutra_channels::diag::Diagnostic;
 use sutra_channels::stores::InboxStore as ChannelInboxStore;
 use sutra_channels::stores::{InboundIncident, IncidentSink};
 use sutra_persistence::scope::begin_deployment_tx;
-use sutra_persistence::snapshot::{InstanceSnapshot, SnapshotCrypto};
+use sutra_persistence::snapshot::{InstanceSnapshot, RawSnapshot, SnapshotCrypto};
 
 use crate::snapshot_values;
 use sutra_persistence::step::{
@@ -293,17 +293,6 @@ impl PersistenceBridge {
         }
     }
 
-    /// Decode a persisted snapshot, decrypting its `sutra.enc.` values when the snapshot carries a
-    /// keyId (read from the snapshot itself — no external tenant lookup). Fails closed on an
-    /// encrypted snapshot with no key provider configured.
-    fn decode_snapshot(
-        &self,
-        bytes: &[u8],
-        instance_id: &str,
-    ) -> Result<InstanceSnapshot, Diagnostic> {
-        decode_persisted_snapshot(self.key_provider.as_deref(), bytes, instance_id)
-    }
-
     /// Blind-index this instance's `@subjectKey` values: HMAC each raw value under the tenant's
     /// migration-stable index key, producing the `subject_index` rows the step writes
     /// atomically with the snapshot. Empty when no key provider is configured, the instance carries
@@ -339,13 +328,23 @@ pub(crate) fn decode_persisted_snapshot(
     bytes: &[u8],
     instance_id: &str,
 ) -> Result<InstanceSnapshot, Diagnostic> {
-    let key_id = InstanceSnapshot::peek_key_id(bytes).map_err(decode_diag)?;
-    match (key_id, key_provider) {
+    // Parsed once: the key id picks the cipher, and the same parse is then decoded.
+    let raw = RawSnapshot::parse(bytes).map_err(decode_diag)?;
+    decode_raw_snapshot(key_provider, &raw, instance_id)
+}
+
+/// [`decode_persisted_snapshot`] over an already-parsed snapshot.
+pub(crate) fn decode_raw_snapshot(
+    key_provider: Option<&(dyn KeyProvider + Send + Sync)>,
+    raw: &RawSnapshot,
+    instance_id: &str,
+) -> Result<InstanceSnapshot, Diagnostic> {
+    match (raw.key_id(), key_provider) {
         (Some(key_id), Some(provider)) => {
-            let key = provider.data_key(&key_id).map_err(crypto_diag)?;
+            let key = provider.data_key(key_id).map_err(crypto_diag)?;
             let cipher = Aes256GcmCipher::new(&key);
-            let ctx = SnapshotCrypto::new(&cipher, &key_id, instance_id);
-            InstanceSnapshot::read_encrypted(bytes, Some(&ctx)).map_err(decode_diag)
+            let ctx = SnapshotCrypto::new(&cipher, key_id, instance_id);
+            InstanceSnapshot::from_raw(raw, Some(&ctx)).map_err(decode_diag)
         }
         (Some(_), None) => Err(Diagnostic::error(
             channel_codes::RUNTIME_UNEXPECTED,
@@ -355,7 +354,7 @@ pub(crate) fn decode_persisted_snapshot(
                  decrypt; refusing to resume in the clear"
             ),
         )),
-        (None, _) => InstanceSnapshot::read(bytes).map_err(decode_diag),
+        (None, _) => InstanceSnapshot::from_raw(raw, None).map_err(decode_diag),
     }
 }
 
@@ -594,10 +593,9 @@ impl InstanceBridge for PersistenceBridge {
         // Decrypt at-rest values when the snapshot self-describes a keyId (fail-closed on a missing
         // provider). The keyId itself is carried forward so a re-park re-encrypts under the same
         // migration-stable anchor even though the resume path has no channel binding.
-        let key_id = InstanceSnapshot::peek_key_id(&row.serialised)
-            .map_err(decode_diag)?
-            .unwrap_or_default();
-        let decoded = self.decode_snapshot(&row.serialised, instance_id)?;
+        let raw = RawSnapshot::parse(&row.serialised).map_err(decode_diag)?;
+        let key_id = raw.key_id().unwrap_or_default().to_owned();
+        let decoded = decode_raw_snapshot(self.key_provider.as_deref(), &raw, instance_id)?;
         Ok(Some(SuspendedInstance {
             process_id: decoded.process_id().to_string(),
             deployment_id: decoded.deployment_id().to_string(),

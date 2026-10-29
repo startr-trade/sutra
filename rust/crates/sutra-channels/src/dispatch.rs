@@ -60,6 +60,16 @@ pub const ACK_DISPOSITION_ATTR: &str = "sutra.ackDisposition";
 /// posture of an idempotent process.
 pub const ACK_DISPOSITION_REQUEUE: &str = "requeue";
 
+/// A [`Diagnostic`] attribute the relay path stamps on a refusal that means "the target exists,
+/// but is not parked at the wait yet": no live instance carries the wait's correlation alias
+/// (the instance has not reached the wait, so its alias is not written), the instance is parked
+/// at a different node, or it is not suspended at all. Nothing was executed and no inbox record
+/// was written, so the same delivery can be offered again. A transport that cannot tell a race
+/// from a stale message keeps its own disposition; the in-process `local` sink, whose sender is
+/// a co-deployed process that may still be between steps, holds and retries it (bounded) instead
+/// of poisoning it.
+pub const WAIT_PENDING_ATTR: &str = "sutra.waitPending";
+
 /// One transport delivery, as handed to the dispatcher. The transport stamps the
 /// channel's namespace (`module_key`) and tenant — never the client.
 #[derive(Debug, Clone)]
@@ -2409,14 +2419,17 @@ impl ChannelEngine {
             .find_live_alias(deployment, &alias_name, &alias_value)
             .await?
         else {
-            return Ok(RelayResolution::NotCorrelated(Diagnostic::error(
-                codes::RUNTIME_RELAY_CORRELATION_NOT_FOUND,
-                format!(
-                    "No live instance carries alias {alias_name}={alias_value} for \
+            return Ok(RelayResolution::NotCorrelated(
+                Diagnostic::error(
+                    codes::RUNTIME_RELAY_CORRELATION_NOT_FOUND,
+                    format!(
+                        "No live instance carries alias {alias_name}={alias_value} for \
                      deployment {}; the relay cannot be correlated to a waiting instance.",
-                    deployment.value()
-                ),
-            )));
+                        deployment.value()
+                    ),
+                )
+                .with_attribute(WAIT_PENDING_ATTR, "true"),
+            ));
         };
 
         // Shard routing seam (execution scale-out §1.1): correlation just named the
@@ -2572,7 +2585,8 @@ impl ChannelEngine {
                      a parked instance.",
                         snapshot.status
                     ),
-                ));
+                )
+                .with_attribute(WAIT_PENDING_ATTR, "true"));
             }
             // A relay for a channel-call node sitting in a RETRY BACKOFF window: the response
             // belongs to a DEAD attempt (its timeout fired, or its delivery poisoned, and the
@@ -2667,7 +2681,8 @@ impl ChannelEngine {
                     ),
                 )
                 .with_attribute("instanceId", instance_id)
-                .with_attribute("nodeId", wait_node_id));
+                .with_attribute("nodeId", wait_node_id)
+                .with_attribute(WAIT_PENDING_ATTR, "true"));
             }
             // Restored variables come back TYPED (the snapshot value model); the relay's variables
             // are merged in by resume() — relay wins on collision. Nothing is re-parsed here: a

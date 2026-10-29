@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  race-worker: started by a local delivery on worker-in, it answers at once on to-answer
+  (local://answer-in), racing the race-intake instance to its AwaitAnswer wait.
+-->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0"
+                  id="Definitions_race_worker"
+                  targetNamespace="urn:sutra:module:waitrace:1.0.0">
+
+  <bpmn:process id="race-worker" name="Race worker" isExecutable="true">
+    <bpmn:extensionElements>
+      <q:variables>
+        <q:variable name="responseBody" type="object"/>
+      </q:variables>
+    </bpmn:extensionElements>
+
+    <bpmn:startEvent id="Start" name="Forward received">
+      <bpmn:extensionElements>
+        <q:source channel="worker-in"/>
+      </bpmn:extensionElements>
+      <bpmn:outgoing>W1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="W1" sourceRef="Start" targetRef="BuildAnswer"/>
+
+    <bpmn:serviceTask id="BuildAnswer" name="Build the answer (FEEL)">
+      <bpmn:incoming>W1</bpmn:incoming><bpmn:outgoing>W2</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment>
+          <bpmn:from>{ref: payload.ref, status: "ANSWERED"}</bpmn:from>
+          <bpmn:to>responseBody</bpmn:to>
+        </bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="W2" sourceRef="BuildAnswer" targetRef="Answer"/>
+
+    <bpmn:sendTask id="Answer" name="Answer the intake">
+      <bpmn:extensionElements>
+        <q:send channel="to-answer"/>
+      </bpmn:extensionElements>
+      <bpmn:incoming>W2</bpmn:incoming><bpmn:outgoing>W3</bpmn:outgoing>
+    </bpmn:sendTask>
+    <bpmn:sequenceFlow id="W3" sourceRef="Answer" targetRef="End"/>
+
+    <bpmn:endEvent id="End" name="Answered"><bpmn:incoming>W3</bpmn:incoming></bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>

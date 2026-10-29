@@ -107,7 +107,7 @@ pub use dispatch::{
     ChannelCallPoisonFire, ChannelCallPoisonOutcome, ChannelEngine, DeferredDispatch,
     DispatchOutcome, InboundMessage, InlineChain, RelayReplyContext, ResolvedResume,
     ScheduledStartFire, ScheduledStartOutcome, SyncReply, TimerFireOutcome, ACK_DISPOSITION_ATTR,
-    ACK_DISPOSITION_REQUEUE, SCHEDULE_CHANNEL,
+    ACK_DISPOSITION_REQUEUE, SCHEDULE_CHANNEL, WAIT_PENDING_ATTR,
 };
 #[cfg(feature = "transport")]
 pub use external_task::{
@@ -122,7 +122,7 @@ pub use http::{
     EngineShard, HttpRouteSet,
 };
 #[cfg(feature = "transport")]
-pub use http_sink::HttpSink;
+pub use http_sink::{shared_client_tls_config, HttpSink};
 pub use inline::{
     InlineCaller, InlineCallerRegistry, InlineChunk, InlineChunkSink, InlineFailure, InlineResponse,
 };
@@ -133,7 +133,7 @@ pub use intake::{InboundChain, IntakeOutcome};
 pub use outbox_dispatch::{
     encode_wire_message, spawn_concurrent_dispatch_loop, spawn_dispatch_loop, ClaimedOutboxRow,
     DispatchStats, LiveDeploymentSet, OutboxConcurrency, OutboxDispatcher, OutboxDispatcherHandle,
-    OutboxRowStore, OutboxSignal, PoisonedDelivery, RetryPolicy,
+    OutboxRowStore, OutboxSignal, PoisonedDelivery, RetryPolicy, BOUNDED_RETRY_ATTR,
 };
 pub use policy::{
     ActiveInstanceCount, AllowAllFeatureProvider, Clock, ConcurrencyStore,

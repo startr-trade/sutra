@@ -13,6 +13,44 @@ This is the changelog for the **Rust-native** engine (`rust/` workspace). It beg
 
 Nothing yet.
 
+## [0.6.6] — 2026-10-29
+
+A **patch** release: one lost-message fix, one boot failure under file-descriptor pressure, and
+less CPU per completed relay. Durability is unchanged — no commit was added, removed or made
+asynchronous. The snapshot format and the database schema are unchanged (no migration), and the
+`q:` namespace is untouched. On the same laptop and durable PostgreSQL as 0.6.5, the relay
+workload at 500/s costs 6.3 ms of CPU per settle instead of 8.1 (engine 2.18 → 1.48 cores), at
+the same 0.60 WAL flushes per settle and p99.
+
+### Fixed
+
+- **A local answer that reached its target before the target parked was lost.** In-process
+  (`local://`) deliveries are handed over the moment the sender commits, so an answer could reach
+  an instance that had committed its request at one park and had not yet reached the wait that
+  takes the answer (a `q:reply continue="true"`, a timer, any earlier wait in between). The engine
+  refused it (`SUTRA.RUNTIME.RELAY.CORRELATION_NOT_FOUND`, or `RESUME.NOT_WAITING` /
+  `RESUME.NOT_SUSPENDED`) and the delivery went to the poison horizon, five minutes away. Those
+  refusals are now marked `sutra.waitPending`; the local sink holds such a delivery and offers it
+  again (after 5–80 ms, 155 ms in all), then retries it with the outbox backoff for up to 8
+  attempts before it takes the poison posture as before. Nothing is lost either way. A finished
+  instance is never wait-pending. Other transports are unchanged.
+- **An HTTP client build could panic a lane when file descriptors ran out.** Every outbound HTTP
+  client read the CA bundle when it was built (one per lane, plus each sink); under EMFILE the
+  build panicked and the lane's deliveries were dead-lettered. The bundle is now read once per
+  process and shared (`sutra_channels::shared_client_tls_config`).
+
+### Changed
+
+- **Less CPU per step.** A pooled database connection is pinged before use only after a second
+  idle (it is still pinged when returned); `BEGIN` and the deployment-scope `set_config` go in one
+  round trip; a stored instance is parsed once per load, not two or three times; FEEL expressions,
+  `matches()` patterns and SRL rulesets are parsed or compiled once per thread instead of per
+  evaluation; the outbox dispatcher's memory of recently delivered rows expires in time order
+  instead of rescanning itself; the XSD validator counts columns incrementally (it was quadratic
+  on a one-line document).
+- `tools/sutra-load-test/relay-bench.sh` also reports PostgreSQL CPU and CPU milliseconds per
+  settle.
+
 ## [0.6.5] — 2026-10-29
 
 A **patch** release about durable throughput, plus two small fixes. Durability is unchanged:

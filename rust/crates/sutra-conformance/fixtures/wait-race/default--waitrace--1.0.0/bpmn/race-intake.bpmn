@@ -1,0 +1,98 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  race-intake: sends a request, and only parks at the wait for its answer one step LATER.
+
+    startEvent (order-in) -> BuildForward -> Forward (send to-worker, local)
+    -> Settle (timer, PT2S: the step boundary the answer races)
+    -> AwaitAnswer (receive on answer-in, correlated by ref)
+    -> BuildCallback -> Callback (send callback-out, HTTP) -> End
+
+  The forward is committed when the instance parks at Settle, and the worker answers at once, so
+  the answer reaches this instance while it is parked at the timer: AwaitAnswer's alias does not
+  exist yet. The answer must be held and retried until the instance parks at AwaitAnswer.
+-->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0"
+                  id="Definitions_race_intake"
+                  targetNamespace="urn:sutra:module:waitrace:1.0.0">
+
+  <bpmn:process id="race-intake" name="Race intake" isExecutable="true">
+    <bpmn:extensionElements>
+      <q:variables>
+        <q:variable name="answer" type="object"/>
+        <q:variable name="responseBody" type="object"/>
+      </q:variables>
+    </bpmn:extensionElements>
+
+    <bpmn:startEvent id="Start" name="Order received">
+      <bpmn:extensionElements>
+        <q:source channel="order-in"/>
+        <q:alias name="orderRef" expression="payload.ref" unique="true"/>
+      </bpmn:extensionElements>
+      <bpmn:outgoing>F1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="F1" sourceRef="Start" targetRef="BuildForward"/>
+
+    <bpmn:serviceTask id="BuildForward" name="Build the forward (FEEL)">
+      <bpmn:incoming>F1</bpmn:incoming><bpmn:outgoing>F2</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment>
+          <bpmn:from>{ref: payload.ref}</bpmn:from>
+          <bpmn:to>responseBody</bpmn:to>
+        </bpmn:assignment>
+      </bpmn:dataInputAssociation>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment>
+          <!-- The wait's alias (answer.ref) is evaluated when the instance parks at AwaitAnswer. -->
+          <bpmn:from>{ref: payload.ref}</bpmn:from>
+          <bpmn:to>answer</bpmn:to>
+        </bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F2" sourceRef="BuildForward" targetRef="Forward"/>
+
+    <bpmn:sendTask id="Forward" name="Forward to the worker">
+      <bpmn:extensionElements>
+        <q:send channel="to-worker"/>
+      </bpmn:extensionElements>
+      <bpmn:incoming>F2</bpmn:incoming><bpmn:outgoing>F3</bpmn:outgoing>
+    </bpmn:sendTask>
+    <bpmn:sequenceFlow id="F3" sourceRef="Forward" targetRef="Settle"/>
+
+    <bpmn:intermediateCatchEvent id="Settle" name="Between steps">
+      <bpmn:incoming>F3</bpmn:incoming><bpmn:outgoing>F4</bpmn:outgoing>
+      <bpmn:timerEventDefinition><bpmn:timeDuration>PT2S</bpmn:timeDuration></bpmn:timerEventDefinition>
+    </bpmn:intermediateCatchEvent>
+    <bpmn:sequenceFlow id="F4" sourceRef="Settle" targetRef="AwaitAnswer"/>
+
+    <bpmn:receiveTask id="AwaitAnswer" name="Await the worker's answer">
+      <bpmn:extensionElements>
+        <q:source channel="answer-in" name="answer"/>
+        <q:alias name="answerRef" expression="answer.ref" unique="true"/>
+      </bpmn:extensionElements>
+      <bpmn:incoming>F4</bpmn:incoming><bpmn:outgoing>F5</bpmn:outgoing>
+    </bpmn:receiveTask>
+    <bpmn:sequenceFlow id="F5" sourceRef="AwaitAnswer" targetRef="BuildCallback"/>
+
+    <bpmn:serviceTask id="BuildCallback" name="Build the callback (FEEL)">
+      <bpmn:incoming>F5</bpmn:incoming><bpmn:outgoing>F6</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment>
+          <bpmn:from>{ref: payload.ref, status: answer.status}</bpmn:from>
+          <bpmn:to>responseBody</bpmn:to>
+        </bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F6" sourceRef="BuildCallback" targetRef="Callback"/>
+
+    <bpmn:sendTask id="Callback" name="Call back">
+      <bpmn:extensionElements>
+        <q:send channel="callback-out"/>
+      </bpmn:extensionElements>
+      <bpmn:incoming>F6</bpmn:incoming><bpmn:outgoing>F7</bpmn:outgoing>
+    </bpmn:sendTask>
+    <bpmn:sequenceFlow id="F7" sourceRef="Callback" targetRef="End"/>
+
+    <bpmn:endEvent id="End" name="Settled"><bpmn:incoming>F7</bpmn:incoming></bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>

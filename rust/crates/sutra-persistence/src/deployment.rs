@@ -21,7 +21,7 @@ impl DeploymentId {
         }
     }
 
-    fn is_valid(value: &str) -> bool {
+    pub(crate) fn is_valid(value: &str) -> bool {
         let Some(hex) = value.strip_prefix("dep-") else {
             return false;
         };

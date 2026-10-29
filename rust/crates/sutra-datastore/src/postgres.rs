@@ -222,7 +222,22 @@ fn store_inner(
     // Config-driven pool sizing (datastores.yaml `maxConnections` / `acquireTimeout`),
     // defaulting to the shared ceiling when unset — no hardcoded pool size.
     let pool_config = def.pool_config()?;
-    let mut pool_options = PgPoolOptions::new().max_connections(pool_config.max_connections);
+    //
+    // No ping on every acquire: sqlx already pings a connection when it is returned (and closes
+    // one that fails), so only a connection idle for a second or more — long enough for the
+    // server or a proxy to have dropped it — is pinged before it is handed out. That saves a
+    // round trip per read without handing out connections nobody has checked lately.
+    let mut pool_options = PgPoolOptions::new()
+        .max_connections(pool_config.max_connections)
+        .test_before_acquire(false)
+        .before_acquire(|conn, meta| {
+            Box::pin(async move {
+                if meta.idle_for < std::time::Duration::from_secs(1) {
+                    return Ok(true);
+                }
+                Ok(sqlx::Connection::ping(conn).await.is_ok())
+            })
+        });
     if let Some(acquire_timeout) = pool_config.acquire_timeout {
         pool_options = pool_options.acquire_timeout(acquire_timeout);
     }

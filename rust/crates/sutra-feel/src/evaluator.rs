@@ -1600,7 +1600,7 @@ impl Evaluator<'_> {
         // `s/m/i/x` map to inline regex flags (plus a source pre-pass for `x`/dot-vs-CR/
         // `\p{IsXxx}`/class-subtraction — see `translated_pattern`).
         let prefixed = self.translated_pattern(p, &flags, "matches", site)?;
-        let matched = match regex::Regex::new(&prefixed) {
+        let matched = match cached_regex(&prefixed) {
             Ok(re) => re.is_match(s),
             // The XPath flavor allows BACKREFERENCES (`(a)\1` — DMN-TCK 1111-feel-matches-
             // function K2-MatchesFunc-17), which the `regex` crate rejects by design (no
@@ -1872,7 +1872,7 @@ impl Evaluator<'_> {
         site: usize,
     ) -> Result<regex::Regex, FeelError> {
         let prefixed = self.translated_pattern(pattern, flags, func, site)?;
-        regex::Regex::new(&prefixed).map_err(|e| {
+        cached_regex(&prefixed).map_err(|e| {
             self.error(
                 codes::FEEL_COMPILE_TYPE_MISMATCH,
                 format!("{func}() invalid regex pattern '{pattern}': {e}"),
@@ -3880,4 +3880,34 @@ fn disambiguate_replacement_backreferences(replacement: &str) -> String {
         i += 1;
     }
     out
+}
+
+/// How many compiled patterns one thread keeps (see [`cached_regex`]).
+const COMPILED_REGEXES_PER_THREAD: usize = 512;
+
+thread_local! {
+    /// Patterns this thread has compiled for `matches()` / `replace()` / `split()`, by their final
+    /// (flag-prefixed, translated) source text.
+    static COMPILED_REGEXES: std::cell::RefCell<std::collections::HashMap<String, regex::Regex>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// `regex::Regex::new(pattern)`, compiled once per thread. Compilation is a pure function of the
+/// pattern text, so the cached regex matches exactly as a fresh one would; a model that calls
+/// `matches()` on every message then compiles each pattern once instead of per call. A pattern
+/// that fails to compile is not cached (the next call compiles it again and returns the same
+/// error). Bounded: when full, the cache is emptied and refills from use.
+fn cached_regex(pattern: &str) -> Result<regex::Regex, regex::Error> {
+    if let Some(hit) = COMPILED_REGEXES.with(|cache| cache.borrow().get(pattern).cloned()) {
+        return Ok(hit);
+    }
+    let compiled = regex::Regex::new(pattern)?;
+    COMPILED_REGEXES.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.len() >= COMPILED_REGEXES_PER_THREAD {
+            cache.clear();
+        }
+        cache.insert(pattern.to_owned(), compiled.clone());
+    });
+    Ok(compiled)
 }

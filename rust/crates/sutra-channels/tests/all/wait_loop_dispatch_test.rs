@@ -600,6 +600,13 @@ fn a_relay_for_a_wait_the_instance_already_left_is_refused() {
 
     let d = send(&rig, "turn-in", "K-1", "r-1-dup").expect_err("A is no longer waiting");
     assert_eq!(d.code, "SUTRA.RUNTIME.RESUME.NOT_WAITING", "{d:?}");
+    assert_eq!(
+        d.attributes
+            .get(sutra_channels::WAIT_PENDING_ATTR)
+            .map(String::as_str),
+        Some("true"),
+        "nothing ran, so the refusal is marked wait-pending: {d:?}"
+    );
     assert_eq!(rig.bridge.waiting(), ["B"], "the instance did not move");
 
     send(&rig, "other-in", "K-1", "r-2").expect("B resumes");

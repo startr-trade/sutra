@@ -82,6 +82,43 @@ suspends the instance, so a relay arriving later — on a different channel, aga
 replica — finds it by the key you named. And because a hard-invalid relay is refused *before*
 anything is rehydrated, the parked instance is never the thing that pays for a bad message.
 
+### An answer that arrives before its wait
+
+*Since 0.6.6.* Between co-deployed processes an answer can be faster than the process that asked.
+A `local://` delivery goes out the moment the sender's step commits, so when a process sends a
+request at one park and reaches the wait for the answer only one step later — a
+`q:reply continue="true"`, a timer, or any other wait in between — the answer can reach the
+instance before it has parked there. Its wait key is not written yet, so the engine refuses the
+answer (`SUTRA.RUNTIME.RELAY.CORRELATION_NOT_FOUND`, or `SUTRA.RUNTIME.RESUME.NOT_WAITING` when the
+instance is parked at another node), having run nothing.
+
+The engine marks such a refusal *wait-pending* (`sutra.waitPending=true` on the diagnostic), and a
+`local://` delivery that gets one is held, not dropped: it is offered again after a few
+milliseconds (155 ms in all, about one step), and then retried with the outbox backoff for up to
+8 attempts — about four minutes. If the instance still has not parked by then, the delivery takes
+the outbox's usual poison posture: kept with its last error and redelivered at the poison horizon,
+so nothing is lost. An answer for an instance that has finished is never wait-pending. A message
+from outside the engine (HTTP, a broker) keeps the transport's own handling, because the engine
+cannot tell a fast answer from a stale one there; send it again, or make the wait come first.
+
+To watch it, run the conformance test that builds the race on purpose. Its package
+(`rust/crates/sutra-conformance/fixtures/wait-race/`) sends a request to a second process, waits two
+seconds on a timer, and only then parks at the wait for the answer, which the second process sends
+at once. It needs Docker and the engine image built from your checkout (`make image`):
+
+```bash
+cd rust && cargo test -p sutra-conformance --test all tc_wait_race -- --ignored --nocapture
+```
+
+```text
+test tc_wait_race::tc_wait_race_an_answer_that_beats_the_wait_is_held_until_the_wait_parks ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 46 filtered out; finished in 8.85s
+```
+
+All 20 answers arrive while their instances sit at the timer, and all 20 instances complete, each
+called back once. On a 0.6.5 engine the same test fails after 90 seconds with every answer still in
+the outbox, refused with `SUTRA.RUNTIME.RELAY.CORRELATION_NOT_FOUND` and parked at the poison horizon.
+
 ## Variables survive the wait **typed**
 
 The instance variables held across a wait keep their real types. A number comes back a number, a

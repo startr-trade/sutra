@@ -193,6 +193,11 @@ impl std::error::Error for DocumentError {}
 pub(crate) struct SourceMap<'a> {
     text: &'a [u8],
     line_starts: Vec<usize>,
+    /// The last position answered from a valid-UTF-8 line prefix: `(line index, byte offset,
+    /// columns before it)`. A validator asks for positions in document order, mostly on one
+    /// line (a message is often a single line), so the next answer only counts the bytes since
+    /// this one instead of the whole line again.
+    last: std::cell::Cell<Option<(usize, usize, usize)>>,
 }
 
 impl<'a> SourceMap<'a> {
@@ -203,7 +208,11 @@ impl<'a> SourceMap<'a> {
                 line_starts.push(i + 1);
             }
         }
-        SourceMap { text, line_starts }
+        SourceMap {
+            text,
+            line_starts,
+            last: std::cell::Cell::new(None),
+        }
     }
 
     pub(crate) fn pos(&self, offset: usize) -> SourcePos {
@@ -213,13 +222,62 @@ impl<'a> SourceMap<'a> {
             Err(i) => i.saturating_sub(1),
         };
         let line_start = self.line_starts[idx];
-        let column = String::from_utf8_lossy(&self.text[line_start..offset])
-            .chars()
-            .count()
-            + 1;
+        // Columns are the Unicode scalar values before `offset` on its line. Over valid UTF-8 the
+        // count is additive, so it continues from the last answer on the same line; anything
+        // else (an earlier offset, another line, invalid UTF-8) counts the line prefix afresh —
+        // with the lossy decoding, one replacement character per invalid sequence, as always.
+        let continued = self.last.get().and_then(|(line, at, columns)| {
+            (line == idx && at <= offset)
+                .then(|| std::str::from_utf8(&self.text[at..offset]).ok())
+                .flatten()
+                .map(|delta| columns + delta.chars().count())
+        });
+        let columns = match continued {
+            Some(columns) => {
+                self.last.set(Some((idx, offset, columns)));
+                columns
+            }
+            None => {
+                let prefix = &self.text[line_start..offset];
+                match std::str::from_utf8(prefix) {
+                    Ok(text) => {
+                        let columns = text.chars().count();
+                        self.last.set(Some((idx, offset, columns)));
+                        columns
+                    }
+                    Err(_) => {
+                        self.last.set(None);
+                        String::from_utf8_lossy(prefix).chars().count()
+                    }
+                }
+            }
+        };
         SourcePos {
             line: (idx + 1) as u32,
-            column: column as u32,
+            column: (columns + 1) as u32,
+        }
+    }
+}
+
+#[cfg(test)]
+mod source_map_tests {
+    use super::*;
+
+    /// The incremental column count answers exactly what a fresh lossy count of the line prefix
+    /// does, for offsets in any order, across lines, multi-byte characters and invalid bytes.
+    #[test]
+    fn positions_match_a_fresh_count_in_any_order() {
+        let text: &[u8] = b"<a>\xc3\xa9t\xc3\xa9<b x='1'/>\n<c>\xff\xfe</c><d>\xe2\x82\xac</d>\n";
+        let fresh = |offset: usize| {
+            let map = SourceMap::new(text);
+            map.pos(offset)
+        };
+        let map = SourceMap::new(text);
+        let mut offsets: Vec<usize> = (0..=text.len()).collect();
+        offsets.extend((0..=text.len()).rev());
+        offsets.extend([5, 3, 19, 2, 30, 31, 22, 23, 24]);
+        for offset in offsets {
+            assert_eq!(map.pos(offset), fresh(offset), "offset {offset}");
         }
     }
 }

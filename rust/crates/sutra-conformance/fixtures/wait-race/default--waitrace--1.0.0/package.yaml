@@ -1,0 +1,9 @@
+# Deployment package for the wait-race conformance suite: a local answer that arrives while its
+# target instance is still between steps (it has sent the request but not yet parked at the wait
+# that takes the answer). Labels are opaque selectors.
+labels:
+  "tenant": "default"
+  "module": "waitrace"
+  "version": "1.0.0"
+engine:
+  minContract: 1

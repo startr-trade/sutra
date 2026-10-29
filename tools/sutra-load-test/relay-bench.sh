@@ -14,7 +14,8 @@
 #
 # It prints one markdown block: settles/s, settle latency p50/p99 (sink-measured: callback
 # received minus intake sent), intake latency, commits and WAL flushes per settle, engine CPU,
-# and the top statements by calls. Everything it started is stopped on exit.
+# PostgreSQL CPU, CPU milliseconds per settle (engine + PostgreSQL), and the top statements by
+# calls. Everything it started is stopped on exit.
 #
 # Usage:
 #   tools/sutra-load-test/relay-bench.sh                      # 20/s for 60 s
@@ -213,9 +214,19 @@ stats_sql="SELECT (SELECT sum(xact_commit) FROM pg_stat_database WHERE datname I
   (SELECT wal_bytes FROM pg_stat_wal),
   (SELECT coalesce(sum(fsync_time),0) FROM pg_stat_io WHERE object = 'wal')"
 cpu_ticks() { awk '{print $14 + $15}' "/proc/$ENGINE_PID/stat"; }
+# PostgreSQL's CPU: utime+stime of the postmaster and every backend, as "pid:ticks" pairs. A
+# backend that exits mid-run takes its ticks with it, so pooled (long-lived) connections are what
+# this measures well; the engine's pools keep theirs open.
+pg_ticks() {
+    local pm pid
+    pm="$(head -1 "$PGDATA/postmaster.pid")"
+    for pid in "$pm" $(pgrep -P "$pm"); do
+        [ -r "/proc/$pid/stat" ] && printf '%s:%s ' "$pid" "$(awk '{print $14 + $15}' "/proc/$pid/stat" 2>/dev/null)"
+    done
+}
 read -r C0 F0 B0 S0 < <("${PSQL[@]}" -d sutra -F ' ' -c "$stats_sql")
 "${PSQL[@]}" -d sutra -c "SELECT pg_stat_statements_reset()" >/dev/null
-T0="$(cpu_ticks)"; W0="$(date +%s.%N)"
+T0="$(cpu_ticks)"; P0="$(pg_ticks)"; W0="$(date +%s.%N)"
 
 PERF_PIDS=()
 if [ -n "${PERF_DIR:-}" ]; then
@@ -234,16 +245,20 @@ if wait_settled "$SENT"; then drained=yes; else drained=no; fi
 for pid in "${PERF_PIDS[@]}"; do kill -INT "$pid" 2>/dev/null; done
 for pid in "${PERF_PIDS[@]}"; do wait "$pid" 2>/dev/null; done
 read -r C1 F1 B1 S1 < <("${PSQL[@]}" -d sutra -F ' ' -c "$stats_sql")
-T1="$(cpu_ticks)"; W1="$(date +%s.%N)"
+T1="$(cpu_ticks)"; P1="$(pg_ticks)"; W1="$(date +%s.%N)"
 SINK_STATS="$(curl -s "$SINK/stats")"
 SETTLED="$(jq -r .settled <<<"$SINK_STATS")"
 DUPS="$(jq -r .duplicates <<<"$SINK_STATS")"
 HZ="$(getconf CLK_TCK)"
 
 report="$(python3 - "$SINK_STATS" "$K6DIR/run.json" "$SENT" "$C0" "$C1" "$F0" "$F1" "$B0" "$B1" \
-    "$T0" "$T1" "$HZ" "$W0" "$W1" "$RATE" "$DURATION" "$drained" "$ENGINE_ENV" "$S0" "$S1" <<'PY'
+    "$T0" "$T1" "$HZ" "$W0" "$W1" "$RATE" "$DURATION" "$drained" "$ENGINE_ENV" "$S0" "$S1" "$P0" "$P1" <<'PY'
 import json, sys
-(sink, run, sent, c0, c1, f0, f1, b0, b1, t0, t1, hz, w0, w1, rate, duration, drained, env, s0, s1) = sys.argv[1:]
+(sink, run, sent, c0, c1, f0, f1, b0, b1, t0, t1, hz, w0, w1, rate, duration, drained, env, s0, s1, p0, p1) = sys.argv[1:]
+def ticks(pairs):
+    return {k: float(v) for k, v in (p.split(":") for p in pairs.split() if ":" in p and p.split(":")[1])}
+pg0, pg1 = ticks(p0), ticks(p1)
+pg_ticks = sum(v - pg0.get(k, 0.0) for k, v in pg1.items())
 s = json.loads(sink); r = json.load(open(run))
 sent = int(sent); settled = s["settled"]
 # Throughput: settles over the time from the measured run's start to its last settle.
@@ -251,10 +266,12 @@ span = max((s["lastAtMs"] or 0) - float(w0) * 1000.0, 1) / 1000.0
 per = lambda a, b: (float(b) - float(a)) / max(settled, 1)
 cpu = (float(t1) - float(t0)) / float(hz) / max(float(w1) - float(w0), 1e-9)
 d = r["metrics"].get("http_req_duration", {})
-print(f"| offered | sent | settled | dup | drained | settles/s | settle p50 | settle p99 | intake p50 | intake p99 | commits/settle | WAL flushes/settle | WAL KB/settle | WAL fsync busy | engine CPU (cores) | engine env |")
-print(f"|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+pg_cpu = pg_ticks / float(hz) / max(float(w1) - float(w0), 1e-9)
+cpu_ms = (cpu + pg_cpu) * max(float(w1) - float(w0), 1e-9) * 1000.0 / max(settled, 1)
+print(f"| offered | sent | settled | dup | drained | settles/s | settle p50 | settle p99 | intake p50 | intake p99 | commits/settle | WAL flushes/settle | WAL KB/settle | WAL fsync busy | engine CPU (cores) | PG CPU (cores) | CPU ms/settle (engine+PG) | engine env |")
+print(f"|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
 busy = (float(s1) - float(s0)) / 1000.0 / max(float(w1) - float(w0), 1e-9)
-print(f"| {rate}/s x {duration} | {sent} | {settled} | {s['duplicates']} | {drained} | {settled/span:.1f} | {s['p50Ms']:.0f} ms | {s['p99Ms']:.0f} ms | {d.get('med',0):.0f} ms | {d.get('p(99)',0):.0f} ms | {per(c0,c1):.1f} | {per(f0,f1):.2f} | {per(b0,b1)/1024:.1f} | {busy*100:.0f}% | {cpu:.2f} | `{env or 'defaults'}` |")
+print(f"| {rate}/s x {duration} | {sent} | {settled} | {s['duplicates']} | {drained} | {settled/span:.1f} | {s['p50Ms']:.0f} ms | {s['p99Ms']:.0f} ms | {d.get('med',0):.0f} ms | {d.get('p(99)',0):.0f} ms | {per(c0,c1):.1f} | {per(f0,f1):.2f} | {per(b0,b1)/1024:.1f} | {busy*100:.0f}% | {cpu:.2f} | {pg_cpu:.2f} | {cpu_ms:.2f} | `{env or 'defaults'}` |")
 PY
 )"
 top="$("${PSQL[@]}" -d sutra -F ' | ' -c "SELECT calls, round(total_exec_time::numeric,0), left(regexp_replace(query, '\s+', ' ', 'g'), 110)

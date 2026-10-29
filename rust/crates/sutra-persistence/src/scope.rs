@@ -10,9 +10,12 @@
 //!    scopes the setting to the current transaction — it resets automatically at
 //!    commit/rollback, matching `SET LOCAL` semantics, so no explicit `RESET` is needed.
 //!
-//! The value is bound as a statement parameter (never inlined), so there is no injection
-//! surface; the [`DeploymentId`] form validation (`dep-<24 hex>`) is retained as defence in
-//! depth.
+//! [`set_deployment_guc`] binds the value as a statement parameter. The two `begin_*` entry
+//! points send `BEGIN` and the `set_config` together, as one simple-protocol query — one round
+//! trip instead of two on every transaction — so there the value is written into the SQL text.
+//! That is only done for a value that passes the [`DeploymentId`] form check (`dep-` and 24
+//! lowercase hex digits: no quote, backslash or whitespace can occur), re-checked right before
+//! the text is built; anything else falls back to the bound-parameter path.
 
 use sqlx::{PgConnection, PgPool, Postgres, Transaction};
 
@@ -35,12 +38,29 @@ pub async fn begin_deployment_tx(
     pool: &PgPool,
     deployment: &DeploymentId,
 ) -> Result<Transaction<'static, Postgres>> {
+    if let Some(literal) = guc_literal(deployment) {
+        return pool
+            .begin_with(format!(
+                "BEGIN; SELECT set_config('sutra.deployment_id', {literal}, true)"
+            ))
+            .await
+            .map_err(PersistenceError::db(
+                "begin transaction + set_config(sutra.deployment_id)",
+            ));
+    }
     let mut tx = pool
         .begin()
         .await
         .map_err(PersistenceError::db("begin transaction"))?;
     set_deployment_guc(&mut tx, deployment).await?;
     Ok(tx)
+}
+
+/// The deployment id as a SQL string literal, for the one-round-trip `BEGIN; SELECT set_config`
+/// — only when it has the validated `dep-<24 lowercase hex>` form (re-checked here, so the text
+/// can hold nothing but `[a-z0-9-]`). `None` sends the caller down the bound-parameter path.
+fn guc_literal(deployment: &DeploymentId) -> Option<String> {
+    DeploymentId::is_valid(deployment.as_str()).then(|| format!("'{}'", deployment.as_str()))
 }
 
 /// [`begin_deployment_tx`] for a transaction whose commit need not wait for its own WAL flush
@@ -60,6 +80,17 @@ pub async fn begin_deployment_tx_flush_deferred(
     pool: &PgPool,
     deployment: &DeploymentId,
 ) -> Result<Transaction<'static, Postgres>> {
+    if let Some(literal) = guc_literal(deployment) {
+        return pool
+            .begin_with(format!(
+                "BEGIN; SELECT set_config('synchronous_commit', 'off', true), \
+                 set_config('sutra.deployment_id', {literal}, true)"
+            ))
+            .await
+            .map_err(PersistenceError::db(
+                "begin transaction + set_config(synchronous_commit, sutra.deployment_id)",
+            ));
+    }
     let mut tx = pool
         .begin()
         .await
@@ -75,4 +106,22 @@ pub async fn begin_deployment_tx_flush_deferred(
         "set_config(synchronous_commit, sutra.deployment_id)",
     ))?;
     Ok(tx)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_one_round_trip_begin_inlines_only_the_validated_form() {
+        let id = DeploymentId::new("dep-0123456789abcdef01234567").unwrap();
+        assert_eq!(
+            guc_literal(&id).as_deref(),
+            Some("'dep-0123456789abcdef01234567'")
+        );
+        assert_eq!(
+            guc_literal(&DeploymentId::system()).as_deref(),
+            Some("'dep-000000000000000000000000'")
+        );
+    }
 }

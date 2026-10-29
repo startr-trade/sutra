@@ -95,7 +95,7 @@ docker compose -p sutra-ai-summarize down -v
 
 For the Anthropic wire, package `variants/stub-anthropic` instead (remove the previous archive from
 `deploy/deployments` first); the answers are the same. The engine image is
-`ghcr.io/startr-trade/sutra:0.6.5`; set `SUTRA_ENGINE_IMAGE` to run a locally built tag. Validate a
+`ghcr.io/startr-trade/sutra:0.6.6`; set `SUTRA_ENGINE_IMAGE` to run a locally built tag. Validate a
 variant without Docker:
 
 ```bash
