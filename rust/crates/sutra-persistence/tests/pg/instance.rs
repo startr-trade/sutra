@@ -173,7 +173,12 @@ async fn typed_snapshot_round_trips_through_postgres() {
     )
     .with_variables(typed.clone());
     let bytes = snap.write();
-    assert!(String::from_utf8_lossy(&bytes).contains("sutra.snapshot=4"));
+    assert_eq!(
+        sutra_persistence::snapshot::RawSnapshot::parse(&bytes)
+            .unwrap()
+            .get("sutra.snapshot"),
+        Some("4")
+    );
 
     store
         .persist(
@@ -321,8 +326,14 @@ async fn a_stored_v2_snapshot_still_loads_with_string_values() {
             "a v2 value must decode as the STRING it was, never as a type"
         );
     }
-    // Re-encoding an untouched legacy snapshot reproduces the legacy bytes: no silent upgrade.
-    assert_eq!(String::from_utf8(decoded.write()).unwrap(), legacy);
+    // Re-encoding an untouched legacy snapshot reproduces the legacy key/value map — in the
+    // binary container since format 5 — with no value upgraded.
+    let rewritten = decoded.write();
+    assert!(rewritten.starts_with(b"\\uSNAPSHOT/5\n"));
+    assert_eq!(InstanceSnapshot::read(&rewritten).unwrap(), decoded);
+    let raw = sutra_persistence::snapshot::RawSnapshot::parse(&rewritten).unwrap();
+    assert_eq!(raw.get("sutra.snapshot"), Some("2"));
+    assert_eq!(raw.get("sutra.var.looksTagged"), Some("n|7"));
 }
 
 #[ignore = "docker"]

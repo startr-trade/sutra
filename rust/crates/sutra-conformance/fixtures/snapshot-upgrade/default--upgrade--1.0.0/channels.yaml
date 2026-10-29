@@ -1,0 +1,35 @@
+# Channels for the snapshot-upgrade package.
+#
+#   order-in      HTTP intake (apikey). Starts upgrade-hold, which parks at AwaitDecision.
+#   decision-in   HTTP (apikey). Resumes the parked instance, correlated by ref.
+#   callback-out  outbound HTTP to the host recorder: the instance finished.
+channels:
+  - name: order-in
+    transport: http
+    bind: "POST /channels/order-in"
+    codec: json
+    ack-mode: on-persist
+    cloudevents-mode: none
+    auth:
+      scheme: apikey
+      apikey:
+        value: env:UPGRADE_API_KEY
+        header: X-Api-Key
+
+  - name: decision-in
+    transport: http
+    bind: "POST /channels/decision-in"
+    codec: json
+    ack-mode: on-persist
+    cloudevents-mode: none
+    auth:
+      scheme: apikey
+      apikey:
+        value: env:UPGRADE_API_KEY
+        header: X-Api-Key
+
+  - name: callback-out
+    direction: outbound
+    transport: http
+    bind: "${UPGRADE_CALLBACK_URL}"
+    cloudevents-mode: none

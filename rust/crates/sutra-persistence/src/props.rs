@@ -21,6 +21,10 @@
 ///
 /// `escape_space == true` is the key flavour (every space escaped); `false` is the value
 /// flavour (only a leading space escaped).
+// The text WRITER is kept for tests only: since snapshot format 5 the engine writes the binary
+// container, and the tests render snapshots in this (formats 2-4) text to pin their content and
+// to build stored-by-an-earlier-release inputs.
+#[cfg(test)]
 fn save_convert(s: &str, escape_space: bool) -> String {
     let mut out = String::with_capacity(s.len() * 2);
     let mut first = true;
@@ -59,6 +63,7 @@ fn save_convert(s: &str, escape_space: bool) -> String {
 ///
 /// The iteration order of `entries` does not matter — sorting happens on the escaped lines,
 /// as the container's canonical byte ordering requires.
+#[cfg(test)]
 pub fn write_lines<'a>(entries: impl IntoIterator<Item = (&'a str, &'a str)>) -> Vec<u8> {
     let mut lines: Vec<String> = entries
         .into_iter()

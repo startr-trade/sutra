@@ -33,6 +33,7 @@ pub mod migrate;
 mod props;
 pub mod scope;
 pub mod snapshot;
+mod snapshot_container;
 pub mod step;
 pub mod stores;
 pub mod value;

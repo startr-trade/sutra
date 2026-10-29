@@ -131,11 +131,18 @@ impl HandlebarsTemplateEngine {
             self.compiled.borrow_mut().insert(template_id.to_string());
         }
         // Strip null-valued map entries so an explicitly-null value strict-fails exactly like
-        // an absent key.
-        let model = strip_nulls(model);
+        // an absent key. A model with no null-valued entry anywhere renders as it is: stripping
+        // it would rebuild an identical copy.
+        let stripped;
+        let model = if has_null_entry(model) {
+            stripped = strip_nulls(model);
+            &stripped
+        } else {
+            model
+        };
         self.registry
             .borrow()
-            .render(template_id, &model)
+            .render(template_id, model)
             .map_err(|e| match e.reason() {
                 RenderErrorReason::MissingVariable(path) => TemplateError::new(format!(
                     "unresolved template reference {{{{{}}}}} (strict rendering: every \
@@ -147,6 +154,16 @@ impl HandlebarsTemplateEngine {
                     TemplateError::new(format!("Handlebars render failed for '{template_id}': {e}"))
                 }
             })
+    }
+}
+
+/// Whether [`strip_nulls`] would change `v`: some object, at any depth (inside arrays too), has a
+/// null-valued entry. A walk without allocation, so the common all-present model skips the copy.
+fn has_null_entry(v: &Json) -> bool {
+    match v {
+        Json::Object(map) => map.values().any(|val| val.is_null() || has_null_entry(val)),
+        Json::Array(items) => items.iter().any(has_null_entry),
+        _ => false,
     }
 }
 
@@ -162,5 +179,27 @@ fn strip_nulls(v: &Json) -> Json {
         ),
         Json::Array(items) => Json::Array(items.iter().map(strip_nulls).collect()),
         other => other.clone(),
+    }
+}
+
+#[cfg(test)]
+mod null_strip_tests {
+    use super::*;
+
+    /// `has_null_entry` is exactly "stripping would change the model".
+    #[test]
+    fn has_null_entry_is_true_exactly_when_stripping_changes_the_model() {
+        let cases = [
+            serde_json::json!({"a": 1, "b": {"c": "x", "d": [1, {"e": true}]}}),
+            serde_json::json!({"a": null}),
+            serde_json::json!({"a": {"b": [1, {"c": null}]}}),
+            serde_json::json!({"a": [null, 2]}),
+            serde_json::json!([{"a": 1}, {"b": null}]),
+            serde_json::json!(null),
+            serde_json::json!("text"),
+        ];
+        for case in cases {
+            assert_eq!(has_null_entry(&case), strip_nulls(&case) != case, "{case}");
+        }
     }
 }

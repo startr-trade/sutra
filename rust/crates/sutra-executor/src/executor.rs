@@ -2596,14 +2596,16 @@ impl TokenExecutor {
     /// caller-injected `uuid` / `now` suppliers, and `sourceXml` (raw inbound body) for
     /// XML-transform engines.
     fn render_model(&self, vars: &Variables, param_values: &Variables) -> serde_json::Value {
-        let mut model = match vars.to_json() {
-            serde_json::Value::Object(m) => m,
+        // The variables, converted once: they are the model's top level and, again, `vars`.
+        let vars_json = vars.to_json();
+        let mut model = match &vars_json {
+            serde_json::Value::Object(m) => m.clone(),
             _ => serde_json::Map::new(),
         };
         for (k, v) in param_values.iter() {
             model.insert(k.to_string(), feel_to_json(v));
         }
-        model.insert("vars".to_string(), vars.to_json());
+        model.insert("vars".to_string(), vars_json);
         model.insert(
             "uuid".to_string(),
             serde_json::Value::String((self.uuid_supplier)()),

@@ -20,6 +20,7 @@ server, so no provider key is needed.
 | **Timer intervals from FEEL** (0.6.4) | A `timeDuration`, `timeDate` or `timeCycle`, a `q:timeout` and the `q:retry` delays can each be a FEEL expression over the instance's variables and `config.<key>`. Deployment `properties:` in `package.yaml` hold per-environment values. | [Timer intervals from FEEL](building/retries-history-schedules.md#timer-intervals-from-feel) |
 | **Durable throughput** (0.6.5) | A concurrent outbox dispatcher, in-process hand-off of `local://` deliveries, fewer durable commits per step, separate pools for intake and delivery, and an opt-in data-store read cache. On one laptop with durable PostgreSQL a two-process relay went from 14 to 499 completions per second, p99 250 ms. | [Tuning for throughput](operating/throughput-tuning.md) |
 | **Answers that beat their wait; less CPU** (0.6.6) | A `local://` answer that reaches a process before it has parked at the wait for it is held and retried instead of dropped. HTTP clients read the CA bundle once. About a fifth less CPU per completed relay. | [An answer that arrives before its wait](building/wait-states.md#an-answer-that-arrives-before-its-wait), [Tuning for throughput](operating/throughput-tuning.md) |
+| **Binary snapshots; restart-proof local deliveries** (0.6.7) | Instance snapshots are stored in a binary container — **an older release cannot read it, so upgrade every replica at once**. A local delivery that fails because the database restarted is retried instead of poisoned. | [The binary container](internals/durable-execution.md#the-binary-container) |
 | **Live audio sessions** (preview) | `AudioSession` and `require: [realtime]`, opened through an `llm` channel by a media transport, not by a process. | [Live audio sessions](building/llm-channels.md#live-audio-sessions-preview) |
 
 Telephony, IVRs, meetings and WebRTC are not part of this engine. They live in the separate
@@ -34,7 +35,7 @@ Every walkthrough runs from the root of a checkout of this repository. It needs:
   `base64 -i <file>` wherever a walkthrough says `base64 -w0 <file>`);
 - an engine image and the `sutra` CLI, both **0.6.0 or later**.
 
-The compose files default to the published `ghcr.io/startr-trade/sutra:0.6.6` image, and
+The compose files default to the published `ghcr.io/startr-trade/sutra:0.6.7` image, and
 [Installation](getting-started/installation.md) installs the CLI. To run a walkthrough against
 your own checkout instead, build both from it:
 

@@ -97,7 +97,9 @@ The engine marks such a refusal *wait-pending* (`sutra.waitPending=true` on the 
 milliseconds (155 ms in all, about one step), and then retried with the outbox backoff for up to
 8 attempts — about four minutes. If the instance still has not parked by then, the delivery takes
 the outbox's usual poison posture: kept with its last error and redelivered at the poison horizon,
-so nothing is lost. An answer for an instance that has finished is never wait-pending. A message
+so nothing is lost. An answer for an instance that has finished is never wait-pending. *Since 0.6.7* a
+`local://` delivery whose step failed because the database was unreachable (a reset connection, a
+restart) is retried the same way, without the bound, instead of being parked at the poison horizon. A message
 from outside the engine (HTTP, a broker) keeps the transport's own handling, because the engine
 cannot tell a fast answer from a stale one there; send it again, or make the wait come first.
 

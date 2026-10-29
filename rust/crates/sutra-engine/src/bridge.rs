@@ -422,7 +422,15 @@ fn persistence_diag(context: &str, e: &PersistenceError) -> Diagnostic {
             ),
         );
     }
-    Diagnostic::error(channel_codes::RUNTIME_UNEXPECTED, format!("{context}: {e}"))
+    let diagnostic =
+        Diagnostic::error(channel_codes::RUNTIME_UNEXPECTED, format!("{context}: {e}"));
+    if e.is_transient() {
+        // The database was unreachable: nothing about this delivery is wrong, so a sender that
+        // can retry (the in-process local sink) offers it again instead of poisoning it.
+        diagnostic.with_attribute(sutra_channels::TRANSIENT_ATTR, "true")
+    } else {
+        diagnostic
+    }
 }
 
 /// Convert a step's collected emissions to outbox rows: row identity is
@@ -512,6 +520,11 @@ fn step_timer_waits(
 
 #[async_trait::async_trait(?Send)]
 impl InstanceBridge for PersistenceBridge {
+    /// `commit_complete` deletes the instance's `channel_instance` row in its own transaction.
+    fn terminal_commit_releases_admission(&self) -> bool {
+        true
+    }
+
     async fn commit_park(
         &self,
         deployment: &sutra_executor::DeploymentId,
@@ -713,6 +726,13 @@ impl InstanceBridge for PersistenceBridge {
             .execute(&mut *tx)
             .await
             .map_err(PersistenceError::db("terminal alias retire"))?;
+            // The per-channel admission row (`channel_instance`) goes with the terminal step, in
+            // this transaction, for every instance — whether or not its channel is capped, and
+            // whether or not a row exists — so the freed slot can never lag the completion.
+            sutra_persistence::stores::PgChannelConcurrencyStore::record_terminal_in(
+                &mut tx, &dep, instance,
+            )
+            .await?;
             for entry in &entries {
                 PgOutboxStore::enqueue_in(&mut tx, entry).await?;
             }

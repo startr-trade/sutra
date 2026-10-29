@@ -1,0 +1,9 @@
+# Deployment package for the snapshot-upgrade conformance suite: an instance that parks at a wait
+# with typed variables (numbers, a list, a nested context, text with characters the old text
+# container escaped), so an earlier release can park it and the current one resume it.
+labels:
+  "tenant": "default"
+  "module": "upgrade"
+  "version": "1.0.0"
+engine:
+  minContract: 1

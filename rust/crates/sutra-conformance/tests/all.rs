@@ -36,6 +36,8 @@ mod tc_multi_replica;
 mod tc_outbox_relay;
 #[path = "all/tc_shard_lanes.rs"]
 mod tc_shard_lanes;
+#[path = "all/tc_snapshot_upgrade.rs"]
+mod tc_snapshot_upgrade;
 #[path = "all/tc_timer_expressions.rs"]
 mod tc_timer_expressions;
 #[path = "all/tc_wait_race.rs"]

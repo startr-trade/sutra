@@ -13,6 +13,48 @@ This is the changelog for the **Rust-native** engine (`rust/` workspace). It beg
 
 Nothing yet.
 
+## [0.6.7] — 2026-10-29
+
+A **patch** release: a binary container for instance snapshots, two fewer costs per completed
+instance, and a fix for local deliveries poisoned by a database restart. Durability is unchanged —
+no commit was added or made asynchronous; one separate transaction per completed instance is now
+part of the instance's own terminal commit. The database schema is unchanged (no migration) and
+the `q:` namespace is untouched. Measured on the relay workload at 500/s: 8.3 → 8.0 CPU ms per settle against 0.6.6 in paired runs (10.4 on 0.6.5 in the same session), one database transaction fewer per settle (14.2 → 13.1); on a CPU-bound downstream XML workload at 400/s offered, 362 → 400 settles/s (300 on 0.6.5).
+
+### Upgrade note — read before upgrading
+
+- **Snapshots are now written in a binary container (format 5).** 0.6.7 reads every snapshot an
+  earlier release wrote and rewrites it in format 5 the next time its instance commits. **A release
+  before 0.6.7 cannot read format 5**: it refuses such a row ("failed to decode persisted instance
+  snapshot: malformed \uXXXX encoding") and leaves the instance untouched.
+  - Upgrade the whole fleet at once — stop every older replica, then start 0.6.7. Do not run 0.6.7
+    next to older replicas on one database.
+  - Rolling back to 0.6.6 or earlier works only for instances no 0.6.7 engine has committed;
+    finish or cancel the others first.
+
+### Fixed
+
+- **A local delivery was poisoned when the database restarted under it.** A `local://` delivery
+  whose step failed because the database connection was reset (or the pool timed out, or the
+  server was shutting down) took the generic `SUTRA.RUNTIME.UNEXPECTED` refusal and waited at the
+  poison horizon for five minutes. Such failures are now marked `sutra.transient` and retried with
+  the outbox backoff; the step either did not commit or committed with its inbox dedup record, so
+  the retry is processed at most once. Found by the PostgreSQL-crash test, which failed on the
+  published 0.6.5 and 0.6.6 images in every run here and passes on 0.6.7.
+
+### Changed
+
+- **Binary snapshot container (format 5).** The same key/value map as before (keys, typed values,
+  the `sutra.snapshot` generation, encryption and its key id), stored as length-prefixed UTF-8
+  behind the marker `\uSNAPSHOT/5\n` instead of Properties text. Identical state still produces
+  identical bytes; a truncated or malformed container is a decode error, never a partial instance.
+- **The per-channel admission row is released inside the terminal commit.** A completing
+  instance's `channel_instance` row is deleted in the same transaction as the rest of its terminal
+  step, instead of in a separate transaction after it; it is deleted for every instance, capped
+  channel or not.
+- **Templates render with less copying.** The template model converts the instance's variables
+  once instead of twice, and is no longer deep-copied to strip null entries when it has none.
+
 ## [0.6.6] — 2026-10-29
 
 A **patch** release: one lost-message fix, one boot failure under file-descriptor pressure, and

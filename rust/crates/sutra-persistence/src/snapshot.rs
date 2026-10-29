@@ -1,10 +1,16 @@
 //! Instance-snapshot codec — the byte-deterministic encoding of one in-flight instance.
 //!
-//! Container: Properties-line text ([`crate::props`]) — `key=value` lines with the
-//! Properties-line escaping rules (part of the persisted format), sorted byte-wise
-//! ascending, no comment lines, trailing `\n` per line. Determinism is normative: identical
-//! logical state produces identical bytes; the reference baseline writes this format
-//! natively and the round-trip tests must be byte-identical.
+//! Container (snapshot format 5, written since 0.6.7): the binary key/value container of
+//! [`crate::snapshot_container`] — a marker, then length-prefixed UTF-8 keys and values, keys
+//! ascending. Formats 2-4 used Properties-line text ([`crate::props`]: `key=value` lines with the
+//! Properties-line escaping rules, sorted byte-wise ascending, trailing `\n` per line); those rows
+//! are still read, detected by the absence of the format-5 marker, and are rewritten in format 5
+//! the next time their instance commits. The logical key/value map below is the same in every
+//! container. Determinism is normative: identical logical state produces identical bytes.
+//!
+//! A release before 0.6.7 cannot read a format-5 row: its text reader fails on the marker
+//! ("malformed \uXXXX encoding") and leaves the instance untouched. Downgrading across 0.6.7
+//! therefore needs the instances that a 0.6.7 engine committed to be finished first.
 //!
 //! Keys (v2) — the key names are frozen; changing one is a persisted-format break:
 //!
@@ -48,8 +54,8 @@
 //!
 //! The writer bumps the version only when it must: `4` when at least one variable needs the typed
 //! form, else `3` when something was encrypted, else `2`. So an instance whose variables are all
-//! strings still writes the exact bytes it wrote before typing existed — the golden-bytes corpus
-//! below is untouched, and no already-parked row changes shape when it re-parks.
+//! strings still writes the same key/value map it wrote before typing existed — the golden corpus
+//! below (pinned as its Properties-text rendering) is untouched.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -58,6 +64,7 @@ use base64::Engine as _;
 use sutra_crypto::{CipherError, PayloadCipher};
 
 use crate::props;
+use crate::snapshot_container;
 use crate::value::SnapshotValue;
 
 /// Instance status strings — part of the persisted format. Kept as strings — the engine round-trips
@@ -670,7 +677,7 @@ impl InstanceSnapshot {
         for (k, v) in &enc_pairs {
             entries.push((k.as_str(), v.as_str()));
         }
-        Ok(props::write_lines(entries))
+        Ok(snapshot_container::encode(entries))
     }
 
     /// Peek at a persisted instance's routing keys without resuming it (mirrors
@@ -716,7 +723,7 @@ impl InstanceSnapshot {
         } else {
             map.insert(K_FAILURE_DETAIL.to_owned(), detail.to_owned());
         }
-        Ok(props::write_lines(
+        Ok(snapshot_container::encode(
             map.iter().map(|(k, v)| (k.as_str(), v.as_str())),
         ))
     }
@@ -753,7 +760,7 @@ impl InstanceSnapshot {
         }
         let mut map = Self::raw_map(bytes)?;
         map.insert(K_STATUS.to_owned(), status.to_owned());
-        Ok(props::write_lines(
+        Ok(snapshot_container::encode(
             map.iter().map(|(k, v)| (k.as_str(), v.as_str())),
         ))
     }
@@ -797,7 +804,7 @@ impl InstanceSnapshot {
         map.insert(K_STATUS.to_owned(), STATUS_SUSPENDED.to_owned());
         map.remove(K_FAILURE_CODE);
         map.remove(K_FAILURE_DETAIL);
-        Ok(props::write_lines(
+        Ok(snapshot_container::encode(
             map.iter().map(|(k, v)| (k.as_str(), v.as_str())),
         ))
     }
@@ -953,7 +960,7 @@ impl InstanceSnapshot {
                 map.insert(K_AUDIT_SEQ.to_owned(), seq.to_string());
             }
         }
-        Ok(props::write_lines(
+        Ok(snapshot_container::encode(
             map.iter().map(|(k, v)| (k.as_str(), v.as_str())),
         ))
     }
@@ -968,8 +975,14 @@ impl InstanceSnapshot {
     /// Parse the raw properties key/value map (last-write-wins), without any decode/decrypt — the
     /// shared front half of [`read_encrypted`](Self::read_encrypted) / [`peek`](Self::peek).
     pub(crate) fn raw_map(bytes: &[u8]) -> Result<BTreeMap<String, String>, String> {
+        let pairs = if snapshot_container::is_binary(bytes) {
+            snapshot_container::decode(bytes)?
+        } else {
+            // Formats 2-4: the Properties text container, read exactly as before.
+            props::read_lines(bytes)?
+        };
         let mut map = BTreeMap::new();
-        for (k, v) in props::read_lines(bytes)? {
+        for (k, v) in pairs {
             map.insert(k, v);
         }
         Ok(map)
@@ -1101,10 +1114,28 @@ impl RawSnapshot {
     pub fn key_id(&self) -> Option<&str> {
         self.map.get(K_KEY_ID).map(String::as_str)
     }
+
+    /// One raw entry (undecoded, still encrypted for a `sutra.enc.` key), whichever container the
+    /// snapshot was stored in — for inspection and tests.
+    pub fn get(&self, key: &str) -> Option<&str> {
+        self.map.get(key).map(String::as_str)
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    /// The snapshot's key/value map rendered as the Properties text that formats 2-4 stored —
+    /// the readable form these assertions pin. Since format 5 the bytes are the binary container
+    /// ([`crate::snapshot_container`]); the logical map, and so this rendering, is unchanged.
+    fn text(bytes: impl AsRef<[u8]>) -> String {
+        let bytes = bytes.as_ref();
+        let map = InstanceSnapshot::raw_map(bytes).expect("decodable snapshot");
+        String::from_utf8(crate::props::write_lines(
+            map.iter().map(|(k, v)| (k.as_str(), v.as_str())),
+        ))
+        .expect("Properties text is ASCII")
+    }
+
     use super::*;
 
     fn vars(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
@@ -1153,7 +1184,7 @@ mod tests {
     fn a_snapshot_that_never_failed_emits_no_failure_keys() {
         // Byte-determinism guard: the new keys must not appear on the pre-existing corpus.
         let bytes = parked().write();
-        let text = String::from_utf8(bytes).unwrap();
+        let text = text(bytes);
         assert!(!text.contains("sutra.failureCode"));
         assert!(!text.contains("sutra.failureDetail"));
     }
@@ -1208,7 +1239,7 @@ mod tests {
         let marked =
             InstanceSnapshot::mark_failed(raw.as_bytes(), "SUTRA.RUNTIME.TASK.UNCAUGHT", "boom")
                 .unwrap();
-        let text = String::from_utf8(marked).unwrap();
+        let text = text(marked);
 
         assert!(text.contains("sutra.status=FAILED"));
         assert!(
@@ -1272,7 +1303,7 @@ mod tests {
         raw.push_str("sutra.enc.iban=Y2lwaGVydGV4dA==\n");
 
         let marked = InstanceSnapshot::mark_terminal(raw.as_bytes(), STATUS_COMPLETED).unwrap();
-        let text = String::from_utf8(marked).unwrap();
+        let text = text(marked);
 
         assert!(text.contains("sutra.status=COMPLETED"));
         assert!(
@@ -1352,7 +1383,7 @@ mod tests {
             "S",
             0,
         );
-        let text = String::from_utf8(no_seq.write()).unwrap();
+        let text = text(no_seq.write());
         assert!(!text.contains("sutra.auditSeq"));
         assert_eq!(
             InstanceSnapshot::peek(&no_seq.write()).unwrap().audit_seq,
@@ -1421,7 +1452,7 @@ mod tests {
             second, first,
             "byte-stable round-trip (migration relies on this)"
         );
-        let text = String::from_utf8(first.clone()).unwrap();
+        let text = text(first.clone());
         assert!(!text.contains("sutra.waitingNodes"));
         assert!(!text.contains("sutra.startNode"));
         assert!(text.contains("sutra.snapshot=2"));
@@ -1460,7 +1491,7 @@ mod tests {
             .unwrap();
 
         // Ciphertext form: pan is `sutra.enc.`, the version bumped to 3, the raw PAN is nowhere.
-        let text = String::from_utf8(bytes.clone()).unwrap();
+        let text = text(bytes.clone());
         assert!(text.contains("sutra.snapshot=3"));
         assert!(text.contains("sutra.enc.pan="));
         assert!(!text.contains("sutra.var.pan="));
@@ -1477,6 +1508,30 @@ mod tests {
             SnapshotValue::from("4111111111111111")
         );
         assert_eq!(read.variables()["amount"], SnapshotValue::from("42"));
+        assert!(
+            !bytes.windows(16).any(|w| w == b"4111111111111111"),
+            "raw sensitive value present in the stored bytes"
+        );
+
+        // The same encrypted snapshot as a 0.6.5 / 0.6.6 engine stored it (the Properties text
+        // container): the key id is found, and it decrypts to the same values.
+        let stored_by_older_engine = self::text(&bytes).into_bytes();
+        assert_eq!(
+            InstanceSnapshot::peek_key_id(&stored_by_older_engine)
+                .unwrap()
+                .as_deref(),
+            Some("tenant-1")
+        );
+        assert_eq!(
+            InstanceSnapshot::peek_key_id(&bytes).unwrap().as_deref(),
+            Some("tenant-1")
+        );
+        let older = InstanceSnapshot::read_encrypted(&stored_by_older_engine, Some(&ctx)).unwrap();
+        assert_eq!(older, read);
+        assert!(
+            InstanceSnapshot::read(&stored_by_older_engine).is_err(),
+            "no cipher, no plaintext"
+        );
     }
 
     #[test]
@@ -1497,9 +1552,7 @@ mod tests {
             plain, none_encrypted,
             "an empty encrypt-set must not change the bytes"
         );
-        assert!(String::from_utf8(plain)
-            .unwrap()
-            .contains("sutra.snapshot=2"));
+        assert!(text(plain).contains("sutra.snapshot=2"));
     }
 
     #[test]
@@ -1601,14 +1654,96 @@ mod tests {
             7,
         );
         let expected = "sutra.auditSeq=7\nsutra.completedNodes=S,A\nsutra.deploymentId=dep-0123456789abcdef01234567\nsutra.processId=p1\nsutra.snapshot=2\nsutra.startNode=S\nsutra.status=SUSPENDED\nsutra.var.approvedBy=A\nsutra.var.inboundId=INB-7\nsutra.waitingNodes=U\n";
-        assert_eq!(String::from_utf8(snap.write()).unwrap(), expected);
+        assert_eq!(text(snap.write()), expected);
     }
 
     #[test]
     fn golden_running_empty_bytes_are_pinned() {
         let snap = InstanceSnapshot::of("loan", "", STATUS_RUNNING, vec![], BTreeMap::new());
         let expected = "sutra.completedNodes=\nsutra.deploymentId=\nsutra.processId=loan\nsutra.snapshot=2\nsutra.status=RUNNING\n";
-        assert_eq!(String::from_utf8(snap.write()).unwrap(), expected);
+        assert_eq!(text(snap.write()), expected);
+        // The format-5 bytes themselves, laid out by hand: marker, count, then each key and
+        // value length-prefixed (u32 little-endian), keys ascending.
+        let mut pinned = b"\\uSNAPSHOT/5\n".to_vec();
+        pinned.extend_from_slice(&5u32.to_le_bytes());
+        for (k, v) in [
+            ("sutra.completedNodes", ""),
+            ("sutra.deploymentId", ""),
+            ("sutra.processId", "loan"),
+            ("sutra.snapshot", "2"),
+            ("sutra.status", "RUNNING"),
+        ] {
+            pinned.extend_from_slice(&(k.len() as u32).to_le_bytes());
+            pinned.extend_from_slice(k.as_bytes());
+            pinned.extend_from_slice(&(v.len() as u32).to_le_bytes());
+            pinned.extend_from_slice(v.as_bytes());
+        }
+        assert_eq!(snap.write(), pinned);
+    }
+
+    /// Real rows: the bytes a published 0.6.5 and 0.6.6 engine stored for a parked instance
+    /// (captured by the tier-2 upgrade suite with `SUTRA_UPGRADE_DUMP_DIR`). They decode to the
+    /// parked state, typed values included; and re-written they become format 5 holding exactly
+    /// the same key/value map — rendered back to text, byte-identical to what was stored.
+    #[test]
+    fn snapshots_stored_by_published_0_6_5_and_0_6_6_engines_load() {
+        for stored in [
+            &include_bytes!("../tests/fixtures/snapshots/written-by-0.6.5.snapshot")[..],
+            &include_bytes!("../tests/fixtures/snapshots/written-by-0.6.6.snapshot")[..],
+        ] {
+            assert!(stored.starts_with(b"sutra."), "a text-container row");
+            let read = InstanceSnapshot::read(stored).unwrap();
+            assert_eq!(read.process_id(), "upgrade-hold");
+            assert_eq!(read.status(), STATUS_SUSPENDED);
+            assert_eq!(read.waiting_nodes(), ["AwaitDecision".to_string()]);
+            let SnapshotValue::Context(held) = &read.variables()["held"] else {
+                panic!("held decodes typed: {:?}", read.variables()["held"]);
+            };
+            assert_eq!(
+                held.get("note"),
+                Some(&SnapshotValue::from("line1\nline2 = : # ! \u{e9}"))
+            );
+            assert_eq!(InstanceSnapshot::peek_key_id(stored).unwrap(), None);
+            assert_eq!(
+                InstanceSnapshot::peek(stored).unwrap(),
+                InstanceSnapshot::peek(&read.write()).unwrap()
+            );
+            let rewritten = read.write();
+            assert!(rewritten.starts_with(crate::snapshot_container::MAGIC));
+            assert_eq!(InstanceSnapshot::read(&rewritten).unwrap(), read);
+            assert_eq!(text(&rewritten).as_bytes(), stored);
+        }
+    }
+
+    /// Snapshots written by 0.6.5 and 0.6.6 (the Properties text container, formats 2-4) still
+    /// read, peek and key-patch exactly as they did, and a re-write produces format 5 with the
+    /// same logical content.
+    #[test]
+    fn text_snapshots_from_earlier_engines_read_and_rewrite_unchanged() {
+        let suspended = InstanceSnapshot::of_suspended(
+            "p1",
+            "dep-0123456789abcdef01234567",
+            strs(&["S", "A"]),
+            vars(&[("inboundId", "INB-7"), ("approvedBy", "A")]),
+            strs(&["U"]),
+            "S",
+            7,
+        );
+        // Byte-for-byte what a 0.6.5 / 0.6.6 engine stored for this instance.
+        let stored = "sutra.auditSeq=7\nsutra.completedNodes=S,A\nsutra.deploymentId=dep-0123456789abcdef01234567\nsutra.processId=p1\nsutra.snapshot=2\nsutra.startNode=S\nsutra.status=SUSPENDED\nsutra.var.approvedBy=A\nsutra.var.inboundId=INB-7\nsutra.waitingNodes=U\n";
+        let read = InstanceSnapshot::read(stored.as_bytes()).unwrap();
+        assert_eq!(read, suspended);
+        assert_eq!(
+            InstanceSnapshot::peek_key_id(stored.as_bytes()).unwrap(),
+            None
+        );
+        let rewritten = read.write();
+        assert!(rewritten.starts_with(crate::snapshot_container::MAGIC));
+        assert_eq!(text(&rewritten), stored);
+        let terminal =
+            InstanceSnapshot::mark_terminal(stored.as_bytes(), STATUS_COMPLETED).unwrap();
+        assert!(terminal.starts_with(crate::snapshot_container::MAGIC));
+        assert_eq!(text(&terminal), stored.replace("SUSPENDED", "COMPLETED"));
     }
 
     #[test]
@@ -1640,7 +1775,7 @@ mod tests {
             "sutra.var.path=C\\:\\\\temp\\\\x\n",
             "sutra.var.unicode=caf\\u00E9 \\u4E16\\u754C \\uD83D\\uDE00\n",
         );
-        assert_eq!(String::from_utf8(snap.write()).unwrap(), expected);
+        assert_eq!(text(snap.write()), expected);
         // And the escaped form reads back to the identical logical state + identical bytes.
         let read = InstanceSnapshot::read(&snap.write()).unwrap();
         assert_eq!(read, snap);
@@ -1679,7 +1814,7 @@ mod tests {
             "sutra.var.ssn=000-00-0000\n",
             "sutra.waitingNodes=W\n",
         );
-        assert_eq!(String::from_utf8(snap.write()).unwrap(), expected);
+        assert_eq!(text(snap.write()), expected);
         let read = InstanceSnapshot::read(&snap.write()).unwrap();
         assert_eq!(read.coverage().get("happy_path"), Some(&3));
         assert_eq!(read.coverage().get("reject.path"), Some(&1));
@@ -1691,7 +1826,7 @@ mod tests {
     fn zero_coverage_counters_emit_no_keys() {
         let snap = InstanceSnapshot::of("p", "", STATUS_RUNNING, vec![], BTreeMap::new())
             .with_coverage([("touched".to_owned(), 1u64), ("untouched".to_owned(), 0u64)].into());
-        let text = String::from_utf8(snap.write()).unwrap();
+        let text = text(snap.write());
         assert!(text.contains("sutra.coverage.touched=1"));
         assert!(!text.contains("untouched"));
     }
@@ -1711,8 +1846,8 @@ mod tests {
             .clone()
             .with_deployment_id("dep-aaaaaaaaaaaaaaaaaaaaaaaa");
         assert_eq!(repinned.deployment_id(), "dep-aaaaaaaaaaaaaaaaaaaaaaaa");
-        let old = String::from_utf8(snap.write()).unwrap();
-        let new = String::from_utf8(repinned.write()).unwrap();
+        let old = text(snap.write());
+        let new = text(repinned.write());
         assert_eq!(
             old.replace(
                 "dep-0123456789abcdef01234567",
@@ -1748,7 +1883,7 @@ mod tests {
             ("callRisk".to_string(), 1),
         ]));
         let bytes = snap.write();
-        let text = String::from_utf8(bytes.clone()).unwrap();
+        let text = text(bytes.clone());
         assert!(text.contains("sutra.retry.callRisk=1"), "{text}");
         assert!(text.contains("sutra.retry.chargeCard=2"), "{text}");
 
@@ -1775,9 +1910,7 @@ mod tests {
                 .write(),
             baseline
         );
-        assert!(!String::from_utf8(baseline)
-            .unwrap()
-            .contains("sutra.retry."));
+        assert!(!text(baseline).contains("sutra.retry."));
     }
 
     #[test]
@@ -1799,7 +1932,7 @@ mod tests {
                 "SUTRA.DISPATCH.CHANNEL_CALL.TIMEOUT".to_string(),
             )]));
         let bytes = snap.write();
-        let text = String::from_utf8(bytes.clone()).unwrap();
+        let text = text(bytes.clone());
         assert!(
             text.contains("sutra.retryWait.Call=SUTRA.DISPATCH.CHANNEL_CALL.TIMEOUT"),
             "{text}"
@@ -1828,9 +1961,7 @@ mod tests {
                 .write(),
             baseline
         );
-        assert!(!String::from_utf8(baseline)
-            .unwrap()
-            .contains("sutra.retryWait."));
+        assert!(!text(baseline).contains("sutra.retryWait."));
     }
 
     #[test]
@@ -1959,7 +2090,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let text = String::from_utf8(migrated).unwrap();
+        let text = text(migrated);
 
         assert!(text.contains("sutra.deploymentId=dep-aaaaaaaaaaaaaaaaaaaaaaaa"));
         assert!(text.contains("sutra.waitingNodes=U2"));
@@ -2053,7 +2184,7 @@ mod tests {
     #[test]
     fn typed_variables_round_trip_through_the_codec() {
         let bytes = parked_typed().write();
-        let text = String::from_utf8(bytes.clone()).unwrap();
+        let text = text(bytes.clone());
         assert!(text.contains("sutra.snapshot=4"), "{text}");
 
         let read = InstanceSnapshot::read(&bytes).unwrap();
@@ -2081,9 +2212,7 @@ mod tests {
             .with_variables(typed(&[("inboundId", SnapshotValue::from("INB-7"))]))
             .write();
         assert_eq!(via_strings, via_typed);
-        assert!(String::from_utf8(via_typed)
-            .unwrap()
-            .contains("sutra.snapshot=2"));
+        assert!(text(via_typed).contains("sutra.snapshot=2"));
     }
 
     #[test]
@@ -2115,9 +2244,7 @@ mod tests {
         let bytes = snap
             .write_encrypted(Some(&ctx), &enc_set(&["pan"]))
             .unwrap();
-        assert!(String::from_utf8(bytes.clone())
-            .unwrap()
-            .contains("sutra.snapshot=3"));
+        assert!(text(bytes.clone()).contains("sutra.snapshot=3"));
 
         let read = InstanceSnapshot::read_encrypted(&bytes, Some(&ctx)).unwrap();
         // The decrypted plaintext is NOT tag-decoded at v3 — that would rewrite history.
@@ -2151,7 +2278,7 @@ mod tests {
             .write_encrypted(Some(&ctx), &enc_set(&["salary"]))
             .unwrap();
 
-        let text = String::from_utf8(bytes.clone()).unwrap();
+        let text = text(bytes.clone());
         assert!(text.contains("sutra.snapshot=4"), "{text}");
         assert!(text.contains("sutra.enc.salary="));
         assert!(!text.contains("125000"), "the raw value is on disk: {text}");
@@ -2206,7 +2333,7 @@ mod tests {
             "sutra.var.missing=z|\n",
             "sutra.waitingNodes=U\n",
         );
-        assert_eq!(String::from_utf8(snap.write()).unwrap(), expected);
+        assert_eq!(text(snap.write()), expected);
     }
 
     #[test]
@@ -2226,9 +2353,7 @@ mod tests {
         assert_eq!(read.status(), STATUS_FAILED);
         assert_eq!(read.failure_code(), "SUTRA.RUNTIME.TASK.UNCAUGHT");
         assert_eq!(read.variables(), before.variables());
-        assert!(String::from_utf8(failed)
-            .unwrap()
-            .contains("sutra.snapshot=4"));
+        assert!(text(failed).contains("sutra.snapshot=4"));
 
         for status in [STATUS_COMPLETED, STATUS_TERMINATED] {
             let terminal = InstanceSnapshot::mark_terminal(&original, status).unwrap();
@@ -2337,8 +2462,7 @@ mod tests {
                    sutra.processId=p1\nsutra.status=FAILED\nsutra.failureCode=SUTRA.X\n\
                    sutra.failureDetail=boom\nsutra.completedNodes=S\nsutra.waitingNodes=U\n\
                    sutra.keyId=acme\nsutra.enc.iban=Y2lwaGVydGV4dA==\n";
-        let text = String::from_utf8(InstanceSnapshot::resume_from_failed(raw.as_bytes()).unwrap())
-            .unwrap();
+        let text = text(InstanceSnapshot::resume_from_failed(raw.as_bytes()).unwrap());
         assert!(text.contains("sutra.status=SUSPENDED"));
         assert!(!text.contains("sutra.failureCode"));
         assert!(!text.contains("sutra.failureDetail"));
@@ -2358,7 +2482,7 @@ mod tests {
                    sutra.processId=p1\nsutra.status=SUSPENDED\nsutra.completedNodes=S\n\
                    sutra.waitingNodes=U\nsutra.var.exotic=Q|whatever\n";
         let marked = InstanceSnapshot::mark_failed(raw.as_bytes(), "SUTRA.X", "boom").unwrap();
-        let text = String::from_utf8(marked).unwrap();
+        let text = text(marked);
         assert!(text.contains("sutra.status=FAILED"));
         assert!(text.contains("sutra.var.exotic=Q|whatever"), "{text}");
     }

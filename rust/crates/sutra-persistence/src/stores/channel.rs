@@ -106,6 +106,25 @@ impl PgChannelConcurrencyStore {
     }
 }
 
+impl PgChannelConcurrencyStore {
+    /// [`ChannelConcurrencyStore::record_terminal`] on an already-open (deployment-scoped)
+    /// transaction: the instance's admission row is deleted with the terminal step itself, so a
+    /// completed instance and its freed slot commit together (one transaction, never two).
+    pub async fn record_terminal_in(
+        conn: &mut sqlx::PgConnection,
+        deployment: &DeploymentId,
+        instance_id: Uuid,
+    ) -> Result<()> {
+        sqlx::query(SQL_DELETE)
+            .bind(deployment.as_str())
+            .bind(instance_id)
+            .execute(conn)
+            .await
+            .map_err(PersistenceError::db("channel recordTerminal"))?;
+        Ok(())
+    }
+}
+
 impl ChannelConcurrencyStore for PgChannelConcurrencyStore {
     async fn record_started(
         &self,
@@ -130,12 +149,7 @@ impl ChannelConcurrencyStore for PgChannelConcurrencyStore {
 
     async fn record_terminal(&self, deployment: &DeploymentId, instance_id: Uuid) -> Result<()> {
         let mut tx = begin_deployment_tx(&self.pool, deployment).await?;
-        sqlx::query(SQL_DELETE)
-            .bind(deployment.as_str())
-            .bind(instance_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(PersistenceError::db("channel recordTerminal"))?;
+        Self::record_terminal_in(&mut tx, deployment, instance_id).await?;
         tx.commit()
             .await
             .map_err(PersistenceError::db("channel recordTerminal commit"))

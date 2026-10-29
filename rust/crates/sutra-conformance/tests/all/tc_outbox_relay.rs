@@ -258,6 +258,12 @@ async fn assert_recovered(
                 sql(slot, &format!("SELECT string_agg(destination||' due='||next_attempt_at||' att='||attempt_count||' diag='||coalesce(left(last_diagnostic_json,200),'-'), '; ') FROM outbox_entry WHERE instance_id IN (SELECT instance_id FROM alias_index WHERE alias_value = '{r}')")),
                 sql(slot, "SELECT count(*) FROM inbox_seen"),
             ));
+            // Every instance that carries the ref anywhere in its state (the worker has no alias),
+            // so a lost hop shows whether the worker ran at all.
+            dump.push_str(&format!(
+                " | holders={}",
+                sql(slot, &format!("SELECT string_agg(instance_id || ' terminal=' || coalesce(terminal_at::text,'-') || ' worker=' || (position(convert_to('relay-worker','UTF8') in serialised) > 0)::text, '; ') FROM instance_state WHERE position(convert_to('{r}','UTF8') in serialised) > 0")),
+            ));
         }
         panic!("accepted orders never called back: {lost:?}{dump}");
     }

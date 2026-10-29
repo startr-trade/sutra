@@ -59,6 +59,29 @@ pub enum PersistenceError {
 }
 
 impl PersistenceError {
+    /// Whether the failure is the database being unreachable or going away — a dropped or reset
+    /// connection, a pool that could not hand one out in time, the server shutting down or not
+    /// yet accepting connections — rather than anything about the statement. Such a step did not
+    /// commit, or (a COMMIT whose answer was lost) committed together with its inbox dedup record;
+    /// either way the same delivery can be offered again and is processed at most once.
+    pub fn is_transient(&self) -> bool {
+        match self {
+            Self::Database { source, .. } => match source {
+                sqlx::Error::Io(_)
+                | sqlx::Error::PoolTimedOut
+                | sqlx::Error::PoolClosed
+                | sqlx::Error::WorkerCrashed => true,
+                sqlx::Error::Database(db) => db.code().is_some_and(|code| {
+                    // SQLSTATE class 08 (connection exception) and 57P01/57P02/57P03
+                    // (admin shutdown, crash shutdown, cannot connect now).
+                    code.starts_with("08") || matches!(code.as_ref(), "57P01" | "57P02" | "57P03")
+                }),
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
     /// Tags a sqlx error with the store operation that produced it.
     pub fn db(operation: &'static str) -> impl FnOnce(sqlx::Error) -> Self {
         move |source| Self::Database { operation, source }
@@ -68,5 +91,22 @@ impl PersistenceError {
     #[cfg(feature = "mssql")]
     pub fn mssql(operation: &'static str) -> impl FnOnce(tiberius::error::Error) -> Self {
         move |source| Self::Mssql { operation, source }
+    }
+}
+
+#[cfg(test)]
+mod transient_tests {
+    use super::*;
+
+    #[test]
+    fn only_an_unreachable_database_is_transient() {
+        let io = PersistenceError::db("step commit")(sqlx::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "Connection reset by peer",
+        )));
+        assert!(io.is_transient());
+        assert!(PersistenceError::db("acquire")(sqlx::Error::PoolTimedOut).is_transient());
+        assert!(!PersistenceError::db("decode")(sqlx::Error::RowNotFound).is_transient());
+        assert!(!PersistenceError::InvalidArgument("bad".into()).is_transient());
     }
 }

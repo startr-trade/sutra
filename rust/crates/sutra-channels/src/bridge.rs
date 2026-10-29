@@ -343,6 +343,16 @@ pub trait InstanceBridge {
         emissions: &[OutboxEmission],
     ) -> Result<(), Diagnostic>;
 
+    /// Whether [`Self::commit_complete`] also removes the instance's per-channel admission row
+    /// (the durable `channel_instance` gauge) inside its own transaction. When it does AND the
+    /// wired [`crate::ConcurrencyStore`] is that same durable gauge
+    /// ([`crate::ConcurrencyStore::released_by_terminal_commit`]), the dispatcher does not issue
+    /// a second, separate release after a successful terminal commit. Default `false`: the
+    /// dispatcher releases through the concurrency store, as always.
+    fn terminal_commit_releases_admission(&self) -> bool {
+        false
+    }
+
     /// Re-park step (wait→wait): overwrite the snapshot with the new frontier, resolve
     /// every satisfied wait node (the relayed/fired node plus any timer rows it cancels),
     /// record the new wait/timer/alias rows, enqueue the step's emissions — one

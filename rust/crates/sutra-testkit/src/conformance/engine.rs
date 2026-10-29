@@ -219,6 +219,7 @@ pub struct EngineBuilder {
     expected_deployments: u64,
     shards: Option<u32>,
     mounts: Vec<(String, String)>,
+    image: Option<String>,
 }
 
 impl EngineBuilder {
@@ -237,7 +238,16 @@ impl EngineBuilder {
             expected_deployments: 1,
             shards: conformance_shards(),
             mounts: Vec::new(),
+            image: None,
         }
+    }
+
+    /// Run this container from `image` (`name:tag`) instead of the run-wide
+    /// [`engine_image_ref`] — for a suite that boots an earlier release against the same
+    /// database first (an upgrade test).
+    pub fn image(mut self, image: impl Into<String>) -> Self {
+        self.image = Some(image.into());
+        self
     }
 
     /// The engine container's name — its address on the suite network — known before
@@ -298,7 +308,8 @@ impl EngineBuilder {
     /// Start the engine against a mounted archives directory and block until it is ready
     /// (HTTP 200 on `/sutra/health/ready`, with at least `expected_deployments` active).
     pub fn start(self, archives_dir: &Path) -> EngineHandle {
-        let (name, tag) = image_name_tag(&engine_image_ref());
+        let image_ref = self.image.clone().unwrap_or_else(engine_image_ref);
+        let (name, tag) = image_name_tag(&image_ref);
         let mount = Mount::bind_mount(
             archives_dir.to_string_lossy().to_string(),
             CONTAINER_DEPLOYMENTS_DIR,

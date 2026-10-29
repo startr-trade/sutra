@@ -255,6 +255,17 @@ impl MessageSink for LocalDeliverySink {
                 Err(diagnostic) if is_engine_unavailable(&diagnostic) => {
                     SendOutcome::RetryableFailure(diagnostic)
                 }
+                // The database was unreachable while the delivery ran (nothing committed, or it
+                // committed with its dedup record): retried with the outbox backoff, like an
+                // unavailable engine — never poisoned for a database restart.
+                Err(diagnostic)
+                    if diagnostic
+                        .attributes
+                        .get(crate::dispatch::TRANSIENT_ATTR)
+                        .is_some_and(|v| v == "true") =>
+                {
+                    SendOutcome::RetryableFailure(diagnostic)
+                }
                 // Another delivery of the same event committed first: it was processed exactly
                 // once, so this delivery is done.
                 Err(diagnostic)

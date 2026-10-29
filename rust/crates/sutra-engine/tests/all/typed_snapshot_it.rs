@@ -271,12 +271,13 @@ fn an_encrypted_variable_restores_typed_from_inside_its_envelope() {
             .fetch_one(&pool),
         )
         .unwrap();
-    let text = String::from_utf8_lossy(&stored);
-    assert!(text.contains("sutra.snapshot=4"), "{text}");
-    assert!(text.contains("sutra.enc.salary="));
+    let raw = sutra_persistence::snapshot::RawSnapshot::parse(&stored).expect("stored snapshot");
+    assert_eq!(raw.get("sutra.snapshot"), Some("4"));
+    assert!(raw.get("sutra.enc.salary").is_some());
+    assert!(raw.get("sutra.var.salary").is_none());
     assert!(
-        !text.contains("125000"),
-        "raw sensitive value at rest: {text}"
+        !stored.windows(6).any(|w| w == b"125000"),
+        "raw sensitive value at rest"
     );
 
     let loaded = rt
@@ -297,9 +298,9 @@ fn an_encrypted_variable_restores_typed_from_inside_its_envelope() {
 #[ignore = "docker"]
 #[test]
 fn an_all_string_instance_still_parks_as_the_pre_typing_bytes() {
-    // Compatibility in the direction that actually ships: an instance whose variables happen to
-    // be strings must produce the bytes it always produced, so a fleet mid-upgrade writes rows
-    // an older replica can still read.
+    // An instance whose variables happen to be strings still parks the generation-2 map it always
+    // produced (since snapshot format 5 inside the binary container, which an older replica
+    // cannot read — the upgrade note says so).
     let rt = tokio::runtime::Runtime::new().unwrap();
     let pool = rt.block_on(fresh_pool());
     let bridge = PersistenceBridge::new(pool.clone());
@@ -326,7 +327,11 @@ fn an_all_string_instance_still_parks_as_the_pre_typing_bytes() {
             .fetch_one(&pool),
         )
         .unwrap();
-    let text = String::from_utf8(stored).unwrap();
-    assert!(text.contains("sutra.snapshot=2"), "{text}");
-    assert!(text.contains("sutra.var.inboundId=INB-7"), "{text}");
+    assert!(
+        stored.starts_with(b"\\uSNAPSHOT/5\n"),
+        "the binary container"
+    );
+    let raw = sutra_persistence::snapshot::RawSnapshot::parse(&stored).expect("stored snapshot");
+    assert_eq!(raw.get("sutra.snapshot"), Some("2"));
+    assert_eq!(raw.get("sutra.var.inboundId"), Some("INB-7"));
 }

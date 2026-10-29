@@ -179,6 +179,13 @@ pub trait ConcurrencyStore {
     async fn record_resumed(&self, deployment: &DeploymentId, instance_id: &str);
     /// Instance reached a terminal state → entry removed. Unknown instance is a silent no-op.
     async fn record_terminal(&self, deployment: &DeploymentId, instance_id: &str);
+    /// Whether this store's entries live in the same durable table the instance bridge's terminal
+    /// commit deletes from (see `InstanceBridge::terminal_commit_releases_admission`), so a
+    /// completed instance's entry is already gone once that commit succeeds. Default `false`
+    /// (an in-memory gauge is never touched by a database commit).
+    fn released_by_terminal_commit(&self) -> bool {
+        false
+    }
 }
 
 /// Whether an in-flight instance is executing or parked at a wait node.

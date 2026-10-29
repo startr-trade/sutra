@@ -70,6 +70,13 @@ pub const ACK_DISPOSITION_REQUEUE: &str = "requeue";
 /// of poisoning it.
 pub const WAIT_PENDING_ATTR: &str = "sutra.waitPending";
 
+/// A [`Diagnostic`] attribute the persistence bridge stamps on a failure that was the database
+/// being unreachable (a reset connection, a pool timeout, a server restart) rather than anything
+/// about the delivery. The step did not commit — or committed together with its inbox dedup
+/// record — so the same delivery can be offered again and is processed at most once. The
+/// in-process `local` sink retries such a delivery with the outbox backoff instead of poisoning it.
+pub const TRANSIENT_ATTR: &str = "sutra.transient";
+
 /// One transport delivery, as handed to the dispatcher. The transport stamps the
 /// channel's namespace (`module_key`) and tenant — never the client.
 #[derive(Debug, Clone)]
@@ -1334,6 +1341,18 @@ impl ChannelEngine {
         if !instance_id.is_empty() {
             self.release_pool_slots(deployment, instance_id).await;
         }
+    }
+
+    /// Whether a successful `commit_complete` already removed the instance's admission entry:
+    /// the bridge deletes the durable row in its terminal transaction AND the wired gauge is that
+    /// same durable row. Any other pairing (an in-memory gauge, a bridge that does not) releases
+    /// through the store as before.
+    fn terminal_commit_released_admission(&self, store: &dyn ConcurrencyStore) -> bool {
+        store.released_by_terminal_commit()
+            && self
+                .bridge
+                .as_ref()
+                .is_some_and(|bridge| bridge.terminal_commit_releases_admission())
     }
 
     /// End an instance's WHOLE session (`session-end:` with no call key to go by): free its
@@ -2900,9 +2919,12 @@ impl ChannelEngine {
                     .map_err(Transient)?;
                 // §6.1: a resume pass committed (terminal) on this lane.
                 self.shard_metrics.resumed();
-                // The instance is terminal — free its channel_instance slot and its pool slots.
+                // The instance is terminal — free its channel_instance slot (unless the terminal
+                // commit already did, in its own transaction) and its pool slots.
                 if let Some(store) = &self.concurrency {
-                    store.record_terminal(pinned, &instance_id).await;
+                    if !self.terminal_commit_released_admission(store.as_ref()) {
+                        store.record_terminal(pinned, &instance_id).await;
+                    }
                 }
                 self.release_pool_slots(pinned, &instance_id).await;
                 // A relay answers with the `<q:reply>` THIS pass reached, rendered against its
@@ -4564,9 +4586,11 @@ impl ChannelEngine {
             }
             self.shard_metrics.resumed();
             if let Some(store) = &self.concurrency {
-                store
-                    .record_terminal(&chain.deployment, &chain.instance_id)
-                    .await;
+                if !self.terminal_commit_released_admission(store.as_ref()) {
+                    store
+                        .record_terminal(&chain.deployment, &chain.instance_id)
+                        .await;
+                }
             }
             self.release_chain(&chain, ChainEnd::Completed).await;
             chain.visited.extend(visited_nodes);
@@ -4861,9 +4885,16 @@ impl ChannelEngine {
         if ended {
             if chain.counted {
                 if let Some(store) = &self.concurrency {
-                    store
-                        .record_terminal(&chain.deployment, &chain.instance_id)
-                        .await;
+                    // A stored chain that completed went through `commit_complete`, which may
+                    // have released the entry in its own transaction already.
+                    let released = matches!(end, ChainEnd::Completed)
+                        && chain.stored.is_some()
+                        && self.terminal_commit_released_admission(store.as_ref());
+                    if !released {
+                        store
+                            .record_terminal(&chain.deployment, &chain.instance_id)
+                            .await;
+                    }
                 }
             }
             if chain.pooled || chain.stored.is_some() {

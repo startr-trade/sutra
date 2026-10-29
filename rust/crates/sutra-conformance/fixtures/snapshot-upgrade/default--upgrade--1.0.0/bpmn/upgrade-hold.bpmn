@@ -1,0 +1,79 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  upgrade-hold: parks with typed state, resumes on a decision, calls back with that state.
+
+    startEvent (order-in) -> Prepare (FEEL: typed variables) -> AwaitDecision (receive on
+    decision-in, correlated by ref) -> BuildCallback -> Callback (send callback-out) -> End
+-->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0"
+                  id="Definitions_upgrade_hold"
+                  targetNamespace="urn:sutra:module:upgrade:1.0.0">
+
+  <bpmn:process id="upgrade-hold" name="Upgrade hold" isExecutable="true">
+    <bpmn:extensionElements>
+      <q:variables>
+        <q:variable name="decision" type="object"/>
+        <q:variable name="held" type="object"/>
+        <q:variable name="responseBody" type="object"/>
+      </q:variables>
+    </bpmn:extensionElements>
+
+    <bpmn:startEvent id="Start" name="Order received">
+      <bpmn:extensionElements>
+        <q:source channel="order-in"/>
+        <q:alias name="orderRef" expression="payload.ref" unique="true"/>
+      </bpmn:extensionElements>
+      <bpmn:outgoing>F1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="F1" sourceRef="Start" targetRef="Prepare"/>
+
+    <bpmn:serviceTask id="Prepare" name="Hold typed state (FEEL)">
+      <bpmn:incoming>F1</bpmn:incoming><bpmn:outgoing>F2</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment>
+          <bpmn:from>{ref: payload.ref, amount: payload.amount, items: payload.items, note: payload.note, nested: {flag: true, ratio: 0.25, empty: null}}</bpmn:from>
+          <bpmn:to>held</bpmn:to>
+        </bpmn:assignment>
+      </bpmn:dataInputAssociation>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment>
+          <!-- The wait's alias (decision.ref) is evaluated when the instance parks. -->
+          <bpmn:from>{ref: payload.ref}</bpmn:from>
+          <bpmn:to>decision</bpmn:to>
+        </bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F2" sourceRef="Prepare" targetRef="AwaitDecision"/>
+
+    <bpmn:receiveTask id="AwaitDecision" name="Await the decision">
+      <bpmn:extensionElements>
+        <q:source channel="decision-in" name="decision"/>
+        <q:alias name="decisionRef" expression="decision.ref" unique="true"/>
+      </bpmn:extensionElements>
+      <bpmn:incoming>F2</bpmn:incoming><bpmn:outgoing>F3</bpmn:outgoing>
+    </bpmn:receiveTask>
+    <bpmn:sequenceFlow id="F3" sourceRef="AwaitDecision" targetRef="BuildCallback"/>
+
+    <bpmn:serviceTask id="BuildCallback" name="Build the callback (FEEL)">
+      <bpmn:incoming>F3</bpmn:incoming><bpmn:outgoing>F4</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment>
+          <bpmn:from>{ref: held.ref, verdict: decision.verdict, amount: held.amount, doubled: held.amount * 2, items: held.items, count: count(held.items), note: held.note, flag: held.nested.flag, ratio: held.nested.ratio}</bpmn:from>
+          <bpmn:to>responseBody</bpmn:to>
+        </bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F4" sourceRef="BuildCallback" targetRef="Callback"/>
+
+    <bpmn:sendTask id="Callback" name="Call back">
+      <bpmn:extensionElements>
+        <q:send channel="callback-out"/>
+      </bpmn:extensionElements>
+      <bpmn:incoming>F4</bpmn:incoming><bpmn:outgoing>F5</bpmn:outgoing>
+    </bpmn:sendTask>
+    <bpmn:sequenceFlow id="F5" sourceRef="Callback" targetRef="End"/>
+
+    <bpmn:endEvent id="End" name="Done"><bpmn:incoming>F5</bpmn:incoming></bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>

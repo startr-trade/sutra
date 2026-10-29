@@ -49,6 +49,11 @@ impl PersistedChannelConcurrency {
 
 #[async_trait::async_trait(?Send)]
 impl ConcurrencyStore for PersistedChannelConcurrency {
+    /// The rows are the `channel_instance` rows the persistence bridge's terminal commit deletes.
+    fn released_by_terminal_commit(&self) -> bool {
+        true
+    }
+
     async fn count_active(
         &self,
         deployment: &DeploymentId,

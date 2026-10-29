@@ -143,22 +143,52 @@ simply `4`. There is no generation for "typed and encrypted", and there never ne
 
 **Decode is version detection, not migration.** An older snapshot is not tag-decoded at all: every
 value becomes a string, byte for byte what it was — *including* a legacy value that happens to look
-like a tag. An old row read and re-written untouched reproduces its original bytes. There is no
-silent upgrade on load.
+like a tag. An old row read and re-written untouched reproduces its original key/value map (in the
+binary container since 0.6.7). There is no silent upgrade of values on load.
 
 **Encode emits the lowest generation that can carry the state**: `4` when at least one variable
 actually needs the typed form, else `3` when something is encrypted, else `2`. An instance whose
 variables are all strings therefore still writes the exact bytes it wrote before typing existed.
 
-That asymmetry is doing real work. It keeps a byte-for-byte golden corpus valid across the feature,
-and — more importantly — it lets a **fleet mid-upgrade** write rows an older replica can still
-read. A rolling upgrade does not need every replica to reach the new version before anything is
-safe.
+That asymmetry did real work for generations 2 to 4: it kept a golden corpus valid across the
+feature and let a fleet mid-upgrade write rows an older replica could still read. The binary
+container of 0.6.7 (below) gives that up on purpose.
 
 The decode path is also deliberately lenient in one further respect: a malformed engine-internal
 counter reads as zero rather than as an error. **A snapshot must never become unloadable.** An
 instance that cannot be read is an instance no operator can inspect, migrate, or terminate — a
 strictness that turns a small corruption into an unrecoverable one is the wrong trade.
+
+### The binary container (format 5, since 0.6.7) {#the-binary-container}
+
+Up to 0.6.6 the key/value map was stored as Properties text: every character of every key and
+value went through escaping on write and unescaping on read, which made encoding and decoding a
+visible share of each step's CPU. Since 0.6.7 the same map is stored as a binary container:
+
+```text
+\uSNAPSHOT/5\n                      marker, 13 bytes
+entry count                          u32, little-endian
+per entry, keys ascending:           u32 key length, key bytes (UTF-8), u32 value length, value bytes
+```
+
+The map inside is unchanged — the same keys, the same tagged values, the same `sutra.snapshot`
+generation, the same encryption envelope and key id — so everything above still holds, and the
+byte-level patchers work on either container. Identical state still produces identical bytes.
+
+- **Reading old rows.** A row written by any earlier release starts with a `sutra.` key, never with
+  the marker, so it is read as text exactly as before. It is rewritten in the binary container the
+  next time its instance commits (a re-park, completion, a FAILED or terminal re-stamp, a
+  migration). Nothing is migrated in bulk.
+- **Older engines cannot read new rows.** A release before 0.6.7 reads the marker as a malformed
+  Properties escape and refuses the row ("failed to decode persisted instance snapshot: malformed
+  \uXXXX encoding"); the instance is left untouched. So:
+  - **upgrade the whole fleet at once** — stop every older replica, then start 0.6.7 — rather than
+    rolling replica by replica; an older replica still running would refuse every instance a 0.6.7
+    replica has committed;
+  - **rolling back** to 0.6.6 or earlier works only for instances no 0.6.7 engine has committed;
+    finish or cancel the rest first.
+- **Fail-closed.** A truncated container, a length that runs past the end, trailing bytes or
+  non-UTF-8 text is a decode error, never a partial instance.
 
 ### The byte-level key patchers
 
@@ -222,7 +252,7 @@ as `null` rather than blank) instead of restoring as an empty string.
 
 ## The snapshot key registry
 
-Everything a stored snapshot's properties map can carry, in one place — useful when reading a raw
+Everything a stored snapshot's key/value map can carry (in either container), in one place — useful when reading a raw
 row. `sutra.`-prefixed keys are engine-internal: opaque strings to the byte-level key patchers and
 never tag-decoded. `sutra.var.<name>` entries are the user variables the typed encoding exists for.
 

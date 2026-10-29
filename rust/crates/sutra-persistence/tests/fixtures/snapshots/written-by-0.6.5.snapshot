@@ -1,0 +1,16 @@
+sutra.completedNodes=Prepare
+sutra.deploymentId=dep-3d9b39db237006806fd38155
+sutra.processId=upgrade-hold
+sutra.snapshot=4
+sutra.startNode=Start
+sutra.status=SUSPENDED
+sutra.var.attr=j|{}
+sutra.var.decision=j|{"ref"\:"up0-0"}
+sutra.var.event=j|{"body"\:"{\\"ref\\"\:\\"up0-0\\",\\"amount\\"\:0.5,\\"items\\"\:[\\"a\\",\\"b\=c\\",\\"\u00E9\\"],\\"note\\"\:\\"line1\\\\nline2 \= \: \# \! \u00E9\\"}","channel"\:"order-in","contentType"\:"application/json","dedupKey"\:"d059c84d518fc5f42d71632a5fc2199c","headers"\:{"accept"\:"*/*","content-length"\:"86","content-type"\:"application/json","host"\:"127.0.0.1\:38331","x-api-key"\:"snapshot-upgrade-key"},"idempotencyKey"\:"d059c84d518fc5f42d71632a5fc2199c","receivedAt"\:"2026-10-29T13\:18\:33.911496591Z"}
+sutra.var.header=j|{"accept"\:"*/*","content-length"\:"86","content-type"\:"application/json","host"\:"127.0.0.1\:38331","x-api-key"\:"snapshot-upgrade-key"}
+sutra.var.held=j|{"amount"\:0.5,"items"\:["a","b\=c","\u00E9"],"nested"\:{"empty"\:null,"flag"\:true,"ratio"\:0.25},"note"\:"line1\\nline2 \= \: \# \! \u00E9","ref"\:"up0-0"}
+sutra.var.orderRef=s|up0-0
+sutra.var.payload.validation=j|[]
+sutra.var.payload=j|{"amount"\:0.5,"items"\:["a","b\=c","\u00E9"],"note"\:"line1\\nline2 \= \: \# \! \u00E9","ref"\:"up0-0"}
+sutra.var.validation=j|{"firstIssue"\:"","firstReasonCode"\:"","issues"\:[],"outcome"\:"OK","tier"\:"n/a"}
+sutra.waitingNodes=AwaitDecision

@@ -107,7 +107,7 @@ pub use dispatch::{
     ChannelCallPoisonFire, ChannelCallPoisonOutcome, ChannelEngine, DeferredDispatch,
     DispatchOutcome, InboundMessage, InlineChain, RelayReplyContext, ResolvedResume,
     ScheduledStartFire, ScheduledStartOutcome, SyncReply, TimerFireOutcome, ACK_DISPOSITION_ATTR,
-    ACK_DISPOSITION_REQUEUE, SCHEDULE_CHANNEL, WAIT_PENDING_ATTR,
+    ACK_DISPOSITION_REQUEUE, SCHEDULE_CHANNEL, TRANSIENT_ATTR, WAIT_PENDING_ATTR,
 };
 #[cfg(feature = "transport")]
 pub use external_task::{
