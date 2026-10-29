@@ -522,6 +522,18 @@ pub fn classify_timer_text(
         Err(rejection) => rejection,
     };
     if text.trim().is_empty() || is_literal_shaped(form, text) {
+        // A mistyped duration literal: name the literal that was most likely meant.
+        if form == TimerExpressionForm::Duration {
+            if let Some(meant) = suggest_duration_literal(text) {
+                let reason = format!("{}; did you mean {meant}?", literal.reason());
+                return Err(match literal {
+                    TimerSpecRejection::UnsupportedForm(_) => {
+                        TimerSpecRejection::UnsupportedForm(reason)
+                    }
+                    TimerSpecRejection::Malformed(_) => TimerSpecRejection::Malformed(reason),
+                });
+            }
+        }
         return Err(literal);
     }
     match parse_timer_expression(text) {
@@ -554,6 +566,84 @@ pub fn timer_expression_roots(text: &str) -> Result<Vec<String>, sutra_feel::Fee
         }
     }
     Ok(roots)
+}
+
+/// The ISO-8601 literal a mistyped timer text was most likely meant to be (`PT10SEC` → `PT10S`,
+/// `pt5m` → `PT5M`, `P1DAY` → `P1D`, `PT1H30MIN` → `PT1H30M`), or `None` when the text does not
+/// look like a duration attempt. Only ever used to word a diagnostic.
+pub fn suggest_duration_literal(text: &str) -> Option<String> {
+    let upper: String = text
+        .trim()
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '_')
+        .collect::<String>()
+        .to_ascii_uppercase();
+    let rest = upper.strip_prefix('P')?;
+    let mut date = String::new();
+    let mut time = String::new();
+    let mut in_time = false;
+    let mut chars = rest.chars().peekable();
+    if chars.peek() == Some(&'T') {
+        chars.next();
+        in_time = true;
+    }
+    let mut seen_unit = false;
+    while chars.peek().is_some() {
+        let mut number = String::new();
+        while let Some(c) = chars.peek() {
+            if c.is_ascii_digit() || *c == '.' {
+                number.push(*c);
+                chars.next();
+            } else {
+                break;
+            }
+        }
+        let mut word = String::new();
+        while let Some(c) = chars.peek() {
+            if c.is_ascii_alphabetic() {
+                word.push(*c);
+                chars.next();
+            } else {
+                break;
+            }
+        }
+        if number.is_empty() {
+            if word == "T" && !in_time {
+                in_time = true;
+                continue;
+            }
+            return None;
+        }
+        // A unit word: the unit letter, optionally spelled out (and a time `T` the author left
+        // out, inferred from a time unit after a date part).
+        let unit = match word.as_str() {
+            "S" | "SEC" | "SECS" | "SECOND" | "SECONDS" => 'S',
+            "M" if in_time => 'M',
+            "MIN" | "MINS" | "MINUTE" | "MINUTES" => 'M',
+            "H" | "HR" | "HRS" | "HOUR" | "HOURS" => 'H',
+            "D" | "DAY" | "DAYS" => 'D',
+            "W" | "WEEK" | "WEEKS" => 'W',
+            _ => return None,
+        };
+        seen_unit = true;
+        match unit {
+            'D' | 'W' if !in_time => date.push_str(&format!("{number}{unit}")),
+            'S' | 'M' | 'H' => {
+                in_time = true;
+                time.push_str(&format!("{number}{unit}"));
+            }
+            _ => return None,
+        }
+    }
+    if !seen_unit {
+        return None;
+    }
+    let candidate = if time.is_empty() {
+        format!("P{date}")
+    } else {
+        format!("P{date}T{time}")
+    };
+    (candidate != text.trim() && parse_timer_duration(&candidate).is_ok()).then_some(candidate)
 }
 
 /// The `config.<key>` keys a timer expression reads, deduplicated in source order.
@@ -922,5 +1012,42 @@ mod tests {
             TimerDefinition::Cycle(parse_timer_cycle("R7/PT1H").unwrap()).total_fires(),
             Some(7)
         );
+    }
+}
+
+#[cfg(test)]
+mod suggest_tests {
+    use super::suggest_duration_literal;
+
+    #[test]
+    fn a_mistyped_duration_is_mapped_to_the_literal_meant() {
+        for (typo, meant) in [
+            ("PT10SEC", "PT10S"),
+            ("pt5m", "PT5M"),
+            ("P1DAY", "P1D"),
+            ("PT1H30MIN", "PT1H30M"),
+            ("P10S", "PT10S"),
+            ("PT 2 SECONDS", "PT2S"),
+        ] {
+            assert_eq!(
+                suggest_duration_literal(typo).as_deref(),
+                Some(meant),
+                "{typo}"
+            );
+        }
+    }
+
+    #[test]
+    fn text_that_is_no_duration_attempt_gets_no_suggestion() {
+        for text in [
+            "retryWindow",
+            "payload.delay",
+            "PT10S",
+            "P",
+            "PTX",
+            "Period",
+        ] {
+            assert_eq!(suggest_duration_literal(text), None, "{text}");
+        }
     }
 }

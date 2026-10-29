@@ -306,6 +306,8 @@ async fn one_sync_post_exports_traces_metrics_and_logs_over_otlp() {
         datasource_username: None,
         datasource_password: None,
         outbox_tick_interval: std::time::Duration::from_secs(5),
+        outbox_tuning: Default::default(),
+        datasource_pools: Default::default(),
         outbox_retry: Default::default(),
         deferred_ack: Default::default(),
         external_task: Default::default(),

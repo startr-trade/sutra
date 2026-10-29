@@ -42,3 +42,37 @@ pub async fn begin_deployment_tx(
     set_deployment_guc(&mut tx, deployment).await?;
     Ok(tx)
 }
+
+/// [`begin_deployment_tx`] for a transaction whose commit need not wait for its own WAL flush
+/// (`synchronous_commit = off` for THIS transaction only; the server setting is untouched).
+///
+/// Only for writes that are safe to lose in a crash: bookkeeping a crash voids anyway, so losing
+/// it can neither lose an acknowledged state nor create one. The complete list of callers: the
+/// instance ownership claim (`PgInstanceStore::claim_flush_deferred` — a crashed process's claim
+/// is void), the outbox claim (`PgOutboxStore::claim_due_excluding` — row locks only) and the
+/// delete of delivered outbox rows (`PgOutboxStore::delete_many` — a lost delete redelivers,
+/// which the outbox's at-least-once contract already allows). Add to this list only with the
+/// same argument, and record it in the design notes and the public tuning guide.
+///
+/// The row is visible to other transactions as soon as this commit returns, exactly as with a
+/// synchronous commit; only its durability is deferred, by at most `wal_writer_delay`.
+pub async fn begin_deployment_tx_flush_deferred(
+    pool: &PgPool,
+    deployment: &DeploymentId,
+) -> Result<Transaction<'static, Postgres>> {
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(PersistenceError::db("begin transaction"))?;
+    sqlx::query(
+        "SELECT set_config('synchronous_commit', 'off', true), \
+                set_config('sutra.deployment_id', $1, true)",
+    )
+    .bind(deployment.as_str())
+    .execute(&mut *tx)
+    .await
+    .map_err(PersistenceError::db(
+        "set_config(synchronous_commit, sutra.deployment_id)",
+    ))?;
+    Ok(tx)
+}

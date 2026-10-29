@@ -13,6 +13,78 @@ This is the changelog for the **Rust-native** engine (`rust/` workspace). It beg
 
 Nothing yet.
 
+## [0.6.5] — 2026-10-29
+
+A **patch** release about durable throughput, plus two small fixes. Durability is unchanged:
+every state change is committed synchronously before it is acknowledged, delivery stays
+at-least-once with idempotency keys, inbox dedup stays exactly-once, and an engine that crashes
+mid-flight is recovered from the durable rows. The snapshot format and the database schema are
+unchanged (no migration), and the `q:` namespace is untouched. Measured on one laptop with a
+consumer NVMe (~325 fsync/s) and PostgreSQL on durable settings, a relay of two processes (HTTP
+intake, local forward, local answer, HTTP callback) went from 13.7 to 499 completed relays per
+second at a p99 of 250 ms.
+
+### Added
+
+- **A concurrent outbox dispatcher.** Deliveries run on `sutra.outbox.workers` workers (default:
+  the lane count, at least 8). One instance's deliveries always go to one worker, in order; the
+  rows of different instances go out in parallel. A step that enqueues wakes the dispatcher at
+  once, so `sutra.outbox.tick-interval` now only paces retries and rows another replica enqueued.
+  Delivered rows are deleted in batches. Retry, backoff, the attempts ceiling, poison handling
+  and incidents behave exactly as before. `sutra.outbox.batch-size` (default 50) replaces the
+  hardcoded claim size.
+- **In-process hand-off of `local://` deliveries.** A local delivery is still a durable outbox
+  row committed with the sender's step; once that commit is durable the engine hands the row to
+  its dispatcher directly instead of claiming it back. The row becomes claimable only after a
+  30-second grace, so after a crash any engine delivers it; the receiver's inbox dedup absorbs a
+  repeat.
+- **Fair lanes.** Each lane serves deliveries that continue admitted work (local hand-offs,
+  resolved resumes) before new intake, so a burst of intake meets backpressure instead of starving
+  the hops that finish what it started.
+- **Configurable engine pools.** `sutra.datasource.max-connections` (default 8, the old fixed
+  size) sizes the pool the lanes use; `sutra.datasource.dispatch-max-connections` (default 2) is a
+  separate pool for the dispatcher and the timer poller.
+- **A data-store read cache**, opt-in per store in `datastores.yaml`:
+  `cache: {enabled, maxEntries, ttl}`. With the default `ttl: PT0S` a cached key costs one
+  revision check instead of a full read, and any write through any engine applies to the next
+  read. A positive `ttl` serves a key with no query for that long.
+- `tools/sutra-load-test/relay-bench.sh`: the relay workload end to end against a throwaway
+  durable PostgreSQL, reporting settles/s, latency, commits and WAL flushes per settle, with an
+  optional CPU profile.
+
+### Fixed
+
+- **A delivery could be lost after a crash.** The inbox dedup record was committed before the
+  delivery was processed, so a crash (or a `CLAIM_HELD` bounce) between the two left a record
+  with no effects behind, and the redelivery was dropped as a duplicate. The record is now written
+  in the same transaction as the step's effects. An in-process delivery that the engine refuses as
+  retry-safe (`SUTRA.RUNTIME.RESUME.CLAIM_HELD`) is now retried with backoff instead of parked at
+  the poison horizon. Two deliveries of one event at the same moment: the second step rolls back
+  with `SUTRA.INBOUND.DUPLICATE_CONCURRENT`.
+
+### Changed
+
+- **Fewer durable commits.** The inbox dedup record of a delivery is written in the transaction of
+  the step that processes it, instead of in its own. Bookkeeping that a crash cannot hurt no
+  longer waits for its own WAL flush: the instance ownership claim, the outbox claim and the
+  delete of delivered rows. The per-channel
+  concurrency gauge is written only for a channel that declares `max-concurrent-instances`. A data
+  task reads a value and its revision in one statement. Together: 12 WAL flushes per completed
+  relay down to about 3 at low load and under 1 at high load.
+- **A timer expression that reads an unknown name is refused.** A timer body, `q:timeout` or
+  `q:retry` expression whose root name nothing in scope provides — not `config`, a declared
+  variable or data object, the payload, or a variable the process sets — is a lint, package and
+  deploy error (`SUTRA.CONFIG.BPMN.TIMER_EXPRESSION_UNKNOWN_NAME`) instead of a null at run time.
+  A mistyped duration literal now names the literal that was meant ("did you mean PT10S?").
+- **`sutra test simulate` no longer hangs during boot.** With a package in `--deployments` and a
+  log level that logs while the engine boots (`-v`, `RUST_LOG`), the command stopped after
+  "schema up to date" and ignored `--timeout`: the CLI held the terminal's stderr lock for the
+  whole command, and the engine's first log line from a runtime thread waited on it forever. The
+  CLI now writes to stderr without holding it, and `--timeout` also bounds the boot.
+- **SQL Server driver**: tiberius 0.13 (rustls 0.23). This removes rustls 0.21 and rustls-webpki
+  0.101 from the build and the six time-boxed advisories that came with them. rustls is now
+  compiled with two crypto providers, so the engine and the CLI select ring explicitly.
+
 ## [0.6.4] — 2026-10-28
 
 A **patch** release that adds one backward-compatible feature: a timer's interval can come from a

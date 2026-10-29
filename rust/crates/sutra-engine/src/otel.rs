@@ -400,6 +400,7 @@ impl Telemetry {
 /// metrics listener. Fail-open at every step: exporter build failures degrade to
 /// JSON-logs-only and are reported as WARNs once the subscriber is up.
 pub fn init(config: &TelemetryConfig) -> Telemetry {
+    crate::install_tls_provider();
     let mut deferred_warnings: Vec<String> = config.warnings.clone();
     let active = config.is_active();
 

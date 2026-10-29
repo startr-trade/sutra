@@ -131,8 +131,9 @@ pub use inline_chain::{InlineHandoff, StreamFrame};
 pub use intake::{InboundChain, IntakeOutcome};
 #[cfg(feature = "transport")]
 pub use outbox_dispatch::{
-    encode_wire_message, spawn_dispatch_loop, ClaimedOutboxRow, DispatchStats, LiveDeploymentSet,
-    OutboxDispatcher, OutboxDispatcherHandle, OutboxRowStore, PoisonedDelivery, RetryPolicy,
+    encode_wire_message, spawn_concurrent_dispatch_loop, spawn_dispatch_loop, ClaimedOutboxRow,
+    DispatchStats, LiveDeploymentSet, OutboxConcurrency, OutboxDispatcher, OutboxDispatcherHandle,
+    OutboxRowStore, OutboxSignal, PoisonedDelivery, RetryPolicy,
 };
 pub use policy::{
     ActiveInstanceCount, AllowAllFeatureProvider, Clock, ConcurrencyStore,
@@ -155,7 +156,7 @@ pub use source::{
 };
 pub use stores::{
     AliasStore, CollectingOutbox, InMemoryAliasStore, InMemoryInboxStore, InMemoryIncidentSink,
-    InboundIncident, InboxStore, IncidentSink, OutboxSink,
+    InboundIncident, InboxStore, IncidentSink, OutboxSink, PendingDedup,
 };
 pub use transport_audit::{
     is_transport_event_type, transport_audit, transport_audit_payload, transport_event_type,

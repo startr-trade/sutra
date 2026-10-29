@@ -1,0 +1,11 @@
+# Relay-bench package: the domain-neutral full-relay workload behind the `relay` k6 profile.
+# One HTTP intake, validated, forwarded over a local channel to a second process, answered
+# back over a second local channel, then delivered to an HTTP callback sink. Every hop rides
+# the durable outbox, so this package measures the engine's durable message path end to end.
+# Labels are opaque selectors.
+labels:
+  "tenant": "default"
+  "module": "relay-bench"
+  "version": "1.0.0"
+engine:
+  minContract: 1

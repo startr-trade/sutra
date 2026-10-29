@@ -69,6 +69,7 @@ fn step(instance_id: Uuid) -> StepWrite {
         }],
         resolved_waits: vec![],
         withdrawn_call_nodes: Vec::new(),
+        inbox_seen: Vec::new(),
         aliases: vec![StepAlias {
             alias_name: "loanId".to_owned(),
             alias_value: "L-1".to_owned(),
@@ -341,6 +342,7 @@ async fn wait_to_wait_step_resolves_prior_frontier_and_writes_next() {
         }],
         resolved_waits: vec!["waitApproval".to_owned()],
         withdrawn_call_nodes: Vec::new(),
+        inbox_seen: Vec::new(),
         aliases: vec![],
         subjects: vec![],
         outbox: vec![],
@@ -431,6 +433,7 @@ async fn a_backoff_park_withdraws_the_dead_attempts_rows_and_the_redrive_resets_
         }],
         resolved_waits: vec![],
         withdrawn_call_nodes: Vec::new(),
+        inbox_seen: Vec::new(),
         aliases: vec![],
         subjects: vec![],
         outbox: vec![call_request.clone(), other_send],
@@ -465,6 +468,7 @@ async fn a_backoff_park_withdraws_the_dead_attempts_rows_and_the_redrive_resets_
     let backoff = StepWrite {
         resolved_waits: vec!["Call".to_owned(), "Call#timeout".to_owned()],
         withdrawn_call_nodes: vec!["Call".to_owned()],
+        inbox_seen: Vec::new(),
         aliases: vec![],
         outbox: vec![],
         ..park.clone()
@@ -510,6 +514,7 @@ async fn a_backoff_park_withdraws_the_dead_attempts_rows_and_the_redrive_resets_
     let redrive = StepWrite {
         resolved_waits: vec!["Call".to_owned()],
         withdrawn_call_nodes: Vec::new(),
+        inbox_seen: Vec::new(),
         aliases: vec![],
         outbox: vec![fresh_request],
         ..park.clone()

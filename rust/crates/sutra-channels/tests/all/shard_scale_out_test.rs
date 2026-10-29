@@ -508,6 +508,7 @@ fn resolved_resume(instance_id: &str) -> ResolvedResume {
         labels: BTreeMap::new(),
         traceparent: None,
         reply_to: None,
+        pending_dedup: Vec::new(),
     }
 }
 

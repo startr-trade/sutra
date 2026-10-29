@@ -32,6 +32,8 @@ mod tc_listen_window;
 mod tc_money_transfer;
 #[path = "all/tc_multi_replica.rs"]
 mod tc_multi_replica;
+#[path = "all/tc_outbox_relay.rs"]
+mod tc_outbox_relay;
 #[path = "all/tc_shard_lanes.rs"]
 mod tc_shard_lanes;
 #[path = "all/tc_timer_expressions.rs"]

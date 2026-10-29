@@ -11,6 +11,7 @@ name = "sutra"
 path = "src/main.rs"
 
 [dependencies]
+rustls = { workspace = true }
 # Read-only route enumeration + scaffold verification over the engine's own model.
 sutra-bpmn = { path = "../sutra-bpmn" }
 sutra-feel = { path = "../sutra-feel" }

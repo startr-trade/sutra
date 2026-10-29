@@ -79,7 +79,7 @@ lto = false
 codegen-units = 16
 
 [workspace.package]
-version = "0.6.4"
+version = "0.6.5"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/startr-trade/sutra"
@@ -172,6 +172,13 @@ vaultrs = { version = "0.7", default-features = false, features = ["rustls"] }
 # (rustls 0.23 → ring; no native-tls / openssl-sys / aws-lc-sys). The `json` feature is for the
 # small token/secret response bodies.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+# rustls itself, named only so the binaries can install ring as the process-wide crypto provider.
+# The SQL Server driver (tiberius 0.13, on rustls 0.23) enables tokio-rustls's default
+# `aws_lc_rs` feature, so rustls is built with BOTH providers; with two compiled in, rustls has no
+# implicit default and any library that calls `ClientConfig::builder()` would panic. Installing
+# ring at startup keeps every TLS client on the ring stack the rest of the tree uses (tiberius
+# honours an installed provider too).
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 # RS256 JWT signing for the GCP service-account OAuth2 jwt-bearer flow, and admin-JWT
 # verification. v10 requires the crypto provider to be chosen EXPLICITLY (v9 linked `ring`
 # implicitly): `rust_crypto` keeps the tree pure-Rust — no aws-lc-rs C toolchain, no openssl.

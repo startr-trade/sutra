@@ -1,0 +1,10 @@
+# Reference data the intake reads on every request: one settings row and one party row.
+datastores:
+  - name: refdata
+    type: sql
+    sql:
+      url-ref: env:RELAY_DB_URL
+      username-ref: env:RELAY_DB_USER
+      password-ref: env:RELAY_DB_PASSWORD
+      migrations: migrations/refdata
+    dataClass: operational

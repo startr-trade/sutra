@@ -61,7 +61,7 @@ fn store_diag(context: &str, e: sutra_persistence::PersistenceError) -> Diagnost
 }
 
 /// Persistence row → the dispatcher's transport-neutral claimed shape.
-fn to_claimed(entry: OutboxEntry) -> ClaimedOutboxRow {
+pub(crate) fn to_claimed(entry: OutboxEntry) -> ClaimedOutboxRow {
     ClaimedOutboxRow {
         entry_id: entry.entry_id.to_string(),
         attempt_count: entry.attempt_count,
@@ -98,6 +98,48 @@ fn to_claimed(entry: OutboxEntry) -> ClaimedOutboxRow {
 }
 
 impl OutboxRowStore for PgOutboxRows {
+    fn claim_due_excluding<'a>(
+        &'a self,
+        deployment: &'a sutra_executor::DeploymentId,
+        now: OffsetDateTime,
+        max_entries: i64,
+        exclude: &'a [String],
+    ) -> BoxFuture<'a, Result<Vec<ClaimedOutboxRow>, Diagnostic>> {
+        Box::pin(async move {
+            let dep = persist_dep(deployment)?;
+            // A non-UUID id cannot name a row in this table, so it has nothing to exclude.
+            let exclude: Vec<Uuid> = exclude
+                .iter()
+                .filter_map(|id| Uuid::from_str(id).ok())
+                .collect();
+            let claimed = self
+                .store
+                .claim_due_excluding(&dep, now, max_entries, &exclude)
+                .await
+                .map_err(|e| store_diag("outbox claimDue failed", e))?;
+            Ok(claimed.into_iter().map(to_claimed).collect())
+        })
+    }
+
+    fn delete_many<'a>(
+        &'a self,
+        deployment: &'a sutra_executor::DeploymentId,
+        entry_ids: &'a [String],
+    ) -> BoxFuture<'a, Result<(), Diagnostic>> {
+        Box::pin(async move {
+            let dep = persist_dep(deployment)?;
+            let ids = entry_ids
+                .iter()
+                .map(|id| parse_entry_id(id))
+                .collect::<Result<Vec<Uuid>, Diagnostic>>()?;
+            self.store
+                .delete_many(&dep, &ids)
+                .await
+                .map(|_| ())
+                .map_err(|e| store_diag("outbox delete failed", e))
+        })
+    }
+
     fn claim_due<'a>(
         &'a self,
         deployment: &'a sutra_executor::DeploymentId,

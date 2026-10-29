@@ -173,6 +173,9 @@ pub struct ResolvedResume {
     /// The relay delivery itself, so the turn's `<q:reply>` can answer it (rendered against
     /// the relay's own binding and message, exactly like a start's reply).
     pub reply_to: Option<Box<RelayReplyContext>>,
+    /// Inbox dedup keys the arrival lane recorded for this delivery, written by the owner
+    /// lane's resume step in its own transaction (0.6.5).
+    pub pending_dedup: Vec<crate::stores::PendingDedup>,
 }
 
 /// The delivery a relayed resume answers: its channel binding and message, against which the
@@ -341,6 +344,9 @@ pub struct ChannelEngine {
     /// The inbox dedup keys THIS dispatch recorded (`(channel, key)`), handed to a synchronous
     /// chain so a chain that fails can release them. Cleared at every dispatch entry.
     dispatch_dedup: std::cell::RefCell<Vec<(String, String)>>,
+    /// Whether THIS dispatch recorded an inbox dedup key, so it must be settled
+    /// ([`InboxStore::settle`]) before the dispatch returns.
+    dedup_touched: std::cell::Cell<bool>,
     /// Stored instances a synchronous chain on THIS lane is driving. The chain holds the
     /// instance's claim, and claims are re-entrant per owner (one owner per lane), so a second
     /// relay or timer for the same instance would be granted the claim and resume a stale
@@ -404,6 +410,7 @@ impl ChannelEngine {
                 }),
                 inline_capable: std::cell::Cell::new(false),
                 dispatch_dedup: std::cell::RefCell::new(Vec::new()),
+                dedup_touched: std::cell::Cell::new(false),
                 inline_held: std::cell::RefCell::new(std::collections::HashSet::new()),
                 sse_channels: BTreeSet::new(),
             },
@@ -448,7 +455,40 @@ impl ChannelEngine {
         // another delivery's callbacks.
         self.pending_settle.borrow_mut().take();
         self.begin_dispatch(true);
-        self.dispatch_inner(message).await
+        let result = self.dispatch_inner(message).await;
+        let result = self.hand_over_dedup(result);
+        self.settle_dedup(result.is_ok()).await;
+        result
+    }
+
+    /// A relay resolved to another lane carries the dispatch's unwritten dedup keys with it:
+    /// the owner lane's resume step writes them in its own transaction.
+    fn hand_over_dedup(
+        &self,
+        result: Result<DispatchOutcome, Diagnostic>,
+    ) -> Result<DispatchOutcome, Diagnostic> {
+        match result {
+            Ok(DispatchOutcome::Handoff {
+                shard,
+                mut resolved,
+            }) => {
+                if let Some(inbox) = &self.inbox {
+                    resolved.pending_dedup = inbox.take_pending();
+                }
+                Ok(DispatchOutcome::Handoff { shard, resolved })
+            }
+            other => other,
+        }
+    }
+
+    /// Before a dispatch that recorded a dedup key returns: write what no step consumed when the
+    /// dispatch completed, drop it when it failed (see [`InboxStore::settle`]).
+    async fn settle_dedup(&self, processed: bool) {
+        if self.dedup_touched.replace(false) {
+            if let Some(inbox) = &self.inbox {
+                inbox.settle(processed).await;
+            }
+        }
     }
 
     /// Reset the per-dispatch scratch at an entry point; `inline` says whether a caller waits on
@@ -456,6 +496,7 @@ impl ChannelEngine {
     fn begin_dispatch(&self, inline: bool) {
         self.inline_capable.set(inline);
         self.dispatch_dedup.borrow_mut().clear();
+        self.dedup_touched.set(false);
     }
 
     /// `ack-mode: on-complete` (broker) dispatch: the SAME pipeline, but when the
@@ -476,6 +517,8 @@ impl ChannelEngine {
         *self.pending_settle.borrow_mut() = Some(settle);
         self.begin_dispatch(true);
         let result = self.dispatch_inner(message).await;
+        let result = self.hand_over_dedup(result);
+        self.settle_dedup(result.is_ok()).await;
         let leftover = self.pending_settle.borrow_mut().take();
         let outcome = result?;
         // A synchronous chain carries the callbacks itself (when it took them) and settles at
@@ -634,6 +677,7 @@ impl ChannelEngine {
                 let first = inbox
                     .record_seen(&deployment, &message.channel, &message.idempotency_key)
                     .await;
+                self.dedup_touched.set(true);
                 if !first {
                     return Ok(DispatchOutcome::Duplicate);
                 }
@@ -834,10 +878,11 @@ impl ChannelEngine {
         // it only re-projected `event.idempotencyKey`, never driving inbox dedup).
         if let Some(body_key) = apply_body_path_dedup_key(process, start_id, &mut variables) {
             if let Some(inbox) = &self.inbox {
-                if !inbox
+                let first = inbox
                     .record_seen(deployment, &message.channel, &body_key)
-                    .await
-                {
+                    .await;
+                self.dedup_touched.set(true);
+                if !first {
                     return Ok(DispatchOutcome::Duplicate);
                 }
                 self.dispatch_dedup
@@ -2091,7 +2136,15 @@ impl ChannelEngine {
                 // dispatcher owns the write because it knows the admitting channel — the executor
                 // lifecycle event does not. Freed at the terminal step (see drive_relay /
                 // fire_timer).
-                if let Some(store) = &self.concurrency {
+                //
+                // Only a CAPPED channel is counted (as the synchronous-chain path below already
+                // does): the count is read solely by the `max-concurrent-instances` admission
+                // check, so the rows of an uncapped channel are never read, and writing them
+                // cost three durable commits per instance. The later status updates and the
+                // terminal delete then match no row and commit nothing.
+                if let (Some(store), Some(_)) =
+                    (&self.concurrency, binding.max_concurrent_instances)
+                {
                     store
                         .record_started(deployment, &instance_id, &message.channel)
                         .await;
@@ -2389,6 +2442,8 @@ impl ChannelEngine {
                     binding: binding.clone(),
                     message: message.clone(),
                 })),
+                // Filled by `hand_over_dedup` once the dispatch returns the handoff.
+                pending_dedup: Vec::new(),
             })));
         }
         let outcome = self
@@ -2755,20 +2810,29 @@ impl ChannelEngine {
         };
         // The router side awaits the handoff, so the resume may run a chain.
         self.begin_dispatch(true);
-        self.resume_correlated_claimed(
-            &bridge,
-            &resolved.deployment,
-            &resolved.instance_id,
-            &resolved.wait_node_id,
-            resolved.variables.clone(),
-            &resolved.alias_name,
-            &resolved.alias_value,
-            &resolved.channel,
-            resolved.labels.clone(),
-            resolved.traceparent.clone(),
-            resolved.reply_to.as_deref().cloned(),
-        )
-        .await
+        if !resolved.pending_dedup.is_empty() {
+            if let Some(inbox) = &self.inbox {
+                inbox.restore_pending(resolved.pending_dedup.clone());
+                self.dedup_touched.set(true);
+            }
+        }
+        let result = self
+            .resume_correlated_claimed(
+                &bridge,
+                &resolved.deployment,
+                &resolved.instance_id,
+                &resolved.wait_node_id,
+                resolved.variables.clone(),
+                &resolved.alias_name,
+                &resolved.alias_value,
+                &resolved.channel,
+                resolved.labels.clone(),
+                resolved.traceparent.clone(),
+                resolved.reply_to.as_deref().cloned(),
+            )
+            .await;
+        self.settle_dedup(result.is_ok()).await;
+        result
     }
 
     /// Persist a resume pass's quiescent point (shared by the relay path and the timer
@@ -4689,7 +4753,9 @@ impl ChannelEngine {
         }
         self.shard_metrics.parked();
         // The slot was taken when the chain began; the parked instance keeps it (WAITING).
-        if let Some(store) = &self.concurrency {
+        // Only a capped channel is counted (see the initial-park arm).
+        if let (Some(store), Some(_)) = (&self.concurrency, chain.binding.max_concurrent_instances)
+        {
             if !chain.counted {
                 store
                     .record_started(

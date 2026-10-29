@@ -162,6 +162,11 @@ pub fn shard_index_of(instance_id: &str, count: u32) -> u32 {
 #[derive(Clone)]
 struct ShardSender {
     queue: ShardQueueSender,
+    /// The lane's CONTINUATION queue (0.6.5): work that finishes something already started —
+    /// a local delivery handed over by the outbox, a resolved resume. The lane drains it
+    /// before its intake queue, so new intake cannot starve the deliveries that complete the
+    /// instances already admitted. Unbounded: its producers are bounded by the outbox claim.
+    priority: tokio::sync::mpsc::UnboundedSender<EngineRequest>,
     /// The lane's counters: `send` moves the queue-depth gauge (+1 at a successful
     /// enqueue; the lane's actor loop takes the −1 at dequeue).
     metrics: Arc<ShardLaneMetrics>,
@@ -196,10 +201,25 @@ impl ShardSender {
         }
         sent
     }
+
+    /// Enqueue on the continuation queue (drained ahead of intake).
+    fn send_priority(&self, request: EngineRequest) -> Result<(), Diagnostic> {
+        self.metrics.enqueued();
+        let sent = self.priority.send(request).map_err(|_| engine_gone());
+        if sent.is_err() {
+            self.metrics.dequeued();
+        }
+        sent
+    }
 }
 
 /// The receiving half of a shard mailbox, drained by that shard's single actor task.
-enum ShardReceiver {
+struct ShardReceiver {
+    queue: ShardQueueReceiver,
+    priority: tokio::sync::mpsc::UnboundedReceiver<EngineRequest>,
+}
+
+enum ShardQueueReceiver {
     Unbounded(tokio::sync::mpsc::UnboundedReceiver<EngineRequest>),
     Bounded(tokio::sync::mpsc::Receiver<EngineRequest>),
 }
@@ -207,11 +227,23 @@ enum ShardReceiver {
 impl ShardReceiver {
     /// Async dequeue, awaited by the lane's actor loop between requests (execution
     /// scale-out §3(a): the loop is `while let Some(req) = rx.recv().await { handle(req).await }`);
-    /// `None` once every handle is dropped — the actor's exit condition.
+    /// `None` once every handle is dropped — the actor's exit condition. The continuation
+    /// queue is served first; each queue is FIFO on its own.
     async fn recv(&mut self) -> Option<EngineRequest> {
-        match self {
-            ShardReceiver::Unbounded(rx) => rx.recv().await,
-            ShardReceiver::Bounded(rx) => rx.recv().await,
+        if let Ok(request) = self.priority.try_recv() {
+            return Some(request);
+        }
+        let queue = &mut self.queue;
+        let intake = async move {
+            match queue {
+                ShardQueueReceiver::Unbounded(rx) => rx.recv().await,
+                ShardQueueReceiver::Bounded(rx) => rx.recv().await,
+            }
+        };
+        tokio::select! {
+            biased;
+            Some(request) = self.priority.recv() => Some(request),
+            request = intake => request,
         }
     }
 }
@@ -225,15 +257,29 @@ fn shard_queue(
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
             (
                 ShardQueueSender::Unbounded(tx),
-                ShardReceiver::Unbounded(rx),
+                ShardQueueReceiver::Unbounded(rx),
             )
         }
         Some(capacity) => {
             let (tx, rx) = tokio::sync::mpsc::channel(capacity.max(1));
-            (ShardQueueSender::Bounded(tx), ShardReceiver::Bounded(rx))
+            (
+                ShardQueueSender::Bounded(tx),
+                ShardQueueReceiver::Bounded(rx),
+            )
         }
     };
-    (ShardSender { queue, metrics }, rx)
+    let (priority, priority_rx) = tokio::sync::mpsc::unbounded_channel();
+    (
+        ShardSender {
+            queue,
+            priority,
+            metrics,
+        },
+        ShardReceiver {
+            queue: rx,
+            priority: priority_rx,
+        },
+    )
 }
 
 /// Cloneable, Send+Sync handle to the engine's shard router: one mailbox per shard
@@ -294,6 +340,26 @@ impl EngineHandle {
             .filter(|(_, shard)| shard.is_dead())
             .map(|(index, _)| index as u32)
             .collect()
+    }
+
+    /// [`Self::dispatch`] for a delivery that CONTINUES work already admitted — the outbox's
+    /// in-process (`local://`) hand-over. It is queued on the lane's continuation queue, which
+    /// the lane serves before new intake, so a burst of intake cannot starve the hops that
+    /// finish the instances it already started. Semantics are otherwise those of `dispatch`.
+    pub async fn dispatch_continuation(
+        &self,
+        message: InboundMessage,
+    ) -> Result<DispatchOutcome, Diagnostic> {
+        let (respond, rx) = tokio::sync::oneshot::channel();
+        self.arrival_shard()
+            .send_priority(EngineRequest::Dispatch { message, respond })?;
+        match rx.await.map_err(|_| engine_gone())?? {
+            DispatchOutcome::Handoff { resolved, .. } => self.resume_resolved(*resolved).await,
+            DispatchOutcome::InlineCalls(handoff) => {
+                self.drive_inline_chain(handoff, None).await.outcome
+            }
+            outcome => Ok(outcome),
+        }
     }
 
     /// Dispatch one delivery through the engine: resolution runs on the arrival shard; a
@@ -608,12 +674,12 @@ impl EngineHandle {
         tap: Option<std::sync::Arc<crate::inline_chain::StreamTap>>,
     ) -> Result<DispatchOutcome, Diagnostic> {
         let (respond, rx) = tokio::sync::oneshot::channel();
+        // A resolved resume continues an instance already admitted: continuation queue.
         self.shard_for_instance(&resolved.instance_id)
-            .send(EngineRequest::ResumeResolved {
+            .send_priority(EngineRequest::ResumeResolved {
                 resolved: Box::new(resolved),
                 respond,
-            })
-            .await?;
+            })?;
         match rx.await.map_err(|_| engine_gone())?? {
             DispatchOutcome::InlineCalls(handoff) => {
                 self.drive_inline_chain(handoff, tap).await.outcome
@@ -1932,5 +1998,48 @@ mod local_channel_tests {
         // Contrast: an HTTP inbound channel with no auth scheme fails the auth mandate closed.
         let http_no_auth = channel("sender-in", "http", None);
         assert!(http_routes_of(&[http_no_auth]).is_err());
+    }
+}
+
+/// The lane mailbox's continuation queue (0.6.5).
+#[cfg(test)]
+mod lane_queue_tests {
+    use super::*;
+
+    fn refresh(instance: &str) -> EngineRequest {
+        EngineRequest::RefreshClaim {
+            deployment: crate::DeploymentId::of("dep-0000000000000000000000d1").expect("id"),
+            instance_id: instance.to_string(),
+        }
+    }
+
+    fn instance_of(request: EngineRequest) -> String {
+        match request {
+            EngineRequest::RefreshClaim { instance_id, .. } => instance_id,
+            _ => panic!("unexpected request"),
+        }
+    }
+
+    /// Continuations are served before queued intake; each queue stays FIFO; both drain.
+    #[tokio::test]
+    async fn continuations_are_served_before_intake_and_each_queue_stays_fifo() {
+        let metrics = ShardRouterMetrics::new(1).lane(0);
+        for capacity in [None, Some(8)] {
+            let (tx, mut rx) = shard_queue(capacity, Arc::clone(&metrics));
+            tx.send(refresh("intake-1")).await.unwrap();
+            tx.send(refresh("intake-2")).await.unwrap();
+            tx.send_priority(refresh("cont-1")).unwrap();
+            tx.send_priority(refresh("cont-2")).unwrap();
+            let mut order = Vec::new();
+            for _ in 0..4 {
+                order.push(instance_of(rx.recv().await.unwrap()));
+            }
+            assert_eq!(order, ["cont-1", "cont-2", "intake-1", "intake-2"]);
+            drop(tx);
+            assert!(
+                rx.recv().await.is_none(),
+                "the lane exits once every sender is gone"
+            );
+        }
     }
 }

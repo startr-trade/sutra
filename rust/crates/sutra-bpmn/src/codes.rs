@@ -123,6 +123,14 @@ pub const CONFIG_BPMN_TIMER_START_EXPRESSION_SCOPE: &str =
 /// A timer expression reads `config.<key>`, but the deployment's `package.yaml` declares no such
 /// key under `properties:`. Raised by lint, by packaging and when the deployment is planned.
 pub const CONFIG_BPMN_TIMER_CONFIG_UNDECLARED: &str = "SUTRA.CONFIG.BPMN.TIMER_CONFIG_UNDECLARED";
+/// A timer expression (a timer event body, `q:timeout@duration`, `q:retry@initialDelay` /
+/// `@maxDelay`) reads a name that nothing in scope provides — not `config`, not a declared
+/// variable or data object, not the payload or another variable the process provably sets. It
+/// would evaluate to null when the timer is armed; most often it is a mistyped literal (`PT10SEC`
+/// for `PT10S`), which the message names. Raised by lint, by packaging and when the deployment is
+/// planned.
+pub const CONFIG_BPMN_TIMER_EXPRESSION_UNKNOWN_NAME: &str =
+    "SUTRA.CONFIG.BPMN.TIMER_EXPRESSION_UNKNOWN_NAME";
 /// A timer expression did not produce a usable interval when the timer was armed: null, a value
 /// of the wrong type, an unparseable string, a negative or calendar-length duration, or a
 /// zone-less instant. The instance fails once; a start timer fails its deployment's activation.

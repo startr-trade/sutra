@@ -9,6 +9,6 @@
 
 // `compose` (the `shared/` + `variants/` composer, the same `sutra_loader::overlay` path as
 // `sutra package --overlay`) is used by `tc_ai_examples`, whose examples keep one shared layer
-// plus one small layer per provider. `callback` (host recorders) is NOT re-exported: no suite in
-// THIS repo uses it; it remains part of `sutra_testkit::conformance` for out-of-workspace suites.
-pub use sutra_testkit::conformance::{broker, compose, engine, k8s, util};
+// plus one small layer per provider. `callback` (the host recorder an outbound HTTP channel posts
+// to) is used by `tc_outbox_relay`.
+pub use sutra_testkit::conformance::{broker, callback, compose, engine, k8s, util};

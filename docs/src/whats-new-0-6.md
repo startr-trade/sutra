@@ -18,6 +18,7 @@ server, so no provider key is needed.
 | **Capacity pools and `session-end:`** | Named, cluster-wide slot counts drawn from by inbound and outbound channels. A full pool answers 503 inbound and holds outbound requests in the outbox. A session can end before its instance does. | [Capacity pools and sessions](operating/capacity-pools.md) |
 | **Re-enterable waits** | A loop back to a message catch, user task, timer or channel call parks a new wait each time round. | [Waiting at the same node again](building/wait-states.md#waiting-at-the-same-node-again-loops) |
 | **Timer intervals from FEEL** (0.6.4) | A `timeDuration`, `timeDate` or `timeCycle`, a `q:timeout` and the `q:retry` delays can each be a FEEL expression over the instance's variables and `config.<key>`. Deployment `properties:` in `package.yaml` hold per-environment values. | [Timer intervals from FEEL](building/retries-history-schedules.md#timer-intervals-from-feel) |
+| **Durable throughput** (0.6.5) | A concurrent outbox dispatcher, in-process hand-off of `local://` deliveries, fewer durable commits per step, separate pools for intake and delivery, and an opt-in data-store read cache. On one laptop with durable PostgreSQL a two-process relay went from 14 to 499 completions per second, p99 250 ms. | [Tuning for throughput](operating/throughput-tuning.md) |
 | **Live audio sessions** (preview) | `AudioSession` and `require: [realtime]`, opened through an `llm` channel by a media transport, not by a process. | [Live audio sessions](building/llm-channels.md#live-audio-sessions-preview) |
 
 Telephony, IVRs, meetings and WebRTC are not part of this engine. They live in the separate
@@ -32,7 +33,7 @@ Every walkthrough runs from the root of a checkout of this repository. It needs:
   `base64 -i <file>` wherever a walkthrough says `base64 -w0 <file>`);
 - an engine image and the `sutra` CLI, both **0.6.0 or later**.
 
-The compose files default to the published `ghcr.io/startr-trade/sutra:0.6.4` image, and
+The compose files default to the published `ghcr.io/startr-trade/sutra:0.6.5` image, and
 [Installation](getting-started/installation.md) installs the CLI. To run a walkthrough against
 your own checkout instead, build both from it:
 

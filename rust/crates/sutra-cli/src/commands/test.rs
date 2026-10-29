@@ -354,10 +354,21 @@ async fn run_inner(
         now_override: Some(clock.clone()),
         ..EngineConfig::default()
     };
-    let engine = match serve(engine_config).await {
-        Ok(e) => e,
-        Err(e) => return Outcome::Usage(format!("engine failed to boot: {e}")),
+    // `--timeout` bounds the boot too: a boot that never completes (an unreachable store, a
+    // deployment that cannot activate) ends the run instead of hanging it.
+    let boot_started = Instant::now();
+    let engine = match tokio::time::timeout(timeout, serve(engine_config)).await {
+        Ok(Ok(e)) => e,
+        Ok(Err(e)) => return Outcome::Usage(format!("engine failed to boot: {e}")),
+        Err(_) => {
+            return Outcome::Usage(format!(
+                "engine did not boot within --timeout ({:.1}s)",
+                timeout.as_secs_f64()
+            ))
+        }
     };
+    // The fast-forward gets what is left of the budget.
+    let timeout = timeout.saturating_sub(boot_started.elapsed());
     progress(
         io,
         &format!(

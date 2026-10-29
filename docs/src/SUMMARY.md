@@ -51,6 +51,7 @@
 
 - [Configuration reference](operating/configuration.md)
 - [Acknowledgement modes](operating/ack-modes.md)
+- [Tuning for throughput](operating/throughput-tuning.md)
 - [Limits and quotas](operating/limits.md)
 - [Capacity pools and sessions](operating/capacity-pools.md)
 - [Deploy, hot-deploy, and rollback](operating/deploy-rollback.md)

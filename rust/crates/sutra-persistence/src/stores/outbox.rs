@@ -204,6 +204,22 @@ const SQL_POISONED_EXISTS: &str = "SELECT COUNT(*) FROM outbox_entry \
 
 const SQL_DELETE: &str = "DELETE FROM outbox_entry WHERE deployment_id = $1 AND entry_id = $2";
 
+/// [`SQL_CLAIM_DUE`] past the entries the caller already has in flight.
+const SQL_CLAIM_DUE_EXCLUDING: &str = "SELECT entry_id, deployment_id, instance_id, body, \
+      content_type, destination, headers_json, required, mode, outbox_key, cloud_event_json, \
+      auth_ref_json, created_at, next_attempt_at, attempt_count, last_diagnostic_json, \
+      traceparent, labels_json, node_id \
+     FROM outbox_entry \
+     WHERE deployment_id = $1 AND NOT poisoned AND next_attempt_at <= $2 \
+       AND NOT (entry_id = ANY($4)) \
+     ORDER BY next_attempt_at, created_at \
+     LIMIT $3 \
+     FOR UPDATE SKIP LOCKED";
+
+/// The batched delete of delivered entries (one transaction for a burst of deliveries).
+const SQL_DELETE_MANY: &str =
+    "DELETE FROM outbox_entry WHERE deployment_id = $1 AND entry_id = ANY($2)";
+
 const SQL_DEFER: &str = "UPDATE outbox_entry SET next_attempt_at = $1, \
       attempt_count = attempt_count + 1, last_diagnostic_json = $2 \
      WHERE deployment_id = $3 AND entry_id = $4";
@@ -350,6 +366,60 @@ impl PgOutboxStore {
         tx.commit()
             .await
             .map_err(PersistenceError::db("outbox requeue commit"))
+    }
+
+    /// [`OutboxStore::claim_due`] that skips `exclude` — the entries the caller already has in
+    /// flight. Same SKIP LOCKED claim, same order, same commit-before-dispatch posture.
+    pub async fn claim_due_excluding(
+        &self,
+        deployment: &DeploymentId,
+        now: OffsetDateTime,
+        max_entries: i64,
+        exclude: &[Uuid],
+    ) -> Result<Vec<OutboxEntry>> {
+        if max_entries <= 0 {
+            return Ok(Vec::new());
+        }
+        // The claim's commit only releases row locks — it changes no data — so it need not
+        // wait for a WAL flush.
+        let mut tx =
+            crate::scope::begin_deployment_tx_flush_deferred(&self.pool, deployment).await?;
+        let rows = sqlx::query(SQL_CLAIM_DUE_EXCLUDING)
+            .bind(deployment.as_str())
+            .bind(now)
+            .bind(max_entries)
+            .bind(exclude)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(PersistenceError::db("outbox claimDueExcluding"))?;
+        tx.commit()
+            .await
+            .map_err(PersistenceError::db("outbox claimDueExcluding commit"))?;
+        rows.iter().map(read_row).collect()
+    }
+
+    /// Deletes several delivered entries in ONE transaction; missing rows are no-ops.
+    pub async fn delete_many(&self, deployment: &DeploymentId, entry_ids: &[Uuid]) -> Result<u64> {
+        if entry_ids.is_empty() {
+            return Ok(0);
+        }
+        // The delete of rows already DELIVERED commits without waiting for its WAL flush: if a
+        // crash loses it, the rows are delivered again — the at-least-once delivery the outbox
+        // has always had (a failed delete redelivers the same way), absorbed by the receiver's
+        // idempotency key. Nothing is acknowledged on the strength of this commit.
+        let mut tx =
+            crate::scope::begin_deployment_tx_flush_deferred(&self.pool, deployment).await?;
+        let deleted = sqlx::query(SQL_DELETE_MANY)
+            .bind(deployment.as_str())
+            .bind(entry_ids)
+            .execute(&mut *tx)
+            .await
+            .map_err(PersistenceError::db("outbox deleteMany"))?
+            .rows_affected();
+        tx.commit()
+            .await
+            .map_err(PersistenceError::db("outbox deleteMany commit"))?;
+        Ok(deleted)
     }
 
     /// SKIP LOCKED claim on a caller-supplied transaction connection. Rows stay locked until

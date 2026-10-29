@@ -1,0 +1,46 @@
+# Channels for the relay-bench package.
+#
+#   order-in      HTTP intake (external, apikey). Starts relay-intake.
+#   to-worker     outbound, local://worker-in  -> starts relay-worker in the same engine.
+#   to-answer     outbound, local://answer-in  -> resumes the parked relay-intake instance.
+#   callback-out  outbound HTTP to the sink    -> the "settled" signal the profile measures.
+#
+# worker-in and answer-in are internal (transport: local): no listener, no auth.
+channels:
+  - name: order-in
+    transport: http
+    bind: "POST /channels/order-in"
+    codec: json
+    ack-mode: on-persist
+    cloudevents-mode: none
+    auth:
+      scheme: apikey
+      apikey:
+        value: env:RELAY_BENCH_API_KEY
+        header: X-Api-Key
+
+  - name: worker-in
+    transport: local
+    codec: json
+    cloudevents-mode: none
+  - name: to-worker
+    direction: outbound
+    transport: local
+    bind: local://worker-in
+    cloudevents-mode: none
+
+  - name: answer-in
+    transport: local
+    codec: json
+    cloudevents-mode: none
+  - name: to-answer
+    direction: outbound
+    transport: local
+    bind: local://answer-in
+    cloudevents-mode: none
+
+  - name: callback-out
+    direction: outbound
+    transport: http
+    bind: "${RELAY_BENCH_CALLBACK_URL}"
+    cloudevents-mode: none

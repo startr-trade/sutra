@@ -251,6 +251,7 @@ impl RunningEngine {
 /// half-wired engine). Per-archive failures are NOT fatal: a bad `.sutra` is rejected
 /// with its `SUTRA.DEPLOY.*` diagnostic and the rest of the source serves.
 pub async fn serve(config: EngineConfig) -> Result<RunningEngine, Box<dyn std::error::Error>> {
+    crate::install_tls_provider();
     let ready = Arc::new(AtomicBool::new(false));
 
     // ---- capacity pools: engine configuration every deployment's `pool:` is checked against
@@ -286,7 +287,7 @@ pub async fn serve(config: EngineConfig) -> Result<RunningEngine, Box<dyn std::e
     // from the deployment_archive store. Configured ⇒ open the pool and run THE SAME shipped
     // migration SQL (vendored into the image; `sutra_schema_history` interoperates with
     // sutra-migrate). Not configured ⇒ run persistence-less: wait-state inbound fails closed.
-    let pool = match &config.datasource_url {
+    let pools = match &config.datasource_url {
         Some(url) => Some(init_engine_db(url, &config).await?),
         None => {
             warn!(
@@ -295,6 +296,12 @@ pub async fn serve(config: EngineConfig) -> Result<RunningEngine, Box<dyn std::e
             );
             None
         }
+    };
+    // The MAIN pool (actor lanes) and the DISPATCH pool (outbox dispatcher, timer poller,
+    // sweepers) — see `DatasourcePools`.
+    let (pool, dispatch_pool) = match pools {
+        Some((main, dispatch)) => (Some(main), Some(dispatch)),
+        None => (None, None),
     };
 
     // ---- RLS-bypass posture check (the two-layer isolation model) -------
@@ -463,6 +470,7 @@ pub async fn serve(config: EngineConfig) -> Result<RunningEngine, Box<dyn std::e
     let initial_coverage =
         crate::assembly::seed_declared_coverage(&boot_plans, &boot_draining_plans).await;
 
+    let outbox_signal = sutra_channels::OutboxSignal::new();
     let runtime = crate::assembly::build_engine_runtime(
         boot_plans,
         boot_draining_plans,
@@ -481,6 +489,9 @@ pub async fn serve(config: EngineConfig) -> Result<RunningEngine, Box<dyn std::e
         config.now_override.clone(),
         config.engine_shards.clone(),
         initial_coverage,
+        config.outbox_tuning,
+        outbox_signal.clone(),
+        dispatch_pool.clone(),
     )?;
     let crate::assembly::EngineRuntime {
         router: channel_routes,
@@ -538,6 +549,7 @@ pub async fn serve(config: EngineConfig) -> Result<RunningEngine, Box<dyn std::e
         key_provider: key_provider.clone(),
         incident_sql: config.incident_sql,
         instance_retention: config.instance_retention.retention,
+        outbox_signal,
         deferred_acks,
         now_override: config.now_override.clone(),
     };
@@ -677,7 +689,7 @@ pub async fn serve(config: EngineConfig) -> Result<RunningEngine, Box<dyn std::e
             .spawn();
 
             let poller = crate::timer::spawn_timer_poller(
-                pool,
+                dispatch_pool.clone().unwrap_or(pool),
                 live_deployments.clone(),
                 engine_handle.clone(),
                 gate,
@@ -775,7 +787,7 @@ pub async fn serve(config: EngineConfig) -> Result<RunningEngine, Box<dyn std::e
 async fn init_engine_db(
     url: &str,
     config: &EngineConfig,
-) -> Result<PgPool, Box<dyn std::error::Error>> {
+) -> Result<(PgPool, PgPool), Box<dyn std::error::Error>> {
     let mut options = PgConnectOptions::from_str(url)
         .map_err(|e| format!("engine datasource URL '{url}' is invalid: {e}"))?;
     if let Some(user) = &config.datasource_username {
@@ -819,12 +831,18 @@ async fn init_engine_db(
         );
     }
 
-    // The engine-internal datasource pool (shared by every system store: coverage, audit,
-    // outbox). No hardcoded size — the shared default constant centralises it.
+    // The engine-internal datasource pools over the one database: MAIN for the actor lanes
+    // (every system store a step touches), DISPATCH for the outbox dispatcher, the timer
+    // poller and the sweepers — so neither side can take the other's connections. Sizes are
+    // `sutra.datasource.max-connections` (default 8, the pre-0.6.5 size) and
+    // `sutra.datasource.dispatch-max-connections` (default 2).
     let pool = PgPoolOptions::new()
-        .max_connections(sutra_datastore::DEFAULT_MAX_CONNECTIONS)
+        .max_connections(config.datasource_pools.max_connections)
+        .connect_lazy_with(options.clone());
+    let dispatch = PgPoolOptions::new()
+        .max_connections(config.datasource_pools.dispatch_max_connections)
         .connect_lazy_with(options);
-    Ok(pool)
+    Ok((pool, dispatch))
 }
 
 /// Blocking-thread body: dedicated connection + the ordered `V<number>__*.sql` runner.

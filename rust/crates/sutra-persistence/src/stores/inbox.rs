@@ -80,6 +80,33 @@ impl PgInboxStore {
     }
 }
 
+impl PgInboxStore {
+    /// Whether `(deployment, channel, event_id)` is already recorded — a read, no write. The
+    /// engine checks before it processes a delivery and writes the record in the step that
+    /// processes it (`crate::step::record_inbox_seen_in`), so record and effects commit together.
+    pub async fn seen(
+        &self,
+        deployment: &DeploymentId,
+        channel: &str,
+        event_id: &str,
+    ) -> Result<bool> {
+        let mut tx = begin_deployment_tx(&self.pool, deployment).await?;
+        let found: Option<i32> = sqlx::query_scalar(
+            "SELECT 1 FROM inbox_seen WHERE deployment_id = $1 AND channel = $2 AND event_id = $3",
+        )
+        .bind(deployment.as_str())
+        .bind(channel)
+        .bind(event_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(PersistenceError::db("inbox seen"))?;
+        tx.commit()
+            .await
+            .map_err(PersistenceError::db("inbox seen commit"))?;
+        Ok(found.is_some())
+    }
+}
+
 impl InboxStore for PgInboxStore {
     async fn record_seen(
         &self,

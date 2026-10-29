@@ -2784,13 +2784,9 @@ impl TokenExecutor {
                     (value, rev)
                 } else {
                     let store = self.resolve_store(&read.store, id, state)?;
-                    let value = store.get(&key).await.map_err(|e| {
+                    store.get_with_revision(&key).await.map_err(|e| {
                         store_op_failed(&read.store, &key, id, "read", &e.to_string())
-                    })?;
-                    let rev = store.revision(&key).await.map_err(|e| {
-                        store_op_failed(&read.store, &key, id, "read", &e.to_string())
-                    })?;
-                    (value, rev)
+                    })?
                 };
             state
                 .store_revs

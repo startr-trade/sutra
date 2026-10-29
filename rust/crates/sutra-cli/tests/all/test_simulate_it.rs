@@ -382,3 +382,186 @@ fn a_pre_existing_instance_row_refuses_the_run_without_allow_existing_data() {
     assert!(err.contains("already has 1 instance_state row"), "{err}");
     assert!(err.contains("--allow-existing-data"), "{err}");
 }
+
+// ---- 0.6.5: the real binary, a log level that logs during boot, two P1D timers --------------
+
+/// Two flows in one package: `daily` (start -> `P1D` catch -> end) and `await` (start ->
+/// receive task with an interrupting `P1D` boundary timer -> end). Neither completes without the
+/// virtual clock passing a day.
+fn day_timers_package() -> PathBuf {
+    let root = temp_root("day-src");
+    let bpmn = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0" id="Definitions_day"
+                  targetNamespace="urn:sutra:module:day:1.0.0">
+  <bpmn:process id="daily" isExecutable="true">
+    <bpmn:startEvent id="S1">
+      <bpmn:extensionElements><q:source channel="daily-start"/></bpmn:extensionElements>
+    </bpmn:startEvent>
+    <bpmn:intermediateCatchEvent id="Day">
+      <bpmn:timerEventDefinition><bpmn:timeDuration>P1D</bpmn:timeDuration></bpmn:timerEventDefinition>
+    </bpmn:intermediateCatchEvent>
+    <bpmn:endEvent id="E1"/>
+    <bpmn:sequenceFlow id="d1" sourceRef="S1" targetRef="Day"/>
+    <bpmn:sequenceFlow id="d2" sourceRef="Day" targetRef="E1"/>
+  </bpmn:process>
+  <bpmn:process id="await" isExecutable="true">
+    <bpmn:startEvent id="S2">
+      <bpmn:extensionElements><q:source channel="await-start"/></bpmn:extensionElements>
+    </bpmn:startEvent>
+    <bpmn:receiveTask id="Answer">
+      <bpmn:extensionElements><q:source channel="await-answer"/></bpmn:extensionElements>
+    </bpmn:receiveTask>
+    <bpmn:boundaryEvent id="NoAnswer" attachedToRef="Answer" cancelActivity="true">
+      <bpmn:timerEventDefinition><bpmn:timeDuration>P1D</bpmn:timeDuration></bpmn:timerEventDefinition>
+    </bpmn:boundaryEvent>
+    <bpmn:endEvent id="Answered"/>
+    <bpmn:endEvent id="TimedOut"/>
+    <bpmn:sequenceFlow id="a1" sourceRef="S2" targetRef="Answer"/>
+    <bpmn:sequenceFlow id="a2" sourceRef="Answer" targetRef="Answered"/>
+    <bpmn:sequenceFlow id="a3" sourceRef="NoAnswer" targetRef="TimedOut"/>
+  </bpmn:process>
+</bpmn:definitions>
+"#;
+    let channel = |name: &str| {
+        format!(
+            "  - name: {name}\n    transport: http\n    bind: \"POST /channels/{name}\"\n    auth:\n      scheme: apikey\n      apikey:\n        value: time-skip-key\n        header: X-Api-Key\n"
+        )
+    };
+    write(&root, "bpmn/day.bpmn", bpmn);
+    write(
+        &root,
+        "channels.yaml",
+        &format!(
+            "channels:\n{}{}{}",
+            channel("daily-start"),
+            channel("await-start"),
+            channel("await-answer")
+        ),
+    );
+    write(
+        &root,
+        "package.yaml",
+        "labels:\n  \"tenant\": \"t1\"\n  \"module\": \"day\"\n  \"version\": \"1.0.0\"\nengine:\n  minContract: 1\n",
+    );
+    root
+}
+
+/// Park one instance of each flow with a throwaway direct boot.
+fn seed_day_instances(deployments_dir: &Path, url: &str) {
+    block_on(async {
+        let engine = serve(EngineConfig {
+            deployment_source: DeploymentSourceKind::Dir,
+            deployments_dir: Some(deployments_dir.to_path_buf()),
+            http_port: 0,
+            datasource_url: Some(url.to_owned()),
+            rls_bypass_check_enabled: false,
+            ..EngineConfig::default()
+        })
+        .await
+        .expect("seed engine boots");
+        for path in ["/channels/daily-start", "/channels/await-start"] {
+            let addr = engine.local_addr;
+            let status = tokio::task::spawn_blocking(move || http_post(addr, path, b"go"))
+                .await
+                .expect("post task");
+            assert_eq!(status, 200, "{path}: the start parks");
+        }
+        engine.drain().await;
+    });
+}
+
+/// The `sutra` BINARY, at `-v` — the boot logs at info from runtime worker threads, which is
+/// what deadlocked 0.6.4 on the CLI's held stderr lock. A P1D catch and a P1D boundary on a
+/// receive task both fire and their instances complete within seconds of wall time; the child
+/// is killed (and the test fails) if it does not exit within a hard ceiling.
+#[ignore = "docker"]
+#[test]
+fn the_binary_at_verbose_fast_forwards_a_p1d_catch_and_a_p1d_receive_boundary_in_seconds() {
+    let db = "sutra_cli_tskip_day";
+    create_database(db);
+    let url = db_url(db);
+    migrate_db(&url);
+    let deployments_dir = empty_deployments_dir();
+    place_archive(
+        &deployments_dir,
+        "day.sutra",
+        &package(&day_timers_package()),
+    );
+    seed_day_instances(&deployments_dir, &url);
+
+    let started = std::time::Instant::now();
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_sutra"))
+        .args([
+            "test",
+            "simulate",
+            "-v",
+            "--until-quiescent",
+            "--timeout",
+            "PT60S",
+        ])
+        .arg("--allow-existing-data")
+        .arg("--deployments")
+        .arg(&deployments_dir)
+        .arg("--datasource")
+        .arg(&url)
+        .env("SUTRA_PERSISTENCE_RLS_BYPASS_CHECK_ENABLED", "false")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn sutra");
+    // Drain stderr on a thread so a chatty -v run can never fill the pipe and stall the child.
+    let mut stderr = child.stderr.take().expect("stderr");
+    let stderr_text = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = stderr.read_to_string(&mut text);
+        text
+    });
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("wait") {
+            break status;
+        }
+        if started.elapsed() > std::time::Duration::from_secs(90) {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "sutra test simulate did not exit within 90 s (the boot hang). stderr:\n{}",
+                stderr_text.join().unwrap_or_default()
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    let mut out = String::new();
+    child
+        .stdout
+        .take()
+        .expect("stdout")
+        .read_to_string(&mut out)
+        .expect("stdout");
+    let err = stderr_text.join().unwrap_or_default();
+    assert!(
+        status.success(),
+        "exit {status}\nstderr:\n{err}\nstdout:\n{out}"
+    );
+    let summary: serde_json::Value = serde_json::from_str(out.trim().lines().last().unwrap_or(""))
+        .unwrap_or_else(|e| panic!("stdout's last line is not the JSON summary: {e}\n{out}"));
+    assert_eq!(summary["quiescent"], true, "{summary}");
+    assert!(
+        summary["timersFired"].as_i64().unwrap_or(0) >= 2,
+        "{summary}"
+    );
+    assert!(
+        summary["instancesCompleted"].as_i64().unwrap_or(0) >= 2,
+        "{summary}"
+    );
+    assert_eq!(summary["instancesLive"], 0, "{summary}");
+    assert!(
+        summary["virtualSecondsAdvanced"].as_f64().unwrap() >= 86_000.0,
+        "{summary}"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(30),
+        "boot + a day of virtual time must take seconds, took {:?}",
+        started.elapsed()
+    );
+}

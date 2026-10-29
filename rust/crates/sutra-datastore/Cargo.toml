@@ -35,7 +35,7 @@ tokio = { version = "1", features = ["sync", "rt", "net"], optional = true }
 # binds only String/i64 (store_value + rev), so tiberius's `time` mappings aren't needed
 # here. tokio (net, already on) supplies the TCP socket; tokio-util the AsyncRead/Write
 # compatibility wrapper tiberius expects.
-tiberius = { version = "0.12", default-features = false, features = ["tds73", "rustls"], optional = true }
+tiberius = { version = "0.13", default-features = false, features = ["tds73", "rustls"], optional = true }
 tokio-util = { version = "0.7", features = ["compat"], optional = true }
 
 [dev-dependencies]

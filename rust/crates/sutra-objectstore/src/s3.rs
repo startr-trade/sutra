@@ -97,7 +97,11 @@ impl S3ObjectStore {
         http.set_connect_timeout(Some(Duration::from_secs(10)));
         http.enforce_http(false);
         let https = hyper_rustls::HttpsConnectorBuilder::new()
-            .with_native_roots()
+            // ring, named explicitly: the build links rustls with more than one provider (the
+            // SQL Server driver adds aws-lc-rs), and then rustls has no implicit default.
+            .with_provider_and_native_roots(std::sync::Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
             .map_err(|e| ObjectStoreError::Config(format!("no TLS root store: {e}")))?
             .https_or_http()
             .enable_http1()

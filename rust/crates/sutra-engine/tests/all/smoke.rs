@@ -41,6 +41,8 @@ fn config_for(deployments_dir: PathBuf) -> EngineConfig {
         datasource_username: None,
         datasource_password: None,
         outbox_tick_interval: std::time::Duration::from_secs(5),
+        outbox_tuning: Default::default(),
+        datasource_pools: Default::default(),
         outbox_retry: Default::default(),
         deferred_ack: Default::default(),
         external_task: Default::default(),

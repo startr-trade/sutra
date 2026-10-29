@@ -46,22 +46,8 @@ ignore = [
     # published upstream. Reachable only on the MySQL auth handshake over the (trusted) DB
     # link; not used for message signing. Accepted until sqlx-mysql ships a patched rsa.
     "RUSTSEC-2023-0071",
-    # rustls-webpki 0.101.7 — SHIPPED via tiberius 0.12 -> tokio-rustls 0.24 -> rustls 0.21
-    # (the MSSQL dialect's TLS stack only). Name-constraint bypass + CRL-parse panic. Reaches
-    # only the MSSQL server-cert path over a trusted DB link. UPGRADE blocked upstream: tiberius
-    # pins rustls 0.21; unblocks when tiberius moves to rustls 0.23+.
-    "RUSTSEC-2026-0099",
-    "RUSTSEC-2026-0098",
-    "RUSTSEC-2026-0104",
-    # rustls 0.21.12 + rustls-webpki 0.101.7 — SAME chain as the three above: tiberius 0.12
-    # -> tokio-rustls 0.24 -> rustls 0.21, the MSSQL dialect's TLS stack and nothing else.
-    # Both advisories say "upgrade to rustls 0.23 / webpki 0.103", which the modern line
-    # ALREADY is (0.23.46 / 0.103.16, bumped 2026-10-23); only the tiberius-pinned 0.21 line
-    # remains affected, and it unblocks when tiberius moves to rustls 0.23+. `mssql` is an
-    # opt-in cargo feature and is NOT in the default set the release image builds.
-    "RUSTSEC-2026-0346",
-    "RUSTSEC-2026-0349",
-    "RUSTSEC-2026-0382",
+    # (rustls 0.21 / rustls-webpki 0.101 RUSTSEC-2026-0098/-0099/-0104/-0346/-0349/-0382 removed —
+    # tiberius 0.13 moved the SQL Server dialect to rustls 0.23, so neither crate is in the build.)
     # (astral-tokio-tar RUSTSEC-2026-0145/-0112/-0066/-0113 removed — testcontainers now pulls
     # 0.6.4, which fixes all four. cargo-deny reported them as `advisory-not-detected`, i.e.
     # exceptions that no longer excepted anything: an ignore matching nothing hides nothing and

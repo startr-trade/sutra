@@ -290,7 +290,7 @@ dry-run routing report over one BPMN file and boots nothing.
 | `--datasource <URL>` / `--datasource-username` / `--datasource-password` | Engine datasource — the engine's own `SUTRA_DATASOURCE_*` env names, not the CLI's `SUTRA_DB_*` set (required) |
 | `--advance <DURATION>` | Fast-forward the virtual clock by this ISO-8601 duration, firing everything due along the way, then stop |
 | `--until-quiescent` | Fast-forward until nothing is armed and nothing is live, or `--timeout` elapses |
-| `--timeout <DURATION>` | **Real** wall-clock budget for the fast-forward loop, either mode (default `PT30S`) |
+| `--timeout <DURATION>` | **Real** wall-clock budget for the engine boot plus the fast-forward loop, either mode — since 0.6.5 a boot that has not finished within it ends the run (exit `2`) instead of waiting (default `PT30S`) |
 | `--start <RFC3339>` | Virtual start instant (default: the real current instant) |
 | `--allow-existing-data` | Proceed even though the datasource already holds instances |
 
@@ -298,6 +298,12 @@ Exactly one of `--advance` / `--until-quiescent` is required. **Safety:** the ta
 hold no instances or the run refuses with exit `2` — pointing this at a database with real
 in-flight instances would durably fire their real timers early; `--allow-existing-data` is the
 explicit acknowledgement.
+
+*Fixed in 0.6.5:* at a log level that logs while the engine boots (`-v`, or `RUST_LOG`), a
+package in `--deployments` made 0.6.4 hang after "schema up to date" and ignore `--timeout`. The
+CLI held the terminal's stderr lock for the whole command, and the engine's runtime threads
+block on that lock to write their first log line. The CLI now writes to stderr without holding
+it, and `--timeout` covers the boot.
 
 Progress is text on **stderr**; the final summary is one JSON object on **stdout** and nothing
 else touches stdout, so `sutra test simulate … | jq .` is always safe. See
@@ -316,7 +322,7 @@ instance did, offline. See [Logging and audit](../operating/logging.md).
 ### `sutra version`
 
 ```
-sutra version            # sutra 0.6.4
+sutra version            # sutra 0.6.5
 sutra --version          # identical text
 sutra version --format json
 ```
@@ -328,14 +334,14 @@ binary name prints that name, and one that versions itself independently of the 
 
 ```
 <tool> 2.0.0
-sutra  0.6.4 (engine)
+sutra  0.6.5 (engine)
 ```
 
 `--format json` is the structured form and always separates the two — `version` is the
 reporting tool's own, `engine` the embedded engine's (equal for this binary):
 
 ```json
-{"name":"sutra","version":"0.6.4","engine":"0.6.4"}
+{"name":"sutra","version":"0.6.5","engine":"0.6.5"}
 ```
 
 ---

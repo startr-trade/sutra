@@ -89,6 +89,15 @@ mutual-block deadlock impossible and turns a full queue into backpressure on the
 
 Only relays ever hop. Spawns and timer fires never do.
 
+### Continuations before new intake
+
+*Since 0.6.5* each lane has two queues. Work that continues an instance already admitted — a
+`local://` delivery handed over by the outbox, a resume routed from another lane — goes on the
+**continuation** queue, which the lane serves first; new intake waits on the other. Each queue is
+first-in, first-out, and per-instance serialization is unchanged: a lane still runs one request at
+a time. Under a burst, the effect is that the instances already started finish first, and intake
+meets backpressure, instead of a growing backlog of half-finished work.
+
 ## Claims are the correctness mechanism; routing is only affinity
 
 This is the property worth internalizing: **routing is an optimization, not the thing that keeps

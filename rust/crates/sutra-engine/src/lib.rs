@@ -36,7 +36,18 @@ pub mod xslt;
 /// path so callers (the timer election in `server`, the broker leadership IT) are unchanged.
 pub use sutra_transport_spi::leadership;
 
-pub use config::{DeploymentSourceKind, EngineConfig, EngineShardConfig};
+/// Install ring as the process-wide rustls crypto provider. Idempotent; called by
+/// [`otel::init`] and [`serve`] so every TLS client the engine builds — its own and any
+/// library's that asks rustls for the default — uses ring. The build links rustls with two
+/// providers (the SQL Server driver enables aws-lc-rs), and with two compiled in rustls has no
+/// implicit default, so without this a library calling `ClientConfig::builder()` would panic.
+/// A distribution with its own `main` gets this through those two entry points.
+pub fn install_tls_provider() {
+    // Err = a provider is already installed (ours or the embedding binary's): keep it.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
+pub use config::{DeploymentSourceKind, EngineConfig, EngineShardConfig, OutboxTuning};
 pub use otel::{Telemetry, TelemetryConfig};
 pub use server::{serve, RunningEngine};
 pub use sweeper::{StuckInstanceScanner, StuckInstanceScannerConfig, INSTANCE_SWEEPER_ROLE};

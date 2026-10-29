@@ -24,6 +24,31 @@ pub trait InboxStore {
     /// persisted, so keeping the dedup row would turn the client's retry into a silent
     /// duplicate. Best-effort; the default is a no-op for stores that cannot release.
     async fn forget(&self, _deployment: &DeploymentId, _channel: &str, _event_id: &str) {}
+
+    /// End of a dispatch that recorded dedup keys: a store that holds a key back until the step
+    /// that processes the delivery commits (so the record and the effects are one transaction)
+    /// writes any key no step consumed — `processed` = the dispatch completed, so a redelivery
+    /// must be a duplicate — or drops it when the dispatch failed, so a redelivery runs. The
+    /// default is a no-op, for stores that write the record in `record_seen`.
+    async fn settle(&self, _processed: bool) {}
+
+    /// Dedup keys recorded but not yet written, handed over with a resume that continues on
+    /// another lane (whose step then writes them). Default: none.
+    fn take_pending(&self) -> Vec<PendingDedup> {
+        Vec::new()
+    }
+
+    /// Adopt keys handed over by [`Self::take_pending`] on another lane. Default: ignored.
+    fn restore_pending(&self, _pending: Vec<PendingDedup>) {}
+}
+
+/// A dedup key recorded by one lane and written by the step of another (see
+/// [`InboxStore::take_pending`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingDedup {
+    pub deployment: DeploymentId,
+    pub channel: String,
+    pub event_id: String,
 }
 
 /// In-memory [`InboxStore`] (unbounded; tests / persistence-less hosts).

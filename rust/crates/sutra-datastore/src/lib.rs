@@ -50,7 +50,7 @@ pub mod mssql;
 pub mod mysql;
 
 pub use config::{
-    load_migrations, parse_datastores, PoolConfig, StoreDefinition, StructureRef,
+    load_migrations, parse_datastores, CacheConfig, PoolConfig, StoreDefinition, StructureRef,
     DEFAULT_MAX_CONNECTIONS,
 };
 #[cfg(feature = "providers")]

@@ -36,6 +36,15 @@ engine ever disagree.
 | `sutra.datasource.url` | `SUTRA_DATASOURCE_URL` |
 | `sutra.datasource.username` | `SUTRA_DATASOURCE_USERNAME` |
 | `sutra.datasource.password` | `SUTRA_DATASOURCE_PASSWORD` |
+| `sutra.datasource.max-connections` | `SUTRA_DATASOURCE_MAX_CONNECTIONS` |
+| `sutra.datasource.dispatch-max-connections` | `SUTRA_DATASOURCE_DISPATCH_MAX_CONNECTIONS` |
+
+*Since 0.6.5* the engine opens two pools over this database. The **main** pool
+(`max-connections`, default `8`, the size it always had) serves the execution lanes: intake,
+steps and resumes. Size it at least to `sutra.engine.shards`, because each lane holds a
+connection while it commits a step. The **dispatch** pool (`dispatch-max-connections`, default
+`2`) serves the outbox dispatcher and the timer poller, so a burst of intake can never leave
+delivery waiting for a connection.
 
 This is the engine-internal database (instances, outbox, lease, audit, inbox) — never a
 package's own business data store, which owns its connection independently in `datastores.yaml`
@@ -49,11 +58,22 @@ package's own business data store, which owns its connection independently in `d
 | `sutra.*` key | env |
 |---|---|
 | `sutra.outbox.tick-interval` | `SUTRA_OUTBOX_TICK_INTERVAL` |
+| `sutra.outbox.workers` | `SUTRA_OUTBOX_WORKERS` |
+| `sutra.outbox.batch-size` | `SUTRA_OUTBOX_BATCH_SIZE` |
 | `sutra.outbox.retry.base-delay` / `.max-delay` / `.jitter` | `SUTRA_OUTBOX_RETRY_BASE_DELAY` / `_MAX_DELAY` / `_JITTER` |
 | `sutra.outbox.retry.max-attempts` | `SUTRA_OUTBOX_RETRY_MAX_ATTEMPTS` |
 | `sutra.ack.deferred.capacity` | `SUTRA_ACK_DEFERRED_CAPACITY` |
 | `sutra.ack.deferred.timeout` | `SUTRA_ACK_DEFERRED_TIMEOUT` |
 | `sutra.ack.deferred.sweep-interval` | `SUTRA_ACK_DEFERRED_SWEEP_INTERVAL` |
+
+*Since 0.6.5* the outbox delivers on several workers: `sutra.outbox.workers` (default: the lane
+count, at least 8). One instance's deliveries always go to the same worker, in the order they
+were enqueued; the deliveries of different instances run in parallel (`1` restores one delivery
+at a time). A step that enqueues wakes the dispatcher at once, and a `local://` delivery is handed
+to it in-process as soon as the step's commit is durable, so the tick (`tick-interval`, default
+`PT5S`) only paces retries that fall due and rows another replica enqueued.
+`sutra.outbox.batch-size` (default `50`) is how many due rows one claim takes per deployment.
+Delivered rows are deleted in batches. See [Tuning for throughput](throughput-tuning.md).
 
 Outbound deliveries retry with backoff forever by default. `sutra.outbox.retry.max-attempts`
 is the opt-in ceiling: a delivery that exhausts it is marked terminally poisoned — retained

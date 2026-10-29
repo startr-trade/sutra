@@ -532,6 +532,7 @@ pub fn validate_deployment_with_manifests(
     check_node_references(deployment, &definitions, &dep_label, out);
     check_feel_sites(deployment, &dep_label, out);
     check_timer_config_keys(deployment, &dep_label, out);
+    out.extend(timer_expression_name_faults(deployment, &dep_label));
     check_template_inputs(deployment, &definitions, &dep_label, out);
     check_transient_reads(deployment, &dep_label, out);
     check_never_initialized(deployment, &dep_label, out);
@@ -3679,6 +3680,73 @@ fn check_timer_config_keys(
             });
         }
     }
+}
+
+/// Every name a timer expression reads (a timer event body, `q:timeout@duration`,
+/// `q:retry@initialDelay` / `@maxDelay`) must be one something in scope provides: `config`, a
+/// declared variable or data object, the intake payload, or a variable the process (or a process
+/// that calls it) provably sets — the same reasoning the template-input check applies. Anything
+/// else would be null when the timer is armed; most often it is a mistyped literal, and the
+/// message then names the literal that was meant. Errors, so `sutra lint`, `sutra package` and
+/// the engine's deployment planning all refuse it.
+pub fn timer_expression_name_faults(
+    deployment: &LoadedDeployment,
+    dep_label: &str,
+) -> Vec<LintDiagnostic> {
+    let mut out = Vec::new();
+    let reachable = reachable_roots(deployment);
+    let mut seen = BTreeSet::new();
+    for module in deployment.processes.values() {
+        for process in module.processes() {
+            if !seen.insert(process.id.clone()) {
+                continue;
+            }
+            let mut available: BTreeSet<String> =
+                FIXED_ROOTS.iter().map(|s| s.to_string()).collect();
+            available.insert("config".to_string());
+            available.insert("payload".to_string());
+            if let Some(roots) = reachable.get(&process.id) {
+                available.extend(roots.iter().cloned());
+            }
+            visit_nodes(process, &mut |owner, node| {
+                for site in owner.node_timer_expressions(node) {
+                    let Ok(roots) = sutra_bpmn::timer::timer_expression_roots(&site.expression)
+                    else {
+                        continue; // the loader already refused an unparseable expression
+                    };
+                    for root in roots {
+                        if available.contains(&root) {
+                            continue;
+                        }
+                        let hint =
+                            match sutra_bpmn::timer::suggest_duration_literal(&site.expression) {
+                                Some(literal) => format!(
+                                    " It looks like a mistyped literal: did you mean {literal}?"
+                                ),
+                                None => " Declare it (<q:variable>), set it before the timer, or \
+                                     read it from config.<key>."
+                                    .to_string(),
+                            };
+                        out.push(
+                            LintDiagnostic::error(
+                                sutra_bpmn::codes::CONFIG_BPMN_TIMER_EXPRESSION_UNKNOWN_NAME,
+                                format!(
+                                    "deployment {dep_label}: process '{}' node '{}' {} expression \
+                                     '{}' reads '{root}', which nothing in scope provides (not \
+                                     config, a declared variable, the payload or a variable the \
+                                     process sets), so it would be null when the timer is \
+                                     armed.{hint}",
+                                    process.id, site.node_id, site.site, site.expression
+                                ),
+                            )
+                            .at_node(&process.id, &site.node_id),
+                        );
+                    }
+                }
+            });
+        }
+    }
+    out
 }
 
 fn check_feel_pure(

@@ -70,6 +70,7 @@ fn step(instance_id: Uuid) -> StepWrite {
         }],
         resolved_waits: vec![],
         withdrawn_call_nodes: Vec::new(),
+        inbox_seen: Vec::new(),
         aliases: vec![StepAlias {
             alias_name: "loanId".to_owned(),
             alias_value: "L-1".to_owned(),
@@ -233,6 +234,7 @@ async fn wait_to_wait_step_resolves_prior_frontier_and_writes_next() {
         }],
         resolved_waits: vec!["waitApproval".to_owned()],
         withdrawn_call_nodes: Vec::new(),
+        inbox_seen: Vec::new(),
         aliases: vec![],
         subjects: vec![],
         outbox: vec![],

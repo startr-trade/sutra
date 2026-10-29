@@ -508,6 +508,41 @@ If `AccountRecord` later grows an `owner` sub-record, the package stops linting 
 this store) rather than a silent shape change. The evolution rules are in
 [Deployment packages](deployment-packages.md#store-migrations-and-schema-evolution).
 
+## Caching reads {#caching-reads}
+
+*Since 0.6.5.* A data task reads a value and its revision in one round trip. A store that is read
+far more often than it is written — settings, reference data — can also keep a read cache:
+
+```yaml
+datastores:
+  - name: refdata
+    type: sql
+    sql:
+      url-ref: env:REF_DB_URL
+      username-ref: env:REF_DB_USER
+      password-ref: env:REF_DB_PASSWORD
+    cache:
+      enabled: true      # default false
+      maxEntries: 1000   # keys kept; the least recently read is evicted first
+      ttl: PT0S          # default: check the revision on every read
+```
+
+| `ttl` | A read of a cached key | A write made through any engine | A write made by SQL outside the engine |
+|---|---|---|---|
+| `PT0S` (default) | one revision check (`SELECT rev`) instead of a full read | seen by the next read on every replica: each write bumps the row's revision | seen by the next read if the SQL bumps `rev`, otherwise only once the key is evicted |
+| positive, e.g. `PT5S` | no query at all while the key was checked less than `ttl` ago | through this engine: seen at once; through another replica: within `ttl` | within `ttl` |
+
+The cache is shared by every lane of the engine process and is per deployment. A write made
+through the engine — a data task's write, or one inside a `<bpmn:transaction>` — invalidates its
+key at once. Reads inside a transaction always go to the database, because they must see the
+transaction's own snapshot and locks. Keep `ttl` at `PT0S` unless a few seconds of staleness
+after an operator's edit is acceptable. When you change rows by hand, bump `rev` with them:
+
+```sql
+UPDATE data_store SET store_value = '{"maxAmount": 500}', rev = rev + 1
+ WHERE store_name = 'refdata' AND store_key = 'default';
+```
+
 ## Isolation and atomicity
 
 Two separate guarantees, worth keeping distinct:

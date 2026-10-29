@@ -12,7 +12,7 @@ default = ["transport"]
 # dispatcher / outbox loop / audit dispatcher. OFF (`--no-default-features`) leaves the pure channel
 # MODEL (config/channels.yaml parse, codes, registry, sink::scheme_of) — the only part the
 # deploy-time lint consumes — compiling WITHOUT tokio/axum/hyper, hence to `wasm32-*`.
-transport = ["dep:inventory", "dep:axum", "dep:futures-core", "dep:tokio", "dep:http-body-util", "dep:hyper", "dep:hyper-util", "dep:hyper-rustls"]
+transport = ["dep:inventory", "dep:axum", "dep:futures-core", "dep:tokio", "dep:http-body-util", "dep:hyper", "dep:hyper-util", "dep:hyper-rustls", "dep:rustls"]
 
 [dependencies]
 # The dyn-safe async form of the persistence-facing trait seams (InstanceBridge,
@@ -48,6 +48,7 @@ tracing = { workspace = true }
 http-body-util = { version = "0.1", optional = true }
 hyper = { version = "1", features = ["client", "http1"], optional = true }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"], optional = true }
+rustls = { workspace = true, optional = true }
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "native-tokio", "ring", "tls12"], optional = true }
 
 [dev-dependencies]

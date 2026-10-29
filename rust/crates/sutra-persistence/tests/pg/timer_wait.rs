@@ -39,6 +39,7 @@ fn park_step(instance_id: Uuid) -> StepWrite {
         subjects: vec![],
         outbox: vec![],
         withdrawn_call_nodes: Vec::new(),
+        inbox_seen: Vec::new(),
     }
 }
 

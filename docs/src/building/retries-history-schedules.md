@@ -252,6 +252,21 @@ of a `<timeDuration>`, `<timeDate>` or `<timeCycle>`, a `<q:timeout duration>`, 
 | anything else that parses as FEEL (`payload.window`, `config.retryDelay`) | an expression |
 | anything else | a load error |
 
+*Since 0.6.5* an expression may read only names something provides: `config`, a declared
+variable or data object, the payload, or a variable the process (or a process that calls it) sets
+before the timer. Any other name would be null when the timer is armed, so `sutra lint`,
+`sutra package` and the engine refuse it with `SUTRA.CONFIG.BPMN.TIMER_EXPRESSION_UNKNOWN_NAME`.
+A literal written wrong now says which literal was meant. From `sutra lint` on a package with
+one of each:
+
+```text
+[ERROR] SUTRA.DEPLOY.PACKAGE.CONFIG_INVALID — BPMN bpmn/wait.bpmn fails to parse: [SUTRA.DISPATCH.TIMER.DURATION_INVALID] <intermediateCatchEvent> Pause timer is not schedulable: 'PT10SEC' has an unparseable number ''; did you mean PT10S?
+```
+
+```text
+[ERROR] SUTRA.CONFIG.BPMN.TIMER_EXPRESSION_UNKNOWN_NAME — deployment default/window/1.0.0 (dep-ffffffffffffffffffffffff): process 'wait' node 'Hold' timeDuration expression 'holdFor' reads 'holdFor', which nothing in scope provides (not config, a declared variable, the payload or a variable the process sets), so it would be null when the timer is armed. Declare it (<q:variable>), set it before the timer, or read it from config.<key>.
+```
+
 An expression is evaluated **once, when its timer is armed**:
 
 | Timer | Armed when | The expression can read |

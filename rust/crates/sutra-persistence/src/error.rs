@@ -28,6 +28,16 @@ pub enum PersistenceError {
         alias_value: String,
     },
 
+    /// The step carried an inbox dedup record that another delivery of the same event committed
+    /// first (two deliveries of one event ran concurrently). The whole step rolls back: the
+    /// event was processed exactly once, by the other delivery.
+    #[error("inbox duplicate: ({deployment}, {channel}, {event_id}) was already recorded")]
+    InboxDuplicate {
+        deployment: DeploymentId,
+        channel: String,
+        event_id: String,
+    },
+
     /// Underlying SQL Server failure, tagged with the operation that issued it (the
     /// `mssql` dialect runs on its own TDS client stack, not sqlx).
     #[cfg(feature = "mssql")]

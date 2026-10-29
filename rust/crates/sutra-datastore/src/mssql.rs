@@ -299,6 +299,16 @@ impl MssqlDataStore {
         Box::pin(store_revision(Arc::clone(&self.inner), key.to_string()))
     }
 
+    /// The value at `key` and its revision (`0` when absent), read one after the other.
+    pub fn get_with_revision(
+        &self,
+        key: &str,
+    ) -> SendFuture<'static, Result<(Option<Json>, i64), DataStoreError>> {
+        let value = self.get(key);
+        let revision = self.revision(key);
+        Box::pin(async move { Ok((value.await?, revision.await?)) })
+    }
+
     /// Autocommit compare-and-set (`<q:store expect="unchanged">`); `false` = conflict.
     pub fn put_if_revision(
         &self,

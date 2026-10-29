@@ -76,6 +76,18 @@ macro_rules! async_dialect_store {
                 self.inner.revision(key).await.map_err(to_store_err)
             }
 
+            async fn get_with_revision(
+                &self,
+                key: &str,
+            ) -> Result<(Option<FeelValue>, i64), StoreError> {
+                let (value, rev) = self
+                    .inner
+                    .get_with_revision(key)
+                    .await
+                    .map_err(to_store_err)?;
+                Ok((value.map(|j| json_to_feel(&j)), rev))
+            }
+
             async fn put_if_revision(
                 &self,
                 key: &str,
@@ -361,5 +373,415 @@ impl CoverageMetricStore for DeclaredCoverageStores {
                 trace_id: r.trace_id,
             })
             .collect())
+    }
+}
+
+// ---- the opt-in read cache (`datastores.yaml` `cache:`, 0.6.5) ------------------------------
+
+/// One store's cache, shared by every lane of the process (keyed by deployment + store name in
+/// [`shared_cache`]), so a write through any lane invalidates the key for all of them.
+pub struct StoreCache {
+    config: sutra_datastore::CacheConfig,
+    /// key → (revision, value as JSON, when it was last read or revalidated).
+    entries: std::sync::Mutex<HashMap<String, CachedEntry>>,
+}
+
+#[derive(Clone)]
+struct CachedEntry {
+    rev: i64,
+    value: Option<serde_json::Value>,
+    checked: std::time::Instant,
+}
+
+impl StoreCache {
+    fn new(config: sutra_datastore::CacheConfig) -> StoreCache {
+        StoreCache {
+            config,
+            entries: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn lookup(&self, key: &str) -> Option<CachedEntry> {
+        self.entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(key)
+            .cloned()
+    }
+
+    fn store(&self, key: &str, rev: i64, value: Option<serde_json::Value>) {
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        if entries.len() >= self.config.max_entries && !entries.contains_key(key) {
+            // Evict the entry checked longest ago (O(n) over a small, bounded map).
+            if let Some(oldest) = entries
+                .iter()
+                .min_by_key(|(_, e)| e.checked)
+                .map(|(k, _)| k.clone())
+            {
+                entries.remove(&oldest);
+            }
+        }
+        entries.insert(
+            key.to_string(),
+            CachedEntry {
+                rev,
+                value,
+                checked: std::time::Instant::now(),
+            },
+        );
+    }
+
+    fn touch(&self, key: &str) {
+        if let Some(entry) = self
+            .entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(key)
+        {
+            entry.checked = std::time::Instant::now();
+        }
+    }
+
+    fn invalidate(&self, key: &str) {
+        self.entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(key);
+    }
+
+    /// Whether an entry may be served without asking the database at all.
+    fn fresh(&self, entry: &CachedEntry) -> bool {
+        !self.config.ttl.is_zero() && entry.checked.elapsed() < self.config.ttl
+    }
+
+    /// How many keys are cached (tests and diagnostics).
+    pub fn len(&self) -> usize {
+        self.entries.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
+    /// Whether nothing is cached.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// The process-wide cache of one deployment's store — every lane's [`CachedStore`] for the
+/// same `(deployment, store)` shares it, so an invalidation is seen by all of them.
+pub fn shared_cache(
+    deployment: &str,
+    store: &str,
+    config: sutra_datastore::CacheConfig,
+) -> std::sync::Arc<StoreCache> {
+    type Registry = std::sync::Mutex<HashMap<String, std::sync::Arc<StoreCache>>>;
+    static CACHES: std::sync::OnceLock<Registry> = std::sync::OnceLock::new();
+    let mut caches = CACHES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let entry = caches
+        .entry(format!("{deployment}/{store}"))
+        .or_insert_with(|| std::sync::Arc::new(StoreCache::new(config)));
+    if entry.config != config {
+        *entry = std::sync::Arc::new(StoreCache::new(config));
+    }
+    std::sync::Arc::clone(entry)
+}
+
+/// A [`DataStore`] with the opt-in read cache in front of it.
+///
+/// * A read of a cached key asks the database for the key's revision only, and serves the
+///   cached value when the revision is unchanged — one indexed lookup instead of a full read.
+///   Every write the engine makes bumps the revision, so the next read on any replica sees it.
+/// * With a positive `ttl` a key checked within the last `ttl` is served with no query at all.
+/// * A write through this store — autocommit or inside a transaction — invalidates the key at
+///   once, before and after the write.
+pub struct CachedStore {
+    inner: Rc<dyn DataStore>,
+    cache: std::sync::Arc<StoreCache>,
+}
+
+impl CachedStore {
+    pub fn new(inner: Rc<dyn DataStore>, cache: std::sync::Arc<StoreCache>) -> CachedStore {
+        CachedStore { inner, cache }
+    }
+}
+
+#[async_trait(?Send)]
+impl DataStore for CachedStore {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    async fn get(&self, key: &str) -> Result<Option<FeelValue>, StoreError> {
+        Ok(self.get_with_revision(key).await?.0)
+    }
+
+    async fn get_with_revision(&self, key: &str) -> Result<(Option<FeelValue>, i64), StoreError> {
+        if let Some(entry) = self.cache.lookup(key) {
+            if self.cache.fresh(&entry) {
+                return Ok((entry.value.as_ref().map(json_to_feel), entry.rev));
+            }
+            let rev = self.inner.revision(key).await?;
+            if rev == entry.rev && rev >= 0 {
+                self.cache.touch(key);
+                return Ok((entry.value.as_ref().map(json_to_feel), rev));
+            }
+        }
+        let (value, rev) = self.inner.get_with_revision(key).await?;
+        if rev >= 0 {
+            self.cache.store(key, rev, value.as_ref().map(feel_to_json));
+        }
+        Ok((value, rev))
+    }
+
+    async fn revision(&self, key: &str) -> Result<i64, StoreError> {
+        if let Some(entry) = self.cache.lookup(key) {
+            if self.cache.fresh(&entry) {
+                return Ok(entry.rev);
+            }
+        }
+        self.inner.revision(key).await
+    }
+
+    async fn put(&self, key: &str, value: FeelValue) -> Result<(), StoreError> {
+        self.cache.invalidate(key);
+        let result = self.inner.put(key, value).await;
+        self.cache.invalidate(key);
+        result
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), StoreError> {
+        self.cache.invalidate(key);
+        let result = self.inner.delete(key).await;
+        self.cache.invalidate(key);
+        result
+    }
+
+    async fn put_if_revision(
+        &self,
+        key: &str,
+        value: FeelValue,
+        expected_rev: i64,
+    ) -> Result<bool, StoreError> {
+        self.cache.invalidate(key);
+        let result = self.inner.put_if_revision(key, value, expected_rev).await;
+        self.cache.invalidate(key);
+        result
+    }
+
+    async fn begin(&self) -> Result<Option<Rc<dyn DataStoreTx>>, StoreError> {
+        Ok(self.inner.begin().await?.map(|tx| {
+            Rc::new(CachedTx {
+                inner: tx,
+                cache: std::sync::Arc::clone(&self.cache),
+                written: RefCell::new(Vec::new()),
+            }) as Rc<dyn DataStoreTx>
+        }))
+    }
+}
+
+/// A transaction of a [`CachedStore`]: reads go to the database (a transaction must see its
+/// own snapshot and locks), writes invalidate their keys when made and again when the
+/// transaction ends.
+struct CachedTx {
+    inner: Rc<dyn DataStoreTx>,
+    cache: std::sync::Arc<StoreCache>,
+    written: RefCell<Vec<String>>,
+}
+
+impl CachedTx {
+    fn wrote(&self, key: &str) {
+        self.cache.invalidate(key);
+        self.written.borrow_mut().push(key.to_string());
+    }
+
+    fn end(&self) {
+        for key in self.written.borrow_mut().drain(..) {
+            self.cache.invalidate(&key);
+        }
+    }
+}
+
+#[async_trait(?Send)]
+impl DataStoreTx for CachedTx {
+    async fn get(&self, key: &str) -> Result<Option<FeelValue>, StoreError> {
+        self.inner.get(key).await
+    }
+
+    async fn get_for_update(&self, key: &str) -> Result<Option<FeelValue>, StoreError> {
+        self.inner.get_for_update(key).await
+    }
+
+    async fn put(&self, key: &str, value: FeelValue) -> Result<(), StoreError> {
+        self.wrote(key);
+        self.inner.put(key, value).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), StoreError> {
+        self.wrote(key);
+        self.inner.delete(key).await
+    }
+
+    async fn revision(&self, key: &str) -> Result<i64, StoreError> {
+        self.inner.revision(key).await
+    }
+
+    async fn put_if_revision(
+        &self,
+        key: &str,
+        value: FeelValue,
+        expected_rev: i64,
+    ) -> Result<bool, StoreError> {
+        self.wrote(key);
+        self.inner.put_if_revision(key, value, expected_rev).await
+    }
+
+    async fn commit(&self) -> Result<(), StoreError> {
+        let result = self.inner.commit().await;
+        self.end();
+        result
+    }
+
+    async fn rollback(&self) -> Result<(), StoreError> {
+        let result = self.inner.rollback().await;
+        self.end();
+        result
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use std::cell::Cell;
+
+    use super::*;
+    use sutra_executor::InMemoryDataStore;
+
+    /// Counts the reads that reach the store behind the cache.
+    struct Counting {
+        inner: InMemoryDataStore,
+        full_reads: Cell<u32>,
+        revision_reads: Cell<u32>,
+    }
+
+    #[async_trait(?Send)]
+    impl DataStore for Counting {
+        fn name(&self) -> &str {
+            self.inner.name()
+        }
+        async fn get(&self, key: &str) -> Result<Option<FeelValue>, StoreError> {
+            self.full_reads.set(self.full_reads.get() + 1);
+            self.inner.get(key).await
+        }
+        async fn put(&self, key: &str, value: FeelValue) -> Result<(), StoreError> {
+            self.inner.put(key, value).await
+        }
+        async fn delete(&self, key: &str) -> Result<(), StoreError> {
+            self.inner.delete(key).await
+        }
+        async fn revision(&self, key: &str) -> Result<i64, StoreError> {
+            self.revision_reads.set(self.revision_reads.get() + 1);
+            self.inner.revision(key).await
+        }
+        async fn put_if_revision(
+            &self,
+            key: &str,
+            value: FeelValue,
+            expected_rev: i64,
+        ) -> Result<bool, StoreError> {
+            self.inner.put_if_revision(key, value, expected_rev).await
+        }
+        async fn begin(&self) -> Result<Option<Rc<dyn DataStoreTx>>, StoreError> {
+            self.inner.begin().await
+        }
+    }
+
+    fn cached(
+        name: &str,
+        ttl: std::time::Duration,
+    ) -> (Rc<Counting>, CachedStore, InMemoryDataStore) {
+        let backing = InMemoryDataStore::new("ref");
+        let counting = Rc::new(Counting {
+            inner: backing.clone(),
+            full_reads: Cell::new(0),
+            revision_reads: Cell::new(0),
+        });
+        let config = sutra_datastore::CacheConfig {
+            enabled: true,
+            max_entries: 2,
+            ttl,
+        };
+        let store = CachedStore::new(
+            Rc::clone(&counting) as Rc<dyn DataStore>,
+            shared_cache("dep-cache-test", name, config),
+        );
+        (counting, store, backing)
+    }
+
+    fn s(v: &str) -> FeelValue {
+        FeelValue::String(v.to_string())
+    }
+
+    /// Default ttl 0: a cached key costs one revision check, and a write made behind the
+    /// cache's back that bumps the revision is seen on the very next read.
+    #[tokio::test]
+    async fn a_cached_key_is_revalidated_by_revision_and_sees_an_outside_write() {
+        let (counting, store, backing) = cached("revalidate", std::time::Duration::ZERO);
+        backing.put("k", s("v1")).await.unwrap();
+        assert_eq!(store.get_with_revision("k").await.unwrap().0, Some(s("v1")));
+        let full = counting.full_reads.get();
+        assert_eq!(store.get_with_revision("k").await.unwrap().0, Some(s("v1")));
+        assert_eq!(counting.full_reads.get(), full, "served from the cache");
+        // Another writer (another replica, or SQL that bumps rev): the next read sees it.
+        backing.put("k", s("v2")).await.unwrap();
+        assert_eq!(store.get_with_revision("k").await.unwrap().0, Some(s("v2")));
+    }
+
+    /// A write through the engine invalidates at once, even with a long ttl — autocommit and
+    /// inside a transaction.
+    #[tokio::test]
+    async fn a_write_through_the_engine_applies_to_the_next_read_even_with_a_ttl() {
+        let (_, store, _) = cached("invalidate", std::time::Duration::from_secs(3600));
+        store.put("k", s("v1")).await.unwrap();
+        assert_eq!(store.get("k").await.unwrap(), Some(s("v1")));
+        store.put("k", s("v2")).await.unwrap();
+        assert_eq!(store.get("k").await.unwrap(), Some(s("v2")));
+        let tx = store.begin().await.unwrap().expect("transactions");
+        tx.put("k", s("v3")).await.unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(store.get("k").await.unwrap(), Some(s("v3")));
+    }
+
+    /// A positive ttl serves a fresh key with no query at all; an outside write shows once the
+    /// ttl has passed (the documented trade).
+    #[tokio::test]
+    async fn a_ttl_serves_without_a_query_until_it_passes() {
+        let (counting, store, backing) = cached("ttl", std::time::Duration::from_millis(50));
+        backing.put("k", s("v1")).await.unwrap();
+        store.get("k").await.unwrap();
+        let (full, revs) = (counting.full_reads.get(), counting.revision_reads.get());
+        backing.put("k", s("outside")).await.unwrap();
+        assert_eq!(
+            store.get("k").await.unwrap(),
+            Some(s("v1")),
+            "within the ttl"
+        );
+        assert_eq!(
+            (counting.full_reads.get(), counting.revision_reads.get()),
+            (full, revs),
+            "no query within the ttl"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        assert_eq!(store.get("k").await.unwrap(), Some(s("outside")));
+    }
+
+    /// The cache never holds more than maxEntries keys.
+    #[tokio::test]
+    async fn the_cache_is_bounded_by_max_entries() {
+        let (_, store, backing) = cached("bounded", std::time::Duration::ZERO);
+        for key in ["a", "b", "c", "d"] {
+            backing.put(key, s(key)).await.unwrap();
+            store.get(key).await.unwrap();
+        }
+        assert!(store.cache.len() <= 2);
     }
 }

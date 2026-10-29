@@ -35,16 +35,42 @@ serves the channel under test. Set `SUTRA_API_KEY=...` when the target deploymen
 channel resolves an api-key other than the sample `hello-demo-key`, and `PAYLOAD=/abs/path`
 for a request body other than `fixtures/hello.txt`.
 
+## The relay workload: durable throughput, measured end to end
+
+`relay-bench.sh` owns the whole system under test, because its numbers need the database to
+itself: a throwaway PostgreSQL cluster (durable: fsync, synchronous_commit, full_page_writes on)
+on the repository's disk, the callback sink, and the engine binary with the `fixtures/relay`
+package — an HTTP intake with a light validator and two data-store reads, a `local://` forward to
+a second process, its answer relayed back over a second local channel, and an HTTP callback to
+the sink. It reports settles/s, settle latency (callback received minus intake sent), commits and
+WAL flushes per settle, WAL fsync busy time and engine CPU, plus the top statements.
+
+```bash
+(cd rust && cargo build --profile release-it -p sutra-dist -p sutra-cli)
+export SUTRA_ENGINE_BIN=$PWD/rust/target/release-it/sutra-engine SUTRA_CLI=$PWD/rust/target/release-it/sutra
+RATE=100 DURATION=60s tools/sutra-load-test/relay-bench.sh
+RATE=500 DURATION=60s \
+  ENGINE_ENV="SUTRA_ENGINE_SHARDS=32 SUTRA_DATASOURCE_MAX_CONNECTIONS=40" \
+  tools/sutra-load-test/relay-bench.sh
+```
+
+`CACHE_TTL=PT0S` turns on the `refdata` store's read cache; `PERF_DIR=<dir>` records a CPU
+profile and flamegraphs of the engine and the database (needs `perf` and `inferno`). Read the
+header of `relay-bench.sh` for every knob.
+
 ## Layout
 
 ```
 tools/sutra-load-test/
 ├── README.md          (this file)
 ├── run.sh             (harness: run k6 against a URL, capture results, exit code)
+├── relay-bench.sh     (the relay workload: own PG + sink + engine, per-settle DB cost)
+├── sink/              (the relay workload's callback sink — standalone crate, own Cargo.lock)
 ├── profiles/
 │   ├── smoke.js       (~30 s, 10 RPS, 1 VU — PR feedback)
 │   ├── sustained.js   (~5 min, 100 RPS, 4 VUs — headline number)
-│   └── burst.js       (~2 min, 0→500 RPS ramp + hold + ramp-down — peak hour)
+│   ├── burst.js       (~2 min, 0→500 RPS ramp + hold + ramp-down — peak hour)
+│   └── relay.js       (the relay workload's intake, driven by relay-bench.sh)
 └── results/           (.gitignore'd; CI uploads as artifacts)
 ```
 

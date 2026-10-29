@@ -1,0 +1,15 @@
+// The light intake validator: a positive amount and a reference. The ruleset sees the decoded
+// payload's fields at the top level.
+rule "amount must be positive"
+when
+  amount = null or amount <= 0
+then
+  report("RELAY.AMOUNT", "amount", "amount must be positive");
+end
+
+rule "reference required"
+when
+  ref = null
+then
+  report("RELAY.REF", "ref", "ref is required");
+end

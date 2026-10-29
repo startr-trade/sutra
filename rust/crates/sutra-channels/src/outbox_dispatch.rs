@@ -270,6 +270,44 @@ pub trait OutboxRowStore: Send + Sync {
         new_due_at: OffsetDateTime,
         diagnostic_json: &'a str,
     ) -> BoxFuture<'a, Result<(), Diagnostic>>;
+
+    /// [`Self::claim_due`] that skips the entries named in `exclude` — the rows this process
+    /// already has in flight, which the concurrent dispatcher must not hand out twice. The
+    /// default claims enough extra rows to cover the exclusions and filters them out; a store
+    /// that can exclude in its query should.
+    fn claim_due_excluding<'a>(
+        &'a self,
+        deployment: &'a DeploymentId,
+        now: OffsetDateTime,
+        max_entries: i64,
+        exclude: &'a [String],
+    ) -> BoxFuture<'a, Result<Vec<ClaimedOutboxRow>, Diagnostic>> {
+        Box::pin(async move {
+            let claimed = self
+                .claim_due(deployment, now, max_entries + exclude.len() as i64)
+                .await?;
+            Ok(claimed
+                .into_iter()
+                .filter(|row| !exclude.contains(&row.entry_id))
+                .take(max_entries.max(0) as usize)
+                .collect())
+        })
+    }
+
+    /// Deletes several delivered entries at once — one transaction, so a burst of deliveries
+    /// pays one durable commit instead of one each. The default deletes them one by one.
+    fn delete_many<'a>(
+        &'a self,
+        deployment: &'a DeploymentId,
+        entry_ids: &'a [String],
+    ) -> BoxFuture<'a, Result<(), Diagnostic>> {
+        Box::pin(async move {
+            for entry_id in entry_ids {
+                self.delete(deployment, entry_id).await?;
+            }
+            Ok(())
+        })
+    }
 }
 
 // ---- wire-shape rendering (HTTP sink mode branches — frozen strings) -----------------------
@@ -1057,6 +1095,38 @@ impl OutboxDispatcher {
 
     /// Resolve → encode → send → row action. `true` = delivered + deleted.
     async fn send_row(&self, deployment: &DeploymentId, row: &ClaimedOutboxRow) -> bool {
+        if !self.deliver(deployment, row).await {
+            return false;
+        }
+        self.finish_delivered(deployment, row).await
+    }
+
+    /// The delete half of a delivery: the row went out, so it is removed. A failed delete keeps
+    /// the row, which redelivers — at-least-once, the consumer's idempotency key (`outbox_key`)
+    /// absorbs the duplicate — and is deferred with backoff exactly like the catch-all.
+    async fn finish_delivered(&self, deployment: &DeploymentId, row: &ClaimedOutboxRow) -> bool {
+        match self.store.delete(deployment, &row.entry_id).await {
+            Ok(()) => {
+                self.release_finished_call(deployment, row).await;
+                true
+            }
+            Err(diagnostic) => {
+                warn!(
+                    entry_id = %row.entry_id,
+                    code = %diagnostic.code,
+                    error = %diagnostic.message,
+                    "outbox delete after delivery failed — deferring for redelivery"
+                );
+                self.defer_backoff(deployment, row, &diagnostic).await;
+                false
+            }
+        }
+    }
+
+    /// Resolve → encode → send, and on failure the row action (defer or poison). `true` = the
+    /// sink took the message; the row is NOT yet deleted — the caller deletes it, now
+    /// ([`Self::send_row`]) or in a batch (the concurrent loop).
+    async fn deliver(&self, deployment: &DeploymentId, row: &ClaimedOutboxRow) -> bool {
         let Some(sink) = self.sinks.resolve(&row.destination) else {
             // A retry can never grow a sink — the sink set is fixed at assembly, so an
             // unregistered scheme takes the poison posture (max-delay deferral) under the
@@ -1108,25 +1178,7 @@ impl OutboxDispatcher {
             );
         }
         match sink.send(&message).await {
-            SendOutcome::Delivered => match self.store.delete(deployment, &row.entry_id).await {
-                Ok(()) => {
-                    self.release_finished_call(deployment, row).await;
-                    true
-                }
-                Err(diagnostic) => {
-                    // Delivered but the delete failed: the row survives and redelivers —
-                    // at-least-once posture, consumer idempotency (outbox_key) absorbs the
-                    // duplicate. Defer with backoff exactly like the catch-all.
-                    warn!(
-                        entry_id = %row.entry_id,
-                        code = %diagnostic.code,
-                        error = %diagnostic.message,
-                        "outbox delete after delivery failed — deferring for redelivery"
-                    );
-                    self.defer_backoff(deployment, row, &diagnostic).await;
-                    false
-                }
-            },
+            SendOutcome::Delivered => true,
             SendOutcome::RetryableFailure(diagnostic) => {
                 self.defer_backoff(deployment, row, &diagnostic).await;
                 false
@@ -1544,6 +1596,474 @@ pub fn spawn_dispatch_loop(
             }
         }
         info!("outbox dispatch loop drained — refusing further ticks");
+    });
+    OutboxDispatcherHandle { drain, task }
+}
+
+// ---- the concurrent dispatcher (0.6.5) ---------------------------------------------------------
+
+/// The in-process link between the code that ENQUEUES outbox rows (the engine's step commits) and
+/// the concurrent dispatcher that delivers them.
+///
+/// * [`OutboxSignal::wake`] — a step committed rows: claim now rather than at the next tick. The
+///   tick stays as the fallback that picks up retries falling due and rows another replica
+///   enqueued.
+/// * [`OutboxSignal::reserve`] / [`OutboxSignal::hand_off`] — the local fast path: a row the step
+///   is about to commit is reserved (marked in flight) BEFORE the commit, and once the commit is
+///   durable the very same row is handed straight to a worker, so it is never claimed back out of
+///   the table. It stays a durable row the whole time: if this process dies before the delivery
+///   is deleted, any dispatcher claims it after restart, and the receiver's inbox dedup absorbs a
+///   second delivery.
+///
+/// The in-flight set is what keeps two workers of this process from delivering one row twice:
+/// the claim query excludes every entry in it, and an entry leaves it only once its delivery has
+/// been deleted (or deferred). Cross-replica, nothing changes: rows are claimed with
+/// `FOR UPDATE SKIP LOCKED` exactly as before, and delivery stays at-least-once.
+#[derive(Clone, Default)]
+pub struct OutboxSignal {
+    inner: Arc<SignalInner>,
+}
+
+#[derive(Default)]
+struct SignalInner {
+    notify: tokio::sync::Notify,
+    /// Every entry in flight in this process: reserved for a hand-off, or claimed.
+    inflight: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// The subset that was CLAIMED (due rows). Only these need excluding from the next claim:
+    /// a handed-off row is not due until its hand-off grace has passed.
+    claimed: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Entries this process delivered and deleted recently. A claim whose query read a row
+    /// just before its delete committed must not hand it out again; remembering the id for a
+    /// while closes that window.
+    finished: std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
+    handoff: std::sync::Mutex<
+        Option<tokio::sync::mpsc::UnboundedSender<(DeploymentId, ClaimedOutboxRow)>>,
+    >,
+}
+
+impl OutboxSignal {
+    pub fn new() -> OutboxSignal {
+        OutboxSignal::default()
+    }
+
+    /// Rows were enqueued: wake the dispatcher. A wake with no dispatcher waiting is kept
+    /// (one permit), so a commit that lands mid-claim is never missed.
+    pub fn wake(&self) {
+        self.inner.notify.notify_one();
+    }
+
+    /// Whether a running dispatcher accepts hand-offs (the fast path is live).
+    pub fn accepts_hand_off(&self) -> bool {
+        self.inner
+            .handoff
+            .lock()
+            .expect("outbox signal lock")
+            .as_ref()
+            .is_some_and(|tx| !tx.is_closed())
+    }
+
+    /// Mark entries in flight before the transaction that inserts them commits, so no claim
+    /// can hand them to a second worker between the commit and the hand-off.
+    pub fn reserve(&self, entry_ids: &[String]) {
+        let mut inflight = self.inner.inflight.lock().expect("outbox signal lock");
+        for id in entry_ids {
+            inflight.insert(id.clone());
+        }
+    }
+
+    /// Undo [`Self::reserve`] (the commit failed, or the entries were delivered and deleted).
+    pub fn release(&self, entry_ids: &[String]) {
+        {
+            let mut inflight = self.inner.inflight.lock().expect("outbox signal lock");
+            for id in entry_ids {
+                inflight.remove(id);
+            }
+        }
+        let mut claimed = self.inner.claimed.lock().expect("outbox signal lock");
+        for id in entry_ids {
+            claimed.remove(id);
+        }
+    }
+
+    /// Hand committed, reserved rows straight to the dispatcher. With no dispatcher running the
+    /// rows are released and the dispatcher woken instead, so they go out through the ordinary
+    /// claim — nothing is ever dropped.
+    pub fn hand_off(&self, deployment: &DeploymentId, rows: Vec<ClaimedOutboxRow>) {
+        let sender = self
+            .inner
+            .handoff
+            .lock()
+            .expect("outbox signal lock")
+            .clone();
+        let mut unsent = Vec::new();
+        match sender {
+            Some(tx) => {
+                for row in rows {
+                    if let Err(returned) = tx.send((deployment.clone(), row)) {
+                        unsent.push(returned.0 .1.entry_id);
+                    }
+                }
+            }
+            None => unsent.extend(rows.into_iter().map(|row| row.entry_id)),
+        }
+        if !unsent.is_empty() {
+            self.release(&unsent);
+            self.wake();
+        }
+    }
+
+    /// The rows were delivered and their delete committed: release them, and remember them for
+    /// [`FINISHED_MEMORY`] so a claim that raced the delete cannot deliver them again.
+    fn finished(&self, entry_ids: &[String]) {
+        {
+            let now = std::time::Instant::now();
+            let mut finished = self.inner.finished.lock().expect("outbox signal lock");
+            if finished.len() > 4096 {
+                finished.retain(|_, at| now.duration_since(*at) < FINISHED_MEMORY);
+            }
+            for id in entry_ids {
+                finished.insert(id.clone(), now);
+            }
+        }
+        self.release(entry_ids);
+    }
+
+    fn claimed_snapshot(&self) -> Vec<String> {
+        self.inner
+            .claimed
+            .lock()
+            .expect("outbox signal lock")
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    /// Mark a claimed row in flight; `false` if it already was (a hand-off owns it).
+    fn claim_inflight(&self, entry_id: &str) -> bool {
+        if let Some(at) = self
+            .inner
+            .finished
+            .lock()
+            .expect("outbox signal lock")
+            .get(entry_id)
+        {
+            if at.elapsed() < FINISHED_MEMORY {
+                return false;
+            }
+        }
+        let fresh = self
+            .inner
+            .inflight
+            .lock()
+            .expect("outbox signal lock")
+            .insert(entry_id.to_string());
+        if fresh {
+            self.inner
+                .claimed
+                .lock()
+                .expect("outbox signal lock")
+                .insert(entry_id.to_string());
+        }
+        fresh
+    }
+
+    /// How many rows this process has in flight (tests and diagnostics).
+    pub fn inflight_count(&self) -> usize {
+        self.inner
+            .inflight
+            .lock()
+            .expect("outbox signal lock")
+            .len()
+    }
+
+    fn open_hand_off(
+        &self,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<(DeploymentId, ClaimedOutboxRow)> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        *self.inner.handoff.lock().expect("outbox signal lock") = Some(tx);
+        rx
+    }
+
+    fn close_hand_off(&self) {
+        *self.inner.handoff.lock().expect("outbox signal lock") = None;
+    }
+}
+
+/// Sizing of the concurrent dispatcher (`sutra.outbox.workers`, `sutra.outbox.batch-size`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutboxConcurrency {
+    /// Delivery workers. Rows of one instance always go to the same worker, in claim order.
+    pub workers: usize,
+}
+
+/// How far in the future a row handed off in-process is made due in the table. The hand-off
+/// delivers it at once; the due time only matters if this process dies first, when any
+/// dispatcher claims the row after this grace — and while it runs, no claim competes with the
+/// hand-off for it.
+pub const HANDOFF_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long a delivered-and-deleted entry id is remembered (see `OutboxSignal::finished`).
+const FINISHED_MEMORY: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The most claims one deployment gets per claimer round (a round ends early when a claim comes
+/// back short of a full batch).
+const MAX_CLAIM_ROUNDS: usize = 64;
+
+/// The most delivered rows one delete transaction removes.
+const MAX_DELETE_BATCH: usize = 256;
+
+impl OutboxDispatcher {
+    /// The batch size this dispatcher claims.
+    pub fn batch_size(&self) -> i64 {
+        self.batch_size
+    }
+
+    /// The deletes of a batch of delivered rows, in one transaction per deployment. When the
+    /// batch delete fails each row is deleted on its own, and a row whose delete still fails is
+    /// deferred with backoff — the same outcome a failed single delete has always had.
+    /// Returns the ids whose delete committed.
+    async fn finish_delivered_batch(
+        &self,
+        rows: Vec<(DeploymentId, ClaimedOutboxRow)>,
+    ) -> Vec<String> {
+        let mut deleted = Vec::new();
+        let mut by_deployment: BTreeMap<String, (DeploymentId, Vec<ClaimedOutboxRow>)> =
+            BTreeMap::new();
+        for (deployment, row) in rows {
+            by_deployment
+                .entry(deployment.value().to_string())
+                .or_insert_with(|| (deployment, Vec::new()))
+                .1
+                .push(row);
+        }
+        for (_, (deployment, rows)) in by_deployment {
+            let ids: Vec<String> = rows.iter().map(|r| r.entry_id.clone()).collect();
+            match self.store.delete_many(&deployment, &ids).await {
+                Ok(()) => {
+                    for row in &rows {
+                        self.release_finished_call(&deployment, row).await;
+                    }
+                    deleted.extend(ids);
+                }
+                Err(diagnostic) => {
+                    warn!(
+                        deployment = %deployment.value(),
+                        rows = ids.len(),
+                        code = %diagnostic.code,
+                        error = %diagnostic.message,
+                        "outbox batch delete failed — deleting the delivered rows one by one"
+                    );
+                    for row in &rows {
+                        if self.finish_delivered(&deployment, row).await {
+                            deleted.push(row.entry_id.clone());
+                        }
+                    }
+                }
+            }
+        }
+        deleted
+    }
+}
+
+/// Spawn the CONCURRENT dispatcher (0.6.5): one claimer, `workers` delivery workers and one
+/// delete batcher.
+///
+/// * The claimer runs when an enqueue wakes it ([`OutboxSignal::wake`]), on every
+///   `tick_interval` (the fallback for retries and other replicas' rows), and for every row
+///   handed off by a step commit. It claims due rows past the ones already in flight and routes
+///   each to the worker its instance hashes to, so one instance's rows are delivered one after
+///   another in claim order (`next_attempt_at`, then `created_at`) — the order the serial loop
+///   delivered them in. Rows of different instances are delivered in parallel.
+/// * A row on a pooled outbound channel (capacity pools) is delivered by the claimer itself, in
+///   claim order, exactly as the serial loop does: a free slot must go to the oldest waiter.
+/// * A worker sends; on success the row goes to the delete batcher, which deletes whatever has
+///   accumulated in one transaction. A row stays in flight until its delete commits, so it is
+///   never claimed again in between.
+///
+/// Retry, backoff, poison and incident semantics are the serial loop's, by construction: the
+/// workers call the same per-row code.
+pub fn spawn_concurrent_dispatch_loop(
+    runtime: &tokio::runtime::Handle,
+    dispatcher: Arc<OutboxDispatcher>,
+    deployments: LiveDeploymentSet,
+    tick_interval: std::time::Duration,
+    concurrency: OutboxConcurrency,
+    signal: OutboxSignal,
+) -> OutboxDispatcherHandle {
+    let (drain, mut drained) = tokio::sync::watch::channel(false);
+    let interval_duration = tick_interval.max(std::time::Duration::from_millis(1));
+    let workers = concurrency.workers.max(1);
+    let batch_size = dispatcher.batch_size();
+    let rt = runtime.clone();
+    let task = runtime.spawn(async move {
+        let (delete_tx, mut delete_rx) =
+            tokio::sync::mpsc::unbounded_channel::<(DeploymentId, ClaimedOutboxRow)>();
+        // ---- the delete batcher
+        let batcher = {
+            let dispatcher = Arc::clone(&dispatcher);
+            let signal = signal.clone();
+            rt.spawn(async move {
+                while let Some(first) = delete_rx.recv().await {
+                    let mut batch = vec![first];
+                    while batch.len() < MAX_DELETE_BATCH {
+                        match delete_rx.try_recv() {
+                            Ok(next) => batch.push(next),
+                            Err(_) => break,
+                        }
+                    }
+                    let ids: Vec<String> = batch.iter().map(|(_, r)| r.entry_id.clone()).collect();
+                    let deleted = dispatcher.finish_delivered_batch(batch).await;
+                    // Tombstone the deleted rows BEFORE anything leaves the in-flight set, so a
+                    // claim that read a row just before its delete can never find it free. A row
+                    // whose delete failed was deferred: it is released and stays claimable.
+                    signal.finished(&deleted);
+                    signal.release(&ids);
+                }
+            })
+        };
+        // ---- the workers
+        let mut worker_tx = Vec::with_capacity(workers);
+        let mut worker_tasks = Vec::with_capacity(workers);
+        for _ in 0..workers {
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<(DeploymentId, ClaimedOutboxRow)>(
+                (batch_size.max(1) as usize).max(16),
+            );
+            worker_tx.push(tx);
+            let dispatcher = Arc::clone(&dispatcher);
+            let signal = signal.clone();
+            let delete_tx = delete_tx.clone();
+            worker_tasks.push(rt.spawn(async move {
+                while let Some((deployment, row)) = rx.recv().await {
+                    if dispatcher.deliver(&deployment, &row).await {
+                        if let Err(returned) = delete_tx.send((deployment, row)) {
+                            // The batcher is gone (shutdown): delete in place.
+                            let (deployment, row) = returned.0;
+                            dispatcher.finish_delivered(&deployment, &row).await;
+                            signal.release(&[row.entry_id]);
+                        }
+                    } else {
+                        signal.release(&[row.entry_id]);
+                    }
+                }
+            }));
+        }
+        drop(delete_tx);
+        let route = move |row: &ClaimedOutboxRow| -> usize {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            row.instance_id.hash(&mut hasher);
+            (hasher.finish() % workers as u64) as usize
+        };
+        // ---- the hand-off router: rows straight from step commits. Its own task, so a slow
+        // claim never delays a hand-off.
+        let mut handoff_rx = signal.open_hand_off();
+        let router = {
+            let dispatcher = Arc::clone(&dispatcher);
+            let signal = signal.clone();
+            let worker_tx = worker_tx.clone();
+            let mut drained = drained.clone();
+            rt.spawn(async move {
+                loop {
+                    let handed = tokio::select! {
+                        biased;
+                        _ = drained.changed() => break,
+                        handed = handoff_rx.recv() => handed,
+                    };
+                    let Some((deployment, row)) = handed else {
+                        break;
+                    };
+                    if row.headers.contains_key(CAPACITY_POOL_HEADER) {
+                        let mut exhausted = std::collections::BTreeSet::new();
+                        let now = (dispatcher.now)();
+                        dispatcher
+                            .dispatch_one(&deployment, &row, now, &mut exhausted)
+                            .await;
+                        signal.release(&[row.entry_id]);
+                    } else if worker_tx[route(&row)]
+                        .send((deployment, row))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                signal.close_hand_off();
+                // Rows still queued stay committed: release them so a later claim (here or on
+                // another replica) delivers them once their hand-off grace has passed.
+                handoff_rx.close();
+                while let Ok((_, row)) = handoff_rx.try_recv() {
+                    signal.release(&[row.entry_id]);
+                }
+            })
+        };
+        // ---- the claimer (this task)
+        let mut interval = tokio::time::interval(interval_duration);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                biased;
+                _ = drained.changed() => break,
+                _ = signal.inner.notify.notified() => {}
+                _ = interval.tick() => {}
+            }
+            if *drained.borrow() {
+                break;
+            }
+            for deployment in deployments.snapshot() {
+                let mut exhausted = std::collections::BTreeSet::new();
+                // Rows a claim returned that a hand-off still owns (it outlived its grace in a
+                // backlog): excluded for the rest of this round, so they cannot fill every batch
+                // and hold the other due rows back.
+                let mut owned_elsewhere: Vec<String> = Vec::new();
+                for _round in 0..MAX_CLAIM_ROUNDS {
+                    let now = (dispatcher.now)();
+                    let mut exclude = signal.claimed_snapshot();
+                    exclude.extend(owned_elsewhere.iter().cloned());
+                    let claimed = match dispatcher
+                        .store
+                        .claim_due_excluding(&deployment, now, batch_size, &exclude)
+                        .await
+                    {
+                        Ok(claimed) => claimed,
+                        Err(diagnostic) => {
+                            warn!(
+                                deployment = %deployment.value(),
+                                code = %diagnostic.code,
+                                error = %diagnostic.message,
+                                "outbox claim failed — nothing more drained this round"
+                            );
+                            break;
+                        }
+                    };
+                    let full = claimed.len() as i64 >= batch_size;
+                    for row in claimed {
+                        if !signal.claim_inflight(&row.entry_id) {
+                            // A hand-off (or an earlier claim) owns it.
+                            owned_elsewhere.push(row.entry_id);
+                            continue;
+                        }
+                        if row.headers.contains_key(CAPACITY_POOL_HEADER) {
+                            dispatcher
+                                .dispatch_one(&deployment, &row, now, &mut exhausted)
+                                .await;
+                            signal.release(&[row.entry_id]);
+                        } else {
+                            let _ = worker_tx[route(&row)].send((deployment.clone(), row)).await;
+                        }
+                    }
+                    if !full {
+                        break;
+                    }
+                }
+            }
+        }
+        drop(worker_tx);
+        let _ = router.await;
+        for task in worker_tasks {
+            let _ = task.await;
+        }
+        let _ = batcher.await;
+        info!("concurrent outbox dispatcher drained — refusing further claims");
     });
     OutboxDispatcherHandle { drain, task }
 }
@@ -2884,5 +3404,385 @@ mod tests {
             incidents.recorded()[0].failure_code,
             codes::OUTBOUND_REQUIRED_DELIVERY_FAILED
         );
+    }
+}
+
+/// The concurrent dispatcher (0.6.5): exactly-once hand-out within a process, per-instance
+/// order, the local hand-off, batched deletes and unchanged failure semantics.
+#[cfg(test)]
+mod concurrent_tests {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    use super::*;
+    use crate::sink::MessageSink;
+
+    fn dep() -> DeploymentId {
+        DeploymentId::of("dep-0000000000000000000000c1").expect("valid deployment id")
+    }
+
+    fn row(entry_id: &str, instance: &str, destination: &str) -> ClaimedOutboxRow {
+        ClaimedOutboxRow {
+            entry_id: entry_id.to_string(),
+            attempt_count: 0,
+            destination: destination.to_string(),
+            headers: BTreeMap::new(),
+            body: entry_id.as_bytes().to_vec(),
+            content_type: Some("text/plain".to_string()),
+            outbox_key: format!("key-{entry_id}"),
+            mode: ReplyMode::Native,
+            cloud_event_json: None,
+            auth_ref_json: None,
+            labels: BTreeMap::new(),
+            traceparent: None,
+            node_id: None,
+            instance_id: instance.to_string(),
+            required: false,
+            last_diagnostic_json: None,
+        }
+    }
+
+    /// A table of rows with a claim that honours `exclude`, counting delete transactions.
+    #[derive(Default)]
+    struct Table {
+        rows: Mutex<Vec<(ClaimedOutboxRow, bool)>>, // (row, deferred)
+        delete_calls: Mutex<Vec<usize>>,
+        deferred: Mutex<Vec<String>>,
+    }
+
+    impl Table {
+        fn insert(&self, row: ClaimedOutboxRow) {
+            self.rows.lock().unwrap().push((row, false));
+        }
+        fn remaining(&self) -> usize {
+            self.rows.lock().unwrap().len()
+        }
+    }
+
+    impl OutboxRowStore for Table {
+        fn claim_due<'a>(
+            &'a self,
+            deployment: &'a DeploymentId,
+            now: OffsetDateTime,
+            max_entries: i64,
+        ) -> BoxFuture<'a, Result<Vec<ClaimedOutboxRow>, Diagnostic>> {
+            self.claim_due_excluding(deployment, now, max_entries, &[])
+        }
+
+        fn claim_due_excluding<'a>(
+            &'a self,
+            _deployment: &'a DeploymentId,
+            _now: OffsetDateTime,
+            max_entries: i64,
+            exclude: &'a [String],
+        ) -> BoxFuture<'a, Result<Vec<ClaimedOutboxRow>, Diagnostic>> {
+            Box::pin(async move {
+                Ok(self
+                    .rows
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(r, deferred)| !deferred && !exclude.contains(&r.entry_id))
+                    .take(max_entries as usize)
+                    .map(|(r, _)| r.clone())
+                    .collect())
+            })
+        }
+
+        fn delete<'a>(
+            &'a self,
+            deployment: &'a DeploymentId,
+            entry_id: &'a str,
+        ) -> BoxFuture<'a, Result<(), Diagnostic>> {
+            let ids = [entry_id.to_string()];
+            Box::pin(async move {
+                let ids = ids;
+                self.delete_many(deployment, &ids).await
+            })
+        }
+
+        fn delete_many<'a>(
+            &'a self,
+            _deployment: &'a DeploymentId,
+            entry_ids: &'a [String],
+        ) -> BoxFuture<'a, Result<(), Diagnostic>> {
+            Box::pin(async move {
+                self.delete_calls.lock().unwrap().push(entry_ids.len());
+                self.rows
+                    .lock()
+                    .unwrap()
+                    .retain(|(r, _)| !entry_ids.contains(&r.entry_id));
+                Ok(())
+            })
+        }
+
+        fn defer<'a>(
+            &'a self,
+            _deployment: &'a DeploymentId,
+            entry_id: &'a str,
+            _new_due_at: OffsetDateTime,
+            _diagnostic_json: &'a str,
+        ) -> BoxFuture<'a, Result<(), Diagnostic>> {
+            Box::pin(async move {
+                self.deferred.lock().unwrap().push(entry_id.to_string());
+                for (r, deferred) in self.rows.lock().unwrap().iter_mut() {
+                    if r.entry_id == entry_id {
+                        *deferred = true;
+                    }
+                }
+                Ok(())
+            })
+        }
+
+        fn mark_poisoned<'a>(
+            &'a self,
+            deployment: &'a DeploymentId,
+            entry_id: &'a str,
+            diagnostic_json: &'a str,
+        ) -> BoxFuture<'a, Result<(), Diagnostic>> {
+            self.defer(
+                deployment,
+                entry_id,
+                OffsetDateTime::now_utc(),
+                diagnostic_json,
+            )
+        }
+
+        fn requeue<'a>(
+            &'a self,
+            deployment: &'a DeploymentId,
+            entry_id: &'a str,
+            new_due_at: OffsetDateTime,
+            diagnostic_json: &'a str,
+        ) -> BoxFuture<'a, Result<(), Diagnostic>> {
+            self.defer(deployment, entry_id, new_due_at, diagnostic_json)
+        }
+    }
+
+    /// Records every delivery (body = entry id) and the peak number of sends in flight.
+    struct SlowSink {
+        delay: std::time::Duration,
+        delivered: Mutex<Vec<(String, String)>>, // (instance header, entry id)
+        in_flight: std::sync::atomic::AtomicUsize,
+        peak: std::sync::atomic::AtomicUsize,
+        fail: Option<String>,
+    }
+
+    impl SlowSink {
+        fn new(delay_ms: u64) -> SlowSink {
+            SlowSink {
+                delay: std::time::Duration::from_millis(delay_ms),
+                delivered: Mutex::new(Vec::new()),
+                in_flight: std::sync::atomic::AtomicUsize::new(0),
+                peak: std::sync::atomic::AtomicUsize::new(0),
+                fail: None,
+            }
+        }
+    }
+
+    impl MessageSink for SlowSink {
+        fn schemes(&self) -> Vec<String> {
+            vec!["test".to_string()]
+        }
+
+        fn send<'a>(&'a self, message: &'a OutboundMessage) -> BoxFuture<'a, SendOutcome> {
+            Box::pin(async move {
+                use std::sync::atomic::Ordering;
+                let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                self.peak.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(self.delay).await;
+                self.in_flight.fetch_sub(1, Ordering::SeqCst);
+                let id = String::from_utf8(message.body.clone()).unwrap_or_default();
+                if self.fail.as_deref() == Some(id.as_str()) {
+                    return SendOutcome::RetryableFailure(Diagnostic::error(
+                        codes::OUTBOUND_SEND_FAILED,
+                        "down",
+                    ));
+                }
+                let instance = message.destination.clone();
+                self.delivered.lock().unwrap().push((instance, id));
+                SendOutcome::Delivered
+            })
+        }
+    }
+
+    fn dispatcher(table: Arc<Table>, sink: Arc<SlowSink>, batch: i64) -> Arc<OutboxDispatcher> {
+        let mut sinks = SinkRegistry::new();
+        sinks.register(sink);
+        Arc::new(OutboxDispatcher::new(
+            table,
+            sinks,
+            RetryPolicy::new(
+                std::time::Duration::from_secs(1),
+                std::time::Duration::from_secs(300),
+                false,
+            ),
+            batch,
+        ))
+    }
+
+    async fn wait_until(mut done: impl FnMut() -> bool) {
+        for _ in 0..500 {
+            if done() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("condition not reached in 5 s");
+    }
+
+    fn spawn(
+        dispatcher: Arc<OutboxDispatcher>,
+        workers: usize,
+        signal: &OutboxSignal,
+        tick_ms: u64,
+    ) -> OutboxDispatcherHandle {
+        spawn_concurrent_dispatch_loop(
+            &tokio::runtime::Handle::current(),
+            dispatcher,
+            LiveDeploymentSet::new(vec![dep()]),
+            std::time::Duration::from_millis(tick_ms),
+            OutboxConcurrency { workers },
+            signal.clone(),
+        )
+    }
+
+    /// N workers, many instances: every row is delivered exactly once, deliveries really run in
+    /// parallel, the deletes are batched, and nothing stays in flight.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_workers_deliver_every_row_exactly_once_in_parallel() {
+        let table = Arc::new(Table::default());
+        for i in 0..200 {
+            // The destination carries the instance, so the sink can check per-instance order.
+            let instance = format!("inst-{}", i % 40);
+            table.insert(row(
+                &format!("e{i:03}"),
+                &instance,
+                &format!("test://{instance}"),
+            ));
+        }
+        let sink = Arc::new(SlowSink::new(5));
+        let signal = OutboxSignal::new();
+        let handle = spawn(
+            dispatcher(Arc::clone(&table), Arc::clone(&sink), 50),
+            8,
+            &signal,
+            10,
+        );
+        signal.wake();
+        wait_until(|| table.remaining() == 0).await;
+        handle.shutdown().await;
+        let delivered = sink.delivered.lock().unwrap().clone();
+        let mut ids: Vec<&str> = delivered.iter().map(|(_, id)| id.as_str()).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(delivered.len(), 200, "no row delivered twice");
+        assert_eq!(ids.len(), 200, "every row delivered");
+        assert!(
+            sink.peak.load(std::sync::atomic::Ordering::SeqCst) > 1,
+            "parallel delivery"
+        );
+        let calls = table.delete_calls.lock().unwrap().clone();
+        assert!(calls.len() < 200, "deletes were batched: {calls:?}");
+        assert_eq!(signal.inflight_count(), 0);
+    }
+
+    /// One instance's rows are delivered one after another, in claim order, whatever the
+    /// worker count.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn one_instances_rows_are_delivered_in_claim_order() {
+        let table = Arc::new(Table::default());
+        for i in 0..60 {
+            let instance = format!("inst-{}", i % 3);
+            table.insert(row(
+                &format!("e{i:03}"),
+                &instance,
+                &format!("test://{instance}"),
+            ));
+        }
+        let sink = Arc::new(SlowSink::new(2));
+        let signal = OutboxSignal::new();
+        let handle = spawn(
+            dispatcher(Arc::clone(&table), Arc::clone(&sink), 7),
+            8,
+            &signal,
+            10,
+        );
+        signal.wake();
+        wait_until(|| table.remaining() == 0).await;
+        handle.shutdown().await;
+        let delivered = sink.delivered.lock().unwrap().clone();
+        let mut per_instance: HashMap<String, Vec<String>> = HashMap::new();
+        for (instance, id) in delivered {
+            per_instance.entry(instance).or_default().push(id);
+        }
+        for (instance, ids) in per_instance {
+            let mut sorted = ids.clone();
+            sorted.sort();
+            assert_eq!(ids, sorted, "{instance} delivered out of order");
+        }
+    }
+
+    /// A row reserved and handed off by a step commit is delivered once — never also through
+    /// the claim, even though it is due in the table the whole time.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_handed_off_row_is_never_also_claimed() {
+        let table = Arc::new(Table::default());
+        let sink = Arc::new(SlowSink::new(20));
+        let signal = OutboxSignal::new();
+        // A 1 ms tick: the claim runs constantly while the hand-off is in flight.
+        let handle = spawn(
+            dispatcher(Arc::clone(&table), Arc::clone(&sink), 50),
+            4,
+            &signal,
+            1,
+        );
+        wait_until(|| signal.accepts_hand_off()).await;
+        for i in 0..30 {
+            let r = row(&format!("h{i:02}"), &format!("inst-{i}"), "test://local");
+            signal.reserve(std::slice::from_ref(&r.entry_id));
+            table.insert(r.clone()); // the "commit"
+            signal.hand_off(&dep(), vec![r]);
+        }
+        wait_until(|| table.remaining() == 0).await;
+        handle.shutdown().await;
+        assert_eq!(sink.delivered.lock().unwrap().len(), 30);
+        assert_eq!(signal.inflight_count(), 0);
+    }
+
+    /// With no dispatcher running a hand-off releases the rows and wakes, so the next claim
+    /// delivers them — a hand-off can never drop a row.
+    #[tokio::test]
+    async fn a_hand_off_without_a_dispatcher_falls_back_to_the_claim() {
+        let signal = OutboxSignal::new();
+        let r = row("x1", "inst", "test://local");
+        signal.reserve(std::slice::from_ref(&r.entry_id));
+        assert!(!signal.accepts_hand_off());
+        signal.hand_off(&dep(), vec![r]);
+        assert_eq!(signal.inflight_count(), 0);
+    }
+
+    /// A failed delivery is deferred exactly as by the serial loop, and released from flight.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_delivery_is_deferred_and_released() {
+        let table = Arc::new(Table::default());
+        table.insert(row("ok1", "i1", "test://i1"));
+        table.insert(row("bad", "i2", "test://i2"));
+        let mut slow = SlowSink::new(1);
+        slow.fail = Some("bad".to_string());
+        let sink = Arc::new(slow);
+        let signal = OutboxSignal::new();
+        let handle = spawn(
+            dispatcher(Arc::clone(&table), Arc::clone(&sink), 50),
+            4,
+            &signal,
+            10,
+        );
+        signal.wake();
+        wait_until(|| table.deferred.lock().unwrap().contains(&"bad".to_string())).await;
+        wait_until(|| table.remaining() == 1).await;
+        handle.shutdown().await;
+        assert_eq!(signal.inflight_count(), 0);
+        assert_eq!(sink.delivered.lock().unwrap().len(), 1);
     }
 }

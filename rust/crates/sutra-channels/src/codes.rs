@@ -75,6 +75,11 @@ pub const SELECTOR_COMPILE_FAILED: &str = "SUTRA.RESOLVE.SELECTOR_COMPILE_FAILED
 pub const INBOUND_VALIDATION_REJECT: &str = "SUTRA.INBOUND.VALIDATION_REJECT";
 pub const INBOUND_VALIDATION_ERROR: &str = "SUTRA.INBOUND.VALIDATION_ERROR";
 pub const INBOUND_PERSISTENCE_REQUIRED: &str = "SUTRA.INBOUND.PERSISTENCE_REQUIRED";
+/// Two deliveries of the same event (the same idempotency key on the same channel) ran at the
+/// same time and the other one's step committed first; this delivery's step rolled back. The event
+/// was processed exactly once. An in-process delivery treats it as delivered; a transport caller
+/// gets it as a conflict.
+pub const INBOUND_DUPLICATE_CONCURRENT: &str = "SUTRA.INBOUND.DUPLICATE_CONCURRENT";
 pub const INBOUND_ALIAS_CONFLICT_REJECT: &str = "SUTRA.INBOUND.ALIAS_CONFLICT_REJECT";
 /// A NON-IDEMPOTENT process (`<q:process idempotent="false">`, the default) failed during
 /// execution. Blind redelivery-and-reprocess would duplicate side effects, so the inbound is

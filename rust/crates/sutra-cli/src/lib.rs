@@ -289,6 +289,10 @@ pub fn run_with_update_source(version: impl Into<String>, source: UpdateSource) 
 }
 
 pub fn run_with_version(version: impl Into<String>) -> i32 {
+    // The build links rustls with two crypto providers (the SQL Server driver enables
+    // aws-lc-rs); with two compiled in rustls has no implicit default, so pick ring — the
+    // provider the rest of the tree uses — before any TLS client (kube, reqwest) is built.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let version = version.into();
     let command = SutraCli::command()
         .name(program_name())
@@ -302,11 +306,14 @@ pub fn run_with_version(version: impl Into<String>) -> i32 {
     };
     init_tracing(cli.global.verbose);
 
-    let stdout = std::io::stdout();
-    let stderr = std::io::stderr();
+    // stdout/stderr are passed UNLOCKED (each write takes the lock for that write only). A
+    // command that boots an engine in-process (`test simulate`) runs its tracing on runtime
+    // worker threads, and those write to stderr too: holding `stderr.lock()` here for the whole
+    // command made the first such log line block forever on the main thread's lock — the engine
+    // never finished booting, and only at a log level that logs during boot (`-v`, RUST_LOG).
+    let mut out = std::io::stdout();
+    let mut err = std::io::stderr();
     let stdin = std::io::stdin();
-    let mut out = stdout.lock();
-    let mut err = stderr.lock();
     let mut input = stdin.lock();
     let mut io = output::Io {
         out: &mut out,

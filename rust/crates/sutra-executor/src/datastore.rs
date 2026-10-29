@@ -71,6 +71,14 @@ pub trait DataStore {
         Ok(-1)
     }
 
+    /// The value at `key` and its revision, as one read where the store can (a data task
+    /// reads both). The default reads them one after the other.
+    async fn get_with_revision(&self, key: &str) -> Result<(Option<FeelValue>, i64), StoreError> {
+        let value = self.get(key).await?;
+        let revision = self.revision(key).await?;
+        Ok((value, revision))
+    }
+
     /// Compare-and-set: write only if the current revision equals `expected_rev`, returning
     /// whether the write applied. A store that does not track revisions writes unconditionally
     /// and returns `Ok(true)`. A backend failure is `Err` (distinct from an `Ok(false)` conflict).
@@ -135,8 +143,9 @@ struct StoreCell {
 
 /// In-memory [`DataStore`] with revision tracking and buffered transactions: a transaction
 /// works on a copy and publishes on `commit` (a `rollback` discards), exactly like the durable
-/// store's real transaction. Its async methods never error.
-#[derive(Debug, Default)]
+/// store's real transaction. Its async methods never error. A clone is another handle on the
+/// SAME contents (the storage is shared), like a second handle on one pool.
+#[derive(Debug, Default, Clone)]
 pub struct InMemoryDataStore {
     name: String,
     cell: Rc<RefCell<StoreCell>>,

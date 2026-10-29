@@ -249,9 +249,28 @@ impl MessageSink for LocalDeliverySink {
             // Mirror `EngineIntake::deliver`: Ok ⇒ delivered (first-observer owns it); an
             // unavailable engine actor ⇒ retryable (a later tick redelivers, inbox dedup
             // absorbs it); every reject diagnostic ⇒ permanent (poison isolation).
-            match self.engine.dispatch(inbound).await {
+            match self.engine.dispatch_continuation(inbound).await {
                 Ok(_) => SendOutcome::Delivered,
                 Err(diagnostic) if is_engine_unavailable(&diagnostic) => {
+                    SendOutcome::RetryableFailure(diagnostic)
+                }
+                // Another delivery of the same event committed first: it was processed exactly
+                // once, so this delivery is done.
+                Err(diagnostic)
+                    if diagnostic.code == crate::codes::INBOUND_DUPLICATE_CONCURRENT =>
+                {
+                    SendOutcome::Delivered
+                }
+                // A reject the engine marks retry-safe (nothing was executed — e.g. the target
+                // instance is claimed by another lane or replica right now) is retried with the
+                // outbox's backoff, not poisoned.
+                Err(diagnostic)
+                    if diagnostic
+                        .attributes
+                        .get(crate::dispatch::ACK_DISPOSITION_ATTR)
+                        .map(String::as_str)
+                        == Some(crate::dispatch::ACK_DISPOSITION_REQUEUE) =>
+                {
                     SendOutcome::RetryableFailure(diagnostic)
                 }
                 Err(diagnostic) => SendOutcome::PermanentFailure(diagnostic),

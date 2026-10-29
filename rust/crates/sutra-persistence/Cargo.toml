@@ -39,7 +39,7 @@ sqlx = { version = "0.8", default-features = false, features = [
 # MSSQL dialect (feature `mssql`): TDS 7.3+ protocol client, TLS via rustls, `time` type
 # mappings for DATETIME2. tokio supplies the TCP socket, tokio-util the AsyncRead/Write
 # compatibility wrapper tiberius expects.
-tiberius = { version = "0.12", default-features = false, features = [
+tiberius = { version = "0.13", default-features = false, features = [
     "tds73",
     "rustls",
     "time",

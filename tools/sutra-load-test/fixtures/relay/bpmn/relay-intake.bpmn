@@ -1,0 +1,122 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  relay-intake: the first process of the relay-bench workload.
+
+    startEvent (order-in, validated)  -> LoadSettings, LoadParty (two data-store reads)
+    -> BuildForward -> Forward (send to-worker, local)
+    -> AwaitAnswer (receive on answer-in, correlated by ref)
+    -> BuildCallback -> Callback (send callback-out, HTTP) -> End
+-->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0"
+                  id="Definitions_relay_intake"
+                  targetNamespace="urn:sutra:module:relay-bench:1.0.0">
+
+  <bpmn:dataStore id="refStore" name="refdata"/>
+
+  <bpmn:process id="relay-intake" name="Relay intake" isExecutable="true">
+    <bpmn:extensionElements>
+      <q:variables>
+        <q:variable name="answer" type="object"/>
+        <q:variable name="responseBody" type="object"/>
+      </q:variables>
+    </bpmn:extensionElements>
+
+    <bpmn:dataObject id="doSettings" name="settings"/>
+    <bpmn:dataObject id="doParty" name="party"/>
+
+    <bpmn:dataStoreReference id="dsrSettings" name="refdata" dataStoreRef="refStore">
+      <bpmn:extensionElements><q:store key="&quot;default&quot;"/></bpmn:extensionElements>
+    </bpmn:dataStoreReference>
+    <bpmn:dataStoreReference id="dsrParty" name="refdata" dataStoreRef="refStore">
+      <bpmn:extensionElements><q:store key="payload.party"/></bpmn:extensionElements>
+    </bpmn:dataStoreReference>
+
+    <bpmn:startEvent id="Start" name="Order received">
+      <bpmn:extensionElements>
+        <q:source channel="order-in">
+          <q:validators>
+            <q:complexValidator source="order-check.srl"/>
+          </q:validators>
+        </q:source>
+        <q:onValidation mode="reject"/>
+        <q:alias name="orderRef" expression="payload.ref" unique="true"/>
+      </bpmn:extensionElements>
+      <bpmn:outgoing>F1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="F1" sourceRef="Start" targetRef="LoadSettings"/>
+
+    <bpmn:serviceTask id="LoadSettings" name="Read settings">
+      <bpmn:incoming>F1</bpmn:incoming><bpmn:outgoing>F2</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:sourceRef>dsrSettings</bpmn:sourceRef>
+        <bpmn:targetRef>doSettings</bpmn:targetRef>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F2" sourceRef="LoadSettings" targetRef="LoadParty"/>
+
+    <bpmn:serviceTask id="LoadParty" name="Read the party">
+      <bpmn:incoming>F2</bpmn:incoming><bpmn:outgoing>F3</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:sourceRef>dsrParty</bpmn:sourceRef>
+        <bpmn:targetRef>doParty</bpmn:targetRef>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F3" sourceRef="LoadParty" targetRef="BuildForward"/>
+
+    <bpmn:serviceTask id="BuildForward" name="Build the forward (FEEL)">
+      <bpmn:incoming>F3</bpmn:incoming><bpmn:outgoing>F4</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment>
+          <bpmn:from>{ref: payload.ref, amount: payload.amount, party: party.name}</bpmn:from>
+          <bpmn:to>responseBody</bpmn:to>
+        </bpmn:assignment>
+      </bpmn:dataInputAssociation>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment>
+          <bpmn:from>{ref: payload.ref}</bpmn:from>
+          <bpmn:to>answer</bpmn:to>
+        </bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F4" sourceRef="BuildForward" targetRef="Forward"/>
+
+    <bpmn:sendTask id="Forward" name="Forward to the worker">
+      <bpmn:extensionElements>
+        <q:send channel="to-worker"/>
+      </bpmn:extensionElements>
+      <bpmn:incoming>F4</bpmn:incoming><bpmn:outgoing>F5</bpmn:outgoing>
+    </bpmn:sendTask>
+    <bpmn:sequenceFlow id="F5" sourceRef="Forward" targetRef="AwaitAnswer"/>
+
+    <bpmn:receiveTask id="AwaitAnswer" name="Await the worker's answer">
+      <bpmn:extensionElements>
+        <q:source channel="answer-in" name="answer"/>
+        <q:alias name="answerRef" expression="answer.ref" unique="true"/>
+      </bpmn:extensionElements>
+      <bpmn:incoming>F5</bpmn:incoming><bpmn:outgoing>F6</bpmn:outgoing>
+    </bpmn:receiveTask>
+    <bpmn:sequenceFlow id="F6" sourceRef="AwaitAnswer" targetRef="BuildCallback"/>
+
+    <bpmn:serviceTask id="BuildCallback" name="Build the callback (FEEL)">
+      <bpmn:incoming>F6</bpmn:incoming><bpmn:outgoing>F7</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment>
+          <bpmn:from>{ref: payload.ref, status: answer.status, sentAt: payload.sentAt}</bpmn:from>
+          <bpmn:to>responseBody</bpmn:to>
+        </bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F7" sourceRef="BuildCallback" targetRef="Callback"/>
+
+    <bpmn:sendTask id="Callback" name="Call back">
+      <bpmn:extensionElements>
+        <q:send channel="callback-out"/>
+      </bpmn:extensionElements>
+      <bpmn:incoming>F7</bpmn:incoming><bpmn:outgoing>F8</bpmn:outgoing>
+    </bpmn:sendTask>
+    <bpmn:sequenceFlow id="F8" sourceRef="Callback" targetRef="End"/>
+
+    <bpmn:endEvent id="End" name="Settled"><bpmn:incoming>F8</bpmn:incoming></bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>

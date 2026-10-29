@@ -21,13 +21,14 @@ use sutra_bpmn::model::ProcessModule;
 use sutra_channels::http::{spawn_engine_sharded, EngineHandle};
 use sutra_channels::sink::{scheme_of, LocalDeliverySink, SinkRegistry};
 use sutra_channels::{
-    load_channel_definitions, spawn_dispatch_loop, ActiveInstanceCount, AllowAllFeatureProvider,
-    ChannelDefinition, ChannelEngine, CodecRegistry, CollectingOutbox, ConcurrencyStore,
-    DefaultTenantQuotaEnforcer, DeferredAckListener, DeferredAckRegistry, DmnContentValidator,
-    DrainingSink, InMemoryActiveInstanceCount, InMemoryAliasStore, InMemoryConcurrencyStore,
-    InMemoryInboxStore, InboundChain, LiveDeploymentSet, OutboxDispatcher, OutboxDispatcherHandle,
-    PayloadCapPolicy, ProcessModuleRegistry, RedactorRegistry, RetryPolicy, SrlContentValidator,
-    StaticTenantConfigSource, ValidatorRegistry,
+    load_channel_definitions, spawn_concurrent_dispatch_loop, ActiveInstanceCount,
+    AllowAllFeatureProvider, ChannelDefinition, ChannelEngine, CodecRegistry, CollectingOutbox,
+    ConcurrencyStore, DefaultTenantQuotaEnforcer, DeferredAckListener, DeferredAckRegistry,
+    DmnContentValidator, DrainingSink, InMemoryActiveInstanceCount, InMemoryAliasStore,
+    InMemoryConcurrencyStore, InMemoryInboxStore, InboundChain, LiveDeploymentSet,
+    OutboxDispatcher, OutboxDispatcherHandle, PayloadCapPolicy, ProcessModuleRegistry,
+    RedactorRegistry, RetryPolicy, SrlContentValidator, StaticTenantConfigSource,
+    ValidatorRegistry,
 };
 use sutra_persistence::stores::{PgChannelConcurrencyStore, PgInstanceStore};
 use sutra_transport_spi::{
@@ -112,6 +113,9 @@ pub(crate) struct DeploymentPlan {
     /// Module-owned durable stores by name (shared pools — every dialect store is
     /// cheap-clone). The backend is picked by the connection URL scheme at plan time.
     stores: Vec<(String, StoreBackend)>,
+    /// Each store's opt-in read cache (`datastores.yaml` `cache:`), by store name. A store with
+    /// no entry (or a disabled one) is served uncached.
+    store_caches: HashMap<String, sutra_datastore::CacheConfig>,
     /// The deployment's COVERAGE store, built from its own `coverage` declaration in
     /// `datastores.yaml`: the author picks the database,
     /// the engine owns the schema and applies it on first use. `None` when the deployment
@@ -435,6 +439,14 @@ pub(crate) fn build_engine_runtime(
     // The activation-initial coverage snapshot the caller pre-read via
     // `seed_declared_coverage` (async — hence read BEFORE this sync assembly).
     initial_coverage: crate::otel::InitialCoverage,
+    // The concurrent outbox dispatcher's sizing (`sutra.outbox.workers` / `.batch-size`).
+    outbox_tuning: crate::config::OutboxTuning,
+    // The enqueue → dispatcher link (wake + local hand-off), shared by every lane's bridge
+    // and the dispatcher this runtime spawns.
+    outbox_signal: sutra_channels::OutboxSignal,
+    // The DISPATCH pool (`sutra.datasource.dispatch-max-connections`) the outbox dispatcher
+    // draws from, so it never waits behind the lanes for a connection. `None` = use `pool`.
+    dispatch_pool: Option<PgPool>,
 ) -> Result<EngineRuntime, Box<dyn std::error::Error>> {
     // Channel topology comes from the ACTIVE plans only — a draining definition claims no
     // binding and no route (it exists to be resumed into, never to accept new intake).
@@ -458,6 +470,7 @@ pub(crate) fn build_engine_runtime(
     let actor_key_provider = key_provider;
     let actor_deferred_acks = Arc::clone(&deferred_acks);
     let actor_now_override = now_override;
+    let actor_outbox_signal = outbox_signal.clone();
     // The capacity-pool store: ONE per runtime, shared by every lane and the outbox dispatcher
     // (installed before the lanes are built, so each of them picks it up).
     let capacity = crate::capacity::build_capacity_store(pool.clone());
@@ -496,6 +509,7 @@ pub(crate) fn build_engine_runtime(
                 shard,
                 lane_metrics,
                 initial_coverage.clone(),
+                actor_outbox_signal.clone(),
             )
         },
     );
@@ -611,7 +625,8 @@ pub(crate) fn build_engine_runtime(
             external_task_limits.clone(),
         ))
     });
-    let outbox_handle = pool.map(|pool| {
+    let outbox_handle = pool.map(|main_pool| {
+        let pool = dispatch_pool.unwrap_or(main_pool);
         // The delivery-side incident sink, opt-in via the SAME `sutra.incident.sql` gate as the
         // inbound dead-letter sink: a poisoned `<q:send required>` entry records ONE durable
         // incident. Async-safe (it spawns rather than blocks) because the dispatcher is a runtime
@@ -660,7 +675,7 @@ pub(crate) fn build_engine_runtime(
             // `None` keeps the retry-forever posture the outbox has always had; a configured
             // ceiling makes an exhausted entry terminal + incident-raising instead.
             .with_max_attempts(outbox_retry.max_attempts),
-            50,
+            outbox_tuning.batch_size,
         );
         if let Some(incidents) = outbox_incidents {
             dispatcher_build = dispatcher_build.with_incident_sink(incidents);
@@ -713,14 +728,23 @@ pub(crate) fn build_engine_runtime(
         info!(
             deployments = deployment_ids.len(),
             tick = ?outbox_tick_interval,
+            workers = outbox_tuning.workers,
+            batch_size = outbox_tuning.batch_size,
             transports = transport_factories().len(),
             "outbox dispatcher spawned (http/https + one broker sink per registered transport)"
         );
-        spawn_dispatch_loop(
+        // The concurrent dispatcher: woken by every step commit that enqueues, handed local
+        // rows straight from those commits, `tick` kept as the fallback for retries and rows
+        // other replicas enqueued.
+        spawn_concurrent_dispatch_loop(
             &handle,
             dispatcher,
             deployments.clone(),
             outbox_tick_interval,
+            sutra_channels::OutboxConcurrency {
+                workers: outbox_tuning.workers,
+            },
+            outbox_signal.clone(),
         )
     });
     Ok(EngineRuntime {
@@ -1052,6 +1076,17 @@ pub(crate) fn plan_deployment(
     // never an instance failure.
     let config = Arc::new(resolve_deployment_config(d)?);
     check_timer_config_declared(&dep, &modules, &config)?;
+    // A timer expression that reads a name nothing provides — the deploy-time backstop of the
+    // same lint check, for an archive built elsewhere.
+    if let Some(fault) = sutra_loader::lint::timer_expression_name_faults(d, &dep.to_string())
+        .into_iter()
+        .next()
+    {
+        return Err(Box::new(sutra_loader::LoaderError::new(
+            sutra_bpmn::codes::CONFIG_BPMN_TIMER_EXPRESSION_UNKNOWN_NAME,
+            fault.message,
+        )));
+    }
     let resolved_start_timers = resolve_start_timer_expressions(&dep, &modules, &config)?;
 
     let templates = d
@@ -1318,6 +1353,7 @@ pub(crate) fn plan_deployment(
     // Data stores — each store OWNS its connection (datastores.yaml, env-indirected).
     // Pre-cutover compat: INSERTs stamp the legacy namespace triple (see sutra-datastore).
     let mut stores = Vec::new();
+    let mut store_caches: HashMap<String, sutra_datastore::CacheConfig> = HashMap::new();
     let mut coverage = None;
     let mut coverage_fault = None;
     if let Some(yaml) = &d.datastores_yaml {
@@ -1382,6 +1418,12 @@ pub(crate) fn plan_deployment(
                     })?)
                 }
             };
+            let cache = def
+                .cache_config()
+                .map_err(|e| format!("datastores.yaml of deployment {dep} failed to load: {e}"))?;
+            if cache.enabled {
+                store_caches.insert(def.name.clone(), cache);
+            }
             match build_store_backend(
                 def,
                 migrations,
@@ -1453,6 +1495,7 @@ pub(crate) fn plan_deployment(
         definitions,
         outbound,
         stores,
+        store_caches,
         coverage,
         coverage_fault,
         openapi_spec,
@@ -1935,6 +1978,8 @@ pub(crate) fn build_engine(
     // `seed_declared_coverage`, applied per lane) — Phase 3 keeps the engine build
     // `block_on`-free so the flip's rebuild may run on a lane's async actor task.
     initial_coverage: crate::otel::InitialCoverage,
+    // The runtime's enqueue → dispatcher link, handed to this lane's persistence bridge.
+    outbox_signal: sutra_channels::OutboxSignal,
 ) -> ChannelEngine {
     let prior_deployments: Vec<DeploymentId> =
         draining.iter().map(|plan| plan.dep.clone()).collect();
@@ -1978,6 +2023,14 @@ pub(crate) fn build_engine(
                 StoreBackend::Pg(s) => Rc::new(PgStore::new(s.clone())),
                 StoreBackend::Mysql(s) => Rc::new(MysqlStore::new(s.clone())),
                 StoreBackend::Mssql(s) => Rc::new(MssqlStore::new(s.clone())),
+            };
+            // The opt-in read cache, shared by every lane for this (deployment, store).
+            let bound: Rc<dyn DataStore> = match plan.store_caches.get(name) {
+                Some(config) => Rc::new(crate::stores::CachedStore::new(
+                    bound,
+                    crate::stores::shared_cache(plan.dep.value(), name, *config),
+                )),
+                None => bound,
             };
             store_map.insert((plan.dep.value().to_string(), name.clone()), bound);
         }
@@ -2383,7 +2436,8 @@ pub(crate) fn build_engine(
                     .with_retention(instance_retention)
                     // Shard-scoped ownership: same owner ⇒ same lane ⇒ already serialised
                     // (`-s0` at the single-lane default; the store treats it as opaque).
-                    .with_shard_owner(shard.index),
+                    .with_shard_owner(shard.index)
+                    .with_outbox_signal(outbox_signal),
             );
             // The durable dead-letter sink, opt-in via `sutra.incident.sql`.
             if incident_sql {

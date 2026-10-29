@@ -540,6 +540,8 @@ pub(crate) struct ActivationHooks {
     /// engine, so a hot-deploy cannot silently flip a deployment back to delete-at-terminal
     /// (or on to retention) mid-flight.
     pub(crate) instance_retention: std::time::Duration,
+    /// The runtime's outbox enqueue → dispatcher link, handed to every rebuilt lane's bridge.
+    pub(crate) outbox_signal: sutra_channels::OutboxSignal,
     /// The engine-PROCESS-scoped deferred-ack registry, re-registered on each
     /// activated engine (listener + park-arm hook) so pending broker acks from a
     /// pre-flip activation still settle when their instance resumes post-flip.
@@ -657,6 +659,7 @@ pub(crate) async fn activate_plans(
     let key_provider = hooks.key_provider.clone();
     let incident_sql = hooks.incident_sql;
     let instance_retention = hooks.instance_retention;
+    let outbox_signal = hooks.outbox_signal.clone();
     let deferred_acks = std::sync::Arc::clone(&hooks.deferred_acks);
     let now_override = hooks.now_override.clone();
     // Control-plane fan-out (execution scale-out §5.1): the factory below is called once
@@ -680,6 +683,7 @@ pub(crate) async fn activate_plans(
             let deferred_acks = std::sync::Arc::clone(&deferred_acks);
             let now_override = now_override.clone();
             let initial_coverage = initial_coverage.clone();
+            let outbox_signal = outbox_signal.clone();
             Box::new(move |engine: &mut sutra_channels::ChannelEngine| {
                 // The rebuilt engine keeps the lane identity (and the lane's §6.1
                 // counter handle) of the engine it replaces — the Update runs ON that
@@ -705,6 +709,7 @@ pub(crate) async fn activate_plans(
                     shard,
                     shard_metrics,
                     initial_coverage,
+                    outbox_signal,
                 );
             })
         })

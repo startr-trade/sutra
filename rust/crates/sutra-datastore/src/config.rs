@@ -144,6 +144,119 @@ impl StoreDefinition {
             acquire_timeout,
         })
     }
+
+    /// Resolve this store's optional read cache from its `cache:` block (`cache.enabled`,
+    /// `cache.maxEntries`, `cache.ttl`). Absent ⇒ [`CacheConfig::default`] (disabled). Fails
+    /// closed on an unknown key or a malformed value, so a typo cannot silently leave a cache
+    /// off (or on).
+    pub fn cache_config(&self) -> Result<CacheConfig, DataStoreError> {
+        let mut config = CacheConfig::default();
+        let bad = |key: &str, raw: &str, expected: &str| {
+            DataStoreError::new(format!(
+                "data store '{}' has an invalid cache.{key} '{raw}' (expected {expected})",
+                self.name
+            ))
+        };
+        for (key, raw) in &self.properties {
+            let Some(field) = key.strip_prefix("cache.") else {
+                if key == "cache" {
+                    return Err(bad("", raw, "a mapping: enabled, maxEntries, ttl"));
+                }
+                continue;
+            };
+            match field {
+                "enabled" => {
+                    config.enabled = match raw.trim() {
+                        "true" => true,
+                        "false" => false,
+                        _ => return Err(bad(field, raw, "true or false")),
+                    }
+                }
+                "maxEntries" => {
+                    config.max_entries = raw
+                        .trim()
+                        .parse::<usize>()
+                        .ok()
+                        .filter(|n| *n > 0)
+                        .ok_or_else(|| bad(field, raw, "a positive integer"))?
+                }
+                "ttl" => {
+                    config.ttl = parse_iso_seconds(raw.trim()).ok_or_else(|| {
+                        bad(field, raw, "an ISO-8601 duration such as PT0S or PT2S")
+                    })?
+                }
+                other => {
+                    return Err(DataStoreError::new(format!(
+                        "data store '{}' has an unknown cache key '{other}' (allowed: enabled, \
+                         maxEntries, ttl)",
+                        self.name
+                    )))
+                }
+            }
+        }
+        Ok(config)
+    }
+}
+
+/// A store's opt-in read cache (`datastores.yaml` `cache:` block).
+///
+/// A cached key is served with ONE revision check instead of a full read while `ttl` is zero
+/// (the default): every write made through the engine bumps the row's revision, so the next read
+/// on any replica sees it. With a positive `ttl` a cached key is served with no query at all for
+/// that long — writes through THIS engine still invalidate it at once, but a write by another
+/// replica or by SQL outside the engine shows only once the entry is older than `ttl`.
+/// A write made by SQL outside the engine must bump `rev` (`rev = rev + 1`) to be seen by the
+/// revision check; one that does not is seen only when the entry is evicted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CacheConfig {
+    /// `cache.enabled` — default `false`.
+    pub enabled: bool,
+    /// `cache.maxEntries` — the most keys kept; the least recently read is evicted first.
+    /// Default `1000`.
+    pub max_entries: usize,
+    /// `cache.ttl` — how long a cached key is served without a revision check. Default `PT0S`
+    /// (always check).
+    pub ttl: Duration,
+}
+
+impl Default for CacheConfig {
+    fn default() -> CacheConfig {
+        CacheConfig {
+            enabled: false,
+            max_entries: 1000,
+            ttl: Duration::ZERO,
+        }
+    }
+}
+
+/// `PT[nH][nM][n[.n]S]` → a duration; `None` for anything else (no days/months: a cache
+/// lifetime is short by nature).
+fn parse_iso_seconds(raw: &str) -> Option<Duration> {
+    let rest = raw.strip_prefix("PT").or_else(|| raw.strip_prefix("pt"))?;
+    if rest.is_empty() {
+        return None;
+    }
+    let mut total = 0f64;
+    let mut number = String::new();
+    for c in rest.chars() {
+        match c {
+            '0'..='9' | '.' => number.push(c),
+            'H' | 'h' | 'M' | 'm' | 'S' | 's' => {
+                let n: f64 = number.parse().ok()?;
+                number.clear();
+                total += n * match c.to_ascii_uppercase() {
+                    'H' => 3600.0,
+                    'M' => 60.0,
+                    _ => 1.0,
+                };
+            }
+            _ => return None,
+        }
+    }
+    if !number.is_empty() || !total.is_finite() || total < 0.0 {
+        return None;
+    }
+    Some(Duration::from_secs_f64(total))
 }
 
 /// Resolve a secret-ref (`env:VAR`). `k8s:` / `vault:` schemes are a follow-on.
@@ -391,6 +504,41 @@ fn required_string(
                 "datastores YAML entry {index} missing required string '{key}'"
             ))
         })
+}
+
+#[cfg(test)]
+mod cache_config_tests {
+    use super::*;
+
+    fn def(yaml_cache: &str) -> StoreDefinition {
+        let yaml = format!(
+            "datastores:\n  - name: ref\n    type: sql\n    sql:\n      url: postgres://h/db\n{yaml_cache}"
+        );
+        parse_datastores(&yaml).expect("parses").remove(0)
+    }
+
+    #[test]
+    fn the_cache_is_off_by_default_and_parses_every_key() {
+        assert_eq!(def("").cache_config().unwrap(), CacheConfig::default());
+        let c = def("    cache:\n      enabled: true\n      maxEntries: 50\n      ttl: PT2.5S\n")
+            .cache_config()
+            .unwrap();
+        assert!(c.enabled);
+        assert_eq!(c.max_entries, 50);
+        assert_eq!(c.ttl, Duration::from_millis(2500));
+    }
+
+    #[test]
+    fn a_malformed_or_unknown_cache_key_is_refused() {
+        for bad in [
+            "    cache:\n      enabled: yes-please\n",
+            "    cache:\n      maxEntries: 0\n",
+            "    cache:\n      ttl: 5 seconds\n",
+            "    cache:\n      size: 10\n",
+        ] {
+            assert!(def(bad).cache_config().is_err(), "{bad}");
+        }
+    }
 }
 
 #[cfg(test)]

@@ -209,6 +209,8 @@ async fn boot(package_dir: PathBuf, datasource_url: &str) -> RunningEngine {
         datasource_password: None,
         // Fast dispatcher ticks: the tests observe actual delivery to the capture sink.
         outbox_tick_interval: std::time::Duration::from_millis(200),
+        outbox_tuning: Default::default(),
+        datasource_pools: Default::default(),
         outbox_retry: Default::default(),
         deferred_ack: Default::default(),
         external_task: Default::default(),

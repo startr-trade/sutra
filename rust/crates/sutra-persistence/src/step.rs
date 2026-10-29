@@ -91,6 +91,12 @@ pub struct StepWrite {
     /// callers pass the full marked set, not a delta. Empty for every step outside the
     /// channel-call retry feature — the pre-F1 behaviour.
     pub withdrawn_call_nodes: Vec<String>,
+    /// Inbox dedup records `(channel, event_id)` of the deliveries this step processes, written
+    /// in the SAME transaction (0.6.5): the record exists iff the step's effects do, so a crash
+    /// before the commit leaves the delivery unrecorded and its redelivery runs, and a delivery
+    /// whose record another delivery committed first rolls the step back
+    /// ([`PersistenceError::InboxDuplicate`]).
+    pub inbox_seen: Vec<(String, String)>,
 }
 
 /// Commits one logical step in a single deployment-scoped transaction — or nothing.
@@ -119,6 +125,7 @@ pub async fn commit_step(pool: &sqlx::PgPool, step: &StepWrite) -> Result<()> {
 /// can prove atomicity by dropping the transaction before commit; production callers use
 /// [`commit_step`].
 pub async fn write_step_in(conn: &mut sqlx::PgConnection, step: &StepWrite) -> Result<()> {
+    record_inbox_seen_in(conn, &step.deployment, &step.inbox_seen).await?;
     for node_id in &step.resolved_waits {
         sqlx::query(
             "UPDATE waiting_event SET status = 'RESOLVED', resolved_at = CURRENT_TIMESTAMP \
@@ -216,6 +223,30 @@ pub async fn write_step_in(conn: &mut sqlx::PgConnection, step: &StepWrite) -> R
 
     for entry in &step.outbox {
         PgOutboxStore::enqueue_in(conn, entry).await?;
+    }
+    Ok(())
+}
+
+/// Write inbox dedup records on an open transaction; the first that another delivery already
+/// committed fails the transaction with [`PersistenceError::InboxDuplicate`]. A concurrent
+/// insert of the same key blocks on the unique index until the other transaction ends, so the
+/// loser always sees the winner's row.
+pub async fn record_inbox_seen_in(
+    conn: &mut sqlx::PgConnection,
+    deployment: &DeploymentId,
+    records: &[(String, String)],
+) -> Result<()> {
+    for (channel, event_id) in records {
+        let first =
+            crate::stores::PgInboxStore::record_seen_in(conn, deployment, channel, event_id)
+                .await?;
+        if !first {
+            return Err(PersistenceError::InboxDuplicate {
+                deployment: deployment.clone(),
+                channel: channel.clone(),
+                event_id: event_id.clone(),
+            });
+        }
     }
     Ok(())
 }

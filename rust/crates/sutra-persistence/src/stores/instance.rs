@@ -622,6 +622,34 @@ impl InstanceStore for PgInstanceStore {
     }
 }
 
+impl PgInstanceStore {
+    /// [`InstanceStore::claim`] whose commit does not wait for its WAL flush. Losing the claim in
+    /// a crash is harmless: it is the crashed process's own ownership, which a restart voids
+    /// anyway (a durable claim would instead sit until `sutra.instance.claim-timeout`). The step
+    /// that follows a granted claim commits synchronously, and with it the claim.
+    pub async fn claim_flush_deferred(
+        &self,
+        deployment: &DeploymentId,
+        instance_id: Uuid,
+        claim_owner: &str,
+    ) -> Result<bool> {
+        let mut tx =
+            crate::scope::begin_deployment_tx_flush_deferred(&self.pool, deployment).await?;
+        let updated = sqlx::query(SQL_CLAIM)
+            .bind(claim_owner)
+            .bind(deployment.as_str())
+            .bind(instance_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(PersistenceError::db("instance claim"))?
+            .rows_affected();
+        tx.commit()
+            .await
+            .map_err(PersistenceError::db("instance claim commit"))?;
+        Ok(updated == 1)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;

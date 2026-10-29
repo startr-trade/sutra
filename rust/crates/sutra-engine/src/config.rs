@@ -10,7 +10,11 @@
 //! | `sutra.datasource.url`            | `SUTRA_DATASOURCE_URL`            |
 //! | `sutra.datasource.username`       | `SUTRA_DATASOURCE_USERNAME`       |
 //! | `sutra.datasource.password`       | `SUTRA_DATASOURCE_PASSWORD`       |
+//! | `sutra.datasource.max-connections` | `SUTRA_DATASOURCE_MAX_CONNECTIONS` |
+//! | `sutra.datasource.dispatch-max-connections` | `SUTRA_DATASOURCE_DISPATCH_MAX_CONNECTIONS` |
 //! | `sutra.outbox.tick-interval`      | `SUTRA_OUTBOX_TICK_INTERVAL`      |
+//! | `sutra.outbox.workers`            | `SUTRA_OUTBOX_WORKERS`            |
+//! | `sutra.outbox.batch-size`         | `SUTRA_OUTBOX_BATCH_SIZE`         |
 //! | `sutra.outbox.retry.base-delay`   | `SUTRA_OUTBOX_RETRY_BASE_DELAY`   |
 //! | `sutra.outbox.retry.max-delay`    | `SUTRA_OUTBOX_RETRY_MAX_DELAY`    |
 //! | `sutra.outbox.retry.jitter`       | `SUTRA_OUTBOX_RETRY_JITTER`       |
@@ -163,6 +167,12 @@ pub struct EngineConfig {
     /// Outbox dispatcher cadence (`sutra.outbox.tick-interval`, ISO-8601 duration or
     /// bare seconds). Default `PT5S` — the tick-interval default.
     pub outbox_tick_interval: std::time::Duration,
+    /// The concurrent outbox dispatcher's sizing (`sutra.outbox.workers`,
+    /// `sutra.outbox.batch-size`).
+    pub outbox_tuning: OutboxTuning,
+    /// The engine datasource pools (`sutra.datasource.max-connections` /
+    /// `sutra.datasource.dispatch-max-connections`).
+    pub datasource_pools: DatasourcePools,
     /// Outbox delivery retry curve (`sutra.outbox.retry.*`) — the FIRST instance of the
     /// generalized `sutra.<service>.retry.*` shape. Defaults reproduce the
     /// shipped hard-coded curve (base `PT1S`, max `PT5M`, jitter on), so an unconfigured
@@ -252,6 +262,8 @@ impl Default for EngineConfig {
             datasource_username: None,
             datasource_password: None,
             outbox_tick_interval: std::time::Duration::from_secs(5),
+            outbox_tuning: OutboxTuning::default(),
+            datasource_pools: DatasourcePools::default(),
             outbox_retry: RetryConfig::default(),
             deferred_ack: DeferredAckConfig::default(),
             external_task: sutra_channels::ExternalTaskLimits::default(),
@@ -435,6 +447,58 @@ impl Default for DeferredAckConfig {
     }
 }
 
+/// The engine datasource's connection pools.
+///
+/// Two pools over the one database, so the work that admits new instances and the work that
+/// finishes them never queue for the same connections: the MAIN pool serves the actor lanes
+/// (intake, steps, resumes), the DISPATCH pool serves the outbox dispatcher, the timer poller and
+/// the background sweepers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DatasourcePools {
+    /// `sutra.datasource.max-connections` (env `SUTRA_DATASOURCE_MAX_CONNECTIONS`) — the main
+    /// pool, integer >= 1, default `8` (the size hardcoded before 0.6.5). Size it at least to
+    /// `sutra.engine.shards`: each lane holds one connection while it commits a step.
+    pub max_connections: u32,
+    /// `sutra.datasource.dispatch-max-connections` (env
+    /// `SUTRA_DATASOURCE_DISPATCH_MAX_CONNECTIONS`) — the dispatch pool, integer >= 1, default
+    /// `2`: the claimer and the delete batcher each hold at most one connection at a time.
+    pub dispatch_max_connections: u32,
+}
+
+impl Default for DatasourcePools {
+    fn default() -> DatasourcePools {
+        DatasourcePools {
+            max_connections: sutra_datastore::DEFAULT_MAX_CONNECTIONS,
+            dispatch_max_connections: 2,
+        }
+    }
+}
+
+/// The concurrent outbox dispatcher's sizing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutboxTuning {
+    /// `sutra.outbox.workers` (env `SUTRA_OUTBOX_WORKERS`) — delivery workers, integer >= 1
+    /// (capped at 1024), default `sutra.engine.shards`, at least [`DEFAULT_OUTBOX_WORKERS`]. One instance's rows always go to one
+    /// worker, in order; rows of different instances are delivered in parallel. `1` delivers
+    /// one row at a time, as every release before 0.6.5 did.
+    pub workers: usize,
+    /// `sutra.outbox.batch-size` (env `SUTRA_OUTBOX_BATCH_SIZE`) — rows claimed per deployment
+    /// per claim, integer >= 1 (capped at 10 000), default `50` (the value hardcoded before 0.6.5).
+    pub batch_size: i64,
+}
+
+/// The default `sutra.outbox.workers`, chosen by benchmark (see the throughput tuning page).
+pub const DEFAULT_OUTBOX_WORKERS: usize = 8;
+
+impl Default for OutboxTuning {
+    fn default() -> OutboxTuning {
+        OutboxTuning {
+            workers: DEFAULT_OUTBOX_WORKERS,
+            batch_size: 50,
+        }
+    }
+}
+
 /// The execution shard-router knobs (`sutra.engine.*`) — the engine-actor lane count and
 /// the per-lane mailbox bound consumed by `sutra_channels::spawn_engine_sharded`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -549,6 +613,48 @@ impl EngineConfig {
             };
 
         let outbox_retry = parse_retry(&value, "outbox", "OUTBOX", RetryConfig::default())?;
+
+        // The concurrent outbox dispatcher's sizing (`sutra.outbox.workers` / `.batch-size`).
+        let outbox_defaults = OutboxTuning::default();
+        let positive = |key: &str, raw: &str| -> Result<u64, ConfigError> {
+            raw.trim()
+                .parse::<u64>()
+                .ok()
+                .filter(|n| *n >= 1)
+                .ok_or_else(|| ConfigError(format!("{key}: '{raw}' is not an integer >= 1")))
+        };
+        let pool_defaults = DatasourcePools::default();
+        let datasource_pools = DatasourcePools {
+            max_connections: match value(
+                "sutra.datasource.max-connections",
+                "SUTRA_DATASOURCE_MAX_CONNECTIONS",
+            )? {
+                None => pool_defaults.max_connections,
+                Some(raw) => positive("sutra.datasource.max-connections", &raw)?.min(10_000) as u32,
+            },
+            dispatch_max_connections: match value(
+                "sutra.datasource.dispatch-max-connections",
+                "SUTRA_DATASOURCE_DISPATCH_MAX_CONNECTIONS",
+            )? {
+                None => pool_defaults.dispatch_max_connections,
+                Some(raw) => {
+                    positive("sutra.datasource.dispatch-max-connections", &raw)?.min(10_000) as u32
+                }
+            },
+        };
+        let outbox_tuning = OutboxTuning {
+            workers: match value("sutra.outbox.workers", "SUTRA_OUTBOX_WORKERS")? {
+                // Default: one worker per lane, at least DEFAULT_OUTBOX_WORKERS — fewer workers
+                // than lanes leaves lanes idle waiting for their deliveries (benchmark: 32 lanes
+                // with 4 / 8 / 32 workers settled 192 / 406 / 498 of 500 offered per second).
+                None => 0, // resolved below, once the lane count is known
+                Some(raw) => positive("sutra.outbox.workers", &raw)?.min(1024) as usize,
+            },
+            batch_size: match value("sutra.outbox.batch-size", "SUTRA_OUTBOX_BATCH_SIZE")? {
+                None => outbox_defaults.batch_size,
+                Some(raw) => positive("sutra.outbox.batch-size", &raw)?.min(10_000) as i64,
+            },
+        };
 
         // The deferred-ack registry knobs (`sutra.ack.deferred.*`).
         let deferred_ack_defaults = DeferredAckConfig::default();
@@ -764,6 +870,14 @@ impl EngineConfig {
                 ),
             },
         };
+        let outbox_tuning = OutboxTuning {
+            workers: if outbox_tuning.workers == 0 {
+                outbox_defaults.workers.max(engine_shards.shards as usize)
+            } else {
+                outbox_tuning.workers
+            },
+            ..outbox_tuning
+        };
         // N > 1 is LIVE (execution scale-out Phase 2): the router spawns one actor lane
         // per shard. The 0-refusal above (the `>= 1` filter) is the only validation left.
 
@@ -882,6 +996,8 @@ impl EngineConfig {
             crypto_envelope,
             incident_sql,
             outbox_tick_interval,
+            outbox_tuning,
+            datasource_pools,
             outbox_retry,
             deferred_ack,
             external_task,
@@ -1754,6 +1870,59 @@ mod tests {
             "PT0S".to_string(),
         );
         assert!(EngineConfig::from_sources(&file, &|_| None).is_err());
+    }
+
+    #[test]
+    fn outbox_workers_batch_size_and_pools_default_and_parse() {
+        let mut file = BTreeMap::new();
+        file.insert("sutra.deployments.dir".to_string(), "/r".to_string());
+        let c = EngineConfig::from_sources(&file, &|_| None).unwrap();
+        assert_eq!(c.outbox_tuning.workers, DEFAULT_OUTBOX_WORKERS);
+        assert_eq!(
+            c.outbox_tuning.batch_size, 50,
+            "the pre-0.6.5 hardcoded batch"
+        );
+        let c = EngineConfig::from_sources(&file, &|name| {
+            (name == "SUTRA_ENGINE_SHARDS").then(|| "32".to_string())
+        })
+        .unwrap();
+        assert_eq!(
+            c.outbox_tuning.workers, 32,
+            "one worker per lane by default"
+        );
+        assert_eq!(
+            c.datasource_pools.max_connections, 8,
+            "the pre-0.6.5 pool size"
+        );
+        assert_eq!(c.datasource_pools.dispatch_max_connections, 2);
+
+        file.insert("sutra.outbox.workers".to_string(), "16".to_string());
+        file.insert("sutra.outbox.batch-size".to_string(), "200".to_string());
+        file.insert(
+            "sutra.datasource.max-connections".to_string(),
+            "24".to_string(),
+        );
+        let c = EngineConfig::from_sources(&file, &|name| {
+            (name == "SUTRA_DATASOURCE_DISPATCH_MAX_CONNECTIONS").then(|| "4".to_string())
+        })
+        .unwrap();
+        assert_eq!(c.outbox_tuning.workers, 16);
+        assert_eq!(c.outbox_tuning.batch_size, 200);
+        assert_eq!(c.datasource_pools.max_connections, 24);
+        assert_eq!(c.datasource_pools.dispatch_max_connections, 4);
+
+        for (key, bad) in [
+            ("sutra.outbox.workers", "0"),
+            ("sutra.outbox.batch-size", "-1"),
+            ("sutra.datasource.max-connections", "many"),
+        ] {
+            let mut f = file.clone();
+            f.insert(key.to_string(), bad.to_string());
+            assert!(
+                EngineConfig::from_sources(&f, &|_| None).is_err(),
+                "{key}={bad}"
+            );
+        }
     }
 
     #[test]

@@ -146,6 +146,19 @@ impl PostgresDataStore {
         Box::pin(store_revision(Arc::clone(&self.inner), key.to_string()))
     }
 
+    /// The value at `key` and its revision (`0` when absent) in ONE round trip from one
+    /// snapshot — the read a data task makes, which used to be two separate reads (value, then
+    /// revision) that a concurrent write could fall between.
+    pub fn get_with_revision(
+        &self,
+        key: &str,
+    ) -> SendFuture<'static, Result<(Option<Json>, i64), DataStoreError>> {
+        Box::pin(store_get_with_revision(
+            Arc::clone(&self.inner),
+            key.to_string(),
+        ))
+    }
+
     /// Autocommit compare-and-set (`<q:store expect="unchanged">`); `false` = conflict.
     pub fn put_if_revision(
         &self,
@@ -572,6 +585,45 @@ async fn store_delete(inner: Arc<StoreInner>, key: String) -> Result<(), DataSto
     let mut tx = store_begin(inner).await?;
     tx_delete(&mut tx, &key).await?;
     tx.commit().await
+}
+
+async fn store_get_with_revision(
+    inner: Arc<StoreInner>,
+    key: String,
+) -> Result<(Option<Json>, i64), DataStoreError> {
+    let mut tx = store_begin(inner).await?;
+    let result = if tx.projected.is_some() {
+        // A projected store reads its typed columns; take value and revision in the same
+        // transaction (two statements — the projection owns the column list).
+        let value = tx_select(&mut tx, &key).await?;
+        let rev = tx_revision(&mut tx, &key).await?;
+        (value, rev)
+    } else {
+        let store = tx.store.clone();
+        let sql = format!("SELECT store_value, rev FROM data_store{WHERE_KEY}");
+        let row = sqlx::query(&sql)
+            .bind(&store)
+            .bind(&key)
+            .fetch_optional(&mut **tx.conn()?)
+            .await
+            .map_err(|e| op_err(&store, &key, "get", e))?;
+        match row {
+            None => (None, 0),
+            Some(r) => {
+                let text: String = r.get(0);
+                let rev: i64 = r.get(1);
+                let value = serde_json::from_str(&text).map_err(|e| {
+                    DataStoreError::with_source(
+                        format!("stored value at '{store}'[{key}] is not valid JSON"),
+                        e,
+                    )
+                })?;
+                (Some(value), rev)
+            }
+        }
+    };
+    tx.commit().await?;
+    Ok(result)
 }
 
 async fn store_revision(inner: Arc<StoreInner>, key: String) -> Result<i64, DataStoreError> {

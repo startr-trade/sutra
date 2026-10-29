@@ -103,6 +103,20 @@ pub struct PersistenceBridge {
     /// by [`crate::sweeper::TerminalRetentionSweeper`], not here — this bridge only decides whether
     /// a terminal row is born at all.
     retention: std::time::Duration,
+    /// The enqueue → dispatcher link (0.6.5): after a commit that enqueued outbox rows the
+    /// dispatcher is woken, and rows addressed `local://` are handed to it directly. `None`
+    /// (tests, tools) leaves delivery to the dispatcher's own claim.
+    outbox_signal: Option<sutra_channels::OutboxSignal>,
+    /// Inbox dedup keys recorded by `record_seen` and not yet written: the next step commit for
+    /// the same deployment writes them in its own transaction (so the record exists iff the
+    /// step's effects do); `settle` writes or drops what no step consumed.
+    pending_seen: std::sync::Mutex<Vec<sutra_channels::PendingDedup>>,
+}
+
+/// Rows a step commits that the in-process dispatcher can take straight from the commit:
+/// `local://` deliveries never leave the engine, so this process is where they go.
+fn is_local_destination(destination: &str) -> bool {
+    destination.starts_with("local://")
 }
 
 impl PersistenceBridge {
@@ -123,6 +137,84 @@ impl PersistenceBridge {
             key_provider,
             claim_owner: replica_id().to_string(),
             retention: DEFAULT_INSTANCE_RETENTION,
+            outbox_signal: None,
+            pending_seen: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Take the recorded-but-unwritten dedup keys of `dep`, for the step commit about to run.
+    fn pending_for(&self, dep: &PersistDeploymentId) -> Vec<(String, String)> {
+        let mut pending = self.pending_seen.lock().unwrap_or_else(|e| e.into_inner());
+        let (mine, rest): (Vec<_>, Vec<_>) = pending
+            .drain(..)
+            .partition(|p| p.deployment.value() == dep.as_str());
+        *pending = rest;
+        mine.into_iter().map(|p| (p.channel, p.event_id)).collect()
+    }
+
+    /// Wire the runtime's outbox signal (wake on enqueue + the local hand-off).
+    #[must_use]
+    pub fn with_outbox_signal(mut self, signal: sutra_channels::OutboxSignal) -> PersistenceBridge {
+        self.outbox_signal = Some(signal);
+        self
+    }
+
+    /// Before a commit that inserts `entries`: reserve the local ones, so no claim can hand them
+    /// to a dispatcher worker between the commit and the hand-off, and make them due only after
+    /// the hand-off grace ([`sutra_channels::outbox_dispatch::HANDOFF_GRACE`]): the hand-off
+    /// delivers them now, and the due time matters only if this process dies first. Returns the
+    /// reserved ids.
+    fn reserve_local(&self, entries: &mut [OutboxEntry]) -> Vec<String> {
+        let Some(signal) = &self.outbox_signal else {
+            return Vec::new();
+        };
+        if !signal.accepts_hand_off() {
+            return Vec::new();
+        }
+        let grace = time::Duration::try_from(sutra_channels::outbox_dispatch::HANDOFF_GRACE)
+            .unwrap_or(time::Duration::ZERO);
+        let mut ids = Vec::new();
+        for entry in entries.iter_mut() {
+            if is_local_destination(&entry.destination) {
+                entry.next_attempt_at += grace;
+                ids.push(entry.entry_id.to_string());
+            }
+        }
+        signal.reserve(&ids);
+        ids
+    }
+
+    /// After the commit: on success hand the reserved local rows to the dispatcher and wake it
+    /// for the rest; on failure release the reservation (nothing was inserted).
+    fn after_enqueue(
+        &self,
+        deployment: &sutra_executor::DeploymentId,
+        entries: &[OutboxEntry],
+        reserved: Vec<String>,
+        committed: bool,
+    ) {
+        let Some(signal) = &self.outbox_signal else {
+            return;
+        };
+        if !committed {
+            signal.release(&reserved);
+            return;
+        }
+        if entries.is_empty() {
+            return;
+        }
+        let handed: Vec<_> = entries
+            .iter()
+            .filter(|e| reserved.contains(&e.entry_id.to_string()))
+            .cloned()
+            .map(crate::outbox::to_claimed)
+            .collect();
+        let rest = entries.len() - handed.len();
+        if !handed.is_empty() {
+            signal.hand_off(deployment, handed);
+        }
+        if rest > 0 {
+            signal.wake();
         }
     }
 
@@ -319,6 +411,18 @@ fn persistence_diag(context: &str, e: &PersistenceError) -> Diagnostic {
             ),
         );
     }
+    if let PersistenceError::InboxDuplicate {
+        channel, event_id, ..
+    } = e
+    {
+        return Diagnostic::error(
+            channel_codes::INBOUND_DUPLICATE_CONCURRENT,
+            format!(
+                "event '{event_id}' on channel '{channel}' was processed by a concurrent delivery \
+                 of the same event; this delivery's step was rolled back"
+            ),
+        );
+    }
     Diagnostic::error(channel_codes::RUNTIME_UNEXPECTED, format!("{context}: {e}"))
 }
 
@@ -420,7 +524,7 @@ impl InstanceBridge for PersistenceBridge {
     ) -> Result<(), Diagnostic> {
         let dep = persist_dep(deployment)?;
         let instance = parse_instance(instance_id)?;
-        let step = StepWrite {
+        let mut step = StepWrite {
             deployment: dep.clone(),
             instance_id: instance,
             snapshot: self.encode_snapshot(snapshot, instance_id)?,
@@ -447,8 +551,10 @@ impl InstanceBridge for PersistenceBridge {
             // Structurally empty on an initial park (a call's first failure needs a later
             // timeout/poison), but derived uniformly: the marked set IS the withdrawal set.
             withdrawn_call_nodes: snapshot.retry_backoff.keys().cloned().collect(),
+            inbox_seen: self.pending_for(&dep),
         };
         let timers = step_timer_waits(timer_waits, &snapshot.process_id)?;
+        let reserved = self.reserve_local(&mut step.outbox);
         // NO claim, and nothing to release: a park is the FIRST persist of a NEW instance
         // (the dispatcher's park arm is the sole caller, with an id minted microseconds ago
         // on this actor thread). Until this transaction commits there is no row, no alias
@@ -456,9 +562,9 @@ impl InstanceBridge for PersistenceBridge {
         // instance is unreachable, which is a stronger guarantee than a claim. Ownership
         // only becomes meaningful from the first RESUME onwards, which is where the claim
         // is taken and `commit_repark` hands it back.
-        commit_step_with_timers(&self.pool, &step, &timers)
-            .await
-            .map_err(|e| persistence_diag("park step commit failed", &e))?;
+        let committed = commit_step_with_timers(&self.pool, &step, &timers).await;
+        self.after_enqueue(deployment, &step.outbox, reserved, committed.is_ok());
+        committed.map_err(|e| persistence_diag("park step commit failed", &e))?;
         info!(
             instance_id,
             deployment = deployment.value(),
@@ -539,7 +645,8 @@ impl InstanceBridge for PersistenceBridge {
     ) -> Result<(), Diagnostic> {
         let dep = persist_dep(deployment)?;
         let instance = parse_instance(instance_id)?;
-        let entries = outbox_entries(&dep, emissions)?;
+        let mut entries = outbox_entries(&dep, emissions)?;
+        let reserved = self.reserve_local(&mut entries);
         let retain = !self.retention.is_zero();
         // Terminal step (wait→end): retain-or-delete the row + resolve every wait point +
         // retire every live alias + enqueue the step's emissions — ONE deployment-scoped
@@ -549,6 +656,8 @@ impl InstanceBridge for PersistenceBridge {
         // live wait behind and still never loses a send.
         let retained = async {
             let mut tx = begin_deployment_tx(&self.pool, &dep).await?;
+            sutra_persistence::step::record_inbox_seen_in(&mut tx, &dep, &self.pending_for(&dep))
+                .await?;
             let retained = if retain {
                 // Row-locking read, then the SAME key-patch shape `commit_failed` uses: the
                 // stored bytes are re-stamped COMPLETED and written straight back. No decode,
@@ -615,8 +724,9 @@ impl InstanceBridge for PersistenceBridge {
                 .map_err(PersistenceError::db("terminal step commit"))?;
             Ok::<bool, PersistenceError>(retained)
         }
-        .await
-        .map_err(|e| persistence_diag("terminal step failed", &e))?;
+        .await;
+        self.after_enqueue(deployment, &entries, reserved, retained.is_ok());
+        let retained = retained.map_err(|e| persistence_diag("terminal step failed", &e))?;
         info!(
             instance_id,
             deployment = deployment.value(),
@@ -665,7 +775,7 @@ impl InstanceBridge for PersistenceBridge {
     ) -> Result<(), Diagnostic> {
         let dep = persist_dep(deployment)?;
         let instance = parse_instance(instance_id)?;
-        let step = StepWrite {
+        let mut step = StepWrite {
             deployment: dep.clone(),
             instance_id: instance,
             snapshot: self.encode_snapshot(snapshot, instance_id)?,
@@ -695,6 +805,7 @@ impl InstanceBridge for PersistenceBridge {
             // the marked set is authoritative per snapshot, and a re-drive clears its node's
             // marker BEFORE the fresh emission enqueues.
             withdrawn_call_nodes: snapshot.retry_backoff.keys().cloned().collect(),
+            inbox_seen: self.pending_for(&dep),
         };
         let timers = step_timer_waits(timer_waits, &snapshot.process_id)?;
         // Re-park = the wait→wait shape of a RESUMED step: the claim taken before rehydrate
@@ -706,15 +817,17 @@ impl InstanceBridge for PersistenceBridge {
             .iter()
             .map(|a| (a.name.clone(), a.value.clone()))
             .collect();
-        commit_step_with_timers_releasing_retiring(
+        let reserved = self.reserve_local(&mut step.outbox);
+        let committed = commit_step_with_timers_releasing_retiring(
             &self.pool,
             &step,
             &timers,
             Some(&self.claim_owner),
             &retired,
         )
-        .await
-        .map_err(|e| persistence_diag("re-park step commit failed", &e))?;
+        .await;
+        self.after_enqueue(deployment, &step.outbox, reserved, committed.is_ok());
+        committed.map_err(|e| persistence_diag("re-park step commit failed", &e))?;
         info!(
             instance_id,
             deployment = deployment.value(),
@@ -735,9 +848,12 @@ impl InstanceBridge for PersistenceBridge {
     ) -> Result<InstanceClaimOutcome, Diagnostic> {
         let dep = persist_dep(deployment)?;
         let instance = parse_instance(instance_id)?;
+        // The ownership claim commits without waiting for its WAL flush: a claim lost in a
+        // crash is the crashed lane's own, which a restart voids anyway, and the step that
+        // follows a granted claim commits synchronously, claim included.
         let won = self
             .instances
-            .claim(&dep, instance, &self.claim_owner)
+            .claim_flush_deferred(&dep, instance, &self.claim_owner)
             .await
             .map_err(|e| persistence_diag("instance claim failed", &e))?;
         Ok(if won {
@@ -888,11 +1004,14 @@ impl InstanceBridge for PersistenceBridge {
             return Ok(());
         }
         let dep = persist_dep(deployment)?;
-        let entries = outbox_entries(&dep, emissions)?;
+        let mut entries = outbox_entries(&dep, emissions)?;
+        let reserved = self.reserve_local(&mut entries);
         // Sync-path terminal step: the completed activation's emissions land in
         // ONE deployment-scoped transaction — all rows, or none.
-        async {
+        let committed = async {
             let mut tx = begin_deployment_tx(&self.pool, &dep).await?;
+            sutra_persistence::step::record_inbox_seen_in(&mut tx, &dep, &self.pending_for(&dep))
+                .await?;
             let mut instances = Vec::new();
             for entry in &entries {
                 PgOutboxStore::enqueue_in(&mut tx, entry).await?;
@@ -908,8 +1027,9 @@ impl InstanceBridge for PersistenceBridge {
                 .await
                 .map_err(PersistenceError::db("sync-path outbox commit"))
         }
-        .await
-        .map_err(|e| persistence_diag("sync-path outbox commit failed", &e))?;
+        .await;
+        self.after_enqueue(deployment, &entries, reserved, committed.is_ok());
+        committed.map_err(|e| persistence_diag("sync-path outbox commit failed", &e))?;
         info!(
             deployment = deployment.value(),
             emissions = emissions.len(),
@@ -930,14 +1050,69 @@ impl ChannelInboxStore for PersistenceBridge {
         let Ok(dep) = PersistDeploymentId::new(deployment.value()) else {
             return true; // malformed id — proceed (fail-open on dedup, logged below)
         };
-        match self.inbox.record_seen(&dep, channel, event_id).await {
-            Ok(first) => first,
+        // Read, don't write: the record is written by the step that processes this delivery, in
+        // that step's own transaction, so it exists iff the step's effects do. A crash before the
+        // commit leaves no record and the redelivery runs; a concurrent delivery of the same
+        // event that commits first makes this delivery's step roll back
+        // (SUTRA.INBOUND.DUPLICATE_CONCURRENT).
+        match self.inbox.seen(&dep, channel, event_id).await {
+            Ok(true) => false,
+            Ok(false) => {
+                self.pending_seen
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(sutra_channels::PendingDedup {
+                        deployment: deployment.clone(),
+                        channel: channel.to_string(),
+                        event_id: event_id.to_string(),
+                    });
+                true
+            }
             Err(e) => {
                 warn!(channel, event_id, error = %e, "inbox dedup failed — proceeding (fail-open)");
                 true
             }
         }
     }
+
+    async fn settle(&self, processed: bool) {
+        let pending: Vec<sutra_channels::PendingDedup> = self
+            .pending_seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..)
+            .collect();
+        if !processed || pending.is_empty() {
+            return; // a failed dispatch leaves no record, so its redelivery runs
+        }
+        // The dispatch completed without a step consuming these keys (it persisted nothing, or
+        // ended on another path): record them now, synchronously, so a redelivery is a
+        // duplicate.
+        for p in pending {
+            let Ok(dep) = PersistDeploymentId::new(p.deployment.value()) else {
+                continue;
+            };
+            if let Err(e) = self.inbox.record_seen(&dep, &p.channel, &p.event_id).await {
+                warn!(channel = %p.channel, event_id = %p.event_id, error = %e, "inbox dedup write failed");
+            }
+        }
+    }
+
+    fn take_pending(&self) -> Vec<sutra_channels::PendingDedup> {
+        self.pending_seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..)
+            .collect()
+    }
+
+    fn restore_pending(&self, pending: Vec<sutra_channels::PendingDedup>) {
+        self.pending_seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .extend(pending);
+    }
+
     async fn forget(
         &self,
         deployment: &sutra_executor::DeploymentId,
