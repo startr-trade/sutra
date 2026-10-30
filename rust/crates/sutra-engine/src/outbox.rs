@@ -1,5 +1,5 @@
 //! The outbox row-access bridge — `sutra_channels::OutboxRowStore` implemented
-//! over `sutra-persistence`'s `PgOutboxStore` (SKIP-LOCKED claim, delete-on-delivery,
+//! over `sutra-persistence`'s `PgOutboxStore` (SKIP-LOCKED leased claim, delete-on-delivery,
 //! defer-with-diagnostic), keeping `sutra-channels` persistence-free (the
 //! [`crate::bridge`] pattern applied to delivery).
 //!
@@ -22,6 +22,12 @@ use sutra_persistence::stores::{
     DeadLetterRow, OutboxEntry, OutboxStore, PgDeadLetterStore, PgOutboxStore, ReplyMode,
 };
 use sutra_persistence::DeploymentId as PersistDeploymentId;
+
+/// The end of a claim lease taken (or renewed) at `now`.
+fn lease_end(now: OffsetDateTime) -> OffsetDateTime {
+    now + time::Duration::try_from(sutra_channels::outbox_dispatch::CLAIM_LEASE)
+        .unwrap_or(time::Duration::seconds(30))
+}
 
 /// PG-backed [`OutboxRowStore`].
 pub struct PgOutboxRows {
@@ -114,10 +120,31 @@ impl OutboxRowStore for PgOutboxRows {
                 .collect();
             let claimed = self
                 .store
-                .claim_due_excluding(&dep, now, max_entries, &exclude)
+                .claim_due_excluding(&dep, now, max_entries, &exclude, lease_end(now))
                 .await
                 .map_err(|e| store_diag("outbox claimDue failed", e))?;
             Ok(claimed.into_iter().map(to_claimed).collect())
+        })
+    }
+
+    fn renew_claims<'a>(
+        &'a self,
+        deployment: &'a sutra_executor::DeploymentId,
+        entry_ids: &'a [String],
+        now: OffsetDateTime,
+    ) -> BoxFuture<'a, Result<(), Diagnostic>> {
+        Box::pin(async move {
+            let dep = persist_dep(deployment)?;
+            // A non-UUID id cannot name a row in this table, so it has nothing to renew.
+            let ids: Vec<Uuid> = entry_ids
+                .iter()
+                .filter_map(|id| Uuid::from_str(id).ok())
+                .collect();
+            self.store
+                .renew_claims(&dep, &ids, lease_end(now))
+                .await
+                .map(|_| ())
+                .map_err(|e| store_diag("outbox claim lease renewal failed", e))
         })
     }
 
@@ -148,9 +175,11 @@ impl OutboxRowStore for PgOutboxRows {
     ) -> BoxFuture<'a, Result<Vec<ClaimedOutboxRow>, Diagnostic>> {
         Box::pin(async move {
             let dep = persist_dep(deployment)?;
+            // The leasing claim, so the serial loop is replica-safe too: a row stays off every
+            // other claim while it is delivered (see `CLAIM_LEASE`).
             let claimed = self
                 .store
-                .claim_due(&dep, now, max_entries)
+                .claim_due_excluding(&dep, now, max_entries, &[], lease_end(now))
                 .await
                 .map_err(|e| store_diag("outbox claimDue failed", e))?;
             Ok(claimed.into_iter().map(to_claimed).collect())

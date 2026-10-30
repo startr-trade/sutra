@@ -12,7 +12,7 @@ name: sutra-delivery-window
 services:
   engine:
     # 0.6.4 or later. Override with SUTRA_ENGINE_IMAGE to run a locally built tag.
-    image: ${SUTRA_ENGINE_IMAGE:-ghcr.io/startr-trade/sutra:0.6.7}
+    image: ${SUTRA_ENGINE_IMAGE:-ghcr.io/startr-trade/sutra:0.6.8}
     environment:
       SUTRA_DEPLOYMENTS_DIR: /deployments
       SUTRA_HTTP_PORT: "8080"

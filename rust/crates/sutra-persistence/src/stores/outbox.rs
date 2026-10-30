@@ -1,8 +1,9 @@
 //! Outbox store (`outbox_entry`, V601–V606) — the durable half of the transactional outbox.
 //!
 //! Semantics: row-exists-and-not-`poisoned` = pending; the dispatcher claims
-//! due rows with `SELECT ... FOR UPDATE SKIP LOCKED` so concurrent replicas never compete for
-//! the same rows; `delete` on success, `defer` (backoff + diagnostic) on failure, and — only
+//! due rows with `SELECT ... FOR UPDATE SKIP LOCKED` and LEASES them (moves `next_attempt_at` to
+//! the lease end, renewed while in flight) so concurrent replicas never deliver the same row —
+//! the row locks alone end at the claim's commit, before delivery; `delete` on success, `defer` (backoff + diagnostic) on failure, and — only
 //! when the operator configured `sutra.outbox.retry.max-attempts` — [`OutboxStore::mark_poisoned`]
 //! when an entry exhausts that ceiling (V604). A poisoned row is TERMINAL, not gone: it is never
 //! claimed again, but it is never deleted either (at-least-once is not traded for silence), it
@@ -120,6 +121,8 @@ pub trait OutboxStore {
     async fn enqueue(&self, entry: &OutboxEntry) -> Result<()>;
     /// Claims up to `max_entries` due rows via `FOR UPDATE SKIP LOCKED` and commits: the
     /// claim transaction closes before dispatch; delivery idempotency rides on `outbox_key`.
+    /// The row locks end at that commit, so this claim alone does not keep another replica off a
+    /// row while it is delivered — the leasing claim (`PgOutboxStore::claim_due_excluding`) does.
     async fn claim_due(
         &self,
         deployment: &DeploymentId,
@@ -204,17 +207,38 @@ const SQL_POISONED_EXISTS: &str = "SELECT COUNT(*) FROM outbox_entry \
 
 const SQL_DELETE: &str = "DELETE FROM outbox_entry WHERE deployment_id = $1 AND entry_id = $2";
 
-/// [`SQL_CLAIM_DUE`] past the entries the caller already has in flight.
-const SQL_CLAIM_DUE_EXCLUDING: &str = "SELECT entry_id, deployment_id, instance_id, body, \
-      content_type, destination, headers_json, required, mode, outbox_key, cloud_event_json, \
-      auth_ref_json, created_at, next_attempt_at, attempt_count, last_diagnostic_json, \
-      traceparent, labels_json, node_id \
-     FROM outbox_entry \
-     WHERE deployment_id = $1 AND NOT poisoned AND next_attempt_at <= $2 \
-       AND NOT (entry_id = ANY($4)) \
-     ORDER BY next_attempt_at, created_at \
-     LIMIT $3 \
-     FOR UPDATE SKIP LOCKED";
+/// [`SQL_CLAIM_DUE`] past the entries the caller already has in flight, LEASING what it claims.
+///
+/// The row locks of a claim end when its transaction commits, which is before the rows are
+/// delivered. Without a lease a second replica's claim would find a row another replica is still
+/// delivering due and deliver it again. So the claim moves each claimed row's `next_attempt_at` to
+/// the lease end (`$5`): no other claim returns the row until then, the claiming process renews the
+/// lease while the row is in flight ([`PgOutboxStore::renew_claims`]), and a process that dies
+/// holding it lets the lease lapse — any replica then delivers the row (at-least-once, as before).
+/// Deferral, requeue and poison all overwrite or end the lease; delivery deletes the row.
+///
+/// The original due time is returned as `next_attempt_at` (`due.due_at`), so the claimed entry
+/// reads as it was enqueued. `RETURNING` has no order: the caller sorts by (due, created).
+const SQL_CLAIM_DUE_EXCLUDING: &str = "WITH due AS ( \
+       SELECT entry_id, next_attempt_at AS due_at FROM outbox_entry \
+       WHERE deployment_id = $1 AND NOT poisoned AND next_attempt_at <= $2 \
+         AND NOT (entry_id = ANY($4)) \
+       ORDER BY next_attempt_at, created_at \
+       LIMIT $3 \
+       FOR UPDATE SKIP LOCKED) \
+     UPDATE outbox_entry o SET next_attempt_at = $5 \
+     FROM due \
+     WHERE o.deployment_id = $1 AND o.entry_id = due.entry_id \
+     RETURNING o.entry_id, o.deployment_id, o.instance_id, o.body, o.content_type, \
+      o.destination, o.headers_json, o.required, o.mode, o.outbox_key, o.cloud_event_json, \
+      o.auth_ref_json, o.created_at, due.due_at AS next_attempt_at, o.attempt_count, \
+      o.last_diagnostic_json, o.traceparent, o.labels_json, o.node_id";
+
+/// Extend the lease of rows this process still has in flight (see [`SQL_CLAIM_DUE_EXCLUDING`]).
+/// Only ever moves a due time LATER: a row whose due time is already past the new lease end (a
+/// deferral with a long backoff) keeps it.
+const SQL_RENEW_CLAIMS: &str = "UPDATE outbox_entry SET next_attempt_at = $3 \
+     WHERE deployment_id = $1 AND entry_id = ANY($2) AND NOT poisoned AND next_attempt_at < $3";
 
 /// The batched delete of delivered entries (one transaction for a burst of deliveries).
 const SQL_DELETE_MANY: &str =
@@ -369,19 +393,24 @@ impl PgOutboxStore {
     }
 
     /// [`OutboxStore::claim_due`] that skips `exclude` — the entries the caller already has in
-    /// flight. Same SKIP LOCKED claim, same order, same commit-before-dispatch posture.
+    /// flight — and LEASES every row it returns until `lease_until`: no claim (on any replica)
+    /// returns those rows again before then. Same SKIP LOCKED claim, same order (due time, then
+    /// creation), same commit-before-dispatch posture. The caller keeps the lease alive with
+    /// [`Self::renew_claims`] while it delivers; a crashed caller's lease simply lapses.
     pub async fn claim_due_excluding(
         &self,
         deployment: &DeploymentId,
         now: OffsetDateTime,
         max_entries: i64,
         exclude: &[Uuid],
+        lease_until: OffsetDateTime,
     ) -> Result<Vec<OutboxEntry>> {
         if max_entries <= 0 {
             return Ok(Vec::new());
         }
-        // The claim's commit only releases row locks — it changes no data — so it need not
-        // wait for a WAL flush.
+        // The claim's commit need not wait for a WAL flush: if a crash loses it, the lease is
+        // lost with it and the rows are claimable at once — a redelivery, which the outbox's
+        // at-least-once contract already allows. Nothing is acknowledged on this commit.
         let mut tx =
             crate::scope::begin_deployment_tx_flush_deferred(&self.pool, deployment).await?;
         let rows = sqlx::query(SQL_CLAIM_DUE_EXCLUDING)
@@ -389,13 +418,47 @@ impl PgOutboxStore {
             .bind(now)
             .bind(max_entries)
             .bind(exclude)
+            .bind(lease_until)
             .fetch_all(&mut *tx)
             .await
             .map_err(PersistenceError::db("outbox claimDueExcluding"))?;
         tx.commit()
             .await
             .map_err(PersistenceError::db("outbox claimDueExcluding commit"))?;
-        rows.iter().map(read_row).collect()
+        let mut claimed = rows.iter().map(read_row).collect::<Result<Vec<_>>>()?;
+        claimed.sort_by(|a, b| {
+            (a.next_attempt_at, a.created_at).cmp(&(b.next_attempt_at, b.created_at))
+        });
+        Ok(claimed)
+    }
+
+    /// Extend to `lease_until` the lease of the rows named in `entry_ids` that are still pending
+    /// (rows already delivered and deleted are simply not there). Never moves a due time earlier.
+    /// Returns how many rows were renewed.
+    pub async fn renew_claims(
+        &self,
+        deployment: &DeploymentId,
+        entry_ids: &[Uuid],
+        lease_until: OffsetDateTime,
+    ) -> Result<u64> {
+        if entry_ids.is_empty() {
+            return Ok(0);
+        }
+        // Flush-deferred like the claim: a renewal lost in a crash only shortens a lease.
+        let mut tx =
+            crate::scope::begin_deployment_tx_flush_deferred(&self.pool, deployment).await?;
+        let renewed = sqlx::query(SQL_RENEW_CLAIMS)
+            .bind(deployment.as_str())
+            .bind(entry_ids)
+            .bind(lease_until)
+            .execute(&mut *tx)
+            .await
+            .map_err(PersistenceError::db("outbox renewClaims"))?
+            .rows_affected();
+        tx.commit()
+            .await
+            .map_err(PersistenceError::db("outbox renewClaims commit"))?;
+        Ok(renewed)
     }
 
     /// Deletes several delivered entries in ONE transaction; missing rows are no-ops.

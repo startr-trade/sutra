@@ -30,6 +30,9 @@ struct Fixture {
 static CONCURRENT: OnceLock<Fixture> = OnceLock::new();
 static CRASH: OnceLock<Fixture> = OnceLock::new();
 static PG_CRASH: OnceLock<Fixture> = OnceLock::new();
+/// The two-replica suites: two engines on ONE database, deliberately.
+static REPLICAS: OnceLock<Fixture> = OnceLock::new();
+static REPLICA_CRASH: OnceLock<Fixture> = OnceLock::new();
 
 fn fixture(slot: &'static OnceLock<Fixture>) -> &'static Fixture {
     slot.get_or_init(|| {
@@ -105,15 +108,17 @@ fn count(slot: &'static OnceLock<Fixture>, query: &str) -> i64 {
     sql(slot, query).parse().unwrap_or(-1)
 }
 
-/// POST `n` orders with refs `<prefix>-<i>`, 16 at a time; returns the refs the intake ACCEPTED
-/// (answered 2xx — sent only after the order's step committed synchronously).
-async fn post_orders(port: u16, prefix: String, n: usize) -> BTreeSet<String> {
+/// POST `n` orders with refs `<prefix>-<i>`, 16 at a time, spread round-robin over `ports` (one
+/// per engine); returns the refs the intake ACCEPTED (answered 2xx — sent only after the order's
+/// step committed synchronously).
+async fn post_orders(ports: Vec<u16>, prefix: String, n: usize) -> BTreeSet<String> {
     let client = reqwest::Client::new();
     let mut accepted = BTreeSet::new();
     let refs: Vec<String> = (0..n).map(|i| format!("{prefix}-{i:04}")).collect();
-    for chunk in refs.chunks(16) {
+    for (c, chunk) in refs.chunks(16).enumerate() {
         let mut posts = Vec::new();
-        for r in chunk {
+        for (i, r) in chunk.iter().enumerate() {
+            let port = ports[(c * 16 + i) % ports.len()];
             let client = client.clone();
             let r = r.clone();
             let body = format!(r#"{{"ref":"{r}","amount":10,"party":"party-a","sentAt":0}}"#);
@@ -181,6 +186,24 @@ async fn await_outbox_empty(slot: &'static OnceLock<Fixture>, within: Duration) 
     }
 }
 
+/// The refs with `prefix` the recorder saw more than once, with how often each was seen.
+fn duplicate_callbacks(slot: &'static OnceLock<Fixture>, prefix: &str) -> Vec<(String, usize)> {
+    let mut seen: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for body in fixture(slot)
+        .recorder
+        .recorder
+        .matching(&format!("\"{prefix}-"))
+    {
+        if let Some(r) = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|v| v["ref"].as_str().map(str::to_string))
+        {
+            *seen.entry(r).or_default() += 1;
+        }
+    }
+    seen.into_iter().filter(|(_, n)| *n > 1).collect()
+}
+
 /// The instance-level exactly-once checks for the orders with `prefix`: one intake instance per
 /// order that called back, each COMPLETED once, none left parked, every local hop consumed once.
 fn assert_exactly_once(slot: &'static OnceLock<Fixture>, prefix: &str, settled: usize) {
@@ -211,15 +234,16 @@ fn assert_exactly_once(slot: &'static OnceLock<Fixture>, prefix: &str, settled: 
     }
 }
 
-/// Load `n` orders while `kill` runs once 30 orders have called back; returns the accepted refs.
+/// Load `n` orders (spread over `ports`) while `kill` runs once 30 orders have called back;
+/// returns the accepted refs.
 async fn load_and_kill(
     slot: &'static OnceLock<Fixture>,
-    port: u16,
+    ports: Vec<u16>,
     prefix: &str,
     n: usize,
     kill: impl FnOnce(),
 ) -> BTreeSet<String> {
-    let posting = tokio::spawn(post_orders(port, prefix.to_string(), n));
+    let posting = tokio::spawn(post_orders(ports, prefix.to_string(), n));
     let _ = await_callbacks(slot, prefix, 30, Duration::from_secs(60)).await;
     kill();
     let done = called_back(slot, prefix).0.len();
@@ -282,7 +306,7 @@ async fn assert_recovered(
 async fn tc_outbox_relay_settles_every_order_exactly_once_under_concurrency() {
     let slot = &CONCURRENT;
     let engine = start_engine(slot, 4);
-    let accepted = post_orders(engine.http_port, "conc".to_string(), 300).await;
+    let accepted = post_orders(vec![engine.http_port], "conc".to_string(), 300).await;
     assert_eq!(accepted.len(), 300, "every order accepted");
     let (refs, total) = await_callbacks(slot, "conc", 300, Duration::from_secs(120)).await;
     assert_eq!(refs.len(), 300, "every order called back");
@@ -300,7 +324,7 @@ async fn tc_outbox_relay_settles_every_order_exactly_once_under_concurrency() {
 async fn tc_outbox_relay_recovers_from_a_crash_mid_flight() {
     let slot = &CRASH;
     let first = start_engine(slot, 4);
-    let accepted = load_and_kill(slot, first.http_port, "crash", 1500, || {
+    let accepted = load_and_kill(slot, vec![first.http_port], "crash", 1500, || {
         let status = Command::new("docker")
             .args(["kill", "--signal", "KILL", first.container.id()])
             .status()
@@ -325,7 +349,7 @@ async fn tc_outbox_relay_recovers_from_a_postgres_crash_mid_flight() {
     let slot = &PG_CRASH;
     let engine = start_engine(slot, 4);
     let pg = fixture(slot).pg.container.id().to_string();
-    let accepted = load_and_kill(slot, engine.http_port, "pgcrash", 1500, || {
+    let accepted = load_and_kill(slot, vec![engine.http_port], "pgcrash", 1500, || {
         let killed = Command::new("docker")
             .args(["kill", "--signal", "KILL", &pg])
             .status()
@@ -340,4 +364,65 @@ async fn tc_outbox_relay_recovers_from_a_postgres_crash_mid_flight() {
     })
     .await;
     assert_recovered(slot, "pgcrash", &accepted).await;
+}
+
+/// Two engines on ONE database — two replicas — with orders posted to both. Each replica's
+/// dispatcher claims due outbox rows on every enqueue it commits, so the two claim the same table
+/// continuously. Without a crash every order must call back exactly ONCE: a row one replica has
+/// claimed and is delivering must not be claimed and delivered by the other as well.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "docker"]
+async fn tc_outbox_relay_two_replicas_deliver_each_callback_once() {
+    let slot = &REPLICAS;
+    let first = start_engine(slot, 4);
+    let second = start_engine(slot, 4);
+    let n = 600;
+    let accepted = post_orders(
+        vec![first.http_port, second.http_port],
+        "repl".to_string(),
+        n,
+    )
+    .await;
+    assert_eq!(accepted.len(), n, "every order accepted");
+    let (refs, _) = await_callbacks(slot, "repl", n, Duration::from_secs(120)).await;
+    assert_eq!(refs.len(), n, "every order called back");
+    assert_eq!(await_outbox_empty(slot, Duration::from_secs(30)).await, 0);
+    // Duplicates arrive after the first copy: give a late second delivery time to land.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let duplicates = duplicate_callbacks(slot, "repl");
+    assert!(
+        duplicates.is_empty(),
+        "{} of {n} orders were called back more than once without a crash (first: {:?})",
+        duplicates.len(),
+        duplicates.iter().take(5).collect::<Vec<_>>()
+    );
+    assert_exactly_once(slot, "repl", n);
+}
+
+/// Two replicas on one database, one of them SIGKILLed mid-flight: the SURVIVOR — no new engine —
+/// recovers everything the dead one held from the durable rows once its claims lapse (its outbox
+/// claims, its local hand-offs, its instance ownership). Every accepted order calls back (a
+/// callback may repeat — at-least-once after a crash), every intake instance completes exactly
+/// once, and the outbox drains.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "docker"]
+async fn tc_outbox_relay_two_replicas_recover_from_a_crash_mid_flight() {
+    let slot = &REPLICA_CRASH;
+    let first = start_engine(slot, 4);
+    let second = start_engine(slot, 4);
+    let accepted = load_and_kill(
+        slot,
+        vec![first.http_port, second.http_port],
+        "rcrash",
+        1500,
+        || {
+            let status = Command::new("docker")
+                .args(["kill", "--signal", "KILL", first.container.id()])
+                .status()
+                .expect("docker kill");
+            assert!(status.success(), "the first replica was killed");
+        },
+    )
+    .await;
+    assert_recovered(slot, "rcrash", &accepted).await;
 }

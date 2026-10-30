@@ -131,6 +131,57 @@ async fn applies_java_migrations_once_and_is_idempotent() {
     );
 }
 
+/// The high-churn tables carry their own autovacuum storage parameters after the engine's full
+/// migration set (V102/V303/V405/V607/V805): the outbox queue vacuums after a fixed 5,000 dead
+/// tuples, unthrottled; the larger tables at 1% with a 5,000 floor, at the server's throttle.
+#[ignore = "docker"]
+#[tokio::test]
+async fn the_high_churn_tables_carry_their_autovacuum_settings() {
+    let pool = crate::fixture::fresh_pool().await;
+    let options = |table: &'static str| {
+        let pool = pool.clone();
+        async move {
+            let mut opts: Vec<String> = sqlx::query_scalar(
+                "SELECT unnest(reloptions) FROM pg_class \
+                 WHERE relname = $1 AND relkind = 'r'",
+            )
+            .bind(table)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            opts.sort();
+            opts
+        }
+    };
+    assert_eq!(
+        options("outbox_entry").await,
+        vec![
+            "autovacuum_analyze_scale_factor=0",
+            "autovacuum_analyze_threshold=5000",
+            "autovacuum_vacuum_cost_delay=0",
+            "autovacuum_vacuum_scale_factor=0",
+            "autovacuum_vacuum_threshold=5000",
+        ]
+    );
+    for table in [
+        "alias_index",
+        "inbox_seen",
+        "instance_state",
+        "waiting_event",
+    ] {
+        assert_eq!(
+            options(table).await,
+            vec![
+                "autovacuum_analyze_scale_factor=0.02",
+                "autovacuum_analyze_threshold=5000",
+                "autovacuum_vacuum_scale_factor=0.01",
+                "autovacuum_vacuum_threshold=5000",
+            ],
+            "{table}"
+        );
+    }
+}
+
 /// Creates a database WITHOUT running the fixture's migrations.
 async fn fresh_unmigrated() -> (sqlx::PgPool, String) {
     // Reuse the fixture's container by asking it for a migrated db first (starts the

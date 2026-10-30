@@ -123,14 +123,26 @@ other replica that raced it (or a genuine redelivery) sees nothing came back and
 dedup hit. This is a plain unique-index conflict — no application-level locking, and it works
 identically whichever replica happens to receive the redelivered copy.
 
-## Outbox processing: `SKIP LOCKED` fan-out
+## Outbox processing: `SKIP LOCKED` and a claim lease {#outbox-processing-skip-locked-and-a-claim-lease}
 
-Every reply-in-waiting sits in an outbox table; each replica's outbox worker claims a batch with
-`FOR UPDATE SKIP LOCKED`, so replicas never contend on the same row and never double-send under
-normal operation. A replica that dies mid-send leaves its claim stale; another replica's next
-scan clears the stale claim and retries — broker-side dedup (the outbox row's key riding as the
-message's own idempotency token) absorbs the rare case where the original send actually went out
-before the crash.
+Every reply-in-waiting sits in an outbox table. Each replica's outbox dispatcher claims a batch with
+`FOR UPDATE SKIP LOCKED`, so replicas never contend on the same row. Those row locks end when the
+claim's transaction commits, which is before the rows are delivered. So the same statement also
+**leases** each claimed row: it moves the row's due time 30 seconds ahead. No claim on any replica
+returns the row before then. While the row waits for a delivery worker or is being delivered, the
+claiming replica renews the lease every 10 seconds. A successful delivery deletes the row, and a
+failed one replaces the lease with its retry backoff. Under normal operation no row is sent twice,
+however many replicas share the database.
+
+A replica that dies holding rows stops renewing their leases. Within 30 seconds the leases lapse,
+and the next replica to claim delivers the rows. The rare case where the original send went out
+just before the crash is absorbed downstream: the outbox row's key travels as the message's own
+idempotency token.
+
+> **Fixed in 0.6.8.** Releases 0.6.5 to 0.6.7 took the row locks but wrote no lease. A second
+> replica's claim could pick up a row the first was still delivering, and under multi-replica load
+> about half of all outbound messages were sent twice. Nothing was lost and every instance still
+> completed once. A single engine was not affected.
 
 ## Retiring a draining deployment: a three-legged gate {#retiring-a-draining-deployment-a-three-legged-gate}
 
@@ -170,8 +182,8 @@ Because token state lives in the database, a dead replica leaves nothing to reco
   sweep clears it and the next replica to see ready work picks the instance up.
 - **Mid inbox-to-instance handoff** — an inbox row without a matching instance past a recovery
   threshold gets retried; the same unique-index dedup makes the retry safe.
-- **Mid outbox send** — the stale `claimed_at` is cleared and the row is retried by whichever
-  replica's scan finds it next.
+- **Mid outbox send** — the dead replica's claim lease lapses within 30 seconds and the row is
+  delivered by whichever replica claims it next.
 - **The leader itself dies** — its lease expires within its TTL and another replica's next poll
   acquires it; timer scheduling pauses for at most that window, while outbox processing continues
   uninterrupted on every other replica throughout.

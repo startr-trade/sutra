@@ -69,8 +69,9 @@ fn guc_literal(deployment: &DeploymentId) -> Option<String> {
 /// Only for writes that are safe to lose in a crash: bookkeeping a crash voids anyway, so losing
 /// it can neither lose an acknowledged state nor create one. The complete list of callers: the
 /// instance ownership claim (`PgInstanceStore::claim_flush_deferred` — a crashed process's claim
-/// is void), the outbox claim (`PgOutboxStore::claim_due_excluding` — row locks only) and the
-/// delete of delivered outbox rows (`PgOutboxStore::delete_many` — a lost delete redelivers,
+/// is void), the outbox claim and its lease renewal (`PgOutboxStore::claim_due_excluding`,
+/// `PgOutboxStore::renew_claims` — a lost lease only makes the rows claimable again, a
+/// redelivery the at-least-once contract allows) and the delete of delivered outbox rows (`PgOutboxStore::delete_many` — a lost delete redelivers,
 /// which the outbox's at-least-once contract already allows). Add to this list only with the
 /// same argument, and record it in the design notes and the public tuning guide.
 ///

@@ -13,6 +13,66 @@ This is the changelog for the **Rust-native** engine (`rust/` workspace). It beg
 
 Nothing yet.
 
+## [0.6.8] — 2026-10-30
+
+A **patch** release that fixes duplicate outbound deliveries when two or more engine replicas share
+one database, and adds per-table autovacuum settings for the high-churn tables on PostgreSQL.
+Durability is unchanged: no commit was added or made asynchronous. The table definitions are
+unchanged; five new migrations only set storage parameters. The snapshot format and the `q:`
+namespace are untouched. A single engine behaves exactly as in 0.6.7, except that after a crash the rows it had
+claimed are redelivered within 30 s instead of at once.
+
+### Fixed
+
+- **Replicas sharing one database sent the same outbound message twice (0.6.5–0.6.7).** An outbox
+  claim locks the rows it picks with `FOR UPDATE SKIP LOCKED`, but the locks end when the claim's
+  transaction commits, before the rows are delivered. While one replica was still delivering a row,
+  another replica's claim could find the row due and deliver it again. Since 0.6.5 the dispatcher
+  claims on every enqueue instead of on a 5 s timer, so this happened all the time. With two
+  engines on one database, about half of a local relay's HTTP callbacks arrived twice, and nothing
+  was logged. No message was lost and every instance still completed exactly once; only the sends
+  were duplicated. A single engine was not affected.
+  - The claim now also **leases** each row it returns: it moves the row's due time 30 s ahead, so
+    no other claim returns the row. The claiming engine renews the lease every 10 s while the row
+    waits for a worker or is being delivered. Delivery deletes the row, and a failed attempt's
+    backoff replaces the lease.
+  - If the engine dies while it holds a row, the lease lapses and any replica delivers the row:
+    at-least-once, as before. The bound is 30 s, the same one in-process `local://` hand-offs
+    already had.
+  - Releases before 0.6.5 use the same claim on the 5 s timer. They could duplicate a send only
+    when two replicas' polls overlapped a delivery, and the new two-replica test saw no duplicate
+    on a 0.6.4 build.
+  - The bug was found by a downstream two-replica load test: 9,995 duplicate callbacks for 12,001
+    requests at 200/s. The new conformance test reproduces it on the published 0.6.5 and 0.6.6
+    images and on 0.6.7, where 318, 338 and 333 of 600 orders were called back twice. It passes on
+    0.6.8.
+
+### Changed
+
+- **Per-table autovacuum for the high-churn tables (PostgreSQL).** At high rates PostgreSQL's
+  default autovacuum let dead row versions pile up in the outbox queue. In one measured run at
+  about 1,700 requests a second, the outbox claim took 1–1.6 s every two and a half minutes,
+  throughput fell below 100 a second for some 40 s, and p99 latency reached 38 s. New migrations
+  set storage parameters on five tables:
+  - `outbox_entry` (V607) is vacuumed after a fixed 5,000 dead rows, unthrottled.
+  - `instance_state` (V405), `waiting_event` (V805), `alias_index` (V102) and `inbox_seen` (V303)
+    are vacuumed at 1% plus 5,000 rows, at the server's cost throttle.
+
+  At low rates these settings rarely trigger. `autovacuum_naptime` is server-wide and cannot be
+  set per table, so the throughput-tuning guide recommends lowering it (for example to `1s`) for
+  high-rate deployments; with that and an unthrottled global autovacuum, 2,500/s ran ten minutes at
+  p99 329 ms. MySQL/MariaDB and SQL Server have no per-table equivalent and get no migration.
+
+### Added
+
+- A PostgreSQL test that checks the five tables carry their autovacuum parameters after
+  migration.
+- Two conformance tests that run two engines on one database:
+  - `tc_outbox_relay_two_replicas_deliver_each_callback_once` posts the relay workload to both
+    engines and checks that every order is called back exactly once.
+  - `tc_outbox_relay_two_replicas_recover_from_a_crash_mid_flight` kills one replica during the
+    load and checks that the survivor completes every accepted order.
+
 ## [0.6.7] — 2026-10-29
 
 A **patch** release: a binary container for instance snapshots, two fewer costs per completed

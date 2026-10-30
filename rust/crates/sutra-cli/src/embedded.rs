@@ -10,7 +10,8 @@
 //! - the DB-backed deployment source `shipped/deploy` (V10xx — the `deployment_archive` store),
 //! - the Rust-only addendum `native` (V803 timer wait-states, V804 timer-start schedules,
 //!   V1401 `llm` transport async jobs, V302 synchronous-call chain in-flight markers, V703
-//!   capacity pools).
+//!   capacity pools, and the per-table autovacuum settings of the high-churn tables V102, V303,
+//!   V405, V607, V805).
 //!
 //! `shipped/{core,audit}` are byte-identical copies of the frozen reference engine
 //! migration trees, so the checksummed `sutra_schema_history` ledger stays interoperable.
@@ -81,10 +82,11 @@ mod tests {
         assert_eq!(
             versions,
             vec![
-                101, 201, 202, 203, 301, 302, 401, 402, 403, 404, 501, 601, 602, 603, 604, 605, 606, 701,
-                702, 703, 704, 801, 802, 803, 804, 1001, 1101, 1201, 1202, 1301, 1401
+                101, 102, 201, 202, 203, 301, 302, 303, 401, 402, 403, 404, 405, 501, 601, 602, 603,
+                604, 605, 606, 607, 701, 702, 703, 704, 801, 802, 803, 804, 805, 1001, 1101, 1201,
+                1202, 1301, 1401
             ],
-            "core subsystems + audit (V202: transport events outside the replay dedup; V203: the journal ordinal) + channel V7xx + the V803/V804 addenda + deploy V10xx + subject-index V11xx (GDPR erasure) + dead-letter V12xx + data-key V13xx + the V1401 llm-job addendum + the V302 sync-chain in-flight marker + the V703 capacity pools and V704 session ends (no V9xx — coverage migrates the store the deployment declares, not the engine database); V606 is the outbox emitting-node column (channel-call <q:retry>)"
+            "core subsystems + audit (V202: transport events outside the replay dedup; V203: the journal ordinal) + channel V7xx + the V803/V804 addenda + deploy V10xx + subject-index V11xx (GDPR erasure) + dead-letter V12xx + data-key V13xx + the V1401 llm-job addendum + the V302 sync-chain in-flight marker + the V703 capacity pools and V704 session ends + the V102/V303/V405/V607/V805 per-table autovacuum settings (no V9xx — coverage migrates the store the deployment declares, not the engine database); V606 is the outbox emitting-node column (channel-call <q:retry>)"
         );
         assert!(scripts.iter().all(|s| !s.sql.is_empty()));
         // The ledger `script` column records the file name from the synthetic path.

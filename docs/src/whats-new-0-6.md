@@ -21,6 +21,8 @@ server, so no provider key is needed.
 | **Durable throughput** (0.6.5) | A concurrent outbox dispatcher, in-process hand-off of `local://` deliveries, fewer durable commits per step, separate pools for intake and delivery, and an opt-in data-store read cache. On one laptop with durable PostgreSQL a two-process relay went from 14 to 499 completions per second, p99 250 ms. | [Tuning for throughput](operating/throughput-tuning.md) |
 | **Answers that beat their wait; less CPU** (0.6.6) | A `local://` answer that reaches a process before it has parked at the wait for it is held and retried instead of dropped. HTTP clients read the CA bundle once. About a fifth less CPU per completed relay. | [An answer that arrives before its wait](building/wait-states.md#an-answer-that-arrives-before-its-wait), [Tuning for throughput](operating/throughput-tuning.md) |
 | **Binary snapshots; restart-proof local deliveries** (0.6.7) | Instance snapshots are stored in a binary container — **an older release cannot read it, so upgrade every replica at once**. A local delivery that fails because the database restarted is retried instead of poisoned. | [The binary container](internals/durable-execution.md#the-binary-container) |
+| **Replicas no longer send twice** (0.6.8) | Engines sharing one database each claimed outbox rows another was still delivering, so 0.6.5–0.6.7 sent about half of all outbound messages twice under multi-replica load. The claim now leases its rows (30 s, renewed while in flight). | [Outbox processing](architecture/replicas.md#outbox-processing-skip-locked-and-a-claim-lease) |
+| **Autovacuum for the busy tables** (0.6.8) | On PostgreSQL the outbox queue and the other high-churn tables have their own autovacuum settings, so dead rows no longer stall the outbox claim at high rates. Lower `autovacuum_naptime` on the server for high-rate deployments. | [PostgreSQL autovacuum](operating/throughput-tuning.md#postgresql-autovacuum) |
 | **Live audio sessions** (preview) | `AudioSession` and `require: [realtime]`, opened through an `llm` channel by a media transport, not by a process. | [Live audio sessions](building/llm-channels.md#live-audio-sessions-preview) |
 
 Telephony, IVRs, meetings and WebRTC are not part of this engine. They live in the separate
@@ -35,7 +37,7 @@ Every walkthrough runs from the root of a checkout of this repository. It needs:
   `base64 -i <file>` wherever a walkthrough says `base64 -w0 <file>`);
 - an engine image and the `sutra` CLI, both **0.6.0 or later**.
 
-The compose files default to the published `ghcr.io/startr-trade/sutra:0.6.7` image, and
+The compose files default to the published `ghcr.io/startr-trade/sutra:0.6.8` image, and
 [Installation](getting-started/installation.md) installs the CLI. To run a walkthrough against
 your own checkout instead, build both from it:
 

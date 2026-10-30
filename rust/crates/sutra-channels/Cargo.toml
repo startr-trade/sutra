@@ -52,6 +52,8 @@ rustls = { workspace = true, optional = true }
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "native-tokio", "ring", "tls12"], optional = true }
 
 [dev-dependencies]
+# Paused time for the dispatcher tests that span the claim-lease renewal interval.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "test-util"] }
 sutra-formats = { path = "../sutra-formats" }
 sutra-testkit = { path = "../sutra-testkit" }
 bigdecimal = { workspace = true }

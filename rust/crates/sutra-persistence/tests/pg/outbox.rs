@@ -1,7 +1,8 @@
 //! `PgOutboxStore` against a real PostgreSQL: enqueue/claim, claim honouring deployment
 //! isolation, due time, the max-entries limit and ascending `next_attempt_at` order, delete
 //! and defer (which bumps the attempt count), concurrent claims skipping locked rows, and
-//! V604's terminal `poisoned` flag (the `sutra.outbox.retry.max-attempts` ceiling).
+//! V604's terminal `poisoned` flag (the `sutra.outbox.retry.max-attempts` ceiling), and the
+//! leasing claim that keeps a row from every other replica while it is delivered.
 
 use std::collections::BTreeMap;
 
@@ -462,4 +463,107 @@ async fn mark_poisoned_is_deployment_scoped_and_a_missing_row_is_a_no_op() {
         .mark_poisoned(&dep_a(), Uuid::new_v4(), None)
         .await
         .unwrap();
+}
+
+/// The leasing claim: a row claimed by one dispatcher is not returned to a second claim (another
+/// replica's) while its lease runs, even though the first claim's transaction — and its row locks
+/// — ended at once. It is claimable again once the lease lapses (a dead claimer). The claimed
+/// entries still read as enqueued (original due time) and come back in due order.
+#[ignore = "docker"]
+#[tokio::test]
+async fn a_leased_claim_keeps_the_rows_from_every_other_claim_until_the_lease_lapses() {
+    let pool = fresh_pool().await;
+    let store = PgOutboxStore::new(pool);
+    let now = now_micros();
+    let mut first = entry(Uuid::new_v4());
+    first.next_attempt_at = now - Duration::seconds(2);
+    let mut second = entry(Uuid::new_v4());
+    second.next_attempt_at = now - Duration::seconds(1);
+    store.enqueue(&second).await.unwrap();
+    store.enqueue(&first).await.unwrap();
+
+    let lease = now + Duration::seconds(30);
+    let claimed = store
+        .claim_due_excluding(&dep_a(), now, 10, &[], lease)
+        .await
+        .unwrap();
+    assert_eq!(
+        claimed,
+        vec![first.clone(), second.clone()],
+        "due order, as enqueued"
+    );
+
+    // Another replica, a moment later: nothing — both rows are leased.
+    assert!(store
+        .claim_due_excluding(&dep_a(), now + Duration::seconds(1), 10, &[], lease)
+        .await
+        .unwrap()
+        .is_empty());
+    // The claim of the lock-only path agrees: not due before the lease end.
+    assert!(store.claim_due(&dep_a(), now, 10).await.unwrap().is_empty());
+
+    // The lease lapses (its claimer died): claimable again, by anyone.
+    let after = lease + Duration::seconds(1);
+    let reclaimed = store
+        .claim_due_excluding(&dep_a(), after, 10, &[], after + Duration::seconds(30))
+        .await
+        .unwrap();
+    assert_eq!(reclaimed.len(), 2);
+    assert_eq!(
+        reclaimed[0].next_attempt_at, lease,
+        "the lapsed lease is the due time"
+    );
+}
+
+/// Renewal extends the lease of the named pending rows only, never moves a due time earlier, and
+/// ignores rows that are gone; a deferral after a claim overwrites the lease.
+#[ignore = "docker"]
+#[tokio::test]
+async fn renewing_a_claim_extends_its_lease_and_never_shortens_a_due_time() {
+    let pool = fresh_pool().await;
+    let store = PgOutboxStore::new(pool);
+    store.enqueue(&entry(Uuid::new_v4())).await.unwrap();
+    store.enqueue(&entry(Uuid::new_v4())).await.unwrap();
+    let now = now_micros();
+    let claimed = store
+        .claim_due_excluding(&dep_a(), now, 1, &[], now + Duration::seconds(30))
+        .await
+        .unwrap();
+    assert_eq!(claimed.len(), 1);
+    let id = claimed[0].entry_id;
+
+    let renewed = store
+        .renew_claims(&dep_a(), &[id, Uuid::new_v4()], now + Duration::seconds(60))
+        .await
+        .unwrap();
+    assert_eq!(renewed, 1, "only the pending row is renewed");
+    let at_45 = now + Duration::seconds(45);
+    let due: Vec<Uuid> = store
+        .claim_due(&dep_a(), at_45, 10)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|e| e.entry_id)
+        .collect();
+    assert!(!due.contains(&id), "still leased at +45s after the renewal");
+
+    // A renewal to an EARLIER end than the current lease changes nothing.
+    assert_eq!(
+        store
+            .renew_claims(&dep_a(), &[id], now + Duration::seconds(10))
+            .await
+            .unwrap(),
+        0
+    );
+
+    // A deferral overwrites the lease with its backoff.
+    store
+        .defer(&dep_a(), id, now + Duration::seconds(5), Some("{}"))
+        .await
+        .unwrap();
+    let at_6 = store
+        .claim_due(&dep_a(), now + Duration::seconds(6), 10)
+        .await
+        .unwrap();
+    assert!(at_6.iter().any(|e| e.entry_id == id));
 }

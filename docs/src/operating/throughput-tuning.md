@@ -38,7 +38,7 @@ neither lose an acknowledged state nor invent one:
 | Transaction | What it writes | Why it may skip its flush |
 |---|---|---|
 | instance ownership claim | which engine is resuming an instance | a claim held by an engine that crashed is void anyway; the step that follows commits synchronously |
-| outbox claim | row locks only | locks end with the transaction whatever happens |
+| outbox claim and its lease renewal | row locks, and a lease: the claimed rows' due time moved 30 s ahead | a lost lease only makes the rows claimable again, so they are sent again: at-least-once, deduplicated on the idempotency key |
 | delete of delivered outbox rows | removes rows already sent | if it is lost, the row is sent again: outbound delivery has always been at-least-once, and receivers deduplicate on the idempotency key |
 
 The inbox dedup record of a delivery is not on the list: it is written in the same transaction as
@@ -174,6 +174,50 @@ SUTRA_OUTBOX_TICK_INTERVAL=PT0.01S` added to the last run, 8.05 ms on 0.6.5 and 
 | `sutra.outbox.batch-size` | `50` | a deployment enqueues far more than 50 rows between claims |
 | `sutra.outbox.tick-interval` | `PT5S` | you want retries and rows from other replicas picked up sooner; local deliveries do not wait for it |
 | `cache:` on a data store | off | a store is read on every request and changed rarely — see [Caching reads](../building/data-stores.md#caching-reads) |
+
+## PostgreSQL autovacuum {#postgresql-autovacuum}
+
+Several engine tables churn at the request rate:
+
+- `outbox_entry` gets one insert and one delete per delivery;
+- `instance_state` is rewritten on every step;
+- `waiting_event`, `alias_index` and `inbox_seen` gain and lose rows as instances park, finish and
+  age out.
+
+Each delete or rewrite leaves a dead row version, and the engine's hot queries step over those until
+a vacuum removes them. The claim of due outbox rows is the one that suffers most.
+
+PostgreSQL's defaults vacuum a table once 20% of it is dead and look for such tables once a
+minute. That is too late for a queue: it stays small while it produces thousands of dead rows a
+second. One measured run at about 1,700 requests a second used the defaults. Every two and a half
+minutes the outbox claim took 1–1.6 s, throughput fell below 100 a second for some 40 s, and p99
+latency reached 38 s.
+
+**Since 0.6.8 the engine's migrations set per-table values.** You need do nothing for them:
+
+| Table | Vacuum after | Cost throttle |
+|---|---|---|
+| `outbox_entry` | 5,000 dead rows, whatever the table's size (`autovacuum_vacuum_scale_factor = 0`, `autovacuum_vacuum_threshold = 5000`) | none (`autovacuum_vacuum_cost_delay = 0`); the table is small |
+| `instance_state`, `waiting_event`, `alias_index`, `inbox_seen` | 1% of the table plus 5,000 rows (`0.01`, `5000`) | the server's setting; these tables can be large |
+
+Statistics are refreshed on the same kind of trigger. At low rates 5,000 dead rows take a long time
+to accumulate, so these settings cost nothing there.
+
+**One setting is server-wide: `autovacuum_naptime`.** It sets how often autovacuum wakes to look,
+and a table cannot override it. For a deployment running hundreds of requests a second or more,
+lower it in `postgresql.conf`, or in your managed service's database flags:
+
+```ini
+autovacuum_naptime = 1s              # default 1min
+autovacuum_vacuum_cost_limit = 2000  # default 200 (via vacuum_cost_limit); lets the larger tables keep up
+```
+
+The run above, repeated with naptime `1s` and an unthrottled global autovacuum, went on for ten
+minutes at 2,500 requests a second with p99 329 ms and no slow statements. A busy autovacuum worker
+uses some CPU and I/O, so watch both after the change.
+
+MySQL/MariaDB and SQL Server have no per-table equivalent. InnoDB purge and SQL Server's ghost cleanup are
+server-wide, and the engine ships no setting for them.
 
 ## Profiling
 

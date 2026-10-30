@@ -239,7 +239,9 @@ pub struct ClaimedOutboxRow {
 
 /// Row access as the dispatcher needs it — the persistence-free seam (`sutra-engine`
 /// bridges it onto `sutra-persistence`'s `PgOutboxStore`, whose claim uses
-/// `FOR UPDATE SKIP LOCKED` so concurrent replicas never compete for the same rows).
+/// `FOR UPDATE SKIP LOCKED` and leases what it claims for [`CLAIM_LEASE`], so concurrent
+/// replicas never compete for the same rows — not at the claim, and not while a row is being
+/// delivered after the claim's transaction has ended).
 pub trait OutboxRowStore: Send + Sync {
     /// Claims up to `max_entries` rows due at `now` for `deployment`.
     fn claim_due<'a>(
@@ -310,6 +312,20 @@ pub trait OutboxRowStore: Send + Sync {
                 .take(max_entries.max(0) as usize)
                 .collect())
         })
+    }
+
+    /// Extend the claim lease of entries this process still has in flight, to [`CLAIM_LEASE`]
+    /// past `now`, so no other replica claims a row while it waits for a worker or is being
+    /// delivered. Entries no longer pending are ignored. The default does nothing — a store with
+    /// no lease (one process, or an in-memory table) has nothing to renew.
+    fn renew_claims<'a>(
+        &'a self,
+        deployment: &'a DeploymentId,
+        entry_ids: &'a [String],
+        now: OffsetDateTime,
+    ) -> BoxFuture<'a, Result<(), Diagnostic>> {
+        let _ = (deployment, entry_ids, now);
+        Box::pin(async { Ok(()) })
     }
 
     /// Deletes several delivered entries at once — one transaction, so a burst of deliveries
@@ -1749,6 +1765,18 @@ impl OutboxSignal {
         self.release(entry_ids);
     }
 
+    /// Every entry in flight in this process (claimed or handed off): the rows whose leases the
+    /// renewer keeps alive.
+    fn inflight_snapshot(&self) -> Vec<String> {
+        self.inner
+            .inflight
+            .lock()
+            .expect("outbox signal lock")
+            .iter()
+            .cloned()
+            .collect()
+    }
+
     fn claimed_snapshot(&self) -> Vec<String> {
         self.inner
             .claimed
@@ -1820,6 +1848,19 @@ pub struct OutboxConcurrency {
 /// dispatcher claims the row after this grace — and while it runs, no claim competes with the
 /// hand-off for it.
 pub const HANDOFF_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long a claim keeps a row from every other claim (on this replica or another). The claim
+/// moves the row's due time to the lease end; the row locks of the claim itself end at its commit,
+/// before delivery, so without the lease a second replica would claim — and deliver — a row the
+/// first is still delivering. Renewed every [`CLAIM_RENEW_INTERVAL`] while the row is in flight, so
+/// a slow delivery or a backlog in front of the workers never outlives it; if the process dies the
+/// lease lapses and any replica delivers the row (at-least-once). Equal to [`HANDOFF_GRACE`], the
+/// same bound a local hand-off already had.
+pub const CLAIM_LEASE: std::time::Duration = HANDOFF_GRACE;
+
+/// How often the dispatcher renews the leases of the rows it has in flight (a third of
+/// [`CLAIM_LEASE`], so two renewals can fail before a lease lapses).
+const CLAIM_RENEW_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// How long a delivered-and-deleted entry id is remembered (see `OutboxSignal::finished`).
 const FINISHED_MEMORY: std::time::Duration = std::time::Duration::from_secs(60);
@@ -1943,7 +1984,9 @@ impl OutboxDispatcher {
 ///   claim order, exactly as the serial loop does: a free slot must go to the oldest waiter.
 /// * A worker sends; on success the row goes to the delete batcher, which deletes whatever has
 ///   accumulated in one transaction. A row stays in flight until its delete commits, so it is
-///   never claimed again in between.
+///   never claimed again in between — not here (the in-flight set), and not on another replica
+///   sharing the database (the claim's lease, [`CLAIM_LEASE`], which a renewer task extends every
+///   [`CLAIM_RENEW_INTERVAL`] for every row still in flight).
 ///
 /// Retry, backoff, poison and incident semantics are the serial loop's, by construction: the
 /// workers call the same per-row code.
@@ -2061,6 +2104,45 @@ pub fn spawn_concurrent_dispatch_loop(
                 }
             })
         };
+        // ---- the lease renewer: its own task, so a claimer blocked on a full worker queue (a
+        // backlog — exactly when rows wait longest) never lets the leases of the rows it already
+        // handed out lapse to another replica.
+        let renewer = {
+            let dispatcher = Arc::clone(&dispatcher);
+            let signal = signal.clone();
+            let deployments = deployments.clone();
+            let mut drained = drained.clone();
+            rt.spawn(async move {
+                let mut every = tokio::time::interval(CLAIM_RENEW_INTERVAL);
+                every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                every.tick().await;
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = drained.changed() => break,
+                        _ = every.tick() => {}
+                    }
+                    let ids = signal.inflight_snapshot();
+                    if ids.is_empty() {
+                        continue;
+                    }
+                    let now = (dispatcher.now)();
+                    for deployment in deployments.snapshot() {
+                        if let Err(diagnostic) =
+                            dispatcher.store.renew_claims(&deployment, &ids, now).await
+                        {
+                            warn!(
+                                deployment = %deployment.value(),
+                                rows = ids.len(),
+                                code = %diagnostic.code,
+                                error = %diagnostic.message,
+                                "outbox claim lease renewal failed — retried next interval"
+                            );
+                        }
+                    }
+                }
+            })
+        };
         // ---- the claimer (this task)
         let mut interval = tokio::time::interval(interval_duration);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -2124,6 +2206,7 @@ pub fn spawn_concurrent_dispatch_loop(
         }
         drop(worker_tx);
         let _ = router.await;
+        let _ = renewer.await;
         for task in worker_tasks {
             let _ = task.await;
         }
@@ -3605,6 +3688,8 @@ mod concurrent_tests {
         rows: Mutex<Vec<(ClaimedOutboxRow, bool)>>, // (row, deferred)
         delete_calls: Mutex<Vec<usize>>,
         deferred: Mutex<Vec<String>>,
+        /// The id lists of every lease renewal, in order.
+        renewed: Mutex<Vec<Vec<String>>>,
     }
 
     impl Table {
@@ -3617,6 +3702,16 @@ mod concurrent_tests {
     }
 
     impl OutboxRowStore for Table {
+        fn renew_claims<'a>(
+            &'a self,
+            _deployment: &'a DeploymentId,
+            entry_ids: &'a [String],
+            _now: OffsetDateTime,
+        ) -> BoxFuture<'a, Result<(), Diagnostic>> {
+            self.renewed.lock().unwrap().push(entry_ids.to_vec());
+            Box::pin(async { Ok(()) })
+        }
+
         fn claim_due<'a>(
             &'a self,
             deployment: &'a DeploymentId,
@@ -3940,6 +4035,41 @@ mod concurrent_tests {
         wait_until(|| table.remaining() == 1).await;
         handle.shutdown().await;
         assert_eq!(signal.inflight_count(), 0);
+        assert_eq!(sink.delivered.lock().unwrap().len(), 1);
+    }
+
+    /// A row whose delivery outlasts the renewal interval has its claim lease renewed while it is
+    /// in flight — so a second replica cannot claim it mid-delivery — and is dropped from the
+    /// renewals once delivered.
+    #[tokio::test(start_paused = true)]
+    async fn the_lease_of_a_row_in_flight_is_renewed_until_it_is_delivered() {
+        let table = Arc::new(Table::default());
+        table.insert(row("e000", "inst-0", "test://inst-0"));
+        let sink = Arc::new(SlowSink::new(25_000));
+        let signal = OutboxSignal::new();
+        let handle = spawn(
+            dispatcher(Arc::clone(&table), Arc::clone(&sink), 10),
+            2,
+            &signal,
+            1_000,
+        );
+        signal.wake();
+        tokio::time::sleep(std::time::Duration::from_secs(21)).await;
+        let during = table.renewed.lock().unwrap().clone();
+        assert!(
+            during.len() >= 2 && during.iter().all(|ids| ids == &vec!["e000".to_string()]),
+            "renewed every interval while in flight: {during:?}"
+        );
+        wait_until(|| table.remaining() == 0).await;
+        tokio::time::sleep(std::time::Duration::from_secs(11)).await;
+        let after = table.renewed.lock().unwrap().len();
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        assert_eq!(
+            table.renewed.lock().unwrap().len(),
+            after,
+            "nothing in flight, nothing renewed"
+        );
+        handle.shutdown().await;
         assert_eq!(sink.delivered.lock().unwrap().len(), 1);
     }
 }
