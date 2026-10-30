@@ -84,6 +84,33 @@ payload lands in:
   narrows whichever of the message-type selectors above applies rather than replacing one, so
   "exact beats pattern beats accept-anything" is unchanged.
 
+### Several waits on one channel {#several-waits-on-one-channel}
+
+*Since 0.6.10.* A message on a channel that a WAIT subscribes to (a relay) chooses among the waits
+by the same rules a start event uses: an exact `messageTypeValue` beats a `messageTypePattern`,
+which beats a wait that declares no type, and `filterExpression` narrows within a tier. A wait
+pinned to another message type never takes the message. Among the waits that accept it, the one
+the correlated instance is actually parked at is resumed, the most specific first. So two waits on
+one channel can be told apart by message type alone:
+
+```xml
+<bpmn:receiveTask id="WaitAnswer">
+  <bpmn:extensionElements>
+    <q:source channel="answers-in" name="answer" messageTypeValue="Answer"/>
+    <q:alias name="answerRef" expression="answer.ref" unique="true"/>
+  </bpmn:extensionElements>
+</bpmn:receiveTask>
+<bpmn:receiveTask id="WaitCancel">
+  <bpmn:extensionElements>
+    <q:source channel="answers-in" name="cancel" messageTypeValue="Cancel"/>
+    <q:alias name="cancelRef" expression="cancel.ref" unique="true"/>
+  </bpmn:extensionElements>
+</bpmn:receiveTask>
+```
+
+Before 0.6.10 a relay ignored the wait's message type, and such waits needed a `filterExpression`
+on `messageType` to stay apart. That still works.
+
 ### Selecting on attributes, not just a message type
 
 One string cannot always say which process should handle a message. A message standard may use the
@@ -329,7 +356,26 @@ frozen `urn:sutra:q:1.0` namespace. See [Calling a language model](llm-channels.
 Binds a `<bpmn:dataStoreReference>` to a key in a `datastores.yaml`-declared store. `forUpdate`
 takes a pessimistic row lock (serializes concurrent writers on the same key); `field` replaces one
 field of a stored map value; `expect="unchanged"` is an optimistic compare-and-set instead of a
-lock. See [Data stores](data-stores.md).
+lock; `expect="absent"` (0.6.10) writes only when the key does not exist yet — a claim exactly one
+replica wins. A lost compare-and-set raises `SUTRA.RUNTIME.DATASTORE.CONFLICT`, which an error
+boundary on the data task can catch.
+
+On a read, `query` (0.6.10) turns the binding into a key query: every row whose key starts with
+`key` (`query="prefix"`) or lies in `[key, to)` (`query="range"`), keys compared bytewise, in key
+order, `limit` per page (default 1000, maximum 10 000) after the key `after`; `rows="false"`
+returns aggregates only. Each child `<q:aggregate fn="count|sum" field="…" groupBy="…"/>` is
+computed over every matching row:
+
+```xml
+<q:store key="payload.meter + '|' + payload.day + '|'" query="prefix" limit="500" after="payload.after">
+  <q:aggregate fn="sum" field="kwh"/>
+  <q:aggregate fn="sum" field="kwh" groupBy="kind"/>
+</q:store>
+```
+
+The target variable receives `{rows: [{key, value}], aggregates: [...], truncated, next}`. See
+[Querying rows by key](data-stores.md#querying-rows-by-key) for the result shape, the number rules
+and the index the store's table needs.
 
 ## `q:dispatch` / `q:case` — a routing table instead of gateway sprawl
 

@@ -2795,10 +2795,9 @@ fn matches_still_rejects_malformed_backreference_patterns() {
 
 #[test]
 fn parse_with_context_names_resolves_spaced_builtins() {
-    // The precompile case: an AST built once and evaluated per message. `parse` alone performs no
-    // name resolution, so a multi-word builtin never merges into one call-name token and the
-    // expression does not parse at all — which would make `starts with` unusable at every
-    // precompiled site while working everywhere else.
+    // The precompile case: an AST built once and evaluated per message. Both `parse` and
+    // `parse_with_context_names` merge a multi-word builtin into one call-name token, so
+    // `starts with` works at every precompiled site exactly as it does at eval time.
     let names: std::collections::HashSet<String> = ["attr".to_string()].into_iter().collect();
 
     for expr in [
@@ -2807,8 +2806,8 @@ fn parse_with_context_names_resolves_spaced_builtins() {
         r#"string length("abc") = 3"#,
     ] {
         assert!(
-            expressions::parse(expr).is_err(),
-            "plain parse is expected to fail on a spaced builtin: {expr}"
+            expressions::parse(expr).is_ok(),
+            "plain parse accepts a spaced builtin: {expr}"
         );
         let parsed = expressions::parse_with_context_names(expr, &names);
         assert!(parsed.is_ok(), "{expr}: {:?}", parsed.err());

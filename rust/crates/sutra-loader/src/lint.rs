@@ -16,7 +16,7 @@
 //! they were not loadable; every codec is a built-in crate here, so unknown codec
 //! references are deploy-blocking ERRORs — a deliberate posture upgrade.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -2460,6 +2460,36 @@ fn check_store_references(
                     Node::DataTask { data_mapping, .. } => data_mapping,
                     _ => return,
                 };
+                // A key query runs on a key/value `sql` store only: a projected (typed-column)
+                // store has no `store_value` document to aggregate over.
+                for read in mapping.store_reads.iter().filter(|r| r.query.is_some()) {
+                    let Some(def) = stores.iter().find(|s| s.name == read.store) else {
+                        continue; // undeclared: reported below
+                    };
+                    let reason = if def.structure.is_some() {
+                        Some("declares a structure (typed columns)")
+                    } else if !def.store_type.eq_ignore_ascii_case("sql") {
+                        Some("is not a key/value `sql` store")
+                    } else {
+                        None
+                    };
+                    if let Some(reason) = reason {
+                        out.push(
+                            LintDiagnostic::error(
+                                codes::CONFIG_DATASTORE_INVALID,
+                                format!(
+                                    "deployment {dep_label}: process '{}' node '{}' runs a key \
+                                     query on data store '{}', which {reason}; key queries run \
+                                     on key/value sql stores only",
+                                    process.id,
+                                    node.id(),
+                                    read.store
+                                ),
+                            )
+                            .at_node(&process.id, node.id()),
+                        );
+                    }
+                }
                 for store in mapping
                     .store_reads
                     .iter()
@@ -3604,7 +3634,8 @@ fn check_feel_sites(deployment: &LoadedDeployment, dep_label: &str, out: &mut Ve
                     }
                 }
             });
-            for flow in process.flows() {
+            // Sequence-flow conditions, in the process and in every sub-process it contains.
+            for_each_flow(process, &mut |flow| {
                 if let Some(condition) = &flow.condition {
                     if let Err(e) = sutra_feel::expressions::parse(condition) {
                         out.push(
@@ -3620,8 +3651,140 @@ fn check_feel_sites(deployment: &LoadedDeployment, dep_label: &str, out: &mut Ve
                         );
                     }
                 }
+            });
+            // Assignment-side FEEL — data-task `<assignment><from>` expressions, the data-store
+            // key and query expressions, `<q:param>` expressions and multi-instance completion
+            // conditions. Evaluated per pass (not replay-bound), so parse-checked only; a text
+            // that does not parse would otherwise surface as a runtime failure on first use.
+            visit_nodes(process, &mut |_, node| {
+                let site =
+                    |what: &str| format!("process '{}' node '{}' {what}", process.id, node.id());
+                let anchor = || DiagnosticAnchor::BpmnNode {
+                    process: process.id.clone(),
+                    node: node.id().to_string(),
+                };
+                for (what, text) in assignment_feel_sites(node) {
+                    check_feel_parses(&text, &site(&what), anchor(), dep_label, out);
+                }
+            });
+        }
+    }
+}
+
+/// The assignment-side FEEL texts one node carries, each with a short label for the diagnostic.
+fn assignment_feel_sites(node: &Node) -> Vec<(String, String)> {
+    let mut sites = Vec::new();
+    match node {
+        Node::ServiceTask {
+            data_mapping,
+            params,
+            ..
+        } => {
+            push_data_mapping_sites(data_mapping, &mut sites);
+            for param in params {
+                sites.push((
+                    format!("<q:param name=\"{}\"> expression", param.name),
+                    param.expression.clone(),
+                ));
             }
         }
+        Node::DataTask { data_mapping, .. } => push_data_mapping_sites(data_mapping, &mut sites),
+        Node::MultiInstance {
+            completion_condition: Some(condition),
+            ..
+        } => sites.push((
+            "multi-instance completionCondition".to_string(),
+            condition.clone(),
+        )),
+        _ => {}
+    }
+    sites
+}
+
+fn push_data_mapping_sites(
+    mapping: &sutra_bpmn::model::DataMapping,
+    sites: &mut Vec<(String, String)>,
+) {
+    for assignment in &mapping.assignments {
+        sites.push((
+            format!("<assignment> to '{}'", assignment.target_var),
+            assignment.expression.clone(),
+        ));
+    }
+    for read in &mapping.store_reads {
+        sites.push((
+            format!("data-store '{}' read key", read.store),
+            read.key_expression.clone(),
+        ));
+        if let Some(query) = &read.query {
+            if let sutra_bpmn::StoreQueryMode::Range { to_expression } = &query.mode {
+                sites.push((
+                    format!("data-store '{}' query @to", read.store),
+                    to_expression.clone(),
+                ));
+            }
+            if let Some(after) = &query.after_expression {
+                sites.push((
+                    format!("data-store '{}' query @after", read.store),
+                    after.clone(),
+                ));
+            }
+        }
+    }
+    for write in &mapping.store_writes {
+        sites.push((
+            format!("data-store '{}' write key", write.store),
+            write.key_expression.clone(),
+        ));
+    }
+}
+
+/// Apply `f` to every sequence flow of `process` and, recursively, of its embedded /
+/// transaction / event / ad-hoc sub-processes.
+fn for_each_flow(
+    process: &ProcessDefinition,
+    f: &mut impl FnMut(&sutra_bpmn::model::SequenceFlow),
+) {
+    for flow in process.flows() {
+        f(flow);
+    }
+    for node in process.nodes() {
+        match node {
+            Node::SubProcess { inner, .. }
+            | Node::TransactionSubProcess { inner, .. }
+            | Node::EventSubProcess { inner, .. }
+            | Node::AdHocSubProcess { inner, .. } => for_each_flow(inner, f),
+            Node::MultiInstance { inner, .. } | Node::StandardLoop { inner, .. } => {
+                if let Node::SubProcess { inner, .. } | Node::TransactionSubProcess { inner, .. } =
+                    inner.as_ref()
+                {
+                    for_each_flow(inner, f);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Parse-check one FEEL text (no determinism requirement).
+fn check_feel_parses(
+    expression: &str,
+    site: &str,
+    anchor: DiagnosticAnchor,
+    dep_label: &str,
+    out: &mut Vec<LintDiagnostic>,
+) {
+    if let Err(e) = sutra_feel::expressions::parse(expression) {
+        out.push(
+            LintDiagnostic::error(
+                &e.code.clone(),
+                format!(
+                    "deployment {dep_label}: {site} does not parse: {}",
+                    e.message
+                ),
+            )
+            .at_anchor(anchor),
+        );
     }
 }
 
@@ -4506,6 +4669,14 @@ fn variable_readers(
             }
             for read in &mapping.store_reads {
                 add_feel_roots(&read.key_expression, &mut readers);
+                if let Some(query) = &read.query {
+                    if let sutra_bpmn::StoreQueryMode::Range { to_expression } = &query.mode {
+                        add_feel_roots(to_expression, &mut readers);
+                    }
+                    if let Some(after) = &query.after_expression {
+                        add_feel_roots(after, &mut readers);
+                    }
+                }
             }
             for write in &mapping.store_writes {
                 add_feel_roots(&write.key_expression, &mut readers);
@@ -4561,6 +4732,63 @@ fn for_each_flow_condition(process: &ProcessDefinition, f: &mut impl FnMut(&str)
     }
 }
 
+/// The inputs a multi-instance activity puts in scope for every node it runs — its
+/// `<inputDataItem>` (or the default item variable) when it iterates a collection, and
+/// `loopCounter` — keyed by the id of each node inside it (the wrapped activity itself and,
+/// for a sub-process, everything the sub-process contains).
+fn loop_scoped_inputs(process: &ProcessDefinition) -> HashMap<String, BTreeSet<String>> {
+    fn mark(node: &Node, names: &BTreeSet<String>, out: &mut HashMap<String, BTreeSet<String>>) {
+        out.entry(node.id().to_string())
+            .or_default()
+            .extend(names.iter().cloned());
+        match node {
+            Node::SubProcess { inner, .. }
+            | Node::TransactionSubProcess { inner, .. }
+            | Node::EventSubProcess { inner, .. }
+            | Node::AdHocSubProcess { inner, .. } => {
+                for n in inner.nodes() {
+                    mark(n, names, out);
+                }
+            }
+            Node::MultiInstance { inner, .. } | Node::StandardLoop { inner, .. } => {
+                mark(inner, names, out)
+            }
+            _ => {}
+        }
+    }
+    fn walk(nodes: &[Node], out: &mut HashMap<String, BTreeSet<String>>) {
+        for node in nodes {
+            match node {
+                Node::MultiInstance {
+                    inner,
+                    loop_data_input_ref,
+                    input_data_item,
+                    ..
+                } => {
+                    let mut names = BTreeSet::new();
+                    names.insert(sutra_bpmn::LOOP_COUNTER_VARIABLE.to_string());
+                    if let Some(item) = input_data_item {
+                        names.insert(item.clone());
+                    } else if loop_data_input_ref.is_some() {
+                        names.insert(sutra_bpmn::DEFAULT_LOOP_ITEM_VARIABLE.to_string());
+                    }
+                    mark(inner, &names, out);
+                    walk(std::slice::from_ref(inner.as_ref()), out);
+                }
+                Node::SubProcess { inner, .. }
+                | Node::TransactionSubProcess { inner, .. }
+                | Node::EventSubProcess { inner, .. }
+                | Node::AdHocSubProcess { inner, .. } => walk(inner.nodes(), out),
+                Node::StandardLoop { inner, .. } => walk(std::slice::from_ref(inner.as_ref()), out),
+                _ => {}
+            }
+        }
+    }
+    let mut out = HashMap::new();
+    walk(process.nodes(), &mut out);
+    out
+}
+
 fn check_template_inputs(
     deployment: &LoadedDeployment,
     definitions: &[ChannelDefinition],
@@ -4587,6 +4815,7 @@ fn check_template_inputs(
             if let Some(roots) = reachable.get(&process.id) {
                 available.extend(roots.iter().cloned());
             }
+            let loop_scoped = loop_scoped_inputs(process);
             visit_nodes(process, &mut |_, node| {
                 let Node::ServiceTask {
                     id,
@@ -4609,6 +4838,10 @@ fn check_template_inputs(
                 let mut available_here = available.clone();
                 for param in params {
                     available_here.insert(param.name.clone());
+                }
+                // Inside a multi-instance activity the loop item and `loopCounter` are inputs.
+                if let Some(names) = loop_scoped.get(id.as_str()) {
+                    available_here.extend(names.iter().cloned());
                 }
                 for root in &analysis.roots {
                     if !available_here.contains(root) {

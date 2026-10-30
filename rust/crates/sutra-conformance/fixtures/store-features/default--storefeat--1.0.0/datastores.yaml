@@ -1,0 +1,27 @@
+# Three key/value stores on one connection (the suite's PostgreSQL), each with the same idempotent
+# DDL as its first-use migration: the key column is in the bytewise "C" collation, which key
+# queries require. `events` also turns the read cache on: a key query must bypass it.
+datastores:
+  - name: events
+    type: sql
+    sql:
+      url-ref: env:STORE_DB_URL
+      username-ref: env:STORE_DB_USER
+      password-ref: env:STORE_DB_PASSWORD
+      migrations: migrations/events
+    cache:
+      enabled: true
+  - name: claims
+    type: sql
+    sql:
+      url-ref: env:STORE_DB_URL
+      username-ref: env:STORE_DB_USER
+      password-ref: env:STORE_DB_PASSWORD
+      migrations: migrations/claims
+  - name: results
+    type: sql
+    sql:
+      url-ref: env:STORE_DB_URL
+      username-ref: env:STORE_DB_USER
+      password-ref: env:STORE_DB_PASSWORD
+      migrations: migrations/results

@@ -2796,6 +2796,15 @@ impl TokenExecutor {
     ) -> Result<(), Signal> {
         for read in &dm.store_reads {
             let vars = state.ctx.borrow().variables.clone();
+            if let Some(query) = &read.query {
+                let result = self.run_store_query(id, read, query, &vars, state).await?;
+                state
+                    .ctx
+                    .borrow_mut()
+                    .variables
+                    .insert(read.target_var.clone(), result);
+                continue;
+            }
             let key_value =
                 (self.value_evaluator)(&read.key_expression, &vars).map_err(Signal::Fatal)?;
             let key = as_store_key(&key_value, &read.key_expression, id)?;
@@ -2853,11 +2862,8 @@ impl TokenExecutor {
                     store_op_failed(&write.store, &key, id, "write", &e.to_string())
                 })?;
                 let to_store = merge_field(write, value, current);
-                if write.expect_unchanged {
-                    let expected = *state
-                        .store_revs
-                        .get(&format!("{}#{key}", write.store))
-                        .unwrap_or(&0);
+                if write.expect_unchanged || write.expect_absent {
+                    let expected = expected_revision(write, &key, state);
                     let applied =
                         tx.put_if_revision(&key, to_store, expected)
                             .await
@@ -2865,7 +2871,7 @@ impl TokenExecutor {
                                 store_op_failed(&write.store, &key, id, "write", &e.to_string())
                             })?;
                     if !applied {
-                        return Err(store_conflict(write, &key, expected, id));
+                        return Err(store_conflict(write, &key, expected, id, state.process));
                     }
                 } else {
                     tx.put(&key, to_store).await.map_err(|e| {
@@ -2882,11 +2888,8 @@ impl TokenExecutor {
                     None
                 };
                 let to_store = merge_field(write, value, current);
-                if write.expect_unchanged {
-                    let expected = *state
-                        .store_revs
-                        .get(&format!("{}#{key}", write.store))
-                        .unwrap_or(&0);
+                if write.expect_unchanged || write.expect_absent {
+                    let expected = expected_revision(write, &key, state);
                     let applied = store
                         .put_if_revision(&key, to_store, expected)
                         .await
@@ -2894,7 +2897,7 @@ impl TokenExecutor {
                             store_op_failed(&write.store, &key, id, "write", &e.to_string())
                         })?;
                     if !applied {
-                        return Err(store_conflict(write, &key, expected, id));
+                        return Err(store_conflict(write, &key, expected, id, state.process));
                     }
                 } else {
                     store.put(&key, to_store).await.map_err(|e| {
@@ -2904,6 +2907,111 @@ impl TokenExecutor {
             }
         }
         Ok(())
+    }
+
+    /// Run one key query (`<q:store query=…>`) and shape its result for the target variable:
+    /// `{rows: [{key, value}], aggregates: [{count, sum?} | {groups: {k: {count, sum?}}}],
+    /// truncated, next}`. Always against the store itself — committed rows, outside any
+    /// enclosing transaction scope and its uncommitted writes, never the read cache.
+    async fn run_store_query(
+        &self,
+        id: &str,
+        read: &sutra_bpmn::model::StoreRead,
+        query: &sutra_bpmn::StoreQuery,
+        vars: &Variables,
+        state: &ExecutionState<'_>,
+    ) -> Result<FeelValue, Signal> {
+        let bound = |expr: &str, what: &str| -> Result<String, Signal> {
+            match (self.value_evaluator)(expr, vars).map_err(Signal::Fatal)? {
+                FeelValue::String(s) => Ok(s),
+                other => Err(fatal_diag(
+                    codes::RUNTIME_DATASTORE_QUERY_INVALID,
+                    format!(
+                        "Data task '{id}' key query on store '{}': {what} expression '{expr}' \
+                         evaluated to {} — a key bound must be a string.",
+                        read.store,
+                        sutra_feel::value::canonical_string_of(&other)
+                    ),
+                )),
+            }
+        };
+        let lower = bound(&read.key_expression, "the key")?;
+        let upper = match &query.mode {
+            sutra_bpmn::StoreQueryMode::Prefix => {
+                if lower.is_empty() {
+                    return Err(fatal_diag(
+                        codes::RUNTIME_DATASTORE_QUERY_INVALID,
+                        format!(
+                            "Data task '{id}' key query on store '{}': the prefix evaluated to \
+                             the empty string, which would read the whole store.",
+                            read.store
+                        ),
+                    ));
+                }
+                prefix_upper_bound(&lower)
+            }
+            sutra_bpmn::StoreQueryMode::Range { to_expression } => {
+                Some(bound(to_expression, "the @to")?)
+            }
+        };
+        let after = match &query.after_expression {
+            None => None,
+            Some(expr) => match (self.value_evaluator)(expr, vars).map_err(Signal::Fatal)? {
+                FeelValue::Null => None,
+                FeelValue::String(s) => Some(s),
+                other => {
+                    return Err(fatal_diag(
+                        codes::RUNTIME_DATASTORE_QUERY_INVALID,
+                        format!(
+                            "Data task '{id}' key query on store '{}': @after expression \
+                             '{expr}' evaluated to {} — it must be a key (string) or null.",
+                            read.store,
+                            sutra_feel::value::canonical_string_of(&other)
+                        ),
+                    ))
+                }
+            },
+        };
+        let split = |p: &String| p.split('.').map(str::to_string).collect::<Vec<_>>();
+        let spec = crate::datastore::StoreKeyQuery {
+            lower,
+            upper,
+            after,
+            row_limit: query.rows.then_some(query.limit),
+            aggregates: query
+                .aggregates
+                .iter()
+                .map(|a| crate::datastore::StoreQueryAggregateSpec {
+                    sum_field: a.field.as_ref().map(split),
+                    group_by: a.group_by.as_ref().map(split),
+                })
+                .collect(),
+        };
+        let store = self.resolve_store(&read.store, id, state)?;
+        let result = store.query(&spec).await.map_err(|e| {
+            store_op_failed(&read.store, &spec.lower, id, "key query", &e.to_string())
+        })?;
+        for (agg, value) in query.aggregates.iter().zip(&result.aggregates) {
+            let bad: i64 = match value {
+                crate::datastore::StoreAggregateValue::Total(cell) => cell.non_numeric,
+                crate::datastore::StoreAggregateValue::Grouped(groups) => {
+                    groups.values().map(|c| c.non_numeric).sum()
+                }
+            };
+            if bad > 0 {
+                return Err(fatal_diag(
+                    codes::RUNTIME_DATASTORE_QUERY_NOT_NUMERIC,
+                    format!(
+                        "Data task '{id}' key query on store '{}' sums field '{}', which holds a \
+                         value that is not a number in {bad} matching row(s). A sum adds JSON \
+                         numbers and decimal strings; a missing field or null is skipped.",
+                        read.store,
+                        agg.field.as_deref().unwrap_or("")
+                    ),
+                ));
+            }
+        }
+        Ok(query_result_value(&result))
     }
 
     fn resolve_store(
@@ -5357,16 +5465,128 @@ fn merge_field(write: &StoreWrite, value: FeelValue, current: Option<FeelValue>)
     FeelValue::Map(map)
 }
 
-fn store_conflict(write: &StoreWrite, key: &str, expected_rev: i64, node_id: &str) -> Signal {
+/// The revision a compare-and-set write expects: `0` (the key must be ABSENT) for
+/// `expect="absent"`, else the revision this instance read the key at (`0` when it never read it,
+/// or read it absent — so an `expect="unchanged"` write of a key read as missing is also an
+/// insert that only one writer can win).
+fn expected_revision(write: &StoreWrite, key: &str, state: &ExecutionState<'_>) -> i64 {
+    if write.expect_absent {
+        return 0;
+    }
+    *state
+        .store_revs
+        .get(&format!("{}#{key}", write.store))
+        .unwrap_or(&0)
+}
+
+/// A compare-and-set write that did not apply. When an error boundary on the data task or an
+/// event sub-process catches `SUTRA.RUNTIME.DATASTORE.CONFLICT`, it is raised as that BPMN error
+/// (the "someone else got there first" path of a claim); otherwise the instance fails with it.
+fn store_conflict(
+    write: &StoreWrite,
+    key: &str,
+    expected_rev: i64,
+    node_id: &str,
+    process: &ProcessDefinition,
+) -> Signal {
+    let code = codes::RUNTIME_DATASTORE_CONFLICT;
+    if find_error_boundary(process, node_id, code).is_some()
+        || find_error_event_sub_process(process, code).is_some()
+    {
+        return Signal::BpmnError {
+            source: node_id.to_string(),
+            code: code.to_string(),
+        };
+    }
+    let detail = if write.expect_absent {
+        "the key already exists (expect=\"absent\")".to_string()
+    } else {
+        format!("the value changed since it was read (expected revision {expected_rev})")
+    };
     fatal_diag(
-        codes::RUNTIME_DATASTORE_CONFLICT,
+        code,
         format!(
             "Optimistic-concurrency conflict writing data store '{}' key '{key}' at data task \
-             '{node_id}': the value changed since it was read (expected revision \
-             {expected_rev}). Retry the operation.",
+             '{node_id}': {detail}. Retry the operation, or catch {code} with an error boundary.",
             write.store
         ),
     )
+}
+
+/// The exclusive upper bound of the keys starting with `prefix` (next code point of the last
+/// character); `None` when no such bound exists.
+fn prefix_upper_bound(prefix: &str) -> Option<String> {
+    let mut chars: Vec<char> = prefix.chars().collect();
+    while let Some(last) = chars.pop() {
+        let mut next = last as u32 + 1;
+        if (0xD800..=0xDFFF).contains(&next) {
+            next = 0xE000;
+        }
+        if let Some(c) = char::from_u32(next) {
+            chars.push(c);
+            return Some(chars.into_iter().collect());
+        }
+    }
+    None
+}
+
+/// The FEEL value a key query hands its target variable.
+fn query_result_value(result: &crate::datastore::StoreQueryResult) -> FeelValue {
+    use std::collections::BTreeMap;
+    let cell_value = |cell: &crate::datastore::StoreAggregateCell| {
+        let mut m = BTreeMap::new();
+        m.insert("count".to_string(), FeelValue::from(cell.count));
+        if let Some(sum) = &cell.sum {
+            m.insert("sum".to_string(), FeelValue::Number(sum.clone()));
+        }
+        FeelValue::Map(m)
+    };
+    let rows = result
+        .rows
+        .iter()
+        .map(|(key, value)| {
+            let mut m = BTreeMap::new();
+            m.insert("key".to_string(), FeelValue::String(key.clone()));
+            m.insert("value".to_string(), value.clone());
+            FeelValue::Map(m)
+        })
+        .collect();
+    let aggregates = result
+        .aggregates
+        .iter()
+        .map(|a| match a {
+            crate::datastore::StoreAggregateValue::Total(cell) => cell_value(cell),
+            crate::datastore::StoreAggregateValue::Grouped(groups) => {
+                let mut m = BTreeMap::new();
+                m.insert(
+                    "groups".to_string(),
+                    FeelValue::Map(
+                        groups
+                            .iter()
+                            .map(|(k, c)| (k.clone(), cell_value(c)))
+                            .collect(),
+                    ),
+                );
+                FeelValue::Map(m)
+            }
+        })
+        .collect();
+    let mut out = BTreeMap::new();
+    out.insert("rows".to_string(), FeelValue::List(rows));
+    out.insert("aggregates".to_string(), FeelValue::List(aggregates));
+    out.insert(
+        "truncated".to_string(),
+        FeelValue::Boolean(result.truncated),
+    );
+    out.insert(
+        "next".to_string(),
+        result
+            .next
+            .clone()
+            .map(FeelValue::String)
+            .unwrap_or(FeelValue::Null),
+    );
+    FeelValue::Map(out)
 }
 
 /// Coerce a FEEL-evaluated key value to the store key string.

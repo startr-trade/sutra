@@ -173,6 +173,10 @@ pub struct ResolvedResume {
     pub instance_id: String,
     /// The satisfied wait node the relay targets.
     pub wait_node_id: String,
+    /// Every wait node of the target process the relay is compatible with (channel, declared
+    /// message type, predicate), most specific first; the resume rebinds to the one the
+    /// instance is parked at.
+    pub candidate_nodes: Vec<String>,
     /// The relay's merged, already-validated variables (post intake validation, pre
     /// channel-call output mapping — the mapping is applied against the PINNED process).
     pub variables: Variables,
@@ -2396,13 +2400,25 @@ impl ChannelEngine {
                 decoded.as_ref().and_then(|d| d.message_type.as_deref()),
             )
         };
-        let targets =
-            self.processes
-                .resolve_relay_targets(deployment, &message.channel, &relay_selector_ctx);
+        let relay_message_type = decoded.as_ref().and_then(|d| d.message_type.as_deref());
+        let targets = self.processes.resolve_relay_targets(
+            deployment,
+            &message.channel,
+            relay_message_type,
+            &relay_selector_ctx,
+        );
         let Some(target) = targets.first() else {
             return Ok(RelayResolution::NoTargets);
         };
         let process = &target.process;
+        // Every wait of the target process this relay may satisfy, most specific first — the
+        // resume picks the one the correlated instance is actually parked at, never a wait whose
+        // declared message type the relay does not have.
+        let candidate_nodes: Vec<String> = targets
+            .iter()
+            .filter(|t| Arc::ptr_eq(&t.process, process) || t.process.id == process.id)
+            .map(|t| t.wait_node_id.clone())
+            .collect();
 
         // Two-tier intake validation of the relayed payload against the wait node's
         // <q:source> (uniform with a start event). FATAL ⇒ reject; nothing advances.
@@ -2464,6 +2480,7 @@ impl ChannelEngine {
                 deployment: deployment.clone(),
                 instance_id,
                 wait_node_id: target.wait_node_id.clone(),
+                candidate_nodes,
                 variables: relay_vars,
                 alias_name,
                 alias_value,
@@ -2484,6 +2501,7 @@ impl ChannelEngine {
                 deployment,
                 &instance_id,
                 &target.wait_node_id,
+                &candidate_nodes,
                 relay_vars,
                 &alias_name,
                 &alias_value,
@@ -2513,6 +2531,7 @@ impl ChannelEngine {
         deployment: &DeploymentId,
         instance_id: &str,
         wait_node_id: &str,
+        candidate_nodes: &[String],
         relay_vars: Variables,
         alias_name: &str,
         alias_value: &str,
@@ -2678,6 +2697,7 @@ impl ChannelEngine {
                 Some(&resume_process),
                 &snapshot.waiting_nodes,
                 wait_node_id,
+                candidate_nodes,
                 channel,
                 relay_vars,
             );
@@ -2856,6 +2876,7 @@ impl ChannelEngine {
                 &resolved.deployment,
                 &resolved.instance_id,
                 &resolved.wait_node_id,
+                &resolved.candidate_nodes,
                 resolved.variables.clone(),
                 &resolved.alias_name,
                 &resolved.alias_value,
@@ -5882,14 +5903,18 @@ fn timer_records(timer_waits: &[TimerWait]) -> Vec<TimerWaitRecord> {
         .collect()
 }
 
-/// The wait node a correlated relay on `channel` satisfies: `named` (the first subscriber in
-/// model order) when the instance waits there, else the waiting node of the same process that
-/// subscribes `channel` — with the decoded payload moved from `named`'s `<q:source name>` to
-/// that node's. Unchanged when no other waiting node subscribes (the existing posture).
+/// The wait node a correlated relay on `channel` satisfies: `named` (the most specific
+/// compatible subscriber) when the instance waits there, else the first of `candidates` (the
+/// relay's compatible waits, most specific first) the instance is parked at — with the decoded
+/// payload moved from `named`'s `<q:source name>` to that node's. A wait outside `candidates`
+/// (its declared message type or predicate rules the relay out) is never chosen. With no
+/// `candidates` (a resume carried over from a build that did not record them), any waiting node
+/// subscribing `channel` is eligible, as before. Unchanged when no eligible node is waiting.
 fn rebind_relay_to_waiting(
     process: Option<&ProcessDefinition>,
     waiting: &[String],
     named: &str,
+    candidates: &[String],
     channel: &str,
     mut relay_vars: Variables,
 ) -> (String, Variables) {
@@ -5920,7 +5945,14 @@ fn rebind_relay_to_waiting(
                 .any(|s| s.channel == channel),
         }
     };
-    let Some(waiting_node) = waiting.iter().find(|w| subscribes(w)) else {
+    let waiting_node = if candidates.is_empty() {
+        waiting.iter().find(|w| subscribes(w))
+    } else {
+        candidates
+            .iter()
+            .find(|c| waiting.iter().any(|w| w == *c) && subscribes(c))
+    };
+    let Some(waiting_node) = waiting_node else {
         return (named.to_string(), relay_vars);
     };
     let name_of = |node_id: &str| {

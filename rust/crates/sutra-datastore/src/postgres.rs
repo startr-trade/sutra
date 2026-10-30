@@ -27,6 +27,7 @@ use crate::coverage::{
     self, check_deployment_id, CoverageCounts, CoverageFragmentRow, CoverageMetrics,
 };
 use crate::error::DataStoreError;
+use crate::keyquery::{self, KeyAggregateResult, KeyQueryPage, KeyRangeQuery};
 use crate::projected::{ActualColumn, ProjectedStore, SqlDialect};
 
 /// This module's dialect, for the shared projected-store SQL builder.
@@ -71,6 +72,9 @@ struct StoreInner {
     /// field — and arms the first-use table verification. `None` is exactly today's opaque
     /// key→JSON behaviour, which is the compatibility guarantee.
     projected: Option<Arc<ProjectedStore>>,
+    /// `true` once the key column's collation was found bytewise (checked before the first key
+    /// query, then never again).
+    key_order_verified: std::sync::atomic::AtomicBool,
 }
 
 impl PostgresDataStore {
@@ -174,6 +178,16 @@ impl PostgresDataStore {
         ))
     }
 
+    /// Key query (`<q:store query=…>`): the rows whose key lies in the query's range, in key
+    /// order, plus its aggregates over every matching row. Plain autocommit `SELECT`s at the
+    /// connection's READ COMMITTED: no locks, no transaction, never the read cache.
+    pub fn query(
+        &self,
+        query: &KeyRangeQuery,
+    ) -> SendFuture<'static, Result<KeyQueryPage, DataStoreError>> {
+        Box::pin(store_query(Arc::clone(&self.inner), query.clone()))
+    }
+
     /// Opens a caller-managed transaction — the atomicity boundary the engine threads
     /// across the data tasks enclosed in a `<bpmn:transaction>` scope. Dropping the handle
     /// without `commit` rolls back (drop-without-commit is a rollback).
@@ -250,6 +264,7 @@ fn store_inner(
         migrated: Mutex::new(false),
         legacy_namespace,
         projected: projected.map(Arc::new),
+        key_order_verified: std::sync::atomic::AtomicBool::new(false),
     })
 }
 
@@ -658,6 +673,112 @@ async fn store_put_if_revision(
     let applied = tx_put_if_revision(&mut tx, &key, &value, expected_rev).await?;
     tx.commit().await?;
     Ok(applied)
+}
+
+async fn store_query(
+    inner: Arc<StoreInner>,
+    query: KeyRangeQuery,
+) -> Result<KeyQueryPage, DataStoreError> {
+    let store = inner.name.clone();
+    if inner.projected.is_some() {
+        return Err(keyquery::projected_unsupported(&store));
+    }
+    keyquery::validate(&store, &query)?;
+    ensure_migrated(&inner).await?;
+    let q_err =
+        |e: sqlx::Error| DataStoreError::with_source(format!("key query on '{store}' failed"), e);
+    let mut conn = inner.pool.acquire().await.map_err(q_err)?;
+    if !inner
+        .key_order_verified
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        let collation: Option<String> = sqlx::query_scalar(keyquery::key_order_probe_sql(DIALECT))
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(q_err)?
+            .flatten();
+        if !keyquery::is_bytewise_collation(DIALECT, collation.as_deref()) {
+            return Err(keyquery::key_order_error(
+                &store,
+                DIALECT,
+                collation.as_deref(),
+            ));
+        }
+        let indexes: i64 = sqlx::query_scalar(keyquery::key_index_probe_sql(DIALECT))
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(q_err)?;
+        if indexes == 0 {
+            return Err(keyquery::key_index_error(&store));
+        }
+        inner
+            .key_order_verified
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+    let (rows, truncated, next) = match query.row_limit {
+        None => (Vec::new(), false, None),
+        Some(limit) => {
+            let sql = keyquery::rows_sql(DIALECT, &query, limit);
+            let mut statement = sqlx::query(&sql);
+            for value in keyquery::binds(&store, &query, true) {
+                statement = statement.bind(value);
+            }
+            let fetched = statement.fetch_all(&mut *conn).await.map_err(q_err)?;
+            let mut rows = Vec::with_capacity(fetched.len());
+            for r in fetched {
+                let key: String = r.try_get(0).map_err(q_err)?;
+                let text: String = r.try_get(1).map_err(q_err)?;
+                let value = serde_json::from_str(&text).map_err(|e| {
+                    DataStoreError::with_source(
+                        format!("stored value at '{store}'[{key}] is not valid JSON"),
+                        e,
+                    )
+                })?;
+                rows.push((key, value));
+            }
+            keyquery::finish_page(rows, limit)
+        }
+    };
+    let mut aggregates = Vec::with_capacity(query.aggregates.len());
+    for agg in &query.aggregates {
+        let sql = keyquery::aggregate_sql(DIALECT, &query, agg);
+        let mut statement = sqlx::query(&sql);
+        for value in keyquery::binds(&store, &query, false) {
+            statement = statement.bind(value);
+        }
+        let fetched = statement.fetch_all(&mut *conn).await.map_err(q_err)?;
+        if agg.group_by.is_some() {
+            let mut groups = std::collections::BTreeMap::new();
+            for r in fetched {
+                let group: String = r.try_get(0).map_err(q_err)?;
+                let cell = keyquery::cell(
+                    agg,
+                    r.try_get(1).map_err(q_err)?,
+                    r.try_get(2).map_err(q_err)?,
+                    r.try_get(3).map_err(q_err)?,
+                );
+                groups.insert(group, cell);
+            }
+            aggregates.push(KeyAggregateResult::Grouped(groups));
+        } else {
+            let cell = match fetched.first() {
+                Some(r) => keyquery::cell(
+                    agg,
+                    r.try_get(0).map_err(q_err)?,
+                    r.try_get(1).map_err(q_err)?,
+                    r.try_get(2).map_err(q_err)?,
+                ),
+                None => keyquery::cell(agg, 0, None, 0),
+            };
+            aggregates.push(KeyAggregateResult::Total(cell));
+        }
+    }
+    Ok(KeyQueryPage {
+        rows,
+        aggregates,
+        truncated,
+        next,
+    })
 }
 
 /// Run the module-resident idempotent migrations once per store instance (and, via the PG

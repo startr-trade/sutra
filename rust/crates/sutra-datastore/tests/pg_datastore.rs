@@ -820,3 +820,359 @@ async fn coverage_store_marks_and_aggregates_on_the_declared_connection() {
     let again = coverage_store(&pg.url());
     assert_eq!(again.read_metrics(dep).await.unwrap().total, 5);
 }
+
+// ---- key queries (`<q:store query=…>`, 0.6.10) ------------------------------
+
+/// The cutover table with its key column in the bytewise "C" collation — what a store that runs
+/// key queries ships, so the primary key serves a key range in bytewise order.
+const QUERY_DDL: &str = "CREATE TABLE IF NOT EXISTS data_store (\n\
+  store_name  VARCHAR(128) NOT NULL,\n\
+  store_key   VARCHAR(512) COLLATE \"C\" NOT NULL,\n\
+  store_value TEXT         NOT NULL,\n\
+  rev         BIGINT       NOT NULL DEFAULT 1,\n\
+  updated_at  TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,\n\
+  PRIMARY KEY (store_name, store_key)\n\
+);";
+
+const ACCOUNTS: i64 = 5;
+const DAYS: i64 = 20;
+const PER_DAY: i64 = 1000;
+
+/// The amount (in cents) of row `seq`: deterministic, so the expected sums are computable.
+fn cents(seq: i64) -> i64 {
+    (seq * 7919) % 100_000 + 1
+}
+
+fn decimal_text(cents: i64) -> String {
+    format!("{}.{:02}", cents / 100, cents % 100)
+}
+
+async fn admin_pool(pg: &PgContainer, db: &str) -> sqlx::PgPool {
+    sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&format!(
+            "postgres://sutra:sutra@127.0.0.1:{}/{db}",
+            pg.port
+        ))
+        .await
+        .expect("admin connect")
+}
+
+fn day_prefix(account: i64, day: i64) -> String {
+    format!("src-{account}|2026-10-{day:02}|")
+}
+
+fn day_query(account: i64, day: i64, row_limit: Option<u32>) -> sutra_datastore::KeyRangeQuery {
+    let lower = day_prefix(account, day);
+    sutra_datastore::KeyRangeQuery {
+        upper: sutra_datastore::keyquery::prefix_upper_bound(&lower),
+        lower,
+        after: None,
+        row_limit,
+        aggregates: vec![
+            sutra_datastore::KeyQueryAggregate {
+                sum_field: Some(vec!["amount".into()]),
+                group_by: Some(vec!["dir".into()]),
+            },
+            sutra_datastore::KeyQueryAggregate {
+                sum_field: None,
+                group_by: Some(vec!["tag".into()]),
+            },
+            sutra_datastore::KeyQueryAggregate {
+                sum_field: Some(vec!["amount".into()]),
+                group_by: None,
+            },
+        ],
+    }
+}
+
+/// 100 000 rows (5 accounts x 20 days x 1000), then: one day's prefix query with grouped and
+/// ungrouped exact sums checked against a client-side recount, every page of a paged walk, and
+/// EXPLAIN over the very statements the store ran — index range scans, never a sequential scan.
+#[ignore = "docker"]
+#[tokio::test(flavor = "multi_thread")]
+async fn key_query_pages_groups_and_sums_over_the_primary_key() {
+    let pg = PgContainer::start();
+    let store = PostgresDataStore::from_definition(
+        &literal_def("events", &pg.url()),
+        vec![QUERY_DDL.to_string()],
+    )
+    .expect("store builds");
+    // First use runs the migration (an empty query is enough), then bulk-load the rows.
+    let warm = store.query(&day_query(0, 1, Some(1))).await.unwrap();
+    assert!(warm.rows.is_empty());
+    let admin = admin_pool(&pg, "sutra").await;
+    sqlx::query(&format!(
+        "INSERT INTO data_store (store_name, store_key, store_value) \
+         SELECT 'events', \
+                'src-' || a || '|2026-10-' || lpad(d::text, 2, '0') || '|' || lpad(s::text, 6, '0'), \
+                json_build_object( \
+                  'amount', round(((s * 7919) % 100000 + 1) / 100.0, 2), \
+                  'dir', CASE WHEN s % 3 = 0 THEN 'OUT' ELSE 'IN' END, \
+                  'tag', CASE s % 4 WHEN 0 THEN 'OPEN' WHEN 1 THEN 'CLOSE' WHEN 2 THEN 'RETRY' ELSE 'SKIP' END \
+                )::text \
+         FROM generate_series(0, {}) a, generate_series(1, {DAYS}) d, generate_series(0, {}) s",
+        ACCOUNTS - 1,
+        PER_DAY - 1
+    ))
+    .execute(&admin)
+    .await
+    .expect("bulk load");
+    // Rows of another store under the same keys must never leak into "events".
+    sqlx::query(
+        "INSERT INTO data_store (store_name, store_key, store_value) \
+         VALUES ('other', 'src-2|2026-10-07|000001', '{\"amount\": 1000000}')",
+    )
+    .execute(&admin)
+    .await
+    .unwrap();
+    sqlx::query("ANALYZE data_store")
+        .execute(&admin)
+        .await
+        .unwrap();
+
+    // ---- one day: rows + exact aggregates ------------------------------------
+    let page = store.query(&day_query(2, 7, Some(300))).await.unwrap();
+    assert_eq!(page.rows.len(), 300);
+    assert!(page.truncated);
+    assert_eq!(page.next.as_deref(), Some("src-2|2026-10-07|000299"));
+    assert_eq!(page.rows[0].0, "src-2|2026-10-07|000000");
+    let (mut inbound, mut outbound, mut in_n, mut out_n) = (0i64, 0i64, 0i64, 0i64);
+    for s in 0..PER_DAY {
+        if s % 3 == 0 {
+            outbound += cents(s);
+            out_n += 1;
+        } else {
+            inbound += cents(s);
+            in_n += 1;
+        }
+    }
+    let sutra_datastore::KeyAggregateResult::Grouped(by_dir) = &page.aggregates[0] else {
+        panic!("grouped")
+    };
+    let as_cents = |text: &str| -> i64 {
+        let (whole, frac) = text.split_once('.').unwrap_or((text, "0"));
+        whole.parse::<i64>().unwrap() * 100 + format!("{frac:0<2}")[..2].parse::<i64>().unwrap()
+    };
+    assert_eq!(by_dir["IN"].count, in_n);
+    assert_eq!(as_cents(by_dir["IN"].sum.as_deref().unwrap()), inbound);
+    assert_eq!(by_dir["OUT"].count, out_n);
+    assert_eq!(as_cents(by_dir["OUT"].sum.as_deref().unwrap()), outbound);
+    let sutra_datastore::KeyAggregateResult::Grouped(by_tag) = &page.aggregates[1] else {
+        panic!("grouped")
+    };
+    assert_eq!(by_tag.len(), 4);
+    assert!(by_tag
+        .values()
+        .all(|c| c.count == PER_DAY / 4 && c.sum.is_none()));
+    let sutra_datastore::KeyAggregateResult::Total(total) = &page.aggregates[2] else {
+        panic!("total")
+    };
+    assert_eq!(total.count, PER_DAY, "aggregates ignore the row limit");
+    assert_eq!(
+        total.sum.as_deref(),
+        Some(decimal_text(inbound + outbound).as_str())
+    );
+    assert_eq!(total.non_numeric, 0);
+
+    // ---- paging: every row exactly once, in order, aggregates stable ---------
+    let mut query = day_query(2, 7, Some(300));
+    let mut seen: Vec<String> = Vec::new();
+    loop {
+        let page = store.query(&query).await.unwrap();
+        assert_eq!(
+            page.aggregates[2],
+            sutra_datastore::KeyAggregateResult::Total(total.clone())
+        );
+        seen.extend(page.rows.iter().map(|(k, _)| k.clone()));
+        match page.next {
+            Some(next) => query.after = Some(next),
+            None => {
+                assert!(!page.truncated);
+                break;
+            }
+        }
+    }
+    assert_eq!(seen.len() as i64, PER_DAY);
+    assert!(
+        seen.windows(2).all(|w| w[0] < w[1]),
+        "ascending, no repeats"
+    );
+
+    // ---- a range across days -------------------------------------------------
+    let range = sutra_datastore::KeyRangeQuery {
+        lower: "src-4|2026-10-03|".into(),
+        upper: Some("src-4|2026-10-06|".into()),
+        after: None,
+        row_limit: None,
+        aggregates: vec![sutra_datastore::KeyQueryAggregate {
+            sum_field: None,
+            group_by: None,
+        }],
+    };
+    let page = store.query(&range).await.unwrap();
+    assert!(page.rows.is_empty(), "rows=false");
+    assert_eq!(
+        page.aggregates[0],
+        sutra_datastore::KeyAggregateResult::Total(sutra_datastore::KeyAggregateCell {
+            count: 3 * PER_DAY,
+            sum: None,
+            non_numeric: 0,
+        })
+    );
+
+    // ---- EXPLAIN the statements the store runs: the primary key, no seq scan --
+    let mut explained = day_query(2, 7, Some(300));
+    explained.after = Some("src-2|2026-10-07|000299".into());
+    let mut statements = vec![(
+        sutra_datastore::keyquery::rows_sql(sutra_datastore::SqlDialect::Postgres, &explained, 300),
+        true,
+    )];
+    for agg in &explained.aggregates {
+        statements.push((
+            sutra_datastore::keyquery::aggregate_sql(
+                sutra_datastore::SqlDialect::Postgres,
+                &explained,
+                agg,
+            ),
+            false,
+        ));
+    }
+    for (sql, with_after) in statements {
+        let explain_sql = format!("EXPLAIN {sql}");
+        let mut explain = sqlx::query_scalar::<_, String>(&explain_sql).persistent(false);
+        for value in sutra_datastore::keyquery::binds("events", &explained, with_after) {
+            explain = explain.bind(value.to_string());
+        }
+        let plan = explain.fetch_all(&admin).await.unwrap().join("\n");
+        assert!(
+            !plan.contains("Seq Scan"),
+            "sequential scan in:\n{plan}\nfor {sql}"
+        );
+        assert!(
+            plan.contains("data_store_pkey"),
+            "primary key not used:\n{plan}\nfor {sql}"
+        );
+    }
+
+    // ---- the numeric rules on the database ---------------------------------
+    for (key, value) in [
+        ("edge|1", json!({"amount": 1.25, "dir": "A"})),
+        ("edge|2", json!({"amount": "2.50", "dir": "A"})),
+        ("edge|3", json!({"dir": "B"})),
+        ("edge|4", json!({"amount": null})),
+        ("edge|5", json!({"amount": "abc", "dir": "B"})),
+        ("edge|6", json!({"amount": true, "dir": "B"})),
+        ("edge|7", json!({"amount": {"v": 1}, "dir": "B"})),
+    ] {
+        store.put(key, &value).await.unwrap();
+    }
+    let edge = sutra_datastore::KeyRangeQuery {
+        lower: "edge|".into(),
+        upper: sutra_datastore::keyquery::prefix_upper_bound("edge|"),
+        after: None,
+        row_limit: Some(10),
+        aggregates: vec![
+            sutra_datastore::KeyQueryAggregate {
+                sum_field: Some(vec!["amount".into()]),
+                group_by: Some(vec!["dir".into()]),
+            },
+            sutra_datastore::KeyQueryAggregate {
+                sum_field: Some(vec!["amount".into()]),
+                group_by: None,
+            },
+        ],
+    };
+    let page = store.query(&edge).await.unwrap();
+    assert_eq!(page.rows.len(), 7);
+    let sutra_datastore::KeyAggregateResult::Total(cell) = &page.aggregates[1] else {
+        panic!("total")
+    };
+    assert_eq!(cell.count, 7);
+    assert_eq!(
+        cell.sum.as_deref(),
+        Some("3.75"),
+        "1.25 + \"2.50\"; missing and null skipped"
+    );
+    assert_eq!(cell.non_numeric, 3, "text, boolean and object");
+    let sutra_datastore::KeyAggregateResult::Grouped(groups) = &page.aggregates[0] else {
+        panic!("grouped")
+    };
+    assert_eq!(groups["A"].sum.as_deref(), Some("3.75"));
+    assert_eq!(groups["B"].non_numeric, 3);
+    assert_eq!(
+        groups["null"].count, 1,
+        "a row without the group field groups under null"
+    );
+    assert_eq!(groups["null"].sum.as_deref(), Some("0"));
+
+    // ---- no match: zeros, not null -----------------------------------------
+    let mut none = day_query(9, 1, Some(10));
+    none.lower = "nobody|".into();
+    none.upper = sutra_datastore::keyquery::prefix_upper_bound("nobody|");
+    let page = store.query(&none).await.unwrap();
+    assert!(page.rows.is_empty() && !page.truncated && page.next.is_none());
+    assert_eq!(
+        page.aggregates[0],
+        sutra_datastore::KeyAggregateResult::Grouped(BTreeMap::new())
+    );
+    assert_eq!(
+        page.aggregates[2],
+        sutra_datastore::KeyAggregateResult::Total(sutra_datastore::KeyAggregateCell {
+            count: 0,
+            sum: Some("0".into()),
+            non_numeric: 0,
+        })
+    );
+    admin.close().await;
+}
+
+/// A key column in a linguistic collation is refused before any query runs, naming the fix.
+#[ignore = "docker"]
+#[tokio::test(flavor = "multi_thread")]
+async fn key_query_refuses_a_key_column_that_does_not_sort_bytewise() {
+    let pg = PgContainer::start();
+    let admin = admin_pool(&pg, "sutra").await;
+    sqlx::query("CREATE DATABASE linguistic TEMPLATE template0 LC_COLLATE 'en_US.utf8' LC_CTYPE 'en_US.utf8'")
+        .execute(&admin)
+        .await
+        .expect("create database");
+    admin.close().await;
+    let store = PostgresDataStore::from_definition(
+        &literal_def(
+            "events",
+            &format!("postgres://127.0.0.1:{}/linguistic", pg.port),
+        ),
+        vec![CUTOVER_DDL.to_string()],
+    )
+    .expect("store builds");
+    let e = store.query(&day_query(0, 1, Some(10))).await.unwrap_err();
+    assert_eq!(
+        e.code(),
+        Some(sutra_datastore::keyquery::codes::QUERY_KEY_ORDER),
+        "{e}"
+    );
+    assert!(e.to_string().contains("COLLATE \"C\""), "{e}");
+
+    // A bytewise key column but a primary key led by namespace columns: no index serves the
+    // range, so the query is refused instead of scanning the table.
+    let legacy = PostgresDataStore::from_definition_with_namespace(
+        &literal_def("events", &pg.url()),
+        vec!["CREATE TABLE IF NOT EXISTS data_store (\
+              tenant_id VARCHAR(64) NOT NULL, module_id VARCHAR(256) NOT NULL, \
+              module_version VARCHAR(64) NOT NULL, store_name VARCHAR(128) NOT NULL, \
+              store_key VARCHAR(512) COLLATE \"C\" NOT NULL, store_value TEXT NOT NULL, \
+              rev BIGINT NOT NULL DEFAULT 1, \
+              updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP, \
+              PRIMARY KEY (tenant_id, module_id, module_version, store_name, store_key))"
+            .to_string()],
+        Some(("t".into(), "m".into(), "1.0.0".into())),
+    )
+    .expect("store builds");
+    let e = legacy.query(&day_query(0, 1, Some(10))).await.unwrap_err();
+    assert_eq!(
+        e.code(),
+        Some(sutra_datastore::keyquery::codes::QUERY_KEY_INDEX),
+        "{e}"
+    );
+}

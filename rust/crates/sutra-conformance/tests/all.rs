@@ -40,6 +40,8 @@ mod tc_outbox_relay;
 mod tc_shard_lanes;
 #[path = "all/tc_snapshot_upgrade.rs"]
 mod tc_snapshot_upgrade;
+#[path = "all/tc_store_features.rs"]
+mod tc_store_features;
 #[path = "all/tc_timer_expressions.rs"]
 mod tc_timer_expressions;
 #[path = "all/tc_wait_race.rs"]

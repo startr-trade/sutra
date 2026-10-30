@@ -1,0 +1,37 @@
+# Channels for the store-features package (all HTTP intake, apikey):
+#   events-in   {key, entry}            -> events-write: appends one events row
+#   report-in   {id, prefix, after}     -> events-report: key query into results "report|<id>"
+#   claim-in    {day, who}              -> claim-day: insert-if-absent claim of "day"
+#   waits-in    {ref}                   -> typed-waits: parks at two waits on answers-in
+#   answers-in  <Answer>/<Cancel> (xml) -> relays to the wait whose messageTypeValue matches
+channels:
+  - name: events-in
+    transport: http
+    bind: "POST /channels/events-in"
+    codec: json
+    cloudevents-mode: none
+    auth: { scheme: apikey, apikey: { value: env:STORE_FEATURES_API_KEY, header: X-Api-Key } }
+  - name: report-in
+    transport: http
+    bind: "POST /channels/report-in"
+    codec: json
+    cloudevents-mode: none
+    auth: { scheme: apikey, apikey: { value: env:STORE_FEATURES_API_KEY, header: X-Api-Key } }
+  - name: claim-in
+    transport: http
+    bind: "POST /channels/claim-in"
+    codec: json
+    cloudevents-mode: none
+    auth: { scheme: apikey, apikey: { value: env:STORE_FEATURES_API_KEY, header: X-Api-Key } }
+  - name: waits-in
+    transport: http
+    bind: "POST /channels/waits-in"
+    codec: json
+    cloudevents-mode: none
+    auth: { scheme: apikey, apikey: { value: env:STORE_FEATURES_API_KEY, header: X-Api-Key } }
+  - name: answers-in
+    transport: http
+    bind: "POST /channels/answers-in"
+    codec: xml
+    cloudevents-mode: none
+    auth: { scheme: apikey, apikey: { value: env:STORE_FEATURES_API_KEY, header: X-Api-Key } }

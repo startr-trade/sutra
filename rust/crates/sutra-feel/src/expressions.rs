@@ -18,10 +18,39 @@ pub fn parse(expression: &str) -> Result<FeelExpr, FeelError> {
 
 /// Parse with a caller-supplied source URI so any `SUTRA.FEEL.*` diagnostics carry a
 /// meaningful pointer (e.g. the path of the BPMN file the expression was lifted from).
+///
+/// A FEEL builtin whose name contains a space (`context put`, `list contains`,
+/// `string length`, …) is merged into one call name here exactly as [`eval`] merges it, so a
+/// build-time caller with no runtime context (the package lint, the loader) accepts every text
+/// the evaluator accepts. Only the builtin names are known: with no scope there is no evidence
+/// for any other multi-word name, and the lexer's hyphen fold is left as it is.
 pub fn parse_with_uri(expression: &str, source_uri: &str) -> Result<FeelExpr, FeelError> {
     let positions = FeelSourcePositions::new(expression, source_uri);
     let tokens = FeelLexer::new(expression, &positions).tokenize()?;
+    let tokens = if crate::lexer::has_adjacent_name_run(&tokens) {
+        crate::lexer::merge_named_tokens(tokens, spaced_builtin_names())
+    } else {
+        tokens
+    };
     FeelParser::new(tokens, &positions).parse()
+}
+
+/// Every FEEL builtin and property name that contains a space — the names a context-free parse
+/// can still recognise.
+fn spaced_builtin_names() -> &'static std::collections::HashSet<String> {
+    static NAMES: std::sync::OnceLock<std::collections::HashSet<String>> =
+        std::sync::OnceLock::new();
+    NAMES.get_or_init(|| {
+        evaluator::SPACED_BUILTIN_ALIASES
+            .iter()
+            .map(|(spaced, _)| (*spaced).to_string())
+            .chain(
+                evaluator::SPACED_PROPERTY_NAMES
+                    .iter()
+                    .map(|name| (*name).to_string()),
+            )
+            .collect()
+    })
 }
 
 /// Evaluate an expression against a context map. Any runtime error carries the offending

@@ -78,6 +78,7 @@ fn no_impl_service_tasks_with_data_ops_parse_to_data_tasks() {
                     key_expression: "fromId".to_string(),
                     for_update: true,
                     target_var: "fromAccount".to_string(),
+                    query: None,
                 }]
             );
             assert!(data_mapping.assignments.is_empty());
@@ -103,6 +104,7 @@ fn no_impl_service_tasks_with_data_ops_parse_to_data_tasks() {
                 field: Some("balance".to_string()),
                 value_var: "newBal".to_string(),
                 expect_unchanged: false,
+                expect_absent: false,
             }]
         ),
         other => panic!("expected DataTask, got {other:?}"),

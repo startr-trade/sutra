@@ -67,6 +67,22 @@ pub async fn fresh_db() -> String {
 /// A store named `name` on database `db`, carrying the cutover DDL as its first-use
 /// migration (idempotent — a second store on the same database re-runs it as a no-op).
 pub fn store(db: &str, name: &str) -> MysqlDataStore {
+    store_with_ddl(db, name, CUTOVER_DDL)
+}
+
+/// The cutover table with the key column in a bytewise collation — what a store that runs key
+/// queries ships (`ascii_bin`: bytewise, and within InnoDB's index byte limit).
+pub const QUERY_DDL: &str = "CREATE TABLE IF NOT EXISTS data_store (\
+  store_name  VARCHAR(128) NOT NULL, \
+  store_key   VARCHAR(512) CHARACTER SET ascii COLLATE ascii_bin NOT NULL, \
+  store_value LONGTEXT     NOT NULL, \
+  rev         BIGINT       NOT NULL DEFAULT 1, \
+  updated_at  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP, \
+  PRIMARY KEY (store_name, store_key) \
+) CHARACTER SET ascii;";
+
+/// A store named `name` on database `db` whose first-use migration is `ddl`.
+pub fn store_with_ddl(db: &str, name: &str, ddl: &str) -> MysqlDataStore {
     let mut properties = BTreeMap::new();
     properties.insert("sql.url".to_string(), db_url(db));
     let def = StoreDefinition {
@@ -75,7 +91,7 @@ pub fn store(db: &str, name: &str) -> MysqlDataStore {
         properties,
         structure: None,
     };
-    MysqlDataStore::from_definition(&def, vec![CUTOVER_DDL.to_string()]).expect("store builds")
+    MysqlDataStore::from_definition(&def, vec![ddl.to_string()]).expect("store builds")
 }
 
 // ---- the projected (typed-column) shape ------------------------------------

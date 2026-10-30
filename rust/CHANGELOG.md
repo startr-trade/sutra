@@ -13,6 +13,54 @@ This is the changelog for the **Rust-native** engine (`rust/` workspace). It beg
 
 Nothing yet.
 
+## [0.6.10] — 2026-10-30
+
+A **patch** release with one additive feature: data-store key queries, plus insert-if-absent
+writes, a relay routing fix and lint and FEEL parser fixes. The `urn:sutra:q:1.0` changes are
+additive (new optional attributes, a new optional child element, a new `expect` value). No
+migration and no snapshot change.
+
+### Added
+
+- **Key queries on a data store** (`<q:store query="prefix|range">`). On a data-task read, a key
+  query returns every row of a key/value `sql` store whose key starts with `@key`, or lies in
+  `[@key, @to)`. Keys are compared bytewise. The query can also compute aggregates over every
+  matching row (`<q:aggregate fn="count|sum" field groupBy>`), whatever the page size. Rows come
+  back in key order, at most `@limit` per page (default 1000, maximum 10 000), with `@after` for
+  paging. The target variable receives `{rows, aggregates, truncated, next}`. Sums are exact
+  decimals over JSON numbers and decimal strings: a missing or null field is skipped, and any other
+  value fails with `SUTRA.RUNTIME.DATASTORE.QUERY_NOT_NUMERIC`. No match gives zeros, not null. The
+  query runs as one index range (PostgreSQL, MySQL/MariaDB and SQL Server). It takes no locks,
+  reads committed rows and never uses the read cache. Before a store's first query, the engine
+  checks that the key column sorts bytewise and that an index leads with
+  `(store_name, store_key)`. If not, the query fails with `QUERY_KEY_ORDER` or `QUERY_KEY_INDEX`,
+  naming the DDL that fixes it.
+- **`<q:store expect="absent">`** makes a data-store write an insert that applies only when the key
+  does not exist yet: an atomic "claim once" across replicas. A `forUpdate` read of a missing key
+  locks nothing, so read-then-write could not do this.
+- **A data-store conflict can be caught.** `SUTRA.RUNTIME.DATASTORE.CONFLICT` (from
+  `expect="absent"` or `expect="unchanged"`) is raised as a BPMN error when an error boundary on the
+  data task, or an event sub-process, catches it. Uncaught, it still fails the instance.
+
+### Fixed
+
+- **A relay honours a wait's declared message type.** With several waits on one channel, a relay
+  picked a wait by channel and predicate only, so waits that differed by `messageTypeValue` could
+  take each other's messages. Relays now select waits the way start events are selected: exact type,
+  then pattern, then untyped. The resume goes to the most specific compatible wait the instance is
+  parked at.
+- **FEEL: `parse` accepts spaced builtins.** `context put(...)`, `list contains(...)`,
+  `string length(...)` and the other builtins whose names contain a space failed to parse wherever
+  no runtime context was at hand (the package lint, precompiled sites), although they evaluated.
+  For example, `x != null and not(list contains(...))` in a flow condition was refused. The DMN TCK
+  still passes in full (L2 126/126, L3 3365/3365 attempted).
+- **Lint: a multi-instance loop item is a template input.** A template rendered inside a
+  multi-instance activity may read its `<inputDataItem>` (or the default item) and `loopCounter`.
+  Before, it was flagged `CONFIG_TEMPLATE_INPUT_UNSATISFIED`.
+- **Lint parses assignment-side FEEL.** Data-task `<assignment>` expressions, store keys, key-query
+  bounds, `<q:param>` expressions and multi-instance completion conditions are now parse-checked
+  like flow conditions, including flow conditions inside sub-processes.
+
 ## [0.6.9] — 2026-10-30
 
 A **patch** release. It carries everything 0.6.8 brought, because the `v0.6.8` tag was created but

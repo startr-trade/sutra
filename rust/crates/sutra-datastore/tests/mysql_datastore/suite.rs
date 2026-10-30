@@ -6,6 +6,8 @@
 //! syntax and the advisory-lock primitive; this suite is what pins that for MySQL/MariaDB.
 //! The MariaDB binary re-runs these identical sources against a mariadb:11 container.
 
+use std::str::FromStr;
+
 use serde_json::json;
 
 use crate::fixture;
@@ -433,4 +435,175 @@ async fn coverage_store_marks_and_aggregates_on_the_declared_connection() {
     // A second store instance over the same connection re-runs the DDL as a no-op.
     let again = fixture::coverage_store(&db);
     assert_eq!(again.read_metrics(dep).await.unwrap().total, 5);
+}
+
+// ---- key queries (`<q:store query=…>`, 0.6.10) ------------------------------
+
+fn agg(sum: Option<&str>, group: Option<&str>) -> sutra_datastore::KeyQueryAggregate {
+    sutra_datastore::KeyQueryAggregate {
+        sum_field: sum.map(|s| vec![s.to_string()]),
+        group_by: group.map(|g| vec![g.to_string()]),
+    }
+}
+
+fn prefix_query(prefix: &str, row_limit: Option<u32>) -> sutra_datastore::KeyRangeQuery {
+    sutra_datastore::KeyRangeQuery {
+        lower: prefix.to_string(),
+        upper: sutra_datastore::keyquery::prefix_upper_bound(prefix),
+        after: None,
+        row_limit,
+        aggregates: vec![agg(Some("amount"), Some("dir")), agg(Some("amount"), None)],
+    }
+}
+
+/// The same key-query contract the PostgreSQL suite pins: prefix and range selection in bytewise
+/// key order, paging with `after`, grouped and ungrouped exact sums over every matching row,
+/// the numeric rules, zeros on no match — and the refusal of a non-bytewise key column.
+#[ignore = "docker"]
+#[tokio::test(flavor = "multi_thread")]
+async fn key_query_prefix_range_paging_and_aggregates() {
+    let db = fixture::fresh_db().await;
+    let store = fixture::store_with_ddl(&db, "events", fixture::QUERY_DDL);
+    let mut expected_total = 0i64;
+    for s in 0..120i64 {
+        let cents = (s * 7919) % 10_000 + 1;
+        let side = if s % 3 == 0 { "OUT" } else { "IN" };
+        // Half the amounts as JSON numbers, half as decimal strings.
+        let amount = if s % 2 == 0 {
+            serde_json::Value::from_str(&format!("{}.{:02}", cents / 100, cents % 100)).unwrap()
+        } else {
+            json!(format!("{}.{:02}", cents / 100, cents % 100))
+        };
+        expected_total += cents;
+        store
+            .put(
+                &format!("src-1|2026-10-07|{s:06}"),
+                &json!({"amount": amount, "dir": side}),
+            )
+            .await
+            .unwrap();
+    }
+    for key in [
+        "src-1|2026-10-06|000001",
+        "src-1|2026-10-07}",
+        "src-2|2026-10-07|000001",
+    ] {
+        store
+            .put(key, &json!({"amount": 1000, "dir": "IN"}))
+            .await
+            .unwrap();
+    }
+    for (key, value) in [
+        ("edge|1", json!({"amount": 1.25, "dir": "A"})),
+        ("edge|2", json!({"amount": "2.50", "dir": "A"})),
+        ("edge|3", json!({"dir": "B"})),
+        ("edge|4", json!({"amount": null})),
+        ("edge|5", json!({"amount": "abc", "dir": "B"})),
+        ("edge|6", json!({"amount": true, "dir": "B"})),
+    ] {
+        store.put(key, &value).await.unwrap();
+    }
+
+    // Paging over one day's prefix: every row once, ascending; aggregates over all 120.
+    let mut query = prefix_query("src-1|2026-10-07|", Some(50));
+    let mut seen = Vec::new();
+    loop {
+        let page = store.query(&query).await.unwrap();
+        let sutra_datastore::KeyAggregateResult::Total(total) = &page.aggregates[1] else {
+            panic!("total")
+        };
+        assert_eq!(total.count, 120);
+        let sum = total.sum.as_deref().unwrap();
+        let (whole, frac) = sum.split_once('.').unwrap_or((sum, "0"));
+        let cents = whole.parse::<i64>().unwrap() * 100
+            + format!("{frac:0<2}")[..2].parse::<i64>().unwrap();
+        assert_eq!(cents, expected_total, "exact sum: {sum}");
+        assert!(
+            format!("{frac:0<2}")[2..].chars().all(|c| c == '0'),
+            "no float residue: {sum}"
+        );
+        seen.extend(page.rows.iter().map(|(k, _)| k.clone()));
+        match page.next {
+            Some(next) => {
+                assert!(page.truncated);
+                query.after = Some(next);
+            }
+            None => break,
+        }
+    }
+    assert_eq!(seen.len(), 120);
+    assert!(seen.windows(2).all(|w| w[0] < w[1]));
+    assert!(seen.iter().all(|k| k.starts_with("src-1|2026-10-07|")));
+
+    // A range: from inclusive, to exclusive.
+    let range = sutra_datastore::KeyRangeQuery {
+        lower: "src-1|2026-10-06|000001".into(),
+        upper: Some("src-1|2026-10-07|000002".into()),
+        after: None,
+        row_limit: Some(10),
+        aggregates: vec![],
+    };
+    let keys: Vec<String> = store
+        .query(&range)
+        .await
+        .unwrap()
+        .rows
+        .into_iter()
+        .map(|(k, _)| k)
+        .collect();
+    assert_eq!(
+        keys,
+        vec![
+            "src-1|2026-10-06|000001",
+            "src-1|2026-10-07|000000",
+            "src-1|2026-10-07|000001"
+        ]
+    );
+
+    // The numeric rules on this database.
+    let page = store.query(&prefix_query("edge|", Some(10))).await.unwrap();
+    let sutra_datastore::KeyAggregateResult::Total(total) = &page.aggregates[1] else {
+        panic!("total")
+    };
+    assert_eq!(total.count, 6);
+    let sum = total.sum.as_deref().unwrap();
+    assert_eq!(
+        sum.trim_end_matches('0').trim_end_matches('.'),
+        "3.75",
+        "{sum}"
+    );
+    assert_eq!(total.non_numeric, 2, "text and boolean");
+    let sutra_datastore::KeyAggregateResult::Grouped(groups) = &page.aggregates[0] else {
+        panic!("grouped")
+    };
+    assert_eq!(groups["B"].non_numeric, 2);
+    assert_eq!(groups["null"].count, 1);
+
+    // No match: zeros, not null.
+    let page = store
+        .query(&prefix_query("nobody|", Some(10)))
+        .await
+        .unwrap();
+    assert!(page.rows.is_empty() && page.next.is_none());
+    assert_eq!(
+        page.aggregates[0],
+        sutra_datastore::KeyAggregateResult::Grouped(Default::default())
+    );
+    let sutra_datastore::KeyAggregateResult::Total(total) = &page.aggregates[1] else {
+        panic!("total")
+    };
+    assert_eq!((total.count, total.sum.as_deref()), (0, Some("0")));
+
+    // The shipped cutover DDL keys in a case-insensitive collation: refused, naming the fix.
+    let other = fixture::fresh_db().await;
+    let linguistic = fixture::store(&other, "events");
+    let e = linguistic
+        .query(&prefix_query("src|", Some(10)))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        e.code(),
+        Some(sutra_datastore::keyquery::codes::QUERY_KEY_ORDER),
+        "{e}"
+    );
 }

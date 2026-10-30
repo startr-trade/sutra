@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  events-write: append one row to the events store (key = payload.key, value = payload.entry).
+  events-report: one key query on the events store — a prefix, one page of 10 rows after
+  payload.after, and three aggregates over every matching row — stored in results "report|<id>".
+-->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0"
+                  id="Definitions_ledger"
+                  targetNamespace="urn:sutra:module:storefeat:1.0.0">
+  <bpmn:dataStore id="eventsStore" name="events"/>
+  <bpmn:dataStore id="resultsStore" name="results"/>
+
+  <bpmn:process id="events-write" isExecutable="true">
+    <bpmn:extensionElements>
+      <q:variables><q:variable name="entry" type="object"/></q:variables>
+    </bpmn:extensionElements>
+    <bpmn:dataStoreReference id="refEntry" dataStoreRef="eventsStore">
+      <bpmn:extensionElements><q:store key="payload.key"/></bpmn:extensionElements>
+    </bpmn:dataStoreReference>
+    <bpmn:startEvent id="StartWrite"><bpmn:extensionElements><q:source channel="events-in"/></bpmn:extensionElements></bpmn:startEvent>
+    <bpmn:serviceTask id="Append" name="Append the row">
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>payload.entry</bpmn:from><bpmn:to>entry</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+      <bpmn:dataOutputAssociation>
+        <bpmn:sourceRef>entry</bpmn:sourceRef><bpmn:targetRef>refEntry</bpmn:targetRef>
+      </bpmn:dataOutputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="EndWrite"/>
+    <bpmn:sequenceFlow id="W1" sourceRef="StartWrite" targetRef="Append"/>
+    <bpmn:sequenceFlow id="W2" sourceRef="Append" targetRef="EndWrite"/>
+  </bpmn:process>
+
+  <bpmn:process id="events-report" isExecutable="true">
+    <bpmn:extensionElements>
+      <q:variables><q:variable name="report" type="object"/></q:variables>
+    </bpmn:extensionElements>
+    <bpmn:dataStoreReference id="refDay" dataStoreRef="eventsStore">
+      <bpmn:extensionElements>
+        <q:store key="payload.prefix" query="prefix" limit="10" after="payload.after">
+          <q:aggregate fn="sum" field="amount" groupBy="dir"/>
+          <q:aggregate fn="count" groupBy="tag"/>
+          <q:aggregate fn="sum" field="amount"/>
+        </q:store>
+      </bpmn:extensionElements>
+    </bpmn:dataStoreReference>
+    <bpmn:dataStoreReference id="refReport" dataStoreRef="resultsStore">
+      <bpmn:extensionElements><q:store key="'report|' + payload.id"/></bpmn:extensionElements>
+    </bpmn:dataStoreReference>
+    <bpmn:startEvent id="StartReport"><bpmn:extensionElements><q:source channel="report-in"/></bpmn:extensionElements></bpmn:startEvent>
+    <bpmn:serviceTask id="Query" name="Query the day">
+      <bpmn:dataInputAssociation>
+        <bpmn:sourceRef>refDay</bpmn:sourceRef><bpmn:targetRef>report</bpmn:targetRef>
+      </bpmn:dataInputAssociation>
+      <bpmn:dataOutputAssociation>
+        <bpmn:sourceRef>report</bpmn:sourceRef><bpmn:targetRef>refReport</bpmn:targetRef>
+      </bpmn:dataOutputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="EndReport"/>
+    <bpmn:sequenceFlow id="R1" sourceRef="StartReport" targetRef="Query"/>
+    <bpmn:sequenceFlow id="R2" sourceRef="Query" targetRef="EndReport"/>
+  </bpmn:process>
+</bpmn:definitions>

@@ -598,10 +598,19 @@ impl ProcessModuleRegistry {
     /// node and a predicate that silently did nothing on half its legal hosts would be worse than
     /// one that was refused outright. A target whose predicate does not hold is skipped, exactly
     /// as a start event would be.
+    ///
+    /// The wait's declared message type is honoured the same way a start event's is:
+    /// `message_type` (what the codec reported) selects, in order of preference, the waits whose
+    /// `messageTypeValue` equals it, then those whose `messageTypePattern` matches it, then the
+    /// waits that declare no message type. A wait pinned to another type is never a target. The
+    /// result is ordered by that tier first, then (process id, node id), so the FIRST target is
+    /// the most specific match; every compatible target is returned so the resume can still pick
+    /// the wait an instance is actually parked at.
     pub fn resolve_relay_targets(
         &self,
         deployment: &DeploymentId,
         channel: &str,
+        message_type: Option<&str>,
         attributes: &sutra_feel::FeelContext,
     ) -> Vec<RelayTarget> {
         let Some(processes) = self.modules.get(deployment.value()) else {
@@ -611,7 +620,7 @@ impl ProcessModuleRegistry {
             return Vec::new();
         }
         let table = self.selectors.get(deployment.value());
-        let mut out: Vec<RelayTarget> = Vec::new();
+        let mut out: Vec<(u8, RelayTarget)> = Vec::new();
         for process in processes {
             for node in process.nodes() {
                 let subscribed = match node {
@@ -653,20 +662,26 @@ impl ProcessModuleRegistry {
                     {
                         continue;
                     }
-                    out.push(RelayTarget {
-                        process: Arc::clone(process),
-                        wait_node_id: node.id().to_string(),
-                    });
+                    let Some(tier) = relay_type_tier(process, node.id(), channel, message_type)
+                    else {
+                        continue;
+                    };
+                    out.push((
+                        tier,
+                        RelayTarget {
+                            process: Arc::clone(process),
+                            wait_node_id: node.id().to_string(),
+                        },
+                    ));
                 }
             }
         }
-        out.sort_by(|a, b| {
-            a.process
-                .id
-                .cmp(&b.process.id)
+        out.sort_by(|(ta, a), (tb, b)| {
+            ta.cmp(tb)
+                .then_with(|| a.process.id.cmp(&b.process.id))
                 .then_with(|| a.wait_node_id.cmp(&b.wait_node_id))
         });
-        out
+        out.into_iter().map(|(_, target)| target).collect()
     }
 
     /// Every start event in the channel's deployment that subscribes to
@@ -724,6 +739,37 @@ impl ProcessModuleRegistry {
         HandlerResolution {
             handlers,
             predicate_faults,
+        }
+    }
+}
+
+/// How specifically a wait's `<q:source>` on `channel` accepts `message_type`: `0` for an exact
+/// `messageTypeValue`, `1` for a matching `messageTypePattern`, `2` for a source that declares no
+/// message type, and `None` when the wait is pinned to a type the message does not have (or the
+/// codec reported none). The same three tiers a start event selects by.
+fn relay_type_tier(
+    process: &ProcessDefinition,
+    node_id: &str,
+    channel: &str,
+    message_type: Option<&str>,
+) -> Option<u8> {
+    let bindings = process.bindings_for(node_id);
+    let Some(source) = bindings.sources.iter().find(|s| s.channel == channel) else {
+        // A wait whose channel comes from the node itself (no `<q:source>` row) declares no type.
+        return Some(2);
+    };
+    match (
+        source.message_type_value.as_deref(),
+        source.message_type_pattern.as_deref(),
+    ) {
+        (None, None) => Some(2),
+        (Some(pinned), _) => (message_type == Some(pinned)).then_some(0),
+        (None, Some(pattern)) => {
+            let mt = message_type?;
+            regex::Regex::new(&format!("^(?:{pattern})$"))
+                .map(|re| re.is_match(mt))
+                .unwrap_or(false)
+                .then_some(1)
         }
     }
 }

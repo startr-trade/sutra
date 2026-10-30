@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  typed-waits: two waits on ONE channel (answers-in, xml), told apart only by the message type the
+  codec reports (the document element): WaitAnswer takes <Answer>, WaitCancel takes <Cancel>.
+  Each branch records the payload it was resumed with in results "wait|<ref>|<branch>", so the
+  suite can see which wait took which message. Node ids sort WaitAnswer before WaitCancel: a relay
+  that ignored the message type would hand a <Cancel> to WaitAnswer.
+-->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0"
+                  id="Definitions_typed_waits"
+                  targetNamespace="urn:sutra:module:storefeat:1.0.0">
+  <bpmn:dataStore id="resultsStore" name="results"/>
+
+  <bpmn:process id="typed-waits" isExecutable="true">
+    <bpmn:extensionElements>
+      <q:variables>
+        <q:variable name="answer" type="object"/>
+        <q:variable name="cancel" type="object"/>
+      </q:variables>
+    </bpmn:extensionElements>
+    <bpmn:dataStoreReference id="refAnswer" dataStoreRef="resultsStore">
+      <bpmn:extensionElements><q:store key="'wait|' + answer.ref + '|answer'"/></bpmn:extensionElements>
+    </bpmn:dataStoreReference>
+    <bpmn:dataStoreReference id="refCancel" dataStoreRef="resultsStore">
+      <bpmn:extensionElements><q:store key="'wait|' + cancel.ref + '|cancel'"/></bpmn:extensionElements>
+    </bpmn:dataStoreReference>
+
+    <bpmn:startEvent id="Start"><bpmn:extensionElements><q:source channel="waits-in"/></bpmn:extensionElements></bpmn:startEvent>
+    <bpmn:serviceTask id="Prepare" name="Prepare the correlation">
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>{ref: payload.ref}</bpmn:from><bpmn:to>answer</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>{ref: payload.ref}</bpmn:from><bpmn:to>cancel</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:parallelGateway id="Fork"/>
+
+    <bpmn:receiveTask id="WaitAnswer" name="Await the answer">
+      <bpmn:extensionElements>
+        <q:source channel="answers-in" name="answer" messageTypeValue="Answer"/>
+        <q:alias name="answerRef" expression="answer.ref" unique="true"/>
+      </bpmn:extensionElements>
+    </bpmn:receiveTask>
+    <bpmn:receiveTask id="WaitCancel" name="Await a cancel">
+      <bpmn:extensionElements>
+        <q:source channel="answers-in" name="cancel" messageTypeValue="Cancel"/>
+        <q:alias name="cancelRef" expression="cancel.ref" unique="true"/>
+      </bpmn:extensionElements>
+    </bpmn:receiveTask>
+
+    <bpmn:serviceTask id="RecordAnswer" name="Record the answer">
+      <bpmn:dataOutputAssociation>
+        <bpmn:sourceRef>answer</bpmn:sourceRef><bpmn:targetRef>refAnswer</bpmn:targetRef>
+      </bpmn:dataOutputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:serviceTask id="RecordCancel" name="Record the cancel">
+      <bpmn:dataOutputAssociation>
+        <bpmn:sourceRef>cancel</bpmn:sourceRef><bpmn:targetRef>refCancel</bpmn:targetRef>
+      </bpmn:dataOutputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="EndAnswer"/>
+    <bpmn:endEvent id="EndCancel"/>
+
+    <bpmn:sequenceFlow id="F1" sourceRef="Start" targetRef="Prepare"/>
+    <bpmn:sequenceFlow id="F2" sourceRef="Prepare" targetRef="Fork"/>
+    <bpmn:sequenceFlow id="F3" sourceRef="Fork" targetRef="WaitAnswer"/>
+    <bpmn:sequenceFlow id="F4" sourceRef="Fork" targetRef="WaitCancel"/>
+    <bpmn:sequenceFlow id="F5" sourceRef="WaitAnswer" targetRef="RecordAnswer"/>
+    <bpmn:sequenceFlow id="F6" sourceRef="WaitCancel" targetRef="RecordCancel"/>
+    <bpmn:sequenceFlow id="F7" sourceRef="RecordAnswer" targetRef="EndAnswer"/>
+    <bpmn:sequenceFlow id="F8" sourceRef="RecordCancel" targetRef="EndCancel"/>
+  </bpmn:process>
+</bpmn:definitions>

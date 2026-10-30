@@ -322,7 +322,7 @@ instance did, offline. See [Logging and audit](../operating/logging.md).
 ### `sutra version`
 
 ```
-sutra version            # sutra 0.6.9
+sutra version            # sutra 0.6.10
 sutra --version          # identical text
 sutra version --format json
 ```
@@ -334,14 +334,14 @@ binary name prints that name, and one that versions itself independently of the 
 
 ```
 <tool> 2.0.0
-sutra  0.6.9 (engine)
+sutra  0.6.10 (engine)
 ```
 
 `--format json` is the structured form and always separates the two — `version` is the
 reporting tool's own, `engine` the embedded engine's (equal for this binary):
 
 ```json
-{"name":"sutra","version":"0.6.9","engine":"0.6.9"}
+{"name":"sutra","version":"0.6.10","engine":"0.6.10"}
 ```
 
 ---

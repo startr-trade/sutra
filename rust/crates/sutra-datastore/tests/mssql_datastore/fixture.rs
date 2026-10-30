@@ -87,6 +87,24 @@ pub async fn fresh_db() -> String {
 /// migration. The URL is the native `sqlserver://` form a module developer declares; credentials
 /// come from the separate secret-ref properties, as in the money-transfer `datastores.yaml`.
 pub fn store(db: &str, name: &str) -> MssqlDataStore {
+    store_with_ddl(db, name, CUTOVER_DDL)
+}
+
+/// The cutover table with an `NVARCHAR` key in a `_BIN2` (code-point order) collation — what a
+/// store that runs key queries ships. `NVARCHAR` matches the driver's string parameters, so the
+/// key range seeks the primary key without a conversion.
+pub const QUERY_DDL: &str = "IF OBJECT_ID('data_store', 'U') IS NULL \
+  CREATE TABLE data_store ( \
+    store_name  NVARCHAR(128) NOT NULL, \
+    store_key   NVARCHAR(512) COLLATE Latin1_General_100_BIN2 NOT NULL, \
+    store_value NVARCHAR(MAX) NOT NULL, \
+    rev         BIGINT        NOT NULL DEFAULT 1, \
+    updated_at  DATETIME2     NOT NULL DEFAULT SYSUTCDATETIME(), \
+    CONSTRAINT pk_data_store PRIMARY KEY NONCLUSTERED (store_name, store_key) \
+  );";
+
+/// A store named `name` on database `db` whose first-use migration is `ddl`.
+pub fn store_with_ddl(db: &str, name: &str, ddl: &str) -> MssqlDataStore {
     let mut properties = BTreeMap::new();
     properties.insert(
         "sql.url".to_string(),
@@ -106,7 +124,7 @@ pub fn store(db: &str, name: &str) -> MssqlDataStore {
         properties,
         structure: None,
     };
-    MssqlDataStore::from_definition(&def, vec![CUTOVER_DDL.to_string()]).expect("store builds")
+    MssqlDataStore::from_definition(&def, vec![ddl.to_string()]).expect("store builds")
 }
 
 // ---- the projected (typed-column) shape ------------------------------------

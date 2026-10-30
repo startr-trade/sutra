@@ -13,6 +13,8 @@ use sutra_formats as _;
 mod archive_negative;
 #[path = "all/lint_channel_call_alias_test.rs"]
 mod lint_channel_call_alias_test;
+#[path = "all/lint_feel_assignment_and_loop_test.rs"]
+mod lint_feel_assignment_and_loop_test;
 #[path = "all/lint_navigation_test.rs"]
 mod lint_navigation_test;
 #[path = "all/lint_never_init_test.rs"]

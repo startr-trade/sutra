@@ -35,7 +35,10 @@ pub use coverage::{
     metric_flag_urn, CoverageCorrelation, CoverageFragment, CoverageMetricStore, CoverageMetrics,
     InMemoryCoverageStore,
 };
-pub use datastore::{DataStore, DataStoreTx, InMemoryDataStore, StoreError};
+pub use datastore::{
+    DataStore, DataStoreTx, InMemoryDataStore, StoreAggregateCell, StoreAggregateValue, StoreError,
+    StoreKeyQuery, StoreQueryAggregateSpec, StoreQueryResult,
+};
 pub use deployment::{ArtifactType, DeploymentId};
 pub use emission::{CollectingSink, Emission, EmissionKind, EmissionSink};
 pub use error::ExecError;

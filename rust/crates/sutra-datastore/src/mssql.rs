@@ -34,6 +34,7 @@ use crate::coverage::{
     self, check_deployment_id, CoverageCounts, CoverageFragmentRow, CoverageMetrics,
 };
 use crate::error::DataStoreError;
+use crate::keyquery::{self, KeyAggregateResult, KeyQueryPage, KeyRangeQuery};
 use crate::projected::{ActualColumn, ProjectedStore, SqlDialect};
 
 /// This module's dialect, for the shared projected-store SQL builder.
@@ -237,6 +238,8 @@ struct StoreInner {
     /// The store's declared row structure (see [`crate::postgres`]): `Some` serves the store from
     /// the author's typed-column table; `None` is exactly today's opaque key→JSON behaviour.
     projected: Option<Arc<ProjectedStore>>,
+    /// `true` once the key column's collation was found bytewise (see [`crate::keyquery`]).
+    key_order_verified: std::sync::atomic::AtomicBool,
 }
 
 impl MssqlDataStore {
@@ -324,6 +327,16 @@ impl MssqlDataStore {
         ))
     }
 
+    /// Key query (`<q:store query=…>`) — see [`crate::keyquery`]. Plain autocommit `SELECT`s at
+    /// the connection's READ COMMITTED (lock-free when the database runs
+    /// `READ_COMMITTED_SNAPSHOT`); no transaction, never the read cache.
+    pub fn query(
+        &self,
+        query: &KeyRangeQuery,
+    ) -> SendFuture<'static, Result<KeyQueryPage, DataStoreError>> {
+        Box::pin(store_query(Arc::clone(&self.inner), query.clone()))
+    }
+
     /// Opens a caller-managed transaction (the atomicity boundary). Dropping without
     /// `commit` discards the connection, which rolls back server-side.
     pub fn begin(&self) -> SendFuture<'static, Result<MssqlDataStoreTx, DataStoreError>> {
@@ -360,6 +373,7 @@ fn store_inner(
         migrated: tokio::sync::Mutex::new(false),
         legacy_namespace,
         projected: projected.map(Arc::new),
+        key_order_verified: std::sync::atomic::AtomicBool::new(false),
     })
 }
 
@@ -791,6 +805,146 @@ async fn store_put_if_revision(
     let applied = tx_put_if_revision(&mut tx, &key, &value, expected_rev).await?;
     tx.commit().await?;
     Ok(applied)
+}
+
+async fn store_query(
+    inner: Arc<StoreInner>,
+    query: KeyRangeQuery,
+) -> Result<KeyQueryPage, DataStoreError> {
+    let store = inner.name.clone();
+    if inner.projected.is_some() {
+        return Err(keyquery::projected_unsupported(&store));
+    }
+    keyquery::validate(&store, &query)?;
+    ensure_migrated(&inner).await?;
+    let q_err = |e: tiberius::error::Error| {
+        DataStoreError::with_source(format!("key query on '{store}' failed"), e)
+    };
+    let mut conn = inner.pool.acquire().await?;
+    if !inner
+        .key_order_verified
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        let row = conn
+            .client()
+            .query(keyquery::key_order_probe_sql(DIALECT), &[])
+            .await
+            .map_err(q_err)?
+            .into_row()
+            .await
+            .map_err(q_err)?;
+        let collation: Option<String> = match row {
+            Some(r) => r.try_get::<&str, _>(0).map_err(q_err)?.map(str::to_string),
+            None => None,
+        };
+        if !keyquery::is_bytewise_collation(DIALECT, collation.as_deref()) {
+            return Err(keyquery::key_order_error(
+                &store,
+                DIALECT,
+                collation.as_deref(),
+            ));
+        }
+        let indexes = conn
+            .client()
+            .query(keyquery::key_index_probe_sql(DIALECT), &[])
+            .await
+            .map_err(q_err)?
+            .into_row()
+            .await
+            .map_err(q_err)?
+            .map(|r| r.try_get::<i64, _>(0))
+            .transpose()
+            .map_err(q_err)?
+            .flatten()
+            .unwrap_or(0);
+        if indexes == 0 {
+            return Err(keyquery::key_index_error(&store));
+        }
+        inner
+            .key_order_verified
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+    let (rows, truncated, next) = match query.row_limit {
+        None => (Vec::new(), false, None),
+        Some(limit) => {
+            let sql = keyquery::rows_sql(DIALECT, &query, limit);
+            let binds = keyquery::binds(&store, &query, true);
+            let params: Vec<&dyn tiberius::ToSql> =
+                binds.iter().map(|b| b as &dyn tiberius::ToSql).collect();
+            let fetched = conn
+                .client()
+                .query(sql.as_str(), &params)
+                .await
+                .map_err(q_err)?
+                .into_first_result()
+                .await
+                .map_err(q_err)?;
+            let mut rows = Vec::with_capacity(fetched.len());
+            for r in fetched {
+                let key = r
+                    .try_get::<&str, _>(0)
+                    .map_err(q_err)?
+                    .unwrap_or_default()
+                    .to_string();
+                let text = r.try_get::<&str, _>(1).map_err(q_err)?.unwrap_or("null");
+                let value = serde_json::from_str(text).map_err(|e| {
+                    DataStoreError::with_source(
+                        format!("stored value at '{store}'[{key}] is not valid JSON"),
+                        e,
+                    )
+                })?;
+                rows.push((key, value));
+            }
+            keyquery::finish_page(rows, limit)
+        }
+    };
+    let mut aggregates = Vec::with_capacity(query.aggregates.len());
+    for agg in &query.aggregates {
+        let sql = keyquery::aggregate_sql(DIALECT, &query, agg);
+        let binds = keyquery::binds(&store, &query, false);
+        let params: Vec<&dyn tiberius::ToSql> =
+            binds.iter().map(|b| b as &dyn tiberius::ToSql).collect();
+        let fetched = conn
+            .client()
+            .query(sql.as_str(), &params)
+            .await
+            .map_err(q_err)?
+            .into_first_result()
+            .await
+            .map_err(q_err)?;
+        let int = |r: &tiberius::Row, i: usize| -> Result<i64, DataStoreError> {
+            Ok(r.try_get::<i64, _>(i).map_err(q_err)?.unwrap_or(0))
+        };
+        let text = |r: &tiberius::Row, i: usize| -> Result<Option<String>, DataStoreError> {
+            Ok(r.try_get::<&str, _>(i).map_err(q_err)?.map(str::to_string))
+        };
+        let sum = |r: &tiberius::Row, i: usize| -> Result<Option<String>, DataStoreError> {
+            Ok(text(r, i)?.map(|t| keyquery::trim_decimal_zeros(&t)))
+        };
+        if agg.group_by.is_some() {
+            let mut groups = std::collections::BTreeMap::new();
+            for r in &fetched {
+                let group = text(r, 0)?.unwrap_or_else(|| "null".to_string());
+                groups.insert(
+                    group,
+                    keyquery::cell(agg, int(r, 1)?, sum(r, 2)?, int(r, 3)?),
+                );
+            }
+            aggregates.push(KeyAggregateResult::Grouped(groups));
+        } else {
+            let cell = match fetched.first() {
+                Some(r) => keyquery::cell(agg, int(r, 0)?, sum(r, 1)?, int(r, 2)?),
+                None => keyquery::cell(agg, 0, None, 0),
+            };
+            aggregates.push(KeyAggregateResult::Total(cell));
+        }
+    }
+    Ok(KeyQueryPage {
+        rows,
+        aggregates,
+        truncated,
+        next,
+    })
 }
 
 /// Run the module-resident idempotent migrations once per store instance, serialised across

@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  claim-day: claim payload.day once, whichever replica gets there first. The claim is a write with
+  expect="absent": the database inserts it only when the key does not exist yet, so one writer
+  wins however many race. The loser's write raises SUTRA.RUNTIME.DATASTORE.CONFLICT, which the
+  error boundary turns into the "lost" path. Both outcomes are recorded in results.
+-->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0"
+                  id="Definitions_claim"
+                  targetNamespace="urn:sutra:module:storefeat:1.0.0">
+  <bpmn:error id="taken" errorCode="SUTRA.RUNTIME.DATASTORE.CONFLICT"/>
+  <bpmn:dataStore id="claimsStore" name="claims"/>
+  <bpmn:dataStore id="resultsStore" name="results"/>
+
+  <bpmn:process id="claim-day" isExecutable="true">
+    <bpmn:extensionElements>
+      <q:variables>
+        <q:variable name="claim" type="string"/>
+        <q:variable name="outcome" type="string"/>
+      </q:variables>
+    </bpmn:extensionElements>
+    <bpmn:dataStoreReference id="refClaim" dataStoreRef="claimsStore">
+      <bpmn:extensionElements><q:store key="payload.day" expect="absent"/></bpmn:extensionElements>
+    </bpmn:dataStoreReference>
+    <bpmn:dataStoreReference id="refOutcome" dataStoreRef="resultsStore">
+      <bpmn:extensionElements><q:store key="'claim|' + payload.day + '|' + payload.who"/></bpmn:extensionElements>
+    </bpmn:dataStoreReference>
+    <bpmn:startEvent id="Start"><bpmn:extensionElements><q:source channel="claim-in"/></bpmn:extensionElements></bpmn:startEvent>
+    <bpmn:serviceTask id="Claim" name="Claim the day">
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>payload.who</bpmn:from><bpmn:to>claim</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+      <bpmn:dataOutputAssociation>
+        <bpmn:sourceRef>claim</bpmn:sourceRef><bpmn:targetRef>refClaim</bpmn:targetRef>
+      </bpmn:dataOutputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:boundaryEvent id="AlreadyClaimed" attachedToRef="Claim">
+      <bpmn:errorEventDefinition errorRef="taken"/>
+    </bpmn:boundaryEvent>
+    <bpmn:serviceTask id="RecordWon" name="Record: won">
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>"won"</bpmn:from><bpmn:to>outcome</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+      <bpmn:dataOutputAssociation>
+        <bpmn:sourceRef>outcome</bpmn:sourceRef><bpmn:targetRef>refOutcome</bpmn:targetRef>
+      </bpmn:dataOutputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:serviceTask id="RecordLost" name="Record: lost">
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>"lost"</bpmn:from><bpmn:to>outcome</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+      <bpmn:dataOutputAssociation>
+        <bpmn:sourceRef>outcome</bpmn:sourceRef><bpmn:targetRef>refOutcome</bpmn:targetRef>
+      </bpmn:dataOutputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="Won"/>
+    <bpmn:endEvent id="Lost"/>
+    <bpmn:sequenceFlow id="F1" sourceRef="Start" targetRef="Claim"/>
+    <bpmn:sequenceFlow id="F2" sourceRef="Claim" targetRef="RecordWon"/>
+    <bpmn:sequenceFlow id="F3" sourceRef="RecordWon" targetRef="Won"/>
+    <bpmn:sequenceFlow id="F4" sourceRef="AlreadyClaimed" targetRef="RecordLost"/>
+    <bpmn:sequenceFlow id="F5" sourceRef="RecordLost" targetRef="Lost"/>
+  </bpmn:process>
+</bpmn:definitions>

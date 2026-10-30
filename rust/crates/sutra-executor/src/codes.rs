@@ -9,6 +9,12 @@ pub const RUNTIME_MULTI_INSTANCE_COMPLETION_FAILED: &str =
     "SUTRA.RUNTIME.MULTI_INSTANCE.COMPLETION_FAILED";
 pub const RUNTIME_ADHOC_COMPLETION_FAILED: &str = "SUTRA.RUNTIME.ADHOC.COMPLETION_FAILED";
 pub const RUNTIME_DATASTORE_CONFLICT: &str = "SUTRA.RUNTIME.DATASTORE.CONFLICT";
+/// A key query summed a field that holds a value that is not a number (text, a boolean, an
+/// object) in at least one matching row. A missing field or a JSON null is skipped instead.
+pub const RUNTIME_DATASTORE_QUERY_NOT_NUMERIC: &str = "SUTRA.RUNTIME.DATASTORE.QUERY_NOT_NUMERIC";
+/// A key query's bounds cannot be used: an empty prefix (it would read the whole store) or a
+/// bound / `after` expression that does not evaluate to a string.
+pub const RUNTIME_DATASTORE_QUERY_INVALID: &str = "SUTRA.RUNTIME.DATASTORE.QUERY_INVALID";
 
 pub const DISPATCH_NO_MATCH: &str = "SUTRA.DISPATCH.NO_MATCH";
 pub const DISPATCH_FEEL_EVAL_FAILED: &str = "SUTRA.DISPATCH.FEEL_EVAL_FAILED";

@@ -146,13 +146,67 @@ pub struct ParamBinding {
     pub expression: String,
 }
 
-/// Read a key from a data store into a process variable.
+/// Read a key from a data store into a process variable — or, with [`Self::query`], read every
+/// row whose key matches a prefix or falls in a range.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoreRead {
     pub store: String,
+    /// The row key; for a query, the key prefix (`query="prefix"`) or the inclusive lower bound
+    /// of the range (`query="range"`).
     pub key_expression: String,
     pub for_update: bool,
     pub target_var: String,
+    /// `Some` makes this read a key query (`<q:store query=…>`).
+    pub query: Option<StoreQuery>,
+}
+
+/// The rows a query returns when `@limit` is not given.
+pub const STORE_QUERY_DEFAULT_LIMIT: u32 = 1000;
+/// The most rows one query page may return.
+pub const STORE_QUERY_MAX_LIMIT: u32 = 10_000;
+
+/// A key query on a key/value data store (`<q:store query="prefix|range">`): the rows whose key
+/// starts with the prefix, or lies in `[key, to)`, keys compared bytewise. The target variable
+/// receives `{rows, aggregates, truncated, next}`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoreQuery {
+    pub mode: StoreQueryMode,
+    /// Whether the result carries the matching rows (`@rows`, default true).
+    pub rows: bool,
+    /// The most rows one page returns (`@limit`, default [`STORE_QUERY_DEFAULT_LIMIT`]).
+    pub limit: u32,
+    /// FEEL for the key to continue after (`@after`): only keys greater than it are returned.
+    pub after_expression: Option<String>,
+    /// The aggregates computed over every matching row, in declaration order.
+    pub aggregates: Vec<StoreQueryAggregate>,
+}
+
+/// How a [`StoreQuery`] selects keys.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StoreQueryMode {
+    /// Keys starting with the read's key expression.
+    Prefix,
+    /// Keys from the read's key expression (inclusive) to `to_expression` (exclusive).
+    Range { to_expression: String },
+}
+
+/// What an aggregate computes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreAggregateFunction {
+    /// The number of matching rows.
+    Count,
+    /// The number of matching rows and the exact decimal sum of one value field.
+    Sum,
+}
+
+/// One `<q:aggregate>` of a key query.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoreQueryAggregate {
+    pub function: StoreAggregateFunction,
+    /// The dotted value path summed (`@field`; required for `sum`).
+    pub field: Option<String>,
+    /// The dotted value path rows are grouped by (`@groupBy`).
+    pub group_by: Option<String>,
 }
 
 /// Compute a process variable from a FEEL expression (a visible data-assignment node).
@@ -164,7 +218,9 @@ pub struct Assignment {
 
 /// Write a process variable back to a data store. When [`Self::field`] is present, only that
 /// field of the stored (map) value is replaced. [`Self::expect_unchanged`] makes the write a
-/// compare-and-set (data-store optimistic concurrency, `<q:store expect="unchanged">`).
+/// compare-and-set (data-store optimistic concurrency, `<q:store expect="unchanged">`);
+/// [`Self::expect_absent`] makes it an insert that applies only when the key does not exist yet
+/// (`<q:store expect="absent">`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoreWrite {
     pub store: String,
@@ -172,6 +228,7 @@ pub struct StoreWrite {
     pub field: Option<String>,
     pub value_var: String,
     pub expect_unchanged: bool,
+    pub expect_absent: bool,
 }
 
 /// Explicit BPMN data-flow mapping for an activity: variable scoping

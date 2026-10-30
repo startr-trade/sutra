@@ -170,6 +170,8 @@ below.
 access: `key` is a FEEL expression producing the row key, `forUpdate="true"` takes a pessimistic
 row lock so concurrent writers on the same key serialize, `field` narrows a write to one field of a
 stored map value, and `expect="unchanged"` is an optimistic compare-and-set alternative to a lock.
+`expect="absent"` and `query` are covered in [Claiming a key once](#claiming-a-key-once) and
+[Querying rows by key](#querying-rows-by-key).
 A data task — a `serviceTask` with no `implementation` — reads and writes through its data
 associations exactly like it would a data object, except the source/target is a store reference
 instead of a variable.
@@ -507,6 +509,229 @@ If `AccountRecord` later grows an `owner` sub-record, the package stops linting 
 `STRUCTURE_NOT_FLAT` — an explicit, package-time decision (flatten it, or give up projection for
 this store) rather than a silent shape change. The evolution rules are in
 [Deployment packages](deployment-packages.md#store-migrations-and-schema-evolution).
+
+## Querying rows by key {#querying-rows-by-key}
+
+*Since 0.6.10.* A data-task read can return every row of a key/value store whose key starts with a
+prefix, or lies in a range, together with aggregates over all of those rows. It suits append-only
+data — one row per event, keyed so that the rows you report on together share a prefix — where a
+single summary row would be a write hot spot.
+
+```xml
+<bpmn:dataStoreReference id="refDay" dataStoreRef="readingsStore">
+  <bpmn:extensionElements>
+    <q:store key="payload.meter + '|' + payload.day + '|'" query="prefix"
+             limit="2" after="payload.after">
+      <q:aggregate fn="sum" field="kwh"/>
+      <q:aggregate fn="sum" field="kwh" groupBy="kind"/>
+    </q:store>
+  </bpmn:extensionElements>
+</bpmn:dataStoreReference>
+```
+
+| Attribute / element | Meaning |
+|---|---|
+| `query="prefix"` | keys that start with `key` (an empty prefix is refused: it would read the whole store) |
+| `query="range"`, `to` | keys from `key` (inclusive) to `to` (exclusive); both are FEEL strings |
+| `limit` | rows per page, default 1000, maximum 10 000 |
+| `after` | FEEL: only keys after this one — the previous page's `next`, or `null` for the first page |
+| `rows="false"` | aggregates only |
+| `<q:aggregate fn="count">` | `{count}` over every matching row |
+| `<q:aggregate fn="sum" field="…">` | `{count, sum}`; `field` is a dotted path into the stored value |
+| `groupBy="…"` | `{groups: {"<value>": {count, sum?}}}`, one cell per value of that path |
+
+The read's target variable receives:
+
+```json
+{"rows": [{"key": "m-7|2026-10-30|0001", "value": {"kind": "import", "kwh": "1.25"}}, ...],
+ "aggregates": [{"count": 5, "sum": 7.55},
+                {"groups": {"export": {"count": 2, "sum": 1.15}, "import": {"count": 3, "sum": 6.40}}}],
+ "truncated": true, "next": "m-7|2026-10-30|0002"}
+```
+
+- **Keys compare bytewise**, so `m-7|2026-10-01` … `m-7|2026-10-31` covers a month and a `|`
+  separator behaves predictably. Rows come back in ascending key order. `truncated` says more rows
+  follow, and `next` is the key to pass as `after`.
+- **Aggregates cover every matching row**, whatever `limit` and `after` say, so every page reports
+  the same totals.
+- **Sums are exact decimals**, never floats. A sum adds JSON numbers and strings that hold a
+  decimal literal (`"30.05"`). A row whose field is missing or `null` is counted but not summed.
+  Any other value — text, a boolean, an object — fails the task with
+  `SUTRA.RUNTIME.DATASTORE.QUERY_NOT_NUMERIC`. A row without the `groupBy` field groups under
+  `"null"`. No matching row gives `{count: 0, sum: 0}` or `{groups: {}}`, never null.
+- **It is a plain read.** It takes no locks, reads committed rows, never uses the
+  [read cache](#caching-reads), and does not see the uncommitted writes of an enclosing
+  `<bpmn:transaction>`. It cannot be combined with `forUpdate`, cannot be a write, and runs on
+  key/value `sql` stores only (not on a [typed-column](#typed-columns-declaring-the-structure-a-store-holds) store).
+
+### The index a key query needs
+
+A key query is one range scan of an index whose first two columns are `(store_name, store_key)`,
+with `store_key` in a bytewise collation. Declare both in the store's migration:
+
+```sql
+CREATE TABLE IF NOT EXISTS data_store (
+  tenant_id       VARCHAR(64)  NOT NULL,   -- filled by the engine on insert
+  module_id       VARCHAR(256) NOT NULL,
+  module_version  VARCHAR(64)  NOT NULL,
+  store_name      VARCHAR(128) NOT NULL,
+  store_key       VARCHAR(512) COLLATE "C" NOT NULL,
+  store_value     TEXT         NOT NULL,
+  rev             BIGINT       NOT NULL DEFAULT 1,
+  updated_at      TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (store_name, store_key)
+);
+```
+
+On MySQL/MariaDB use a `…_bin` collation for `store_key` (`ascii_bin`, `utf8mb4_bin`); on SQL Server
+an `NVARCHAR` key with a `…_BIN2` collation. Before a store's first query the engine checks both and
+refuses rather than scanning: `SUTRA.RUNTIME.DATASTORE.QUERY_KEY_ORDER` names a key column that does
+not sort bytewise, `SUTRA.RUNTIME.DATASTORE.QUERY_KEY_INDEX` a table with no such index — for example
+one keyed `(tenant_id, module_id, module_version, store_name, store_key)`. Each message carries the
+DDL that fixes it. Stores that never run a key query are unaffected.
+
+On MySQL a JSON number is held as a double, exact to about 15 significant digits; store amounts
+with more digits as strings there. PostgreSQL keeps the inputs' decimal scale (`6.40`); MySQL and
+SQL Server report the sum without trailing zeros.
+
+## Claiming a key once {#claiming-a-key-once}
+
+*Since 0.6.10.* `expect="absent"` makes a write an insert that applies only when the key does not
+exist yet. The database decides, so of any number of instances — on any number of replicas — that
+write the same key, exactly one wins. (A `forUpdate` read of a missing key locks nothing, so "read,
+see nothing, write" cannot do this.) The losing write changes nothing and raises
+`SUTRA.RUNTIME.DATASTORE.CONFLICT`. Catch it with an error boundary on the data task to take a
+"someone else got there first" path; uncaught, it fails the instance:
+
+```xml
+<bpmn:error id="taken" errorCode="SUTRA.RUNTIME.DATASTORE.CONFLICT"/>
+
+<bpmn:dataStoreReference id="refRun" dataStoreRef="runsStore">
+  <bpmn:extensionElements><q:store key="'daily|' + day" expect="absent"/></bpmn:extensionElements>
+</bpmn:dataStoreReference>
+
+<bpmn:serviceTask id="Claim">           <!-- writes `claim` to refRun -->
+  <bpmn:dataOutputAssociation>
+    <bpmn:sourceRef>claim</bpmn:sourceRef><bpmn:targetRef>refRun</bpmn:targetRef>
+  </bpmn:dataOutputAssociation>
+</bpmn:serviceTask>
+<bpmn:boundaryEvent id="AlreadyClaimed" attachedToRef="Claim">
+  <bpmn:errorEventDefinition errorRef="taken"/>
+</bpmn:boundaryEvent>
+```
+
+The same conflict from `expect="unchanged"` is catchable the same way.
+
+### Walkthrough: readings by meter and day
+
+A package with two processes: `record-reading` writes one row per reading with `expect="absent"`
+(so a resent reading is refused), and `day-report` runs the key query above and answers with a
+template. The files:
+
+```text
+readings/
+├── package.yaml            # labels: default / readings / 1.0.0
+├── datastores.yaml         # store `readings`, env-indirected connection, migrations/readings
+├── migrations/readings/V001__data_store.sql   # the table above
+├── channels.yaml           # reading-in, day-report: HTTP + json + apikey
+├── bpmn/readings.bpmn
+└── templates/day-report.hbs
+```
+
+`record-reading` keys the row by meter, day and sequence number:
+
+```xml
+<q:store key="payload.meter + '|' + payload.day + '|' + payload.seq" expect="absent"/>
+```
+
+`day-report` reads the day into `report`, then picks the parts the answer shows:
+
+```xml
+<bpmn:serviceTask id="Query" name="Read the day">
+  <bpmn:dataInputAssociation>
+    <bpmn:sourceRef>refDay</bpmn:sourceRef><bpmn:targetRef>report</bpmn:targetRef>
+  </bpmn:dataInputAssociation>
+  <bpmn:dataInputAssociation>
+    <bpmn:assignment><bpmn:from>report.aggregates[1]</bpmn:from><bpmn:to>total</bpmn:to></bpmn:assignment>
+  </bpmn:dataInputAssociation>
+  <bpmn:dataInputAssociation>
+    <bpmn:assignment><bpmn:from>report.aggregates[2].groups</bpmn:from><bpmn:to>byKind</bpmn:to></bpmn:assignment>
+  </bpmn:dataInputAssociation>
+  <bpmn:dataInputAssociation>
+    <bpmn:assignment><bpmn:from>for row in report.rows return row.key</bpmn:from><bpmn:to>keys</bpmn:to></bpmn:assignment>
+  </bpmn:dataInputAssociation>
+</bpmn:serviceTask>
+```
+
+```handlebars
+{"keys": [{{#each keys}}{{#if @index}}, {{/if}}"{{this}}"{{/each}}],
+ "readings": {{total.count}}, "kwh": {{total.sum}},
+ "importKwh": {{byKind.import.sum}}, "exportKwh": {{byKind.export.sum}},
+ "next": {{#if report.next}}"{{report.next}}"{{else}}null{{/if}}}
+```
+
+Package it and start PostgreSQL and the engine (the engine refuses a superuser database role, so it
+gets its own):
+
+```sh
+sutra package readings --out deployments
+docker network create readings-net
+docker run -d --name readings-db --network readings-net -e POSTGRES_PASSWORD=dev-only postgres:16-alpine
+docker exec readings-db psql -U postgres \
+  -c "CREATE ROLE sutra_engine LOGIN PASSWORD 'dev-only' NOSUPERUSER NOBYPASSRLS" \
+  -c "ALTER SCHEMA public OWNER TO sutra_engine"
+docker run -d --name readings-engine --network readings-net -p 127.0.0.1::8080 \
+  -v "$PWD/deployments:/deployments:ro" -e SUTRA_DEPLOYMENTS_DIR=/deployments \
+  -e SUTRA_DATASOURCE_URL=postgres://readings-db:5432/postgres \
+  -e SUTRA_DATASOURCE_USERNAME=sutra_engine -e SUTRA_DATASOURCE_PASSWORD=dev-only \
+  -e SUTRA_ADMIN_OIDC_DEV_DISABLED=true \
+  -e READINGS_DB_URL=postgres://readings-db:5432/postgres \
+  -e READINGS_DB_USER=sutra_engine -e READINGS_DB_PASSWORD=dev-only \
+  -e READINGS_API_KEY=dev-only-readings-key ghcr.io/startr-trade/sutra:0.6.10
+PORT=$(docker port readings-engine 8080 | head -1 | cut -d: -f2)
+H=(-H 'Content-Type: application/json' -H 'X-Api-Key: dev-only-readings-key')
+```
+
+Record five readings for meter `m-7` on 2026-10-30 (amounts as decimal strings or numbers, both
+sum exactly) and one on the next day:
+
+```sh
+for r in '"0001","kwh":"1.25","kind":"import"' '"0002","kwh":0.75,"kind":"export"' \
+         '"0003","kwh":"2.10","kind":"import"' '"0004","kwh":"0.40","kind":"export"' \
+         '"0005","kwh":"3.05","kind":"import"'; do
+  curl -s -o /dev/null -w "%{http_code}\n" -X POST "http://127.0.0.1:$PORT/channels/reading-in" "${H[@]}" \
+    -d "{\"meter\":\"m-7\",\"day\":\"2026-10-30\",\"seq\":$r}"
+done
+curl -s -o /dev/null -w "%{http_code}\n" -X POST "http://127.0.0.1:$PORT/channels/reading-in" "${H[@]}" \
+  -d '{"meter":"m-7","day":"2026-10-31","seq":"0001","kwh":"9.99","kind":"import"}'
+```
+
+Each answers `200`. Resending reading `0003` is refused, because the key exists:
+
+```text
+{"type":"urn:bpm:diag:SUTRA.RUNTIME.DATASTORE.CONFLICT", ... "detail":"Optimistic-concurrency
+conflict writing data store 'readings' key 'm-7|2026-10-30|0003' at data task 'Record': the key
+already exists (expect=\"absent\"). ..."}
+```
+
+Ask for the day, two rows per page, passing each page's `next` as the next `after`:
+
+```sh
+curl -s -X POST "http://127.0.0.1:$PORT/channels/day-report" "${H[@]}" \
+  -d '{"meter":"m-7","day":"2026-10-30","after":null}'
+```
+
+```text
+{"keys": ["m-7|2026-10-30|0001", "m-7|2026-10-30|0002"],
+ "readings": 5, "kwh": 7.55,
+ "importKwh": 6.40, "exportKwh": 1.15,
+ "next": "m-7|2026-10-30|0002"}
+```
+
+With `"after":"m-7|2026-10-30|0002"` the keys are `0003` and `0004` (next `…|0004`); with
+`"after":"m-7|2026-10-30|0004"` only `0005`, and `"next": null`. The totals are the same on every
+page, and the 2026-10-31 reading is never counted. Clean up with
+`docker rm -f readings-engine readings-db && docker network rm readings-net`.
 
 ## Caching reads {#caching-reads}
 

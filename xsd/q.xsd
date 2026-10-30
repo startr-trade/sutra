@@ -430,23 +430,74 @@
         on a write, replaces just one field of the stored (map) value, preserving the rest;
         @expect="unchanged", on a write, makes it an optimistic-concurrency compare-and-set — it commits only
         if the row's revision still matches the one read earlier in this instance, else the instance fails with
-        SUTRA.RUNTIME.DATASTORE.CONFLICT (a lock-free alternative to @forUpdate for a scaled-out store). A data
+        SUTRA.RUNTIME.DATASTORE.CONFLICT (a lock-free alternative to @forUpdate for a scaled-out store).
+        @expect="absent" (0.6.10), on a write, inserts only when the key does not exist yet; when it exists the
+        write does not apply and SUTRA.RUNTIME.DATASTORE.CONFLICT is raised — the atomic "claim once" across
+        replicas. The conflict of either form is a BPMN error an error boundary on the data task (or an event
+        sub-process) can catch; uncaught, it fails the instance. A data
         task (a serviceTask with no @implementation) reads/writes these via its data associations.
+
+        Key query (0.6.10, additive): @query on a READ makes it read every row of a key/value sql store whose key
+        starts with @key (query="prefix", @key must not evaluate to "") or lies in [@key, @to) (query="range";
+        @key inclusive, @to exclusive), keys compared bytewise. The target variable receives
+        {rows: [{key, value}], aggregates: [...], truncated, next}: rows ascending by key, at most @limit
+        (default 1000, maximum 10000), only keys after @after (FEEL; the previous page's next, or null);
+        @rows="false" returns aggregates only. Each child q:aggregate is computed over EVERY matching row,
+        independent of @limit and @after: fn="count" gives {count}; fn="sum" with @field (a dotted value path)
+        gives {count, sum}, sum an exact decimal over JSON numbers and decimal strings (a missing field or null is
+        skipped; any other value fails with SUTRA.RUNTIME.DATASTORE.QUERY_NOT_NUMERIC); @groupBy (a dotted value
+        path) gives {groups: {value: {count, sum?}}}. No match gives zeros, never null. A query takes no locks,
+        reads committed rows, bypasses the read cache, and cannot be combined with @forUpdate or used on a write.
         See the book's "Data stores" chapter.
       </xsd:documentation>
     </xsd:annotation>
   </xsd:element>
 
   <xsd:complexType name="StoreType">
+    <xsd:sequence>
+      <xsd:element name="aggregate" type="q:StoreAggregateType" minOccurs="0" maxOccurs="unbounded"/>
+    </xsd:sequence>
     <xsd:attribute name="key" type="xsd:string" use="required"/>
     <xsd:attribute name="forUpdate" type="xsd:boolean" default="false"/>
     <xsd:attribute name="field" type="xsd:string"/>
     <xsd:attribute name="expect" type="q:StoreExpect"/>
+    <xsd:attribute name="query" type="q:StoreQueryMode"/>
+    <xsd:attribute name="to" type="xsd:string"/>
+    <xsd:attribute name="rows" type="xsd:boolean" default="true"/>
+    <xsd:attribute name="limit" type="q:StoreQueryLimit"/>
+    <xsd:attribute name="after" type="xsd:string"/>
   </xsd:complexType>
 
   <xsd:simpleType name="StoreExpect">
     <xsd:restriction base="xsd:string">
       <xsd:enumeration value="unchanged"/>
+      <xsd:enumeration value="absent"/>
+    </xsd:restriction>
+  </xsd:simpleType>
+
+  <xsd:simpleType name="StoreQueryMode">
+    <xsd:restriction base="xsd:string">
+      <xsd:enumeration value="prefix"/>
+      <xsd:enumeration value="range"/>
+    </xsd:restriction>
+  </xsd:simpleType>
+
+  <xsd:simpleType name="StoreQueryLimit">
+    <xsd:restriction base="xsd:positiveInteger">
+      <xsd:maxInclusive value="10000"/>
+    </xsd:restriction>
+  </xsd:simpleType>
+
+  <xsd:complexType name="StoreAggregateType">
+    <xsd:attribute name="fn" type="q:StoreAggregateFunction" use="required"/>
+    <xsd:attribute name="field" type="xsd:string"/>
+    <xsd:attribute name="groupBy" type="xsd:string"/>
+  </xsd:complexType>
+
+  <xsd:simpleType name="StoreAggregateFunction">
+    <xsd:restriction base="xsd:string">
+      <xsd:enumeration value="count"/>
+      <xsd:enumeration value="sum"/>
     </xsd:restriction>
   </xsd:simpleType>
 

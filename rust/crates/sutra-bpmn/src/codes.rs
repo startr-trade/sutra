@@ -26,6 +26,10 @@ pub const PARSE_LINK_CATCH_DUPLICATE: &str = "SUTRA.PARSE.LINK.CATCH_DUPLICATE";
 pub const PARSE_SUBPROCESS_UNSUPPORTED: &str = "SUTRA.PARSE.SUBPROCESS.UNSUPPORTED";
 pub const PARSE_DATA_ASSOCIATION_UNSUPPORTED: &str = "SUTRA.PARSE.DATA_ASSOCIATION.UNSUPPORTED";
 pub const PARSE_STORE_KEY_REQUIRED: &str = "SUTRA.PARSE.STORE.KEY_REQUIRED";
+/// A `<q:store query=…>` read that cannot run as declared: an unknown query mode, a range
+/// without `@to`, a limit outside 1..=10000, an aggregate without the field it needs, a query on
+/// a write association, or a query combined with `@forUpdate`.
+pub const PARSE_STORE_QUERY_INVALID: &str = "SUTRA.PARSE.STORE.QUERY_INVALID";
 pub const PARSE_Q_ON_VALIDATION_INVALID_MODE: &str = "SUTRA.PARSE.Q_ON_VALIDATION_INVALID_MODE";
 pub const PARSE_BOUNDARY_EVENT_INVALID_REF: &str = "SUTRA.PARSE.BOUNDARY_EVENT.INVALID_REF";
 

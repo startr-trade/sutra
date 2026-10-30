@@ -27,6 +27,9 @@ pub mod config;
 /// three dialect modules execute them.
 pub mod coverage;
 pub mod error;
+/// Key queries (`<q:store query=…>`) on a key/value store — the statement text, bounds and
+/// collation rules, pure like `projected`; the three dialect modules execute them.
+pub mod keyquery;
 /// PostgreSQL reference dialect (feature `providers`, on by default). The `config` loader above is
 /// pure and always compiles — the deploy-time lint needs only that, so a `--no-default-features`
 /// build carries no sqlx/tokio and targets `wasm32-*`.
@@ -60,6 +63,9 @@ pub use coverage::{
     COVERAGE_STORE_NAME,
 };
 pub use error::DataStoreError;
+pub use keyquery::{
+    KeyAggregateCell, KeyAggregateResult, KeyQueryAggregate, KeyQueryPage, KeyRangeQuery,
+};
 #[cfg(feature = "mssql")]
 pub use mssql::{MssqlDataStore, MssqlDataStoreTx};
 #[cfg(feature = "mysql")]

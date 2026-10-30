@@ -16,8 +16,9 @@ use crate::error::SutraError;
 use crate::model::{
     Assignment, BoundaryKind, BpmnDataSpelling, BpmnImport, CoveragePath, DataMapping,
     DeclaredVariable, FieldType, Node, ParamBinding, ProcessAudit, ProcessDefinition,
-    ProcessModule, SequenceFlow, ShadowedBpmnVariable, StoreRead, StoreWrite, ThrowKind,
-    CHANNEL_CALL_PREFIX,
+    ProcessModule, SequenceFlow, ShadowedBpmnVariable, StoreAggregateFunction, StoreQuery,
+    StoreQueryAggregate, StoreQueryMode, StoreRead, StoreWrite, ThrowKind, CHANNEL_CALL_PREFIX,
+    STORE_QUERY_DEFAULT_LIMIT, STORE_QUERY_MAX_LIMIT,
 };
 use crate::qbindings::{
     AckMode, AliasBinding, AliasConflict, AuditBinding, AuditCapture, CaseEntry, DataClass,
@@ -32,7 +33,8 @@ const BPMN_NS: &str = "http://www.omg.org/spec/BPMN/20100524/MODEL";
 const Q_NS: &str = "urn:sutra:q:1.0";
 
 /// A parsed `<bpmn:dataStoreReference>`: the store it names + its `<q:store>` key /
-/// forUpdate / field / expect attributes.
+/// forUpdate / field / expect attributes, and the key query it declares (`@query`), if any —
+/// kept as the parse outcome so the association that uses it reports a malformed one.
 #[derive(Debug, Clone)]
 struct StoreBinding {
     store_name: Option<String>,
@@ -40,6 +42,8 @@ struct StoreBinding {
     for_update: bool,
     field: Option<String>,
     expect_unchanged: bool,
+    expect_absent: bool,
+    query: Option<Result<StoreQuery, String>>,
 }
 
 /// The lexical surroundings one `assemble_process` call works within: the element whose flow
@@ -1977,11 +1981,26 @@ fn build_data_mapping(
                 ));
             };
             validate_store(sb, id)?;
+            let query = match &sb.query {
+                None => None,
+                Some(Ok(query)) => {
+                    if sb.for_update {
+                        return Err(store_query_invalid(
+                            id,
+                            sb,
+                            "@query cannot be combined with @forUpdate (a query takes no locks)",
+                        ));
+                    }
+                    Some(query.clone())
+                }
+                Some(Err(reason)) => return Err(store_query_invalid(id, sb, reason)),
+            };
             mapping.store_reads.push(StoreRead {
                 store: sb.store_name.clone().unwrap_or_default(),
                 key_expression: sb.key.clone().unwrap_or_default(),
                 for_update: sb.for_update,
                 target_var,
+                query,
             });
             continue;
         }
@@ -2022,12 +2041,20 @@ fn build_data_mapping(
                 ));
             };
             validate_store(sb, id)?;
+            if sb.query.is_some() {
+                return Err(store_query_invalid(
+                    id,
+                    sb,
+                    "a query is a read; it cannot be the target of a data output association",
+                ));
+            }
             mapping.store_writes.push(StoreWrite {
                 store: sb.store_name.clone().unwrap_or_default(),
                 key_expression: sb.key.clone().unwrap_or_default(),
                 field: sb.field.clone(),
                 value_var,
                 expect_unchanged: sb.expect_unchanged,
+                expect_absent: sb.expect_absent,
             });
             continue;
         }
@@ -2103,6 +2130,125 @@ fn validate_store(sb: &StoreBinding, node_id: &str) -> Result<(), SutraError> {
     Ok(())
 }
 
+fn store_query_invalid(node_id: &str, sb: &StoreBinding, reason: &str) -> SutraError {
+    err(
+        codes::PARSE_STORE_QUERY_INVALID,
+        format!(
+            "<serviceTask> '{node_id}' declares a key query on data store '{}' that cannot run: \
+             {reason}.",
+            sb.store_name.as_deref().unwrap_or("")
+        ),
+    )
+}
+
+/// Parse the key query a `<q:store>` declares (`@query`), or `None` when it declares none.
+fn parse_store_query(q: &XmlElement) -> Option<Result<StoreQuery, String>> {
+    let mode = trim_to_none(q.attr_or_empty("query"))?;
+    Some(parse_store_query_body(q, &mode))
+}
+
+fn parse_store_query_body(q: &XmlElement, mode: &str) -> Result<StoreQuery, String> {
+    let to = trim_to_none(q.attr_or_empty("to"));
+    let mode = match mode {
+        "prefix" => {
+            if to.is_some() {
+                return Err(
+                    "@to belongs to query=\"range\"; a prefix query has no upper bound".into(),
+                );
+            }
+            StoreQueryMode::Prefix
+        }
+        "range" => StoreQueryMode::Range {
+            to_expression: to.ok_or_else(|| {
+                "query=\"range\" needs @to, the exclusive upper bound (@key is the inclusive \
+                 lower bound)"
+                    .to_string()
+            })?,
+        },
+        other => {
+            return Err(format!(
+                "@query=\"{other}\" is not a query mode (expected \"prefix\" or \"range\")"
+            ))
+        }
+    };
+    let rows = match trim_to_none(q.attr_or_empty("rows")).as_deref() {
+        None | Some("true") => true,
+        Some("false") => false,
+        Some(other) => return Err(format!("@rows=\"{other}\" is not a boolean")),
+    };
+    let limit = match trim_to_none(q.attr_or_empty("limit")) {
+        None => STORE_QUERY_DEFAULT_LIMIT,
+        Some(text) => match text.parse::<u32>() {
+            Ok(n) if (1..=STORE_QUERY_MAX_LIMIT).contains(&n) => n,
+            _ => {
+                return Err(format!(
+                    "@limit=\"{text}\" must be a whole number from 1 to {STORE_QUERY_MAX_LIMIT}"
+                ))
+            }
+        },
+    };
+    let mut aggregates = Vec::new();
+    for a in q.children_ns(Q_NS, "aggregate") {
+        let function = match a.attr_or_empty("fn").trim() {
+            "count" => StoreAggregateFunction::Count,
+            "sum" => StoreAggregateFunction::Sum,
+            other => {
+                return Err(format!(
+                    "<q:aggregate fn=\"{other}\"> is not an aggregate (expected \"count\" or \
+                     \"sum\")"
+                ))
+            }
+        };
+        let field = trim_to_none(a.attr_or_empty("field"));
+        let group_by = trim_to_none(a.attr_or_empty("groupBy"));
+        match (function, &field) {
+            (StoreAggregateFunction::Sum, None) => {
+                return Err("<q:aggregate fn=\"sum\"> needs @field, the value path to sum".into())
+            }
+            (StoreAggregateFunction::Count, Some(_)) => {
+                return Err(
+                    "<q:aggregate fn=\"count\"> counts rows and takes no @field (use fn=\"sum\")"
+                        .into(),
+                )
+            }
+            _ => {}
+        }
+        for path in field.iter().chain(group_by.iter()) {
+            if !is_value_path(path) {
+                return Err(format!(
+                    "\"{path}\" is not a value path (dot-separated names of letters, digits, \
+                     '_' and '-')"
+                ));
+            }
+        }
+        aggregates.push(StoreQueryAggregate {
+            function,
+            field,
+            group_by,
+        });
+    }
+    if !rows && aggregates.is_empty() {
+        return Err("@rows=\"false\" with no <q:aggregate> would return nothing".into());
+    }
+    Ok(StoreQuery {
+        mode,
+        rows,
+        limit,
+        after_expression: trim_to_none(q.attr_or_empty("after")),
+        aggregates,
+    })
+}
+
+/// A dotted path into a stored value: `amount`, `totals.credit`, `bk-tx-cd`.
+fn is_value_path(path: &str) -> bool {
+    path.split('.').all(|segment| {
+        !segment.is_empty()
+            && segment
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    })
+}
+
 fn first_source_ref(association: &XmlElement) -> Option<&str> {
     association
         .children_ns(BPMN_NS, "sourceRef")
@@ -2172,13 +2318,20 @@ fn collect_store_bindings(root: &XmlElement) -> HashMap<String, StoreBinding> {
         let mut for_update = false;
         let mut field = None;
         let mut expect_unchanged = false;
+        let mut expect_absent = false;
+        let mut query = None;
         if let Some(q) = r.collect_descendants_ns(Q_NS, "store").first() {
             key = trim_to_none(q.attr_or_empty("key"));
             for_update = q.attr_or_empty("forUpdate").eq_ignore_ascii_case("true");
             field = trim_to_none(q.attr_or_empty("field"));
-            expect_unchanged = trim_to_none(q.attr_or_empty("expect"))
-                .map(|v| v.eq_ignore_ascii_case("unchanged"))
-                .unwrap_or(false);
+            let expect = trim_to_none(q.attr_or_empty("expect"));
+            expect_unchanged = expect
+                .as_deref()
+                .is_some_and(|v| v.eq_ignore_ascii_case("unchanged"));
+            expect_absent = expect
+                .as_deref()
+                .is_some_and(|v| v.eq_ignore_ascii_case("absent"));
+            query = parse_store_query(q);
         }
         out.insert(
             ref_id.to_string(),
@@ -2188,6 +2341,8 @@ fn collect_store_bindings(root: &XmlElement) -> HashMap<String, StoreBinding> {
                 for_update,
                 field,
                 expect_unchanged,
+                expect_absent,
+                query,
             },
         );
     }

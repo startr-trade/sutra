@@ -22,13 +22,75 @@ use sutra_datastore::{
 };
 use sutra_executor::variables::{feel_to_json, json_to_feel};
 use sutra_executor::{
-    CoverageFragment, CoverageMetricStore, CoverageMetrics, DataStore, DataStoreTx, StoreError,
+    CoverageFragment, CoverageMetricStore, CoverageMetrics, DataStore, DataStoreTx,
+    StoreAggregateCell, StoreAggregateValue, StoreError, StoreKeyQuery, StoreQueryResult,
 };
 use sutra_feel::FeelValue;
 
 /// Map a durable-store backend failure to the executor SPI's typed error (fail-closed).
 fn to_store_err(e: DataStoreError) -> StoreError {
     StoreError::new(e.to_string())
+}
+
+/// The executor's key query in the dialect stores' terms.
+fn to_range_query(query: &StoreKeyQuery) -> sutra_datastore::KeyRangeQuery {
+    sutra_datastore::KeyRangeQuery {
+        lower: query.lower.clone(),
+        upper: query.upper.clone(),
+        after: query.after.clone(),
+        row_limit: query.row_limit,
+        aggregates: query
+            .aggregates
+            .iter()
+            .map(|a| sutra_datastore::KeyQueryAggregate {
+                sum_field: a.sum_field.clone(),
+                group_by: a.group_by.clone(),
+            })
+            .collect(),
+    }
+}
+
+/// A dialect store's key-query page in the executor's terms (values as FEEL, sums as exact
+/// decimals).
+fn from_query_page(page: sutra_datastore::KeyQueryPage) -> Result<StoreQueryResult, StoreError> {
+    fn cell(c: sutra_datastore::KeyAggregateCell) -> Result<StoreAggregateCell, StoreError> {
+        let sum = match c.sum {
+            None => None,
+            Some(text) => Some(
+                <bigdecimal::BigDecimal as std::str::FromStr>::from_str(&text).map_err(|e| {
+                    StoreError::new(format!("key query sum '{text}' is not a decimal: {e}"))
+                })?,
+            ),
+        };
+        Ok(StoreAggregateCell {
+            count: c.count,
+            sum,
+            non_numeric: c.non_numeric,
+        })
+    }
+    let mut aggregates = Vec::with_capacity(page.aggregates.len());
+    for a in page.aggregates {
+        aggregates.push(match a {
+            sutra_datastore::KeyAggregateResult::Total(c) => StoreAggregateValue::Total(cell(c)?),
+            sutra_datastore::KeyAggregateResult::Grouped(groups) => {
+                let mut out = std::collections::BTreeMap::new();
+                for (k, c) in groups {
+                    out.insert(k, cell(c)?);
+                }
+                StoreAggregateValue::Grouped(out)
+            }
+        });
+    }
+    Ok(StoreQueryResult {
+        rows: page
+            .rows
+            .into_iter()
+            .map(|(k, v)| (k, json_to_feel(&v)))
+            .collect(),
+        aggregates,
+        truncated: page.truncated,
+        next: page.next,
+    })
 }
 
 /// Generates the async `DataStore`/`DataStoreTx` adapters over one async dialect
@@ -99,6 +161,15 @@ macro_rules! async_dialect_store {
                     .put_if_revision(key, &json, expected_rev)
                     .await
                     .map_err(to_store_err)
+            }
+
+            async fn query(&self, query: &StoreKeyQuery) -> Result<StoreQueryResult, StoreError> {
+                let page = self
+                    .inner
+                    .query(&to_range_query(query))
+                    .await
+                    .map_err(to_store_err)?;
+                from_query_page(page)
             }
 
             async fn begin(&self) -> Result<Option<Rc<dyn DataStoreTx>>, StoreError> {
@@ -567,6 +638,11 @@ impl DataStore for CachedStore {
         let result = self.inner.put_if_revision(key, value, expected_rev).await;
         self.cache.invalidate(key);
         result
+    }
+
+    /// A key query is never served from (or stored in) the cache: it reads the store itself.
+    async fn query(&self, query: &StoreKeyQuery) -> Result<StoreQueryResult, StoreError> {
+        self.inner.query(query).await
     }
 
     async fn begin(&self) -> Result<Option<Rc<dyn DataStoreTx>>, StoreError> {

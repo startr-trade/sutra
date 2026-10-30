@@ -24,6 +24,8 @@ server, so no provider key is needed.
 | **Replicas no longer send twice** (0.6.8) | Engines sharing one database each claimed outbox rows another was still delivering, so 0.6.5–0.6.7 sent about half of all outbound messages twice under multi-replica load. The claim now leases its rows (30 s, renewed while in flight). | [Outbox processing](architecture/replicas.md#outbox-processing-skip-locked-and-a-claim-lease) |
 | **Autovacuum for the busy tables** (0.6.8) | On PostgreSQL the outbox queue and the other high-churn tables have their own autovacuum settings, so dead rows no longer stall the outbox claim at high rates. Lower `autovacuum_naptime` on the server for high-rate deployments. | [PostgreSQL autovacuum](operating/throughput-tuning.md#postgresql-autovacuum) |
 | **Correlation keys on audit events** (0.6.9) | Every audit event in the JSONL and OTLP sinks carries the instance's `<q:alias>` keys and values, redacted like any other audit content. `SUTRA_AUDIT_OTEL_ENDPOINT` no longer panics the engine at start, and the JSONL sink writes exactly one event per line. 0.6.9 is also the first release of the 0.6.8 changes above. | [Correlation keys on every audit event](operating/logging.md#correlation-keys-on-every-audit-event) |
+| **Key queries on a data store** (0.6.10) | A data-task read returns the rows whose key starts with a prefix or lies in a range, in key order and paged, with count and exact-decimal sum aggregates over every matching row, optionally grouped. One index range scan, no locks. `expect="absent"` claims a key once across replicas, and a data-store conflict can be caught by an error boundary. | [Querying rows by key](building/data-stores.md#querying-rows-by-key) |
+| **Relays honour a wait's message type** (0.6.10) | Several waits on one channel are told apart by `messageTypeValue` / `messageTypePattern`, like start events. Also in 0.6.10: FEEL builtins such as `context put` and `list contains` parse in the package lint, and the lint checks assignment expressions and multi-instance loop items. | [Several waits on one channel](building/q-namespace.md#several-waits-on-one-channel) |
 | **Live audio sessions** (preview) | `AudioSession` and `require: [realtime]`, opened through an `llm` channel by a media transport, not by a process. | [Live audio sessions](building/llm-channels.md#live-audio-sessions-preview) |
 
 Telephony, IVRs, meetings and WebRTC are not part of this engine. They live in the separate
@@ -38,7 +40,7 @@ Every walkthrough runs from the root of a checkout of this repository. It needs:
   `base64 -i <file>` wherever a walkthrough says `base64 -w0 <file>`);
 - an engine image and the `sutra` CLI, both **0.6.0 or later**.
 
-The compose files default to the published `ghcr.io/startr-trade/sutra:0.6.9` image, and
+The compose files default to the published `ghcr.io/startr-trade/sutra:0.6.10` image, and
 [Installation](getting-started/installation.md) installs the CLI. To run a walkthrough against
 your own checkout instead, build both from it:
 

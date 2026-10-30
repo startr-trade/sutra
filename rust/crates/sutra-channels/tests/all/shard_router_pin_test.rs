@@ -399,6 +399,7 @@ fn resolved_resume(instance_id: &str) -> ResolvedResume {
         deployment: deployment(),
         instance_id: instance_id.to_string(),
         wait_node_id: "U".to_string(),
+        candidate_nodes: vec!["U".to_string()],
         variables: Variables::new(),
         alias_name: "e2eId".to_string(),
         alias_value: "K-100".to_string(),

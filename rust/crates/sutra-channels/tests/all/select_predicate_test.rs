@@ -346,7 +346,7 @@ const WAIT_NODE: &str = r#"<?xml version="1.0"?>
 
 fn relay_nodes(processes: &ProcessModuleRegistry, ctx: &FeelContext) -> Vec<String> {
     processes
-        .resolve_relay_targets(&deployment(), "rail-in", ctx)
+        .resolve_relay_targets(&deployment(), "rail-in", None, ctx)
         .iter()
         .map(|t| t.wait_node_id.clone())
         .collect()
@@ -399,4 +399,78 @@ fn a_wait_node_without_a_predicate_still_relays() {
 </bpmn:definitions>"#;
     let processes = registry(PLAIN_WAIT);
     assert_eq!(relay_nodes(&processes, &FeelContext::new()), vec!["W"]);
+}
+
+// ---- the relay path honours a wait node's declared message type (0.6.10) ------------------
+
+/// Three waits on ONE channel, forked in parallel: one pinned to `Answer`, one pinned by
+/// pattern to `Cancel.*`, one with no message type. A relay must reach only the waits whose
+/// declared type admits it, most specific first.
+const TYPED_WAITS: &str = r#"<?xml version="1.0"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0">
+  <bpmn:process id="p">
+    <bpmn:startEvent id="S">
+      <bpmn:extensionElements><q:source channel="kickoff"/></bpmn:extensionElements>
+    </bpmn:startEvent>
+    <bpmn:parallelGateway id="Fork"/>
+    <bpmn:intermediateCatchEvent id="WAnswer">
+      <bpmn:extensionElements>
+        <q:source channel="shared-in" messageTypeValue="Answer"/>
+      </bpmn:extensionElements>
+      <bpmn:messageEventDefinition/>
+    </bpmn:intermediateCatchEvent>
+    <bpmn:intermediateCatchEvent id="WCancel">
+      <bpmn:extensionElements>
+        <q:source channel="shared-in" messageTypePattern="Cancel.*"/>
+      </bpmn:extensionElements>
+      <bpmn:messageEventDefinition/>
+    </bpmn:intermediateCatchEvent>
+    <bpmn:intermediateCatchEvent id="WAny">
+      <bpmn:extensionElements>
+        <q:source channel="shared-in"/>
+      </bpmn:extensionElements>
+      <bpmn:messageEventDefinition/>
+    </bpmn:intermediateCatchEvent>
+    <bpmn:endEvent id="E1"/>
+    <bpmn:endEvent id="E2"/>
+    <bpmn:endEvent id="E3"/>
+    <bpmn:sequenceFlow id="f0" sourceRef="S" targetRef="Fork"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="Fork" targetRef="WAnswer"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="Fork" targetRef="WCancel"/>
+    <bpmn:sequenceFlow id="f3" sourceRef="Fork" targetRef="WAny"/>
+    <bpmn:sequenceFlow id="f4" sourceRef="WAnswer" targetRef="E1"/>
+    <bpmn:sequenceFlow id="f5" sourceRef="WCancel" targetRef="E2"/>
+    <bpmn:sequenceFlow id="f6" sourceRef="WAny" targetRef="E3"/>
+  </bpmn:process>
+</bpmn:definitions>"#;
+
+fn typed_relay_nodes(message_type: Option<&str>) -> Vec<String> {
+    registry(TYPED_WAITS)
+        .resolve_relay_targets(
+            &deployment(),
+            "shared-in",
+            message_type,
+            &context(&[], message_type),
+        )
+        .iter()
+        .map(|t| t.wait_node_id.clone())
+        .collect()
+}
+
+#[test]
+fn a_relay_reaches_only_the_waits_its_message_type_admits_most_specific_first() {
+    assert_eq!(typed_relay_nodes(Some("Answer")), vec!["WAnswer", "WAny"]);
+    assert_eq!(
+        typed_relay_nodes(Some("CancelRequest")),
+        vec!["WCancel", "WAny"]
+    );
+    assert_eq!(typed_relay_nodes(Some("Other")), vec!["WAny"]);
+}
+
+#[test]
+fn a_typeless_relay_never_reaches_a_wait_pinned_to_a_type() {
+    // A codec that reports no message type cannot satisfy a declared type — the start-event
+    // rule — so only the untyped wait remains.
+    assert_eq!(typed_relay_nodes(None), vec!["WAny"]);
 }
