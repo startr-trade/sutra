@@ -98,6 +98,17 @@ fn fixture() -> &'static Fixture {
                     format!("http://{collector_name}:4317"),
                 )
                 .env("SUTRA_AUDIT_JSONL", JSONL_PATH)
+                // The standard resource env and the engine's own resource config: both must reach
+                // the audit records. OTEL_SERVICE_NAME names the engine's telemetry, not audit.
+                .env(
+                    "OTEL_RESOURCE_ATTRIBUTES",
+                    "deployment.environment=conformance,example.run_id=run-42",
+                )
+                .env(
+                    "SUTRA_TELEMETRY_RESOURCE_ATTRIBUTES",
+                    "example.from_config=yes",
+                )
+                .env("OTEL_SERVICE_NAME", "auditsinks-engine")
                 .expected_deployments(1)
                 .start(&assemble_fixture());
             Fixture {
@@ -164,6 +175,24 @@ async fn tc_audit_otel_endpoint_boots_and_the_collector_receives_sutra_audit_rec
     assert!(
         !logs.contains(HOLDER),
         "the raw sensitive value never reaches the collector"
+    );
+    // The records carry the deployment's resource attributes: OTEL_RESOURCE_ATTRIBUTES and the
+    // engine's `sutra.telemetry.resource-attributes`, with service.name kept at sutra-audit.
+    for attribute in [
+        "service.name: Str(sutra-audit)",
+        "deployment.environment: Str(conformance)",
+        "example.run_id: Str(run-42)",
+        "example.from_config: Str(yes)",
+    ] {
+        assert!(
+            logs.contains(&format!("-> {attribute}")),
+            "resource attribute {attribute} on the audit records:\n{}",
+            tail(&logs)
+        );
+    }
+    assert!(
+        !logs.contains("service.name: Str(auditsinks-engine)"),
+        "OTEL_SERVICE_NAME names the engine's telemetry, not the audit stream"
     );
 }
 

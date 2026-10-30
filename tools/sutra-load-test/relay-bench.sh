@@ -32,6 +32,8 @@
 #   CACHE_TTL    turn on the `refdata` store's read cache with this ttl (e.g. PT0S, PT5S)
 #   KEEP=1       leave the cluster and engine running after the run (prints how to stop them)
 #   OUT          write the markdown block to this file as well as stdout
+#   PG_EXTRA_CONF  extra postgresql.conf lines (e.g. "session_preload_libraries = 'auto_explain'")
+#   PG_LOG_OUT   copy the PostgreSQL server log (lock waits over 1 s, deadlocks) to this file on exit
 #   PERF_DIR     record a CPU profile of the engine (and Postgres) over the measured run into
 #                this directory: perf.data, a flamegraph SVG and a top-symbol summary. Needs
 #                `perf` usable by your user (kernel.perf_event_paranoid <= 1) and inferno
@@ -99,6 +101,7 @@ cleanup() {
     [ -n "$ENGINE_PID" ] && kill "$ENGINE_PID" 2>/dev/null && wait "$ENGINE_PID" 2>/dev/null
     [ -n "$SINK_PID" ] && kill "$SINK_PID" 2>/dev/null && wait "$SINK_PID" 2>/dev/null
     [ -f "$PGDATA/postmaster.pid" ] && "$PG_BIN_DIR/pg_ctl" -D "$PGDATA" -m fast stop >/dev/null 2>&1
+    [ -n "${PG_LOG_OUT:-}" ] && [ -f "$WORK/pg.log" ] && cp "$WORK/pg.log" "$PG_LOG_OUT"
     rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -129,6 +132,9 @@ pg_stat_statements.max = 5000
 pg_stat_statements.track = all
 track_io_timing = on
 track_wal_io_timing = on
+log_lock_waits = on
+log_line_prefix = '%m [%p] '
+${PG_EXTRA_CONF:-}
 EOF
 "$PG_BIN_DIR/pg_ctl" -D "$PGDATA" -l "$WORK/pg.log" -w start >/dev/null || die "postgres did not start ($WORK/pg.log)"
 PSQL=(psql -h 127.0.0.1 -p "$PG_PORT" -U sutra -X -q -t -A)
@@ -226,6 +232,7 @@ pg_ticks() {
 }
 read -r C0 F0 B0 S0 < <("${PSQL[@]}" -d sutra -F ' ' -c "$stats_sql")
 "${PSQL[@]}" -d sutra -c "SELECT pg_stat_statements_reset()" >/dev/null
+DL0="$("${PSQL[@]}" -d sutra -c "SELECT deadlocks FROM pg_stat_database WHERE datname = 'sutra'")"
 T0="$(cpu_ticks)"; P0="$(pg_ticks)"; W0="$(date +%s.%N)"
 
 PERF_PIDS=()
@@ -276,8 +283,18 @@ PY
 )"
 top="$("${PSQL[@]}" -d sutra -F ' | ' -c "SELECT calls, round(total_exec_time::numeric,0), left(regexp_replace(query, '\s+', ' ', 'g'), 110)
   FROM pg_stat_statements ORDER BY calls DESC LIMIT 40")"
+# The outbox's lease renewals and delivered-row deletes: how long each statement took, and how many
+# deadlocks the database detected over the measured run.
+outbox="$("${PSQL[@]}" -d sutra -F ' | ' -c "SELECT calls, rows, round(mean_exec_time::numeric,1),
+  round(max_exec_time::numeric,1), round(total_exec_time::numeric,0), left(regexp_replace(query, '\s+', ' ', 'g'), 90)
+  FROM pg_stat_statements
+  WHERE query ~ 'SET next_attempt_at = \\\$3' OR query ~ '^ *(WITH doomed|DELETE FROM outbox_entry)'
+  ORDER BY total_exec_time DESC")"
+DL1="$("${PSQL[@]}" -d sutra -c "SELECT deadlocks FROM pg_stat_database WHERE datname = 'sutra'")"
 {
     printf '%s\n\nTop statements by calls (calls | total ms | query):\n\n```\n%s\n```\n' "$report" "$top"
+    printf '\nOutbox lease renewals and deletes (calls | rows | mean ms | max ms | total ms | query), deadlocks %s:\n\n```\n%s\n```\n' \
+        "$((DL1 - DL0))" "$outbox"
 } | tee ${OUT:+"$OUT"}
 
 if [ -n "${PERF_DIR:-}" ]; then

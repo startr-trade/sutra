@@ -10,7 +10,7 @@ use sutra_persistence::stores::{OutboxEntry, OutboxStore, PgOutboxStore, ReplyMo
 use time::Duration;
 use uuid::Uuid;
 
-use crate::fixture::{dep_a, dep_b, fresh_pool, now_micros};
+use crate::fixture::{db_url, dep_a, dep_b, fresh_pool, fresh_pool_named, now_micros};
 
 fn entry(instance_id: Uuid) -> OutboxEntry {
     let now = now_micros();
@@ -566,4 +566,158 @@ async fn renewing_a_claim_extends_its_lease_and_never_shortens_a_due_time() {
         .await
         .unwrap();
     assert!(at_6.iter().any(|e| e.entry_id == id));
+}
+
+/// The deadlock a burst of deliveries hit: the batch delete of delivered rows and the lease renewal
+/// of everything in flight lock overlapping rows, each in whatever order its plan visits them. On
+/// a queue table's statistics the two got different plans (key order for one, heap order for the
+/// other), and deadlocked. Each side runs here on a pool pinned to one of those plan shapes. The
+/// renewal now never waits for a lock, so no cycle can form whatever the plans: no statement
+/// fails, every row is deleted exactly once, and the renewals keep running.
+#[ignore = "docker"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_batch_deletes_and_lease_renewals_never_deadlock() {
+    const ROWS: usize = 3000;
+    const DELETERS: usize = 3;
+    const BATCH: usize = 200;
+    let (pool, db) = fresh_pool_named().await;
+    // Pin the two plan shapes: deletes walk the primary key (key order), renewals scan the heap.
+    let pinned = |settings: &'static str| {
+        sqlx::postgres::PgPoolOptions::new()
+            .max_connections(4)
+            .after_connect(move |conn, _| {
+                Box::pin(async move {
+                    sqlx::Executor::execute(conn, settings).await?;
+                    Ok(())
+                })
+            })
+            .connect_lazy(&db_url(&db))
+            .unwrap()
+    };
+    let deletes = PgOutboxStore::new(pinned(
+        "SET enable_seqscan = off; SET enable_bitmapscan = off",
+    ));
+    let renewals = PgOutboxStore::new(pinned(
+        "SET enable_indexscan = off; SET enable_indexonlyscan = off",
+    ));
+    let store = PgOutboxStore::new(pool);
+    for _ in 0..ROWS {
+        store.enqueue(&entry(Uuid::new_v4())).await.unwrap();
+    }
+    let now = now_micros();
+    let lease = now + Duration::seconds(30);
+    let claimed = store
+        .claim_due_excluding(&dep_a(), now, ROWS as i64, &[], lease)
+        .await
+        .unwrap();
+    assert_eq!(claimed.len(), ROWS);
+    // Delivered in an order unrelated to both key and heap order, like workers finishing.
+    let mut ids: Vec<Uuid> = claimed.iter().map(|e| e.entry_id).collect();
+    ids.sort_by_key(|id| id.as_u128().rotate_left(17) ^ 0x5555_5555);
+    let all = ids.clone();
+
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let renewer = {
+        let done = std::sync::Arc::clone(&done);
+        tokio::spawn(async move {
+            let mut rounds = 0u32;
+            let mut lease_end = lease;
+            while !done.load(std::sync::atomic::Ordering::SeqCst) {
+                lease_end += Duration::seconds(1);
+                renewals
+                    .renew_claims(&dep_a(), &all, lease_end)
+                    .await
+                    .unwrap_or_else(|e| panic!("renewal round {rounds} failed: {e}"));
+                rounds += 1;
+            }
+            rounds
+        })
+    };
+    let mut deleters = Vec::new();
+    for d in 0..DELETERS {
+        let deletes = deletes.clone();
+        let mine: Vec<Uuid> = ids.iter().skip(d).step_by(DELETERS).copied().collect();
+        deleters.push(tokio::spawn(async move {
+            let mut deleted = 0u64;
+            for batch in mine.chunks(BATCH) {
+                deleted += deletes
+                    .delete_many(&dep_a(), batch)
+                    .await
+                    .unwrap_or_else(|e| panic!("batch delete failed: {e}"));
+            }
+            deleted
+        }));
+    }
+    let mut deleted = 0;
+    for deleter in deleters {
+        deleted += deleter.await.unwrap();
+    }
+    done.store(true, std::sync::atomic::Ordering::SeqCst);
+    let rounds = renewer.await.unwrap();
+    assert!(rounds > 0, "the renewal ran alongside the deletes");
+    assert_eq!(
+        deleted, ROWS as u64,
+        "every delivered row deleted exactly once"
+    );
+    assert_eq!(
+        store.count_pending_for_deployment(&dep_a()).await.unwrap(),
+        0
+    );
+}
+
+/// A renewal skips a row another transaction holds instead of waiting for it, and still renews
+/// every other row: a held row is one whose lease is being ended on purpose (a delete, a
+/// deferral), so the renewal never blocks behind it.
+#[ignore = "docker"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_renewal_skips_a_locked_row_without_waiting_and_renews_the_rest() {
+    let pool = fresh_pool().await;
+    let store = PgOutboxStore::new(pool.clone());
+    for _ in 0..3 {
+        store.enqueue(&entry(Uuid::new_v4())).await.unwrap();
+    }
+    let now = now_micros();
+    let claimed = store
+        .claim_due_excluding(&dep_a(), now, 3, &[], now + Duration::seconds(30))
+        .await
+        .unwrap();
+    let ids: Vec<Uuid> = claimed.iter().map(|e| e.entry_id).collect();
+
+    // Hold one row the way an uncommitted delete does.
+    let mut holder = pool.begin().await.unwrap();
+    sqlx::query("SELECT entry_id FROM outbox_entry WHERE entry_id = $1 FOR UPDATE")
+        .bind(ids[0])
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+
+    let renewed = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        store.renew_claims(&dep_a(), &ids, now + Duration::seconds(60)),
+    )
+    .await
+    .expect("the renewal does not wait for the held row")
+    .unwrap();
+    assert_eq!(
+        renewed, 2,
+        "the two free rows are renewed, the held one skipped"
+    );
+    holder.rollback().await.unwrap();
+
+    // Next round the row is free again and is renewed.
+    assert_eq!(
+        store
+            .renew_claims(&dep_a(), &ids, now + Duration::seconds(61))
+            .await
+            .unwrap(),
+        3
+    );
+    let due: Vec<Uuid> = store
+        .claim_due(&dep_a(), now + Duration::seconds(45), 10)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|e| e.entry_id)
+        .collect();
+    assert!(due.is_empty(), "every row still leased at +45s: {due:?}");
 }

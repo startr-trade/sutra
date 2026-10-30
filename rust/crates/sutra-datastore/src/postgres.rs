@@ -38,10 +38,17 @@ pub type SendFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 const WHERE_KEY: &str = " WHERE store_name = $1 AND store_key = $2";
 
-/// Namespace half of the PG advisory-lock key guarding first-use migrations (the second
-/// half is `hashtext(store_name)`), so concurrent engine replicas serialise the idempotent
+/// Namespace half of the PG advisory-lock key guarding first-use migrations (the second half is
+/// `hashtext(MIGRATION_LOCK_NAME)`), so concurrent engine replicas serialise the idempotent
 /// migration run instead of racing it.
 const MIGRATION_LOCK_SPACE: i32 = 0x5D5A; // "SDS" — sutra data store
+
+/// The second half of the migration lock key. ONE key for every store, not one per store name:
+/// several stores on one database commonly share a table and the same idempotent DDL, and
+/// `CREATE TABLE IF NOT EXISTS` is not safe against itself in two sessions (the loser fails on
+/// `pg_type_typname_nsp_index`). Advisory locks are per database, so stores on different
+/// databases never wait for each other.
+const MIGRATION_LOCK_NAME: &str = "sutra-data-store-migrations";
 
 /// A `sql`-provider data store over the module's OWN connection (never the engine
 /// datasource — each store owns its connection). Cheap to clone; all clones share one pool
@@ -871,7 +878,7 @@ fn run_migration_scripts(
             .map_err(|e| migration_err(name, e))?;
         sqlx::query("SELECT pg_advisory_lock($1, hashtext($2))")
             .bind(MIGRATION_LOCK_SPACE)
-            .bind(name)
+            .bind(MIGRATION_LOCK_NAME)
             .execute(&mut conn)
             .await
             .map_err(|e| migration_err(name, e))?;
@@ -886,7 +893,7 @@ fn run_migration_scripts(
         // explicit before the close below).
         let _ = sqlx::query("SELECT pg_advisory_unlock($1, hashtext($2))")
             .bind(MIGRATION_LOCK_SPACE)
-            .bind(name)
+            .bind(MIGRATION_LOCK_NAME)
             .execute(&mut conn)
             .await;
         let _ = conn.close().await;

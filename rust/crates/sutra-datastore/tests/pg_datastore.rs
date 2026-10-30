@@ -1176,3 +1176,57 @@ async fn key_query_refuses_a_key_column_that_does_not_sort_bytewise() {
         "{e}"
     );
 }
+
+/// Several stores on one database that share a table and its idempotent DDL, first used at the
+/// same moment (two replicas, or one engine's lanes): every first use succeeds. The migration lock
+/// used to be keyed by store name, so the stores ran `CREATE TABLE IF NOT EXISTS` at once and the
+/// loser failed with a duplicate key on `pg_type_typname_nsp_index`.
+#[ignore = "docker"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stores_sharing_a_table_migrate_concurrently_without_racing() {
+    let pg = PgContainer::start();
+    let mut tasks = Vec::new();
+    for round in 0..3 {
+        // A fresh database each round, so every round races the very first CREATE TABLE.
+        let db = format!("race_{round}");
+        let status = Command::new("docker")
+            .args([
+                "exec",
+                &pg.id,
+                "psql",
+                "-U",
+                "sutra",
+                "-d",
+                "postgres",
+                "-c",
+                &format!("CREATE DATABASE {db}"),
+            ])
+            .output()
+            .expect("docker exec");
+        assert!(
+            status.status.success(),
+            "{}",
+            String::from_utf8_lossy(&status.stderr)
+        );
+        let url = pg
+            .url()
+            .rsplit_once('/')
+            .map(|(base, _)| format!("{base}/{db}"))
+            .unwrap();
+        for n in 0..8 {
+            let store = PostgresDataStore::from_definition(
+                &literal_def(&format!("store-{n}"), &url),
+                vec![CUTOVER_DDL.to_string()],
+            )
+            .expect("store builds");
+            tasks.push(tokio::spawn(async move {
+                store.put("k", &json!({"n": n})).await
+            }));
+        }
+    }
+    for task in tasks {
+        task.await
+            .unwrap()
+            .unwrap_or_else(|e| panic!("first use failed: {e}"));
+    }
+}

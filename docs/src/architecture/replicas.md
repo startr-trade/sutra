@@ -139,6 +139,20 @@ and the next replica to claim delivers the rows. The rare case where the origina
 just before the crash is absorbed downstream: the outbox row's key travels as the message's own
 idempotency token.
 
+The renewal never waits for a row lock. It skips a row another transaction holds, because the
+only holders of an in-flight row are the transactions that end its lease on purpose (the delete of
+a delivered row, a retry's backoff, a poison) or another replica's claim of a lease that has
+already lapsed. It renews at most 1024 rows per transaction, leaves out rows already delivered and
+waiting for their delete, and has a database connection of its own. A renewal round slower than
+5 seconds is logged at `warn`.
+
+> **Fixed in 0.6.12.** From 0.6.8 to 0.6.11 the renewal was one statement over every in-flight row,
+> and it locked rows that the batch delete of delivered rows was locking too, each in its own
+> order. Under a burst of deliveries PostgreSQL aborted one of them with `deadlock detected`: a lost
+> delete was retried row by row (`outbox delete failed: deadlock detected`, nothing lost), a lost
+> renewal renewed nothing that round. When the engine fell behind, the renewal took 1 to 3
+> seconds.
+
 > **Fixed in 0.6.8.** Releases 0.6.5 to 0.6.7 took the row locks but wrote no lease. A second
 > replica's claim could pick up a row the first was still delivering, and under multi-replica load
 > about half of all outbound messages were sent twice. Nothing was lost and every instance still

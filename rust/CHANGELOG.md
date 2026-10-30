@@ -13,6 +13,55 @@ This is the changelog for the **Rust-native** engine (`rust/` workspace). It beg
 
 Nothing yet.
 
+## [0.6.12] — 2026-10-30
+
+A **patch** release: two outbox fixes found under load, a data-store first-use race, and resource
+attributes on the OTLP audit records. No `urn:sutra:q:1.0`, migration or snapshot change. Two optional configuration keys are
+new. The engine opens one more database connection than before.
+
+### Fixed
+
+- **The outbox batch delete no longer deadlocks with the claim-lease renewal** (0.6.8–0.6.11). The
+  renewal of every in-flight row and the batch delete of delivered rows locked overlapping rows,
+  each in its own plan's order, and PostgreSQL aborted one with `deadlock detected`: a lost delete
+  was retried row by row (`outbox delete failed: deadlock detected`, nothing lost), a lost renewal
+  renewed no lease that round. The renewal now locks rows in key order and skips any row another
+  transaction holds (only transactions that end the lease on purpose hold one), so it never waits
+  and cannot deadlock. Delivered rows waiting for their delete are no longer renewed.
+- **Lease renewal no longer takes seconds when the engine falls behind.** It ran as one statement
+  over every in-flight row (1–3 s at saturation, mostly lock waits). It now runs in sorted
+  transactions of at most 1024 rows, never waits for a lock, and has its own one-connection pool.
+  A round slower than 5 s is logged at `warn`. Leases are unchanged: 30 s, renewed every 10 s.
+
+- **Data stores that share a table no longer race their first-use migration.** The migration
+  lock was keyed by store name, so stores sharing a table ran `CREATE TABLE IF NOT EXISTS` at once
+  and the loser's request failed with HTTP 500 (`pg_type_typname_nsp_index`). The lock is now one
+  per database (per server on MySQL/MariaDB). Tier-2
+  `stores_sharing_a_table_migrate_concurrently_without_racing` fails on 0.6.11.
+
+### Added
+
+- **Resource attributes on the OTLP audit records.** The audit pipeline builds its resource like
+  the engine telemetry: `OTEL_RESOURCE_ATTRIBUTES`, plus the new `sutra.telemetry.resource-attributes`
+  (`SUTRA_TELEMETRY_RESOURCE_ATTRIBUTES`, `key=value,…`, also applied to every telemetry signal).
+  `service.name` stays `sutra-audit` unless the new `sutra.audit.otel.service-name`
+  (`SUTRA_AUDIT_OTEL_SERVICE_NAME`) sets it; `OTEL_SERVICE_NAME` never renames the audit stream.
+- `tools/sutra-load-test/relay-bench.sh` reports the outbox renewal and delete statements (calls,
+  rows, mean and max time) and the deadlocks of the run; `PG_LOG_OUT` keeps the PostgreSQL log
+  (lock waits over 1 s are logged), `PG_EXTRA_CONF` adds server settings.
+
+### Investigated
+
+- `runtime dropped the dispatch task` in a parallel test run is hyper's error for a request whose
+  connection task died with its tokio runtime: a test harness shared one HTTP client between
+  `#[tokio::test]`s. Not an engine fault; `rust/TESTING.md` now forbids the pattern.
+
+Tests: tier-2 `concurrent_batch_deletes_and_lease_renewals_never_deadlock` (fails on the 0.6.11
+statements) and `a_renewal_skips_a_locked_row_without_waiting_and_renews_the_rest`; tier-1
+`the_lease_renewal_skips_rows_already_delivered` and
+`resource_attributes_parse_and_reach_the_resource`; the conformance audit-sink suite checks the
+resource attributes the collector receives.
+
 ## [0.6.11] — 2026-10-30
 
 A **patch** release with one correctness fix. Every earlier release is affected, up to and

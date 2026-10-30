@@ -2232,7 +2232,7 @@ pub(crate) fn build_engine(
         // lane thread has no runtime of its own, so the call passes the engine's handle and, the
         // provider already existing, only reads it (a per-activation flip reuses it the same way).
         if let Some(endpoint) = audit.otel_endpoint.as_deref() {
-            if crate::audit_sinks::init_audit_otel(&handle, endpoint) {
+            if crate::audit_sinks::init_audit_otel(&handle, &audit) {
                 registry.register(Arc::new(crate::audit_sinks::OtelAuditSink));
             } else {
                 warn!(

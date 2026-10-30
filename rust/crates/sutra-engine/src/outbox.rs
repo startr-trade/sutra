@@ -8,6 +8,7 @@
 
 use std::str::FromStr;
 
+use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use time::OffsetDateTime;
 use tracing::warn;
@@ -32,12 +33,23 @@ fn lease_end(now: OffsetDateTime) -> OffsetDateTime {
 /// PG-backed [`OutboxRowStore`].
 pub struct PgOutboxRows {
     store: PgOutboxStore,
+    /// The lease renewals' own store, over a one-connection pool to the same database: a renewal
+    /// never queues behind the claims, deletes and deferrals for a connection of the dispatcher's
+    /// pool — the backlog in which those are busiest is exactly when the leases matter.
+    lease_store: PgOutboxStore,
 }
 
 impl PgOutboxRows {
+    /// Rows over `pool`, plus a dedicated one-connection pool (opened lazily, same connect options)
+    /// for the lease renewals.
     pub fn new(pool: PgPool) -> PgOutboxRows {
+        let lease_pool = PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(pool.options().get_acquire_timeout())
+            .connect_lazy_with((*pool.connect_options()).clone());
         PgOutboxRows {
             store: PgOutboxStore::new(pool),
+            lease_store: PgOutboxStore::new(lease_pool),
         }
     }
 }
@@ -140,7 +152,7 @@ impl OutboxRowStore for PgOutboxRows {
                 .iter()
                 .filter_map(|id| Uuid::from_str(id).ok())
                 .collect();
-            self.store
+            self.lease_store
                 .renew_claims(&dep, &ids, lease_end(now))
                 .await
                 .map(|_| ())

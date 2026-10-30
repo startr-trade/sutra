@@ -961,7 +961,9 @@ async fn ensure_migrated(inner: &StoreInner) -> Result<(), DataStoreError> {
     }
     if !inner.migrations.is_empty() {
         let mut conn = inner.pool.acquire().await?;
-        let lock_key = format!("sutra_ds_{}", inner.name);
+        // ONE lock for every store (per database), not one per store name: stores commonly share
+        // a table and its idempotent DDL, and two sessions running it at once race.
+        let lock_key = "sutra_ds_migrations";
         run_batch(
             conn.client(),
             &format!(

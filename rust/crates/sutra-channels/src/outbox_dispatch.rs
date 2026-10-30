@@ -1674,6 +1674,10 @@ struct SignalInner {
     /// The subset that was CLAIMED (due rows). Only these need excluding from the next claim:
     /// a handed-off row is not due until its hand-off grace has passed.
     claimed: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// The subset already DELIVERED and waiting for the delete batcher. Their lease no longer
+    /// matters (the delete ends it), so the renewer leaves them alone: renewing them would only
+    /// lock the same rows the batch delete is about to lock.
+    delivered: std::sync::Mutex<std::collections::HashSet<String>>,
     /// Entries this process delivered and deleted recently. A claim whose query read a row
     /// just before its delete committed must not hand it out again; remembering the id for a
     /// while closes that window.
@@ -1721,10 +1725,25 @@ impl OutboxSignal {
                 inflight.remove(id);
             }
         }
-        let mut claimed = self.inner.claimed.lock().expect("outbox signal lock");
-        for id in entry_ids {
-            claimed.remove(id);
+        {
+            let mut claimed = self.inner.claimed.lock().expect("outbox signal lock");
+            for id in entry_ids {
+                claimed.remove(id);
+            }
         }
+        let mut delivered = self.inner.delivered.lock().expect("outbox signal lock");
+        for id in entry_ids {
+            delivered.remove(id);
+        }
+    }
+
+    /// The row was delivered and is on its way to the delete batcher: no lease renewal needed.
+    fn mark_delivered(&self, entry_id: &str) {
+        self.inner
+            .delivered
+            .lock()
+            .expect("outbox signal lock")
+            .insert(entry_id.to_string());
     }
 
     /// Hand committed, reserved rows straight to the dispatcher. With no dispatcher running the
@@ -1765,14 +1784,21 @@ impl OutboxSignal {
         self.release(entry_ids);
     }
 
-    /// Every entry in flight in this process (claimed or handed off): the rows whose leases the
-    /// renewer keeps alive.
-    fn inflight_snapshot(&self) -> Vec<String> {
+    /// Every entry in flight in this process (claimed or handed off) and not yet delivered: the
+    /// rows whose leases the renewer keeps alive.
+    fn lease_snapshot(&self) -> Vec<String> {
+        let delivered = self
+            .inner
+            .delivered
+            .lock()
+            .expect("outbox signal lock")
+            .clone();
         self.inner
             .inflight
             .lock()
             .expect("outbox signal lock")
             .iter()
+            .filter(|id| !delivered.contains(*id))
             .cloned()
             .collect()
     }
@@ -2043,6 +2069,7 @@ pub fn spawn_concurrent_dispatch_loop(
             worker_tasks.push(rt.spawn(async move {
                 while let Some((deployment, row)) = rx.recv().await {
                     if dispatcher.deliver(&deployment, &row).await {
+                        signal.mark_delivered(&row.entry_id);
                         if let Err(returned) = delete_tx.send((deployment, row)) {
                             // The batcher is gone (shutdown): delete in place.
                             let (deployment, row) = returned.0;
@@ -2122,11 +2149,12 @@ pub fn spawn_concurrent_dispatch_loop(
                         _ = drained.changed() => break,
                         _ = every.tick() => {}
                     }
-                    let ids = signal.inflight_snapshot();
+                    let ids = signal.lease_snapshot();
                     if ids.is_empty() {
                         continue;
                     }
                     let now = (dispatcher.now)();
+                    let started = std::time::Instant::now();
                     for deployment in deployments.snapshot() {
                         if let Err(diagnostic) =
                             dispatcher.store.renew_claims(&deployment, &ids, now).await
@@ -2139,6 +2167,21 @@ pub fn spawn_concurrent_dispatch_loop(
                                 "outbox claim lease renewal failed — retried next interval"
                             );
                         }
+                    }
+                    let took = started.elapsed();
+                    if took > CLAIM_RENEW_INTERVAL / 2 {
+                        warn!(
+                            rows = ids.len(),
+                            took_ms = took.as_millis() as u64,
+                            "outbox claim lease renewal round is slow — the leases still have \
+                             two renewal intervals of margin"
+                        );
+                    } else {
+                        tracing::debug!(
+                            rows = ids.len(),
+                            took_ms = took.as_millis() as u64,
+                            "outbox claim lease renewal round"
+                        );
                     }
                 }
             })
@@ -2577,6 +2620,29 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains(codes::OUTBOUND_SEND_FAILED));
+    }
+
+    /// A delivered row waiting for the delete batcher is left out of the lease renewal (the
+    /// delete ends its lease, and renewing it would lock the rows the delete is about to lock);
+    /// every undelivered in-flight row stays in it, and a release forgets the delivered mark.
+    #[test]
+    fn the_lease_renewal_skips_rows_already_delivered() {
+        let signal = OutboxSignal::new();
+        signal.reserve(&["a".to_string(), "b".to_string()]);
+        assert!(signal.claim_inflight("c"));
+        signal.mark_delivered("b");
+        let mut renewed = signal.lease_snapshot();
+        renewed.sort();
+        assert_eq!(renewed, vec!["a".to_string(), "c".to_string()]);
+        signal.release(&["b".to_string()]);
+        signal.reserve(&["b".to_string()]);
+        let mut renewed = signal.lease_snapshot();
+        renewed.sort();
+        assert_eq!(
+            renewed,
+            vec!["a".to_string(), "b".to_string(), "c".to_string()],
+            "a released row reserved again is renewed again"
+        );
     }
 
     #[test]

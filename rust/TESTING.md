@@ -121,6 +121,13 @@ dev machine.
 - Keep tier-1 green while iterating; run the touched crate's tier-2 (`make test-docker
   P=<crate>`) before handing off. The full workspace tier-2 + tier-3 sweep is batched at
   milestones, not on every change.
+- Never share one HTTP client (`reqwest::Client`, a hyper client) between `#[tokio::test]`s, for
+  example through a `static OnceLock<reqwest::Client>`. Each test has its own runtime, and a
+  pooled connection's task lives on the runtime that opened it. When that test ends, a request
+  another test is sending over the same connection fails with `runtime dropped the dispatch
+  task`, but only when the tests overlap, so it shows up as a rare flake under parallel runs.
+  Build the client inside the test (or once per fixture, used only from the fixture's own
+  runtime).
 
 ## Generated code
 

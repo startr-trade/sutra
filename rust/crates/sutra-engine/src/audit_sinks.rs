@@ -38,19 +38,43 @@ static AUDIT_LOGGER: OnceLock<Option<SdkLoggerProvider>> = OnceLock::new();
 /// Initialise (once) the dedicated audit OTLP logs pipeline to `endpoint`. Idempotent — the first
 /// call wins (the endpoint is engine config, constant for the process). Returns whether a live
 /// provider is available, so the assembly registers the `otel` sink only when export can happen.
-pub fn init_audit_otel(runtime: &tokio::runtime::Handle, endpoint: &str) -> bool {
+///
+/// The provider's resource is the engine telemetry's (see [`crate::otel::build_resource`]):
+/// `OTEL_RESOURCE_ATTRIBUTES` and the engine's `sutra.telemetry.resource-attributes`
+/// (`audit.otel_resource_attributes`), with `service.name` = `sutra.audit.otel.service-name`, else
+/// [`AUDIT_SERVICE_NAME`]. Returns `false` when `audit` names no endpoint.
+pub fn init_audit_otel(
+    runtime: &tokio::runtime::Handle,
+    audit: &crate::config::AuditConfig,
+) -> bool {
+    let Some(endpoint) = audit.otel_endpoint.as_deref() else {
+        return false;
+    };
     AUDIT_LOGGER
         .get_or_init(|| {
             // The tonic channel spawns onto the current runtime at build time; an executor lane
             // thread has none, so enter the engine's runtime for the build.
             let _runtime = runtime.enter();
-            build_audit_provider(endpoint)
+            build_audit_provider(endpoint, audit_resource(audit))
         })
         .is_some()
 }
 
-fn build_audit_provider(endpoint: &str) -> Option<SdkLoggerProvider> {
-    let resource = Resource::builder().with_service_name("sutra-audit").build();
+/// The audit pipeline's default `service.name`.
+pub const AUDIT_SERVICE_NAME: &str = "sutra-audit";
+
+/// The audit pipeline's OTel resource (see [`init_audit_otel`]).
+fn audit_resource(audit: &crate::config::AuditConfig) -> Resource {
+    crate::otel::build_resource(
+        audit
+            .otel_service_name
+            .as_deref()
+            .unwrap_or(AUDIT_SERVICE_NAME),
+        &audit.otel_resource_attributes,
+    )
+}
+
+fn build_audit_provider(endpoint: &str, resource: Resource) -> Option<SdkLoggerProvider> {
     match opentelemetry_otlp::LogExporter::builder()
         .with_tonic()
         .with_endpoint(endpoint)
@@ -294,17 +318,23 @@ mod tests {
             .build()
             .unwrap();
         let handle = runtime.handle().clone();
-        let built = std::thread::spawn(move || init_audit_otel(&handle, "http://127.0.0.1:4317"))
+        let audit = crate::config::AuditConfig {
+            otel_endpoint: Some("http://127.0.0.1:4317".to_string()),
+            ..Default::default()
+        };
+        let built = std::thread::spawn(move || init_audit_otel(&handle, &audit))
             .join()
             .expect("no panic on a lane thread");
         assert!(built, "the dedicated audit provider is built");
         // A second call (another lane, a flip) reuses it.
         let handle = runtime.handle().clone();
-        assert!(
-            std::thread::spawn(move || init_audit_otel(&handle, "http://ignored:1"))
-                .join()
-                .unwrap()
-        );
+        let again = crate::config::AuditConfig {
+            otel_endpoint: Some("http://ignored:1".to_string()),
+            ..Default::default()
+        };
+        assert!(std::thread::spawn(move || init_audit_otel(&handle, &again))
+            .join()
+            .unwrap());
         flush_audit();
     }
 

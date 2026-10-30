@@ -99,6 +99,10 @@ impl TemporalityPreference {
 /// | `sutra.telemetry.metrics.export-interval`     | `SUTRA_TELEMETRY_METRICS_EXPORT_INTERVAL`       | `OTEL_METRIC_EXPORT_INTERVAL` (milliseconds)                           |
 /// | `sutra.telemetry.metric-labels`               | `SUTRA_TELEMETRY_METRIC_LABELS`                 | — (comma-separated allowlist; default `tenant,module,version`)         |
 /// | `sutra.telemetry.enabled`                     | `SUTRA_TELEMETRY_ENABLED`                       | `OTEL_SDK_DISABLED` (inverted)                                         |
+/// | `sutra.telemetry.resource-attributes`         | `SUTRA_TELEMETRY_RESOURCE_ATTRIBUTES`           | `OTEL_RESOURCE_ATTRIBUTES` (both apply; the `sutra.*` value wins per key) |
+///
+/// Resource attributes (`key=value,key=value`) ride on every exported span, metric and log, and
+/// on the dedicated audit pipeline's records too (see [`build_resource`]).
 ///
 /// No endpoint configured ⇒ telemetry is OFF: no exporters, no OTel layers, no metrics
 /// listener — boot and hot paths are unaffected.
@@ -116,6 +120,9 @@ pub struct TelemetryConfig {
     pub metric_labels: Vec<String>,
     /// Kill switch (`false` or `OTEL_SDK_DISABLED=true` forces telemetry off).
     pub enabled: bool,
+    /// `sutra.telemetry.resource-attributes`: extra resource attributes, in order. Applied over
+    /// what `OTEL_RESOURCE_ATTRIBUTES` detects, so a key named in both takes this value.
+    pub resource_attributes: Vec<(String, String)>,
     /// Config keys that failed to resolve/parse (fail-open — reported at init).
     pub warnings: Vec<String>,
 }
@@ -129,9 +136,47 @@ impl Default for TelemetryConfig {
             metrics_export_interval_ms: None,
             metric_labels: default_metric_labels(),
             enabled: true,
+            resource_attributes: Vec::new(),
             warnings: Vec::new(),
         }
     }
+}
+
+/// Parse a `key=value,key=value` resource-attribute list (the `OTEL_RESOURCE_ATTRIBUTES` shape).
+/// Blank entries are ignored; an entry with no `=` or an empty key is dropped with a warning.
+fn parse_resource_attributes(raw: &str, warnings: &mut Vec<String>) -> Vec<(String, String)> {
+    let mut attributes = Vec::new();
+    for entry in raw.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        match entry.split_once('=') {
+            Some((key, value)) if !key.trim().is_empty() => {
+                attributes.push((key.trim().to_string(), value.trim().to_string()));
+            }
+            _ => warnings.push(format!(
+                "telemetry resource attribute '{entry}' is not key=value — ignored"
+            )),
+        }
+    }
+    attributes
+}
+
+/// The OTel resource every engine pipeline exports under: the SDK's standard detection
+/// (`OTEL_RESOURCE_ATTRIBUTES`, the telemetry SDK attributes), then `attributes` (the engine's
+/// `sutra.telemetry.resource-attributes`, winning per key), then `service.name`. The engine
+/// telemetry and the dedicated audit pipeline both build theirs here, so a deployment or run id
+/// set once reaches both.
+pub fn build_resource(service_name: &str, attributes: &[(String, String)]) -> Resource {
+    Resource::builder()
+        .with_attributes(
+            attributes
+                .iter()
+                .map(|(k, v)| opentelemetry::KeyValue::new(k.clone(), v.clone())),
+        )
+        .with_service_name(service_name.to_string())
+        .build()
 }
 
 /// The default label-dimension allowlist.
@@ -278,6 +323,17 @@ impl TelemetryConfig {
             enabled = false;
         }
 
+        let resource_attributes = match value(
+            file,
+            env,
+            &mut warnings,
+            "sutra.telemetry.resource-attributes",
+            &["SUTRA_TELEMETRY_RESOURCE_ATTRIBUTES"],
+        ) {
+            None => Vec::new(),
+            Some(raw) => parse_resource_attributes(&raw, &mut warnings),
+        };
+
         TelemetryConfig {
             otlp_endpoint,
             service_name,
@@ -285,6 +341,7 @@ impl TelemetryConfig {
             metrics_export_interval_ms,
             metric_labels,
             enabled,
+            resource_attributes,
             warnings,
         }
     }
@@ -405,9 +462,7 @@ pub fn init(config: &TelemetryConfig) -> Telemetry {
     let active = config.is_active();
 
     // ---- providers (built first — the subscriber needs the tracer) ----------------
-    let resource = Resource::builder()
-        .with_service_name(config.service_name.clone())
-        .build();
+    let resource = build_resource(&config.service_name, &config.resource_attributes);
 
     let mut tracer_provider = None;
     let mut meter_provider = None;
@@ -1233,6 +1288,43 @@ mod tests {
             (name == "APP_OTLP_ENDPOINT").then(|| "http://ignored:4317".to_string())
         });
         assert_eq!(c.otlp_endpoint, None);
+    }
+
+    /// `sutra.telemetry.resource-attributes` parses `key=value,…`, drops a malformed entry with a
+    /// warning, and the resource carries the attributes with the service name last.
+    #[test]
+    fn resource_attributes_parse_and_reach_the_resource() {
+        let mut file = BTreeMap::new();
+        file.insert(
+            "sutra.telemetry.resource-attributes".to_string(),
+            " deployment.environment = staging , run.id=r-7,,broken ".to_string(),
+        );
+        let c = TelemetryConfig::from_sources(&file, &|_| None);
+        assert_eq!(
+            c.resource_attributes,
+            vec![
+                ("deployment.environment".to_string(), "staging".to_string()),
+                ("run.id".to_string(), "r-7".to_string()),
+            ]
+        );
+        assert!(c.warnings.iter().any(|w| w.contains("'broken'")));
+        // The canonical env wins over the file.
+        let c = TelemetryConfig::from_sources(&file, &|name| {
+            (name == "SUTRA_TELEMETRY_RESOURCE_ATTRIBUTES").then(|| "run.id=env".to_string())
+        });
+        assert_eq!(
+            c.resource_attributes,
+            vec![("run.id".to_string(), "env".to_string())]
+        );
+        let resource = build_resource("svc", &c.resource_attributes);
+        assert_eq!(
+            resource.get(&opentelemetry::Key::from_static_str("run.id")),
+            Some(opentelemetry::Value::from("env"))
+        );
+        assert_eq!(
+            resource.get(&opentelemetry::Key::from_static_str("service.name")),
+            Some(opentelemetry::Value::from("svc"))
+        );
     }
 
     #[test]

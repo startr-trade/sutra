@@ -848,16 +848,18 @@ fn run_migration_scripts(
         .enable_all()
         .build()
         .map_err(|e| DataStoreError::with_source("failed to build migration runtime", e))?;
-    // MySQL named locks are capped at 64 bytes; the store name is short (VARCHAR(128) key
-    // column) but truncate defensively.
-    let lock_key: String = format!("sutra_ds_{name}").chars().take(64).collect();
+    // ONE lock for every store, not one per store name: stores on one database commonly share a
+    // table and its idempotent DDL, and two sessions running it at once race. (A MySQL named lock
+    // is server-wide, so stores on other databases of the same server wait too; migrations are a
+    // one-shot first-use cost.)
+    let lock_key = "sutra_ds_migrations";
     runtime.block_on(async move {
         let mut conn: MySqlConnection = options
             .connect()
             .await
             .map_err(|e| migration_err(name, e))?;
         sqlx::query("SELECT GET_LOCK(?, 30)")
-            .bind(&lock_key)
+            .bind(lock_key)
             .execute(&mut conn)
             .await
             .map_err(|e| migration_err(name, e))?;
@@ -869,7 +871,7 @@ fn run_migration_scripts(
             }
         }
         let _ = sqlx::query("SELECT RELEASE_LOCK(?)")
-            .bind(&lock_key)
+            .bind(lock_key)
             .execute(&mut conn)
             .await;
         let _ = conn.close().await;

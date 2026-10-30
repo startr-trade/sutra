@@ -237,12 +237,40 @@ const SQL_CLAIM_DUE_EXCLUDING: &str = "WITH due AS ( \
 /// Extend the lease of rows this process still has in flight (see [`SQL_CLAIM_DUE_EXCLUDING`]).
 /// Only ever moves a due time LATER: a row whose due time is already past the new lease end (a
 /// deferral with a long backoff) keeps it.
+///
+/// It never waits for a row lock. The rows are locked in `entry_id` order, and a row another
+/// transaction holds is SKIPPED: the only holders of an in-flight row are the transactions that
+/// end its lease on purpose (the delete of a delivered row, a deferral, a requeue, a poison, a
+/// withdrawal) or another replica's claim of a lease that has already lapsed. Waiting for any of
+/// them would only renew a row that is about to stop needing it, and that wait was where the
+/// renewal spent seconds under load, and, locking in a different order than a concurrent batch
+/// delete, where the two deadlocked.
+///
+/// The update then names the locked rows by an id array computed once (an init plan), not by a
+/// join. (A plain `UPDATE … WHERE entry_id = ANY($2)` waits for every row lock it meets and takes
+/// them in plan order; against the batch delete of delivered rows that was a deadlock.) The outbox is a queue: its size swings from empty to tens of thousands of rows between two
+/// autovacuum analyses, and a self-join planned on an "empty table" estimate rescans the whole
+/// table once per row (seconds, measured). Against the array the worst plan is one scan per
+/// statement. (Not by `ctid`: a row updated after the statement's snapshot has a tuple id the
+/// snapshot cannot see, so a `ctid` match would silently miss it — measured as redeliveries.)
 const SQL_RENEW_CLAIMS: &str = "UPDATE outbox_entry SET next_attempt_at = $3 \
-     WHERE deployment_id = $1 AND entry_id = ANY($2) AND NOT poisoned AND next_attempt_at < $3";
+     WHERE entry_id = ANY(ARRAY( \
+       SELECT entry_id FROM outbox_entry \
+       WHERE deployment_id = $1 AND entry_id = ANY($2) AND NOT poisoned \
+         AND next_attempt_at < $3 \
+       ORDER BY entry_id \
+       FOR UPDATE SKIP LOCKED))";
 
-/// The batched delete of delivered entries (one transaction for a burst of deliveries).
+/// The batched delete of delivered entries (one transaction for a burst of deliveries). It may
+/// wait for a row lock, but only ever behind a statement that does not wait in turn (a lease
+/// renewal skips locked rows, a deferral or poison touches one row), so it cannot be part of a
+/// deadlock with them.
 const SQL_DELETE_MANY: &str =
     "DELETE FROM outbox_entry WHERE deployment_id = $1 AND entry_id = ANY($2)";
+
+/// The most ids one lease-renewal statement names. Each chunk is its own short transaction, so a
+/// renewal of thousands of in-flight rows never holds thousands of row locks at once.
+const RENEW_CHUNK: usize = 1024;
 
 const SQL_DEFER: &str = "UPDATE outbox_entry SET next_attempt_at = $1, \
       attempt_count = attempt_count + 1, last_diagnostic_json = $2 \
@@ -433,7 +461,9 @@ impl PgOutboxStore {
     }
 
     /// Extend to `lease_until` the lease of the rows named in `entry_ids` that are still pending
-    /// (rows already delivered and deleted are simply not there). Never moves a due time earlier.
+    /// (rows already delivered and deleted are simply not there). Never moves a due time earlier,
+    /// never waits for a row lock (a row another transaction holds is skipped this round — see
+    /// [`SQL_RENEW_CLAIMS`]), and renews at most [`RENEW_CHUNK`] rows per transaction.
     /// Returns how many rows were renewed.
     pub async fn renew_claims(
         &self,
@@ -444,20 +474,26 @@ impl PgOutboxStore {
         if entry_ids.is_empty() {
             return Ok(0);
         }
-        // Flush-deferred like the claim: a renewal lost in a crash only shortens a lease.
-        let mut tx =
-            crate::scope::begin_deployment_tx_flush_deferred(&self.pool, deployment).await?;
-        let renewed = sqlx::query(SQL_RENEW_CLAIMS)
-            .bind(deployment.as_str())
-            .bind(entry_ids)
-            .bind(lease_until)
-            .execute(&mut *tx)
-            .await
-            .map_err(PersistenceError::db("outbox renewClaims"))?
-            .rows_affected();
-        tx.commit()
-            .await
-            .map_err(PersistenceError::db("outbox renewClaims commit"))?;
+        let mut ids = entry_ids.to_vec();
+        ids.sort_unstable();
+        ids.dedup();
+        let mut renewed = 0;
+        for chunk in ids.chunks(RENEW_CHUNK) {
+            // Flush-deferred like the claim: a renewal lost in a crash only shortens a lease.
+            let mut tx =
+                crate::scope::begin_deployment_tx_flush_deferred(&self.pool, deployment).await?;
+            renewed += sqlx::query(SQL_RENEW_CLAIMS)
+                .bind(deployment.as_str())
+                .bind(chunk)
+                .bind(lease_until)
+                .execute(&mut *tx)
+                .await
+                .map_err(PersistenceError::db("outbox renewClaims"))?
+                .rows_affected();
+            tx.commit()
+                .await
+                .map_err(PersistenceError::db("outbox renewClaims commit"))?;
+        }
         Ok(renewed)
     }
 

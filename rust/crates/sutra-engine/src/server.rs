@@ -472,8 +472,8 @@ pub async fn serve(config: EngineConfig) -> Result<RunningEngine, Box<dyn std::e
 
     // The dedicated audit OTLP pipeline: built once, here on the runtime, before the executor
     // lanes start; every lane's sink registry then shares the one provider, and shutdown flushes it.
-    if let Some(endpoint) = config.audit.otel_endpoint.as_deref() {
-        crate::audit_sinks::init_audit_otel(&handle, endpoint);
+    if config.audit.otel_endpoint.is_some() {
+        crate::audit_sinks::init_audit_otel(&handle, &config.audit);
     }
 
     let outbox_signal = sutra_channels::OutboxSignal::new();

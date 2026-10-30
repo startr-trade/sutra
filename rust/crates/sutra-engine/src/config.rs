@@ -37,6 +37,7 @@
 //! | `sutra.codec.max-payload-bytes`   | `SUTRA_CODEC_MAX_PAYLOAD_BYTES`   |
 //! | `sutra.audit.jsonl.path`          | `SUTRA_AUDIT_JSONL`               |
 //! | `sutra.audit.otel.endpoint`       | `SUTRA_AUDIT_OTEL_ENDPOINT`       |
+//! | `sutra.audit.otel.service-name`   | `SUTRA_AUDIT_OTEL_SERVICE_NAME`   |
 //! | `sutra.audit.sql`                 | `SUTRA_AUDIT_SQL`                 |
 //! | `sutra.admin.oidc.issuer`         | `SUTRA_ADMIN_OIDC_ISSUER`         |
 //! | `sutra.admin.oidc.audience`       | `SUTRA_ADMIN_OIDC_AUDIENCE`       |
@@ -398,6 +399,14 @@ pub struct AuditConfig {
     /// telemetry stream (audit stays a distinct, precisely-cullable sidecar). `None` = the OTel sink
     /// is unavailable.
     pub otel_endpoint: Option<String>,
+    /// `sutra.audit.otel.service-name` — the `service.name` of the audit pipeline's resource.
+    /// `None` = `sutra-audit`. The engine's own service name (`OTEL_SERVICE_NAME`) never renames
+    /// the audit stream: it is a separate stream on purpose.
+    pub otel_service_name: Option<String>,
+    /// The engine's resource attributes (`sutra.telemetry.resource-attributes`), carried onto the
+    /// audit pipeline's resource too, over `OTEL_RESOURCE_ATTRIBUTES` — so audit records name the
+    /// same deployment or run as the engine telemetry.
+    pub otel_resource_attributes: Vec<(String, String)>,
     /// `sutra.audit.sql` — when true AND a datasource pool is configured, the SQL sink writes each
     /// event to the shipped `audit_event` table (the `<q:audit>` default sink). Idempotent per
     /// `(deployment_id, instance_id, seq)`; the durable audit of record.
@@ -1012,6 +1021,14 @@ impl EngineConfig {
                 otel_endpoint: value("sutra.audit.otel.endpoint", "SUTRA_AUDIT_OTEL_ENDPOINT")?
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty()),
+                otel_service_name: value(
+                    "sutra.audit.otel.service-name",
+                    "SUTRA_AUDIT_OTEL_SERVICE_NAME",
+                )?
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
+                otel_resource_attributes: crate::otel::TelemetryConfig::from_sources(file, env)
+                    .resource_attributes,
                 sql: match value("sutra.audit.sql", "SUTRA_AUDIT_SQL")? {
                     None => false,
                     Some(raw) => parse_bool(&raw, "sutra.audit.sql")?,

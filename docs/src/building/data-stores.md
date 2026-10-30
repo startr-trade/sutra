@@ -143,6 +143,13 @@ datastores:
     dataClass: financial                  # sensitivity tag — redacted in audit/logs/traces
 ```
 
+A store's migrations run the first time the store is used, under a database lock, so replicas
+never run them at the same moment. The lock is one per database (per server on MySQL and MariaDB),
+not one per store, because several stores often share one table and the same `CREATE TABLE IF NOT
+EXISTS`. Before 0.6.12 the lock was per store, and two stores sharing a table that were first used
+at the same moment could fail that first request with HTTP 500
+(`pg_type_typname_nsp_index`); the next request succeeded.
+
 The engine's own datasource (instances, outbox, lease, audit, inbox) is **never** a store's
 backing connection — a `sql` store always resolves its own connection, and fails closed if it
 declares none. This is what makes a generic engine image self-sufficient against any number of
@@ -687,7 +694,7 @@ docker run -d --name readings-engine --network readings-net -p 127.0.0.1::8080 \
   -e SUTRA_ADMIN_OIDC_DEV_DISABLED=true \
   -e READINGS_DB_URL=postgres://readings-db:5432/postgres \
   -e READINGS_DB_USER=sutra_engine -e READINGS_DB_PASSWORD=dev-only \
-  -e READINGS_API_KEY=dev-only-readings-key ghcr.io/startr-trade/sutra:0.6.11
+  -e READINGS_API_KEY=dev-only-readings-key ghcr.io/startr-trade/sutra:0.6.12
 PORT=$(docker port readings-engine 8080 | head -1 | cut -d: -f2)
 H=(-H 'Content-Type: application/json' -H 'X-Api-Key: dev-only-readings-key')
 ```

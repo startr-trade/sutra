@@ -232,6 +232,7 @@ Gating is disabled only via the explicit `sutra.admin.oidc.dev-disabled=true` es
 |---|---|
 | `sutra.audit.jsonl.path` | `SUTRA_AUDIT_JSONL` |
 | `sutra.audit.otel.endpoint` | `SUTRA_AUDIT_OTEL_ENDPOINT` |
+| `sutra.audit.otel.service-name` | `SUTRA_AUDIT_OTEL_SERVICE_NAME` (default `sutra-audit`, 0.6.12) |
 | `sutra.audit.sql` | `SUTRA_AUDIT_SQL` |
 
 See [Logging and audit](logging.md).
@@ -246,6 +247,7 @@ See [Logging and audit](logging.md).
 | `sutra.telemetry.metrics.export-interval` | `SUTRA_TELEMETRY_METRICS_EXPORT_INTERVAL` | `OTEL_METRIC_EXPORT_INTERVAL` |
 | `sutra.telemetry.metrics.temporality-preference` | `SUTRA_TELEMETRY_METRICS_TEMPORALITY_PREFERENCE` | `OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE` |
 | `sutra.telemetry.metric-labels` | `SUTRA_TELEMETRY_METRIC_LABELS` | — (default `tenant,module,version`) |
+| `sutra.telemetry.resource-attributes` | `SUTRA_TELEMETRY_RESOURCE_ATTRIBUTES` | `OTEL_RESOURCE_ATTRIBUTES` (both apply; the `sutra.*` value wins per key; 0.6.12) |
 
 No OTLP endpoint configured means no exporters at all, and this is the default — telemetry export
 is opt-in, never opt-out, and Sutra itself collects nothing regardless: see

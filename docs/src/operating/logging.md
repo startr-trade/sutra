@@ -50,6 +50,40 @@ highest-priority sink that is switched on (`sql`, then `jsonl`, then `otel`).
   endpoint. The engine builds that pipeline once at start and flushes it on shutdown. Before
   0.6.9, setting this variable made the engine panic at start.
 
+## Resource attributes on audit records {#resource-attributes-on-audit-records}
+
+The OTLP audit records carry the same resource attributes as the engine's own telemetry, so a
+collector can tell which deployment, environment or test run an audit record belongs to:
+
+| Source | Example | On audit records |
+|---|---|---|
+| `OTEL_RESOURCE_ATTRIBUTES` | `deployment.environment=staging,example.run_id=run-42` | yes |
+| `sutra.telemetry.resource-attributes` / `SUTRA_TELEMETRY_RESOURCE_ATTRIBUTES` (0.6.12) | `example.from_config=yes` | yes, and on every telemetry signal; wins over `OTEL_RESOURCE_ATTRIBUTES` for the same key |
+| `sutra.audit.otel.service-name` / `SUTRA_AUDIT_OTEL_SERVICE_NAME` (0.6.12) | `orders-audit` | the records' `service.name`; default `sutra-audit` |
+| `OTEL_SERVICE_NAME` | `orders-engine` | no: it names the engine's telemetry, never the audit stream |
+
+To try it, point the audit pipeline at a collector whose `debug` exporter prints what it receives
+(`verbosity: detailed`), and start the engine with:
+
+```bash
+SUTRA_AUDIT_OTEL_ENDPOINT=http://collector:4317
+OTEL_RESOURCE_ATTRIBUTES=deployment.environment=conformance,example.run_id=run-42
+SUTRA_TELEMETRY_RESOURCE_ATTRIBUTES=example.from_config=yes
+```
+
+Run any process with `<q:audit sink="otel">`. Each batch of audit records the collector prints
+starts with the resource, which includes (with the `telemetry.sdk.*` attributes, in any order):
+
+```text
+Resource attributes:
+     -> deployment.environment: Str(conformance)
+     -> example.run_id: Str(run-42)
+     -> example.from_config: Str(yes)
+     -> service.name: Str(sutra-audit)
+```
+
+The conformance suite `tc_audit_sinks` runs exactly this against a real collector.
+
 ## What an audit event captures
 
 A process chooses how much each of its audit events carries, with `<q:audit capture="…">`:
