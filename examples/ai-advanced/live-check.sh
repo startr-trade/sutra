@@ -43,7 +43,7 @@
 #                         name; your account may offer other ids. Each variable is substituted into
 #                         a copy of the channels at deploy time (the committed YAML is unchanged).
 #                         A model-not-found failure names the variable to set.
-#   SUTRA_ENGINE_IMAGE    the engine image (default ghcr.io/startr-trade/sutra:0.6.10; to check this
+#   SUTRA_ENGINE_IMAGE    the engine image (default ghcr.io/startr-trade/sutra:0.6.11; to check this
 #                         tree instead, use sutra-rust-engine:dev built by `make image`)
 #   SUTRA_BIN             the `sutra` CLI, 0.5.0 or later (default: a build in rust/target, else PATH)
 #   GEMINI_LIVE_MODEL     the Gemini Live model (default gemini-3.8-live, the model the
@@ -206,8 +206,8 @@ if [ "$(printf '%s\n' 0.5.0 "$cli_version" | sort -V | head -1)" != 0.5.0 ]; the
     echo "and point SUTRA_BIN at it, e.g. SUTRA_BIN=\$PWD/rust/target/debug/sutra" >&2
     exit 2
 fi
-echo "using $("$sutra_bin" --version) ($sutra_bin); engine image ${SUTRA_ENGINE_IMAGE:-ghcr.io/startr-trade/sutra:0.6.10}"
-image=${SUTRA_ENGINE_IMAGE:-ghcr.io/startr-trade/sutra:0.6.10}
+echo "using $("$sutra_bin" --version) ($sutra_bin); engine image ${SUTRA_ENGINE_IMAGE:-ghcr.io/startr-trade/sutra:0.6.11}"
+image=${SUTRA_ENGINE_IMAGE:-ghcr.io/startr-trade/sutra:0.6.11}
 if ! docker image inspect "$image" >/dev/null 2>&1 && ! docker pull -q "$image" >/dev/null 2>&1; then
     echo "engine image $image is not available locally and cannot be pulled; build one (make image)" >&2
     echo "and set SUTRA_ENGINE_IMAGE, e.g. SUTRA_ENGINE_IMAGE=sutra-rust-engine:dev" >&2

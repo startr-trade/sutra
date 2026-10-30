@@ -1,0 +1,88 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Three processes that each perform one send.
+
+    send-then-fail     : Start -> NotifyA (send) -> Route -> Fail (uncaught BPMN error)
+                         Route's other branch parks on a timer, so this is a wait-state process
+                         even though the request below never takes that branch.
+    send-then-park     : Start -> NotifyB (send) -> Hold (one-hour timer) -> Done
+    send-then-end      : Start -> NotifyC (send) -> Done
+
+  The failed process's send must never be committed, and must not ride along with the next
+  request's step on the same lane.
+-->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0"
+                  id="Definitions_lane_leak"
+                  targetNamespace="urn:sutra:module:laneleak:1.0.0">
+  <bpmn:error id="Refused" errorCode="REFUSED"/>
+
+  <bpmn:process id="send-then-fail" isExecutable="true">
+    <bpmn:startEvent id="AStart">
+      <bpmn:extensionElements><q:source channel="fail-start" name="req"/></bpmn:extensionElements>
+      <bpmn:outgoing>A1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="A1" sourceRef="AStart" targetRef="NotifyA"/>
+    <bpmn:sendTask id="NotifyA">
+      <bpmn:extensionElements>
+        <q:send destination="http://leak-sink.invalid/from-fail"/>
+      </bpmn:extensionElements>
+      <bpmn:incoming>A1</bpmn:incoming><bpmn:outgoing>A2</bpmn:outgoing>
+    </bpmn:sendTask>
+    <bpmn:sequenceFlow id="A2" sourceRef="NotifyA" targetRef="Route"/>
+    <bpmn:exclusiveGateway id="Route" default="A4">
+      <bpmn:incoming>A2</bpmn:incoming><bpmn:outgoing>A3</bpmn:outgoing><bpmn:outgoing>A4</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:sequenceFlow id="A3" sourceRef="Route" targetRef="AHold">
+      <bpmn:conditionExpression>req.park = true</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="A4" sourceRef="Route" targetRef="Fail"/>
+    <bpmn:intermediateCatchEvent id="AHold">
+      <bpmn:incoming>A3</bpmn:incoming><bpmn:outgoing>A5</bpmn:outgoing>
+      <bpmn:timerEventDefinition><bpmn:timeDuration>PT1H</bpmn:timeDuration></bpmn:timerEventDefinition>
+    </bpmn:intermediateCatchEvent>
+    <bpmn:sequenceFlow id="A5" sourceRef="AHold" targetRef="ADone"/>
+    <bpmn:endEvent id="ADone"><bpmn:incoming>A5</bpmn:incoming></bpmn:endEvent>
+    <bpmn:endEvent id="Fail">
+      <bpmn:incoming>A4</bpmn:incoming>
+      <bpmn:errorEventDefinition errorRef="Refused"/>
+    </bpmn:endEvent>
+  </bpmn:process>
+
+  <bpmn:process id="send-then-park" isExecutable="true">
+    <bpmn:startEvent id="BStart">
+      <bpmn:extensionElements><q:source channel="park-start" name="req"/></bpmn:extensionElements>
+      <bpmn:outgoing>B1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="B1" sourceRef="BStart" targetRef="NotifyB"/>
+    <bpmn:sendTask id="NotifyB">
+      <bpmn:extensionElements>
+        <q:send destination="http://leak-sink.invalid/from-park"/>
+      </bpmn:extensionElements>
+      <bpmn:incoming>B1</bpmn:incoming><bpmn:outgoing>B2</bpmn:outgoing>
+    </bpmn:sendTask>
+    <bpmn:sequenceFlow id="B2" sourceRef="NotifyB" targetRef="BHold"/>
+    <bpmn:intermediateCatchEvent id="BHold">
+      <bpmn:incoming>B2</bpmn:incoming><bpmn:outgoing>B3</bpmn:outgoing>
+      <bpmn:timerEventDefinition><bpmn:timeDuration>PT1H</bpmn:timeDuration></bpmn:timerEventDefinition>
+    </bpmn:intermediateCatchEvent>
+    <bpmn:sequenceFlow id="B3" sourceRef="BHold" targetRef="BDone"/>
+    <bpmn:endEvent id="BDone"><bpmn:incoming>B3</bpmn:incoming></bpmn:endEvent>
+  </bpmn:process>
+
+  <bpmn:process id="send-then-end" isExecutable="true">
+    <bpmn:startEvent id="CStart">
+      <bpmn:extensionElements><q:source channel="straight-start" name="req"/></bpmn:extensionElements>
+      <bpmn:outgoing>C1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="C1" sourceRef="CStart" targetRef="NotifyC"/>
+    <bpmn:sendTask id="NotifyC">
+      <bpmn:extensionElements>
+        <q:send destination="http://leak-sink.invalid/from-straight"/>
+      </bpmn:extensionElements>
+      <bpmn:incoming>C1</bpmn:incoming><bpmn:outgoing>C2</bpmn:outgoing>
+    </bpmn:sendTask>
+    <bpmn:sequenceFlow id="C2" sourceRef="NotifyC" targetRef="CDone"/>
+    <bpmn:endEvent id="CDone"><bpmn:incoming>C2</bpmn:incoming></bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>

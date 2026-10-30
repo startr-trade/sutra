@@ -515,9 +515,30 @@ impl ChannelEngine {
     /// Reset the per-dispatch scratch at an entry point; `inline` says whether a caller waits on
     /// this pass (see `inline_capable`).
     fn begin_dispatch(&self, inline: bool) {
+        self.discard_stale_emissions();
         self.inline_capable.set(inline);
         self.dispatch_dedup.borrow_mut().clear();
         self.dedup_touched.set(false);
+    }
+
+    /// Every step starts with an EMPTY emission sink. The sink is per lane and outlives the
+    /// step, so an emission a failed step left behind would otherwise be drained by the NEXT
+    /// step on the lane and committed as that step's own: the persistence layer refuses an
+    /// outbox row stamped with another instance (the next caller sees a failure that is not
+    /// its own), and a persistence-less host would deliver a send of a step that failed. Each
+    /// failure path drains the sink itself; this is the guard that keeps one missed path from
+    /// crossing into an unrelated request. Finding anything here is an engine bug, so it is
+    /// logged at error level and the emissions are dropped, never delivered.
+    fn discard_stale_emissions(&self) {
+        let stale = self.emissions.drain();
+        if !stale.is_empty() {
+            tracing::error!(
+                lane = self.shard.index,
+                discarded = stale.len(),
+                "emissions left behind by an earlier step were discarded at the start of a new \
+                 step; they belonged to a step that did not commit and are never delivered"
+            );
+        }
     }
 
     /// `ack-mode: on-complete` (broker) dispatch: the SAME pipeline, but when the
@@ -1923,8 +1944,13 @@ impl ChannelEngine {
             Ok(result) => result,
             Err(e) => {
                 // The initial stateful pass FAILED (before any quiescent commit, so nothing
-                // persisted). Gate the ack disposition on the process's idempotency assertion:
-                // idempotent ⇒ retry (NackRequeue); non-idempotent ⇒ consume + dead-letter.
+                // persisted). Whatever it emitted before failing (a `<q:send>` ahead of the
+                // failing node) never reached a quiescent point: drop it, exactly as the sync
+                // path and the resume paths do, so it is neither delivered nor picked up by the
+                // next step on this lane. Gate the ack disposition on the process's idempotency
+                // assertion: idempotent ⇒ retry (NackRequeue); non-idempotent ⇒ consume +
+                // dead-letter.
+                let _ = self.emissions.drain();
                 let d = e.to_diagnostic();
                 return self
                     .gate_execution_failure(
@@ -1980,6 +2006,13 @@ impl ChannelEngine {
                 // the executor on the continue-reply node) self-resumes the remaining nodes at once.
                 // A plain park answers with the last destination-less `<q:reply>` the pass
                 // rendered, if it reached one.
+                // Quiescent-point rule: the destination-bearing emissions this
+                // step collected (channel-call requests, `<q:send>`s before the park)
+                // ride the park step and commit ATOMICALLY with the snapshot — or not at
+                // all (the strict transactional outbox). Taken off the lane's sink FIRST, so
+                // a reply that cannot render (below) fails the step without leaving them
+                // behind for the next step on the lane.
+                let mut drained = self.emissions.drain();
                 let reply = {
                     let exec = ExecResult {
                         instance_id: instance_id.clone(),
@@ -1988,11 +2021,6 @@ impl ChannelEngine {
                     };
                     self.reply_at(binding, process, message, &exec, !detached_reply)?
                 };
-                // Quiescent-point rule: the destination-bearing emissions this
-                // step collected (channel-call requests, `<q:send>`s before the park)
-                // ride the park step and commit ATOMICALLY with the snapshot — or not at
-                // all (the strict transactional outbox).
-                let mut drained = self.emissions.drain();
                 self.validate_emissions(
                     &binding.namespace.module_key(),
                     deployment,
@@ -4304,6 +4332,8 @@ impl ChannelEngine {
         node_id: String,
         result: InlineCallResult,
     ) -> InlineStep {
+        // A chain pass is a step of its own: the lane ran other requests while the call was out.
+        self.discard_stale_emissions();
         chain.in_flight.remove(&node_id);
         let process = Arc::clone(&chain.process);
         let policy = process.retry_policy(&node_id).cloned();

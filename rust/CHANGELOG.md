@@ -13,6 +13,30 @@ This is the changelog for the **Rust-native** engine (`rust/` workspace). It beg
 
 Nothing yet.
 
+## [0.6.11] — 2026-10-30
+
+A **patch** release with one correctness fix. Every earlier release is affected, up to and
+including 0.6.10. No configuration, `urn:sutra:q:1.0`, migration or snapshot change.
+
+### Fixed
+
+- **A failed start's sends no longer leak into the next request on the engine lane.** A
+  wait-state process (one whose graph has a wait anywhere) that performed a `<q:send>` and then
+  failed in its first pass left that send buffered on its lane. The next request on the same lane
+  took it as its own:
+  - if that request's process parked, its park commit was refused with `outbox entry … does not
+    belong to step instance …`, and an unrelated caller got an HTTP 500;
+  - if that request's process ran to its end, the failed process's send was committed with it and
+    delivered.
+
+  The failed step's sends are now dropped with it, as they already were for a run-to-end process
+  and for resumed instances. A park whose reply cannot be rendered now drops its sends too. As a
+  safeguard, every step now starts with an empty buffer: anything an earlier step left behind is
+  discarded, never delivered, and logged at error level.
+
+  Tests: `failed_step_emission_test` (tier 1, 4 tests) and the conformance suite `tc_lane_leak`
+  (tier 2). The tier-2 suite fails on the 0.6.5, 0.6.6 and 0.6.10 images.
+
 ## [0.6.10] — 2026-10-30
 
 A **patch** release with one additive feature: data-store key queries, plus insert-if-absent

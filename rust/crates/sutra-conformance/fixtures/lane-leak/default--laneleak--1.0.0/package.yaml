@@ -1,0 +1,8 @@
+# Deployment package for the lane-leak conformance suite: a start that sends and then fails,
+# followed by unrelated requests on the same engine lane.
+labels:
+  "module": "laneleak"
+  "tenant": "default"
+  "version": "1.0.0"
+engine:
+  minContract: 1

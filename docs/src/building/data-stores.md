@@ -687,7 +687,7 @@ docker run -d --name readings-engine --network readings-net -p 127.0.0.1::8080 \
   -e SUTRA_ADMIN_OIDC_DEV_DISABLED=true \
   -e READINGS_DB_URL=postgres://readings-db:5432/postgres \
   -e READINGS_DB_USER=sutra_engine -e READINGS_DB_PASSWORD=dev-only \
-  -e READINGS_API_KEY=dev-only-readings-key ghcr.io/startr-trade/sutra:0.6.10
+  -e READINGS_API_KEY=dev-only-readings-key ghcr.io/startr-trade/sutra:0.6.11
 PORT=$(docker port readings-engine 8080 | head -1 | cut -d: -f2)
 H=(-H 'Content-Type: application/json' -H 'X-Api-Key: dev-only-readings-key')
 ```

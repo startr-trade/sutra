@@ -154,6 +154,20 @@ to completion before recv-ing the next, the commit still happens-before the repl
 happens-before the next request is dequeued. There is no intra-lane pipelining and no completion
 re-entry, so there are no re-entry rules to get wrong.
 
+## Each step's sends are its own
+
+While a step runs, the `<q:send>`s and channel-call requests it makes are collected on its lane.
+They are committed with the step, in the same transaction, or not at all. A step that fails drops
+them, and every step starts with nothing collected, so one request's sends never ride along with
+the next request on the lane. An engine that finds anything left over at the start of a step
+discards it and logs an error.
+
+Releases up to and including 0.6.10 broke this in one case. A wait-state process that sent and
+then failed on its first pass left the send behind. The next request on the lane then committed it
+as its own: a parking request failed with an HTTP 500 (`outbox entry … does not belong to step
+instance`), and a run-to-end request delivered the failed process's send. See the 0.6.11 release
+notes.
+
 ## What changes at N > 1 — say it out loud
 
 **Incidental cross-instance serialization disappears.** With one lane, two concurrent deliveries

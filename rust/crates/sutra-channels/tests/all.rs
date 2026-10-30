@@ -17,6 +17,8 @@ mod config_test;
 mod deferred_ack_test;
 #[path = "all/dispatcher_policy_test.rs"]
 mod dispatcher_policy_test;
+#[path = "all/failed_step_emission_test.rs"]
+mod failed_step_emission_test;
 #[path = "all/http_it_test.rs"]
 mod http_it_test;
 #[path = "all/inline_call_test.rs"]

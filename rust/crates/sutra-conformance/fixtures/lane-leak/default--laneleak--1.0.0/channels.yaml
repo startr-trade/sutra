@@ -1,0 +1,40 @@
+# Channels for the lane-leak conformance suite.
+#
+#   POST /channels/fail      fail-start      { id }   sends, then fails (uncaught BPMN error)
+#   POST /channels/park      park-start      { id }   sends, then parks on a one-hour timer
+#   POST /channels/straight  straight-start  { id }   sends, then ends
+#
+# The engine runs one lane (the default shard count), so every request below is a step on the
+# same lane, one after the other.
+
+channels:
+  - name: fail-start
+    transport: http
+    bind: "POST /channels/fail"
+    codec: json
+    cloudevents-mode: none
+    auth:
+      scheme: apikey
+      apikey:
+        value: env:LANELEAK_API_KEY
+        header: X-Api-Key
+  - name: park-start
+    transport: http
+    bind: "POST /channels/park"
+    codec: json
+    cloudevents-mode: none
+    auth:
+      scheme: apikey
+      apikey:
+        value: env:LANELEAK_API_KEY
+        header: X-Api-Key
+  - name: straight-start
+    transport: http
+    bind: "POST /channels/straight"
+    codec: json
+    cloudevents-mode: none
+    auth:
+      scheme: apikey
+      apikey:
+        value: env:LANELEAK_API_KEY
+        header: X-Api-Key
