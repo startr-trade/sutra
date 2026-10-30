@@ -170,3 +170,6 @@ vulnerabilities:
   - id: DLA-4854-1
     statement: "tzdata 2026b in the distroless base; 2026e-0+deb12u1 exists. Same position as DLA-4792-1: a timezone-data refresh, not an exploitable code path, and a distroless image has no package manager. The newest cc-debian12 digest (re-pulled 2026-10-24, sha256:e5d81ddd…) still ships 2026b, so a base bump does not clear it."
     expired_at: 2026-11-09
+  - id: DLA-4867-1
+    statement: "tzdata 2026b in the distroless base; 2026f-0+deb12u1 exists. Same position as DLA-4792-1 and DLA-4854-1: a timezone-data refresh, not an exploitable code path, and a distroless image has no package manager. The newest cc-debian12 digest (re-pulled 2026-10-30, sha256:e5d81ddd…) still ships 2026b, so a base bump does not clear it."
+    expired_at: 2026-11-09

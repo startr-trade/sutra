@@ -24,6 +24,8 @@ mod support;
 mod tc_ai_examples;
 #[path = "all/tc_approval_hold.rs"]
 mod tc_approval_hold;
+#[path = "all/tc_audit_sinks.rs"]
+mod tc_audit_sinks;
 #[path = "all/tc_early_reply_refused.rs"]
 mod tc_early_reply_refused;
 #[path = "all/tc_listen_window.rs"]

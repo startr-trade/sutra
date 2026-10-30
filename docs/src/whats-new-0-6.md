@@ -23,6 +23,7 @@ server, so no provider key is needed.
 | **Binary snapshots; restart-proof local deliveries** (0.6.7) | Instance snapshots are stored in a binary container — **an older release cannot read it, so upgrade every replica at once**. A local delivery that fails because the database restarted is retried instead of poisoned. | [The binary container](internals/durable-execution.md#the-binary-container) |
 | **Replicas no longer send twice** (0.6.8) | Engines sharing one database each claimed outbox rows another was still delivering, so 0.6.5–0.6.7 sent about half of all outbound messages twice under multi-replica load. The claim now leases its rows (30 s, renewed while in flight). | [Outbox processing](architecture/replicas.md#outbox-processing-skip-locked-and-a-claim-lease) |
 | **Autovacuum for the busy tables** (0.6.8) | On PostgreSQL the outbox queue and the other high-churn tables have their own autovacuum settings, so dead rows no longer stall the outbox claim at high rates. Lower `autovacuum_naptime` on the server for high-rate deployments. | [PostgreSQL autovacuum](operating/throughput-tuning.md#postgresql-autovacuum) |
+| **Correlation keys on audit events** (0.6.9) | Every audit event in the JSONL and OTLP sinks carries the instance's `<q:alias>` keys and values, redacted like any other audit content. `SUTRA_AUDIT_OTEL_ENDPOINT` no longer panics the engine at start, and the JSONL sink writes exactly one event per line. 0.6.9 is also the first release of the 0.6.8 changes above. | [Correlation keys on every audit event](operating/logging.md#correlation-keys-on-every-audit-event) |
 | **Live audio sessions** (preview) | `AudioSession` and `require: [realtime]`, opened through an `llm` channel by a media transport, not by a process. | [Live audio sessions](building/llm-channels.md#live-audio-sessions-preview) |
 
 Telephony, IVRs, meetings and WebRTC are not part of this engine. They live in the separate
@@ -37,7 +38,7 @@ Every walkthrough runs from the root of a checkout of this repository. It needs:
   `base64 -i <file>` wherever a walkthrough says `base64 -w0 <file>`);
 - an engine image and the `sutra` CLI, both **0.6.0 or later**.
 
-The compose files default to the published `ghcr.io/startr-trade/sutra:0.6.8` image, and
+The compose files default to the published `ghcr.io/startr-trade/sutra:0.6.9` image, and
 [Installation](getting-started/installation.md) installs the CLI. To run a walkthrough against
 your own checkout instead, build both from it:
 

@@ -470,6 +470,12 @@ pub async fn serve(config: EngineConfig) -> Result<RunningEngine, Box<dyn std::e
     let initial_coverage =
         crate::assembly::seed_declared_coverage(&boot_plans, &boot_draining_plans).await;
 
+    // The dedicated audit OTLP pipeline: built once, here on the runtime, before the executor
+    // lanes start; every lane's sink registry then shares the one provider, and shutdown flushes it.
+    if let Some(endpoint) = config.audit.otel_endpoint.as_deref() {
+        crate::audit_sinks::init_audit_otel(&handle, endpoint);
+    }
+
     let outbox_signal = sutra_channels::OutboxSignal::new();
     let runtime = crate::assembly::build_engine_runtime(
         boot_plans,

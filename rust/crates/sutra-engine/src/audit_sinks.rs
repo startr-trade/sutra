@@ -14,6 +14,14 @@
 //! The dedicated `SdkLoggerProvider` is built ONCE (module-static, mirroring the engine telemetry's
 //! own `ACTIVE_TELEMETRY`) via [`init_audit_otel`], and force-flushed on shutdown via [`flush_audit`]
 //! so buffered audit records leave before the process does. Best-effort: emit is infallible.
+//!
+//! The gRPC exporter spawns its connection task when it is built, so the build must run inside the
+//! tokio runtime. [`init_audit_otel`] therefore takes the runtime handle and enters it: the engine
+//! boot calls it from the runtime before any executor lane starts, and a lane's own call (on a
+//! plain OS thread) finds the provider already built and only reads it.
+//!
+//! Each record also carries the instance's correlation keys, one `correlation.<alias name>`
+//! attribute per `<q:alias>` (already redacted by the executor).
 
 use std::sync::OnceLock;
 
@@ -30,9 +38,14 @@ static AUDIT_LOGGER: OnceLock<Option<SdkLoggerProvider>> = OnceLock::new();
 /// Initialise (once) the dedicated audit OTLP logs pipeline to `endpoint`. Idempotent — the first
 /// call wins (the endpoint is engine config, constant for the process). Returns whether a live
 /// provider is available, so the assembly registers the `otel` sink only when export can happen.
-pub fn init_audit_otel(endpoint: &str) -> bool {
+pub fn init_audit_otel(runtime: &tokio::runtime::Handle, endpoint: &str) -> bool {
     AUDIT_LOGGER
-        .get_or_init(|| build_audit_provider(endpoint))
+        .get_or_init(|| {
+            // The tonic channel spawns onto the current runtime at build time; an executor lane
+            // thread has none, so enter the engine's runtime for the build.
+            let _runtime = runtime.enter();
+            build_audit_provider(endpoint)
+        })
         .is_some()
 }
 
@@ -105,6 +118,9 @@ fn emit_audit_log(provider: &SdkLoggerProvider, e: &sutra_channels::AuditEvent) 
         "node_id",
         e.node_id.clone().unwrap_or_else(|| "-".to_string()),
     );
+    for (name, value) in &e.correlation {
+        record.add_attribute(format!("correlation.{name}"), value.clone());
+    }
     logger.emit(record);
 }
 
@@ -211,6 +227,15 @@ mod tests {
             diagnostic_code: None,
             diagnostic_json: None,
             payload_json: "{}".into(),
+            correlation: [
+                ("orderRef".to_string(), "R-1".to_string()),
+                (
+                    "holder".to_string(),
+                    sutra_bpmn::REDACTED_PLACEHOLDER.to_string(),
+                ),
+            ]
+            .into_iter()
+            .collect(),
         }
     }
 
@@ -254,6 +279,33 @@ mod tests {
         assert!(has("seq", "3"));
         assert!(has("deployment_id", "dep-000000000000000000000001"));
         assert!(has("node_id", "Start"));
+        assert!(has("correlation.orderRef", "R-1"));
+        assert!(has("correlation.holder", sutra_bpmn::REDACTED_PLACEHOLDER));
+    }
+
+    /// The bug 0.6.9 fixes: an executor lane builds its sinks on a plain OS thread with no tokio
+    /// runtime, and building the gRPC exporter there panicked ("there is no reactor running").
+    /// Initialising from such a thread with the runtime handle must succeed.
+    #[test]
+    fn init_from_a_thread_outside_the_runtime_builds_the_provider() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let handle = runtime.handle().clone();
+        let built = std::thread::spawn(move || init_audit_otel(&handle, "http://127.0.0.1:4317"))
+            .join()
+            .expect("no panic on a lane thread");
+        assert!(built, "the dedicated audit provider is built");
+        // A second call (another lane, a flip) reuses it.
+        let handle = runtime.handle().clone();
+        assert!(
+            std::thread::spawn(move || init_audit_otel(&handle, "http://ignored:1"))
+                .join()
+                .unwrap()
+        );
+        flush_audit();
     }
 
     #[test]

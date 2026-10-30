@@ -366,13 +366,17 @@ impl TokenExecutor {
             variables: initial_variables,
         }));
 
+        let audit_sink = self.effective_audit_sink(process);
+        let audit_keys =
+            self.audit_correlation_of(process, audit_sink.is_some(), &ctx.borrow().variables);
         let instance_event = InstanceEvent {
             deployment: deployment.clone(),
             labels: labels.clone(),
             instance_id: instance_id.clone(),
             process_id: process.id.clone(),
             module_version: process.module_version.clone(),
-            audit_sink: self.effective_audit_sink(process),
+            audit_sink,
+            correlation: audit_keys,
         };
         self.notify(|l| l.on_instance_started(&instance_event));
 
@@ -397,12 +401,14 @@ impl TokenExecutor {
         if let Err(signal) = outcome {
             let e = signal_to_error(signal, &state);
             let d = e.to_diagnostic();
-            self.notify(|l| l.on_instance_failed(&instance_event, &d));
+            let failed = self.instance_event_now(&instance_event, &state);
+            self.notify(|l| l.on_instance_failed(&failed, &d));
             return Err(e);
         }
 
         self.mark_coverage(process, &state, &instance_event).await;
-        self.notify(|l| l.on_instance_completed(&instance_event));
+        let completed = self.instance_event_now(&instance_event, &state);
+        self.notify(|l| l.on_instance_completed(&completed));
         Ok(ExecResult {
             instance_id: state.instance_id.clone(),
             outputs: state.end_outputs.clone(),
@@ -467,13 +473,17 @@ impl TokenExecutor {
             variables: initial_variables,
         }));
 
+        let audit_sink = self.effective_audit_sink(process);
+        let audit_keys =
+            self.audit_correlation_of(process, audit_sink.is_some(), &ctx.borrow().variables);
         let instance_event = InstanceEvent {
             deployment: deployment.clone(),
             labels: labels.clone(),
             instance_id: instance_id.clone(),
             process_id: process.id.clone(),
             module_version: process.module_version.clone(),
-            audit_sink: self.effective_audit_sink(process),
+            audit_sink,
+            correlation: audit_keys,
         };
         self.notify(|l| l.on_instance_started(&instance_event));
 
@@ -614,6 +624,8 @@ impl TokenExecutor {
             process_id: process.id.clone(),
             module_version: process.module_version.clone(),
             audit_sink: self.effective_audit_sink(process),
+            // The dispatcher holds no pass variables here; the event carries no keys.
+            correlation: BTreeMap::new(),
         };
         let d = ExecError::diag(code, message).to_diagnostic();
         self.notify(|l| l.on_instance_failed(&instance_event, &d));
@@ -849,13 +861,17 @@ impl TokenExecutor {
             variables: merged,
         }));
 
+        let audit_sink = self.effective_audit_sink(process);
+        let audit_keys =
+            self.audit_correlation_of(process, audit_sink.is_some(), &ctx.borrow().variables);
         let instance_event = InstanceEvent {
             deployment: deployment.clone(),
             labels: labels.clone(),
             instance_id: instance_id.to_string(),
             process_id: process.id.clone(),
             module_version: process.module_version.clone(),
-            audit_sink: self.effective_audit_sink(process),
+            audit_sink,
+            correlation: audit_keys,
         };
         // No on_instance_started — this is a continuation of the original pass.
         self.notify(|l| l.on_instance_resumed(&instance_event));
@@ -1027,6 +1043,11 @@ impl TokenExecutor {
                         .node(&node)
                         .map(|n| node_type(n).to_string())
                         .unwrap_or_default(),
+                    correlation: self.audit_correlation_of(
+                        process,
+                        audit_sink.is_some(),
+                        &state.ctx.borrow().variables,
+                    ),
                     audit_sink,
                     payload_json: None,
                 };
@@ -1051,12 +1072,14 @@ impl TokenExecutor {
         if let Err(signal) = self.run_to_quiescence(&mut state).await {
             let e = signal_to_error(signal, &state);
             let d = e.to_diagnostic();
-            self.notify(|l| l.on_instance_failed(instance_event, &d));
+            let failed = self.instance_event_now(instance_event, &state);
+            self.notify(|l| l.on_instance_failed(&failed, &d));
             return Err(e);
         }
 
         if !state.waiting.is_empty() {
-            self.notify(|l| l.on_instance_suspended(instance_event));
+            let suspended = self.instance_event_now(instance_event, &state);
+            self.notify(|l| l.on_instance_suspended(&suspended));
             // Union of nodes done before this pass and during it — insertion-ordered,
             // deduplicated (an insertion-ordered set).
             let mut completed = state.prior_completed_ordered.clone();
@@ -1091,12 +1114,14 @@ impl TokenExecutor {
                 ),
             );
             let d = e.to_diagnostic();
-            self.notify(|l| l.on_instance_failed(instance_event, &d));
+            let failed = self.instance_event_now(instance_event, &state);
+            self.notify(|l| l.on_instance_failed(&failed, &d));
             return Err(e);
         }
         self.mark_coverage(state.process, &state, instance_event)
             .await;
-        self.notify(|l| l.on_instance_completed(instance_event));
+        let completed = self.instance_event_now(instance_event, &state);
+        self.notify(|l| l.on_instance_completed(&completed));
         Ok(StatefulExecResult::Completed {
             instance_id: state.instance_id.clone(),
             outputs: state.end_outputs.clone(),
@@ -1145,6 +1170,11 @@ impl TokenExecutor {
             instance_id: state.instance_id.clone(),
             node_id: node_id.to_string(),
             node_type: node_type(node).to_string(),
+            correlation: self.audit_correlation_of(
+                state.process,
+                audit_sink.is_some(),
+                &state.ctx.borrow().variables,
+            ),
             audit_sink,
             payload_json,
         };
@@ -4572,6 +4602,38 @@ impl TokenExecutor {
             .as_ref()
             .map(|a| a.sink.clone())
             .or_else(|| self.default_audit_sink.clone())
+    }
+
+    /// The correlation keys an audit event carries (see [`crate::audit_correlation`]). Empty
+    /// when the event is not audited, so an unaudited process pays nothing.
+    fn audit_correlation_of(
+        &self,
+        process: &ProcessDefinition,
+        audited: bool,
+        variables: &Variables,
+    ) -> BTreeMap<String, String> {
+        if !audited {
+            return BTreeMap::new();
+        }
+        let evaluate = |expr: &str, vars: &Variables| (self.value_evaluator)(expr, vars).ok();
+        crate::audit_correlation::correlation_snapshot(process, variables, &evaluate)
+    }
+
+    /// `base` with its correlation keys refreshed from the pass's current variables — for the
+    /// instance events a pass sends at its end (suspended / completed / failed), so they carry
+    /// the keys known at that point rather than at the pass's start.
+    fn instance_event_now(
+        &self,
+        base: &InstanceEvent,
+        state: &ExecutionState<'_>,
+    ) -> InstanceEvent {
+        let mut event = base.clone();
+        event.correlation = self.audit_correlation_of(
+            state.process,
+            event.audit_sink.is_some(),
+            &state.ctx.borrow().variables,
+        );
+        event
     }
 
     /// B1 — resolve a node's audit routing directive: `(audit_sink, payload_json)`.

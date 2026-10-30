@@ -21,6 +21,10 @@ pub struct InstanceEvent {
     /// deployment-manifest default → engine default). `None` = the process is not audited; the
     /// audit listener then emits nothing. Audit goes to exactly one sink (one source of truth).
     pub audit_sink: Option<String>,
+    /// The instance's correlation keys at this event: each declared `<q:alias>` name and its
+    /// current value, redacted like every other observability surface (see
+    /// [`crate::audit_correlation`]). Filled only when the event is audited; empty otherwise.
+    pub correlation: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,6 +41,10 @@ pub struct TokenEvent {
     /// B1 — when the PROCESS captures at payload level, the redacted variable-context JSON at node
     /// entry (`@sensitive` values masked); `None` at metadata level. Ridden into `NODE_ENTERED`.
     pub payload_json: Option<String>,
+    /// The instance's correlation keys at this event: each declared `<q:alias>` name and its
+    /// current value, redacted like every other observability surface (see
+    /// [`crate::audit_correlation`]). Filled only when the event is audited; empty otherwise.
+    pub correlation: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

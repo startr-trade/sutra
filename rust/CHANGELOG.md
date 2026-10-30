@@ -13,6 +13,57 @@ This is the changelog for the **Rust-native** engine (`rust/` workspace). It beg
 
 Nothing yet.
 
+## [0.6.9] — 2026-10-30
+
+A **patch** release. It carries everything 0.6.8 brought, because the `v0.6.8` tag was created but
+never released: its engine image failed the release image scan on a tzdata advisory (DLA-4867-1)
+published the same day, after our local scan had passed. On top of that, 0.6.9 fixes two audit
+sinks and adds the instance's correlation keys to every audit event. Use 0.6.9.
+
+### Fixed
+
+- **`SUTRA_AUDIT_OTEL_ENDPOINT` no longer panics the engine at start** ("there is no reactor
+  running"). Each executor lane built the dedicated audit OTLP exporter on its own thread, outside
+  the tokio runtime, and the gRPC exporter needs the runtime when it is built. The audit logs
+  pipeline is now built once, on the runtime, before the lanes start; every lane shares the one
+  provider, and shutdown flushes it. The audit records arrive on the `sutra.audit` scope as
+  documented.
+- **The JSONL audit sink no longer writes two events on one line.** Each lane opened its own sink
+  on the same file, with its own lock, and wrote the line and its newline as two writes, so under
+  load (about 3% of lines at 300 instances/s) two lanes interleaved. Every sink open on one file now
+  shares a single handle and lock, and each event is one append of the whole line, newline
+  included.
+
+### Added
+
+- **Audit events carry the instance's correlation keys.** Each audit event, in the OTLP and JSONL
+  sinks, now carries the `<q:alias>` names and values the process declares: one
+  `correlation.<name>` attribute per key on the OTLP record, and a `correlation` object on the JSONL
+  line. The values come from the instance's own variables (a start alias is bound under its name),
+  so no database read is added per event. Redaction holds: a key whose alias, or whose input, is
+  declared `sensitive` shows `***REDACTED***`, and a key read from a redactor-controlled input shows
+  the masked projection. The SQL audit row is unchanged.
+
+### Security
+
+- `.trivyignore.yaml` accepts **DLA-4867-1** until 2026-11-09, the same position and expiry as
+  DLA-4792-1 and DLA-4854-1: the distroless base ships tzdata 2026b and 2026f-0+deb12u1 is fixed,
+  but this is a timezone-data refresh, not an exploitable code path, and a distroless image has no
+  package manager. The newest `gcr.io/distroless/cc-debian12` digest (re-pulled 2026-10-30,
+  `sha256:e5d81ddd…`) still ships 2026b, so a base bump does not clear it.
+
+### What 0.6.8 brought (released for the first time here)
+
+- **Replicas sharing one database no longer send an outbound message twice** (0.6.5–0.6.7 did).
+  The outbox claim now leases the rows it claims for 30 s, and the claiming engine renews the lease
+  every 10 s while the rows are in flight. A dead replica's rows are redelivered after the lease
+  lapses (at-least-once, as before).
+- **Per-table autovacuum settings on PostgreSQL** for the high-churn tables (`outbox_entry`,
+  `instance_state`, `waiting_event`, `alias_index`, `inbox_seen`), so dead rows no longer stall the
+  outbox claim at high rates.
+
+See [0.6.8](#068--2026-10-30) below for the full notes.
+
 ## [0.6.8] — 2026-10-30
 
 A **patch** release that fixes duplicate outbound deliveries when two or more engine replicas share

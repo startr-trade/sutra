@@ -369,6 +369,102 @@ async fn process_audit_routes_to_one_sink_captures_payload_and_node_none_suppres
     assert_eq!(of("U").0, None, "capture=\"none\" suppresses the node");
 }
 
+/// Records every audited event's correlation keys, instance and token alike.
+struct CorrelationRecorder {
+    events: RefCell<Vec<(String, BTreeMap<String, String>)>>,
+}
+
+impl ExecutionListener for CorrelationRecorder {
+    fn on_instance_started(&self, e: &InstanceEvent) {
+        self.events
+            .borrow_mut()
+            .push(("instance.started".into(), e.correlation.clone()));
+    }
+    fn on_instance_completed(&self, e: &InstanceEvent) {
+        self.events
+            .borrow_mut()
+            .push(("instance.completed".into(), e.correlation.clone()));
+    }
+    fn on_token_entered(&self, e: &TokenEvent) {
+        self.events.borrow_mut().push((
+            format!("token.entered:{}", e.node_id),
+            e.correlation.clone(),
+        ));
+    }
+}
+
+/// An audited process's events carry its `<q:alias>` keys, read from the variables the start
+/// event bound them to, with a `sensitive` alias masked; an unaudited process's carry none.
+#[tokio::test]
+async fn audited_events_carry_the_instance_correlation_keys() {
+    let bpmn = |audit: &str| {
+        format!(
+            r#"<?xml version="1.0"?>
+        <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                          xmlns:q="urn:sutra:q:1.0">
+          <bpmn:process id="p1">
+            <bpmn:extensionElements>
+              {audit}
+              <q:variable name="holder" sensitive="true"/>
+            </bpmn:extensionElements>
+            <bpmn:startEvent id="S">
+              <bpmn:extensionElements>
+                <q:alias name="orderRef" expression="payload.ref" unique="true"/>
+                <q:alias name="holder" expression="payload.holder"/>
+              </bpmn:extensionElements>
+            </bpmn:startEvent>
+            <bpmn:serviceTask id="T" implementation="${{noop}}"/>
+            <bpmn:endEvent id="E"/>
+            <bpmn:sequenceFlow id="f1" sourceRef="S" targetRef="T"/>
+            <bpmn:sequenceFlow id="f2" sourceRef="T" targetRef="E"/>
+          </bpmn:process>
+        </bpmn:definitions>"#
+        )
+    };
+    let run = |xml: String| async move {
+        let process = proc(&xml, "p1");
+        let registry = TaskRegistry::new().register("noop", |_, _| ok_map(&[]));
+        let recorder = Rc::new(CorrelationRecorder {
+            events: RefCell::new(Vec::new()),
+        });
+        let executor = TokenExecutor::builder(registry)
+            .with_listener(Rc::clone(&recorder) as Rc<dyn ExecutionListener>)
+            .build();
+        // The dispatcher binds each start alias under its name before the pass runs.
+        executor
+            .execute_sync(
+                &process,
+                vars(&[("orderRef", string("R-42")), ("holder", string("Jane Doe"))]),
+            )
+            .await
+            .unwrap();
+        let events = recorder.events.borrow().clone();
+        events
+    };
+
+    let audited = run(bpmn(r#"<q:audit sink="jsonl" capture="metadata"/>"#)).await;
+    assert_eq!(audited.len(), 5, "{audited:?}");
+    for (event, keys) in &audited {
+        assert_eq!(
+            keys.get("orderRef").map(String::as_str),
+            Some("R-42"),
+            "{event}"
+        );
+        assert_eq!(
+            keys.get("holder").map(String::as_str),
+            Some("***REDACTED***"),
+            "{event}: a sensitive alias is masked"
+        );
+    }
+    assert!(!format!("{audited:?}").contains("Jane"));
+
+    let unaudited = run(bpmn("")).await;
+    assert!(
+        unaudited.iter().all(|(_, keys)| keys.is_empty()),
+        "{unaudited:?}"
+    );
+}
+
 /// `capture="media"`: events carry no variable content, only the media references found among
 /// the variables (`kind: "media"` with a `uri` and a `sha256`), each once, never a `@sensitive`
 /// variable's; with no reference the payload stays empty.

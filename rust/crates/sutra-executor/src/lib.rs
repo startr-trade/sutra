@@ -14,6 +14,7 @@
 #![forbid(unsafe_code)]
 
 pub mod artifact_urn;
+pub mod audit_correlation;
 pub mod codes;
 pub mod coverage;
 pub mod datastore;

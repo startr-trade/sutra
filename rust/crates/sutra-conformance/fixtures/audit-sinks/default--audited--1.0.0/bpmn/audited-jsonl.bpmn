@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  An instance audited to the jsonl sink, correlated by two <q:alias> keys:
+    startEvent (JSON on `jsonl-start`: { ref, holder })
+      orderRef := payload.ref     (unique; a status correlates back through it)
+      holder   := payload.holder  (declared sensitive: its audit value is masked)
+    then Wait : receive task on `jsonl-status`: { ref }
+    then Done
+-->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0"
+                  id="Definitions_audited_jsonl"
+                  targetNamespace="urn:sutra:module:audited:1.0.0">
+  <bpmn:process id="audited-jsonl" name="Audited to jsonl" isExecutable="true">
+    <bpmn:extensionElements>
+      <q:audit sink="jsonl" capture="metadata"/>
+      <q:variables>
+        <q:variable name="holder" type="string" sensitive="true"/>
+      </q:variables>
+    </bpmn:extensionElements>
+    <bpmn:startEvent id="Start">
+      <bpmn:extensionElements>
+        <q:source channel="jsonl-start"/>
+        <q:alias name="orderRef" expression="payload.ref" unique="true" onConflict="correlate"/>
+        <q:alias name="holder" expression="payload.holder"/>
+      </bpmn:extensionElements>
+      <bpmn:outgoing>F1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="F1" sourceRef="Start" targetRef="Wait"/>
+    <bpmn:receiveTask id="Wait" name="Wait for a status">
+      <bpmn:extensionElements>
+        <q:source channel="jsonl-status" name="status"/>
+      </bpmn:extensionElements>
+      <bpmn:incoming>F1</bpmn:incoming>
+      <bpmn:outgoing>F2</bpmn:outgoing>
+    </bpmn:receiveTask>
+    <bpmn:sequenceFlow id="F2" sourceRef="Wait" targetRef="Done"/>
+    <bpmn:endEvent id="Done" name="Status received"><bpmn:incoming>F2</bpmn:incoming></bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>

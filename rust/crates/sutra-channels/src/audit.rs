@@ -64,6 +64,12 @@ pub struct AuditEvent {
     /// Capture payload — `"{}"` at metadata level, or the node's variables (with every
     /// `@sensitive` value already redacted by the listener) at payload level. Stored verbatim.
     pub payload_json: String,
+    /// The instance's correlation keys at this event: each `<q:alias>` name the process declares
+    /// and its current value, already redacted by the executor (a `sensitive` or
+    /// redactor-controlled input shows masked). Empty for an instance with no aliases and for
+    /// transport events. The JSONL line carries it as `correlation`, the OTLP record as one
+    /// `correlation.<name>` attribute per key; the SQL row does not store it.
+    pub correlation: std::collections::BTreeMap<String, String>,
 }
 
 impl AuditEvent {
@@ -88,6 +94,9 @@ impl AuditEvent {
             obj.insert("diagnosticCode".into(), serde_json::json!(c));
         }
         obj.insert("payload".into(), payload);
+        if !self.correlation.is_empty() {
+            obj.insert("correlation".into(), serde_json::json!(self.correlation));
+        }
         serde_json::Value::Object(obj).to_string()
     }
 }
@@ -146,15 +155,45 @@ impl AuditSinkRegistry {
 }
 
 /// The built-in JSONL audit sink — appends one [`AuditEvent::to_jsonl`] line per event to a
-/// target file, exactly the shape `sutra audit-replay --from-jsonl` reads back. Append is
-/// guarded by a `Mutex` so concurrent emits interleave cleanly (whole lines, never torn).
+/// target file, exactly the shape `sutra audit-replay --from-jsonl` reads back.
+///
+/// Every line is ONE `write_all` of the complete line, newline included, made while holding a
+/// lock that is shared by every sink open on the same file in this process. Each executor lane
+/// builds its own sink registry, so several `JsonlAuditSink`s commonly target one path; with a
+/// per-sink lock and a separate newline write, two lanes could interleave and leave two events on
+/// one line. The file is opened in append mode, so a single write also lands whole at the end of
+/// the file.
 pub struct JsonlAuditSink {
     path: PathBuf,
-    file: Mutex<std::fs::File>,
+    file: Arc<Mutex<std::fs::File>>,
+}
+
+/// The process-wide handle for one JSONL target, keyed by its canonical path. Held weakly: the
+/// file closes once the last sink using it is dropped (an activation flip reopens it).
+fn shared_jsonl_file(path: &std::path::Path) -> std::io::Result<Arc<Mutex<std::fs::File>>> {
+    type OpenFiles = Mutex<HashMap<PathBuf, std::sync::Weak<Mutex<std::fs::File>>>>;
+    static OPEN: std::sync::OnceLock<OpenFiles> = std::sync::OnceLock::new();
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut open = OPEN
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    open.retain(|_, weak| weak.strong_count() > 0);
+    if let Some(shared) = open.get(&key).and_then(std::sync::Weak::upgrade) {
+        return Ok(shared);
+    }
+    let shared = Arc::new(Mutex::new(file));
+    open.insert(key, Arc::downgrade(&shared));
+    Ok(shared)
 }
 
 impl JsonlAuditSink {
-    /// Open (creating + appending to) the JSONL target file.
+    /// Open (creating + appending to) the JSONL target file. A second sink on the same file
+    /// shares the first one's handle and lock.
     pub fn open(path: impl Into<PathBuf>) -> std::io::Result<JsonlAuditSink> {
         let path = path.into();
         if let Some(parent) = path.parent() {
@@ -162,14 +201,8 @@ impl JsonlAuditSink {
                 std::fs::create_dir_all(parent)?;
             }
         }
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
-        Ok(JsonlAuditSink {
-            path,
-            file: Mutex::new(file),
-        })
+        let file = shared_jsonl_file(&path)?;
+        Ok(JsonlAuditSink { path, file })
     }
 
     /// The target file path.
@@ -184,13 +217,14 @@ impl AuditSink for JsonlAuditSink {
     }
 
     fn emit<'a>(&'a self, event: &'a AuditEvent) -> BoxFuture<'a, Result<(), Diagnostic>> {
-        let line = event.to_jsonl();
+        let mut line = event.to_jsonl();
+        line.push('\n');
         Box::pin(async move {
             // A dedicated audit-dispatcher task drives this; the append is small + best-effort.
             let mut file = self.file.lock().map_err(|_| {
                 Diagnostic::error(AUDIT_SINK_WRITE_FAILED, "audit file lock poisoned")
             })?;
-            writeln!(file, "{line}").map_err(|e| {
+            file.write_all(line.as_bytes()).map_err(|e| {
                 Diagnostic::error(AUDIT_SINK_WRITE_FAILED, format!("jsonl append failed: {e}"))
             })
         })
@@ -333,6 +367,7 @@ impl AuditListener {
         node_id: Option<String>,
         diagnostic_json: Option<String>,
         payload_json: Option<String>,
+        correlation: &std::collections::BTreeMap<String, String>,
     ) {
         let event = AuditEvent {
             sink,
@@ -348,6 +383,7 @@ impl AuditListener {
             // `<q:audit capture="payload">` supplies the redacted variable snapshot; a metadata
             // node (the default) carries `"{}"`.
             payload_json: payload_json.unwrap_or_else(|| "{}".to_string()),
+            correlation: correlation.clone(),
         };
         // Best-effort: a full/closed channel means the dispatcher is gone — drop silently.
         let _ = self.tx.send(event);
@@ -375,6 +411,7 @@ impl ExecutionListener for AuditListener {
             None,
             None,
             None,
+            &e.correlation,
         );
     }
     fn on_instance_completed(&self, e: &InstanceEvent) {
@@ -390,6 +427,7 @@ impl ExecutionListener for AuditListener {
             None,
             None,
             None,
+            &e.correlation,
         );
     }
     fn on_instance_suspended(&self, e: &InstanceEvent) {
@@ -405,6 +443,7 @@ impl ExecutionListener for AuditListener {
             None,
             None,
             None,
+            &e.correlation,
         );
     }
     fn on_instance_resumed(&self, e: &InstanceEvent) {
@@ -420,6 +459,7 @@ impl ExecutionListener for AuditListener {
             None,
             None,
             None,
+            &e.correlation,
         );
     }
     fn on_instance_failed(&self, e: &InstanceEvent, diagnostic: &SutraError) {
@@ -435,6 +475,7 @@ impl ExecutionListener for AuditListener {
             None,
             Some(serde_json::json!({ "error": diagnostic.to_string() }).to_string()),
             None,
+            &e.correlation,
         );
     }
     fn on_token_entered(&self, e: &TokenEvent) {
@@ -452,6 +493,7 @@ impl ExecutionListener for AuditListener {
             Some(e.node_id.clone()),
             None,
             e.payload_json.clone(),
+            &e.correlation,
         );
     }
     fn on_token_left(&self, e: &TokenEvent) {
@@ -467,6 +509,7 @@ impl ExecutionListener for AuditListener {
             Some(e.node_id.clone()),
             None,
             None,
+            &e.correlation,
         );
     }
 }
@@ -488,6 +531,7 @@ mod tests {
             diagnostic_code: None,
             diagnostic_json: None,
             payload_json: "{\"amount\":10}".into(),
+            correlation: Default::default(),
         }
     }
 
@@ -548,6 +592,112 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Many writers at once — several sinks on the same file (one per executor lane), each driven
+    /// from its own thread — never leave two events on one line or tear one: every line parses
+    /// as exactly one JSON event and every event is present once.
+    #[test]
+    fn concurrent_jsonl_writers_leave_exactly_one_event_per_line() {
+        const SINKS: usize = 8;
+        const WRITERS_PER_SINK: usize = 4;
+        const EVENTS_PER_WRITER: usize = 250;
+        let dir = std::env::temp_dir().join(format!("audit-jsonl-many-{}", std::process::id()));
+        let path = dir.join("audit.jsonl");
+        let _ = std::fs::remove_file(&path);
+        let sinks: Vec<Arc<JsonlAuditSink>> = (0..SINKS)
+            .map(|_| Arc::new(JsonlAuditSink::open(&path).unwrap()))
+            .collect();
+        // A payload long enough that a torn or split write would show.
+        let payload = format!("{{\"note\":\"{}\"}}", "x".repeat(512));
+        let mut threads = Vec::new();
+        for (s, sink) in sinks.iter().enumerate() {
+            for w in 0..WRITERS_PER_SINK {
+                let sink = Arc::clone(sink);
+                let payload = payload.clone();
+                threads.push(std::thread::spawn(move || {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .build()
+                        .unwrap();
+                    for n in 0..EVENTS_PER_WRITER {
+                        let mut e = sample();
+                        e.instance_id = format!("i-{s}-{w}");
+                        e.seq = n as u32;
+                        e.payload_json = payload.clone();
+                        rt.block_on(sink.emit(&e)).unwrap();
+                    }
+                }));
+            }
+        }
+        for t in threads {
+            t.join().unwrap();
+        }
+        let body = std::fs::read_to_string(&path).unwrap();
+        let mut seen = std::collections::HashSet::new();
+        for (i, line) in body.lines().enumerate() {
+            let v: serde_json::Value = serde_json::from_str(line)
+                .unwrap_or_else(|e| panic!("line {i} is not one JSON event ({e}): {line:.200}"));
+            let key = (
+                v["instanceId"].as_str().unwrap().to_string(),
+                v["seq"].as_u64().unwrap(),
+            );
+            assert!(seen.insert(key), "event written twice at line {i}");
+        }
+        assert_eq!(seen.len(), SINKS * WRITERS_PER_SINK * EVENTS_PER_WRITER);
+        assert!(body.ends_with('\n'));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn jsonl_line_carries_correlation_keys_only_when_present() {
+        let v: serde_json::Value = serde_json::from_str(&sample().to_jsonl()).unwrap();
+        assert!(v.get("correlation").is_none(), "no aliases, no key: {v}");
+        let mut e = sample();
+        e.correlation.insert("orderRef".into(), "R-1".into());
+        e.correlation
+            .insert("holder".into(), sutra_bpmn::REDACTED_PLACEHOLDER.into());
+        let v: serde_json::Value = serde_json::from_str(&e.to_jsonl()).unwrap();
+        assert_eq!(v["correlation"]["orderRef"], "R-1");
+        assert_eq!(v["correlation"]["holder"], sutra_bpmn::REDACTED_PLACEHOLDER);
+    }
+
+    #[test]
+    fn listener_events_carry_the_executor_correlation_keys() {
+        use std::collections::BTreeMap;
+        use sutra_executor::listener::{ExecutionListener, InstanceEvent, TokenEvent};
+        use sutra_executor::DeploymentId;
+
+        let dep = DeploymentId::of("dep-000000000000000000000001").unwrap();
+        let keys: BTreeMap<String, String> = [("orderRef".to_string(), "R-7".to_string())]
+            .into_iter()
+            .collect();
+        let inst = InstanceEvent {
+            deployment: dep.clone(),
+            labels: BTreeMap::new(),
+            instance_id: "i-9".into(),
+            process_id: "p".into(),
+            module_version: "1.0".into(),
+            audit_sink: Some("jsonl".to_string()),
+            correlation: keys.clone(),
+        };
+        let token = TokenEvent {
+            deployment: dep,
+            labels: BTreeMap::new(),
+            instance_id: "i-9".into(),
+            node_id: "Start".into(),
+            node_type: "startEvent".into(),
+            audit_sink: Some("jsonl".to_string()),
+            payload_json: None,
+            correlation: keys.clone(),
+        };
+        let (tx, mut rx) = audit_channel();
+        let listener = AuditListener::new(tx, || "t".to_string());
+        listener.on_instance_started(&inst);
+        listener.on_token_entered(&token);
+        listener.on_instance_completed(&inst);
+        for _ in 0..3 {
+            assert_eq!(rx.try_recv().unwrap().correlation, keys);
+        }
+    }
+
     #[test]
     fn seed_makes_seq_continue_across_a_simulated_restart() {
         use std::collections::BTreeMap;
@@ -565,6 +715,7 @@ mod tests {
             process_id: "p".into(),
             module_version: "1.0".into(),
             audit_sink: Some("jsonl".to_string()),
+            correlation: Default::default(),
         };
         let token = TokenEvent {
             deployment: dep.clone(),
@@ -574,6 +725,7 @@ mod tests {
             node_type: "startEvent".into(),
             audit_sink: Some("jsonl".to_string()),
             payload_json: None,
+            correlation: Default::default(),
         };
 
         // First pass: STARTED=1, NODE_ENTERED=2, SUSPENDED=3 — the persisted high-water is 3.
@@ -636,6 +788,7 @@ mod tests {
             node_type: "serviceTask".into(),
             audit_sink: Some("jsonl".to_string()),
             payload_json: Some(captured.to_string()),
+            correlation: Default::default(),
         };
         // NODE_ENTERED carries the captured (already-redacted) payload verbatim.
         listener.on_token_entered(&token);
@@ -676,6 +829,7 @@ mod tests {
             process_id: "p".into(),
             module_version: "1.0".into(),
             audit_sink: Some("jsonl".to_string()),
+            correlation: Default::default(),
         };
         let token = TokenEvent {
             deployment: dep.clone(),
@@ -685,6 +839,7 @@ mod tests {
             node_type: "startEvent".into(),
             audit_sink: Some("jsonl".to_string()),
             payload_json: None,
+            correlation: Default::default(),
         };
         listener.on_instance_started(&inst);
         listener.on_token_entered(&token);
@@ -760,6 +915,7 @@ mod tests {
             diagnostic_code: None,
             diagnostic_json: None,
             payload_json: "{}".into(),
+            correlation: Default::default(),
         };
         tx.send(event("sql", "A")).unwrap();
         tx.send(event("jsonl", "B")).unwrap();

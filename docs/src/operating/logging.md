@@ -40,6 +40,16 @@ active at once:
 | `sutra.audit.otel.endpoint` | `SUTRA_AUDIT_OTEL_ENDPOINT` | Ships audit events over OTLP to a collector. |
 | `sutra.audit.sql` | `SUTRA_AUDIT_SQL` | Persists audit rows durably in the engine's own datasource, under the same row-level-security policy as every other engine table — see [Multi-tenancy and isolation](../architecture/multi-tenancy.md). |
 
+A process's events go to one sink: the one its `<q:audit sink="…">` names, or else the
+highest-priority sink that is switched on (`sql`, then `jsonl`, then `otel`).
+
+- **JSONL.** Each event is one line, written in a single append, so a file shared by every
+  executor lane never holds two events on one line (fixed in 0.6.9).
+- **OTLP.** The records are OTLP log records on the instrumentation scope `sutra.audit`, sent
+  through a logs pipeline of their own to `SUTRA_AUDIT_OTEL_ENDPOINT`, never through the telemetry
+  endpoint. The engine builds that pipeline once at start and flushes it on shutdown. Before
+  0.6.9, setting this variable made the engine panic at start.
+
 ## What an audit event captures
 
 A process chooses how much each of its audit events carries, with `<q:audit capture="…">`:
@@ -55,6 +65,71 @@ With `media`, subject erasure and terminal retention also delete the recordings 
 reference, and amend each event to say they are gone. See
 [Recordings and media references](../building/recordings-and-media.md) for the mechanism and a
 walkthrough.
+
+## Correlation keys on every audit event
+
+From 0.6.9, each audit event carries the instance's correlation keys: every `<q:alias>` the
+process declares, with its current value. That lets you find all of one business transaction's
+events by the key your systems already use, without first looking up the instance id.
+
+| Sink | Where the keys are |
+|---|---|
+| JSONL | a `correlation` object on the line: `"correlation":{"draftId":"d-7"}` |
+| OTLP | one attribute per key, named `correlation.<alias name>` |
+| SQL | not stored; the `audit_event` row is unchanged |
+
+- **Where the values come from.** A start event's aliases are bound into the instance's variables
+  under the alias name, and the variables travel with the instance, so every event reads its keys
+  from there, including after a resume on another replica. No database read is added per event.
+- **Wait-node aliases.** An alias declared on a wait node is evaluated over the current variables.
+  Until it has a value, the key is left out.
+- **Transport events and unaudited processes.** Transport events carry no keys, and a process that
+  is not audited computes none.
+
+Redaction applies to the keys as it does everywhere else:
+
+- A key shows `***REDACTED***` when the alias name, or any variable its expression reads, is
+  declared `sensitive`.
+- When the expression reads a payload that has a `<q:redactors>` chain, the key comes from the
+  masked projection, never from the raw payload. When the expression is more than a plain path,
+  the key shows `***REDACTED***`.
+
+### Try it
+
+The `review-loop` example correlates every message by its start event's
+`<q:alias name="draftId" expression="payload.draftId">`. Its compose file switches on the SQL
+sink; this override sends the audit trail to a JSONL file instead. You need Docker, the `sutra` CLI
+and an engine image, both 0.6.9 or later. From the repository root:
+
+```bash
+C=examples/review-loop/deploy/compose.yaml
+cat > /tmp/audit-jsonl.yaml <<'YAML'
+services:
+  engine:
+    environment:
+      SUTRA_AUDIT_SQL: "false"
+      SUTRA_AUDIT_JSONL: /tmp/audit/audit.jsonl
+YAML
+docker compose -f $C -f /tmp/audit-jsonl.yaml up -d --wait
+sutra package examples/review-loop/deployments-src/default--review--1.0.0 \
+    --out examples/review-loop/deploy/deployments 2>/dev/null
+PORT=$(docker compose -f $C port engine 8080 | cut -d: -f2)
+H=(-H 'Content-Type: application/json' -H 'X-Api-Key: dev-only-review-key')
+until curl -sf "http://127.0.0.1:$PORT/sutra/deployments" | grep -q '"phase":"Active"'; do sleep 1; done
+send() { curl -s -o /dev/null -w "HTTP %{http_code}\n" -X POST "http://127.0.0.1:$PORT/channels/drafts$1" "${H[@]}" -d "$2"; }
+send "" '{"draftId":"d-7"}'
+send /review '{"draftId":"d-7","decision":"approve"}'
+docker compose -f $C cp engine:/tmp/audit/audit.jsonl - | tar -xO | head -3
+docker compose -p sutra-review-loop down -v
+```
+
+Both requests answer `HTTP 200`, and every line carries the draft's key (ids and times differ):
+
+```text
+{"instanceId":"66ed7453-…","deploymentId":"dep-84173f…","tenant":"default","seq":1,"at":"…","eventType":"INSTANCE_STARTED","payload":{},"correlation":{"draftId":"d-7"}}
+{"instanceId":"66ed7453-…","deploymentId":"dep-84173f…","tenant":"default","seq":2,"at":"…","eventType":"NODE_ENTERED","nodeId":"Start","payload":{},"correlation":{"draftId":"d-7"}}
+{"instanceId":"66ed7453-…","deploymentId":"dep-84173f…","tenant":"default","seq":3,"at":"…","eventType":"NODE_LEFT","nodeId":"Start","payload":{},"correlation":{"draftId":"d-7"}}
+```
 
 ## Replaying an instance's audit trail offline
 

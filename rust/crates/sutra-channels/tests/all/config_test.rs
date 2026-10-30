@@ -338,6 +338,7 @@ fn ack_registry_observes_the_executor_listener_bus() {
         process_id: "p".to_string(),
         module_version: String::new(),
         audit_sink: None,
+        correlation: Default::default(),
     };
     registry.register("i-listener", "ch", on_ack, || {});
     ExecutionListener::on_instance_completed(registry.as_ref(), &event);
@@ -365,6 +366,7 @@ fn shared_registry_rides_the_rc_listener_bus_via_the_deferred_ack_listener() {
         process_id: "p".to_string(),
         module_version: String::new(),
         audit_sink: None,
+        correlation: Default::default(),
     };
     listener.on_instance_completed(&event);
     assert_eq!(acks.load(Ordering::SeqCst), 1);

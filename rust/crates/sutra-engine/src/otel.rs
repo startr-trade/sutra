@@ -1496,6 +1496,7 @@ mod tests {
             process_id: "p".to_string(),
             module_version: "1.0.0".to_string(),
             audit_sink: None,
+            correlation: Default::default(),
         };
         listener.on_instance_started(&event);
         listener.on_instance_completed(&event);
@@ -1531,6 +1532,7 @@ mod tests {
             process_id: process_id.to_string(),
             module_version: "1.0.0".to_string(),
             audit_sink: None,
+            correlation: Default::default(),
         }
     }
 
@@ -1764,6 +1766,7 @@ mod tests {
             process_id: "payments-v1".to_string(),
             module_version: "1.0.0".to_string(),
             audit_sink: None,
+            correlation: Default::default(),
         };
         let token = TokenEvent {
             deployment: dep.clone(),
@@ -1773,6 +1776,7 @@ mod tests {
             node_type: "serviceTask".to_string(),
             audit_sink: None,
             payload_json: None,
+            correlation: Default::default(),
         };
         let task = TaskEvent {
             deployment: dep,
