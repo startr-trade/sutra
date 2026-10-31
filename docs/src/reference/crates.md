@@ -9,8 +9,8 @@ nothing to do with workflow engines at all.
 
 ```toml
 [dependencies]
-sutra-feel = "0.6.12"
-sutra-dmn  = "0.6.12"   # depends on sutra-feel directly; use it alone if you only need DMN
+sutra-feel = "0.6.13"
+sutra-dmn  = "0.6.13"   # depends on sutra-feel directly; use it alone if you only need DMN
 ```
 
 ## `sutra-feel` — the FEEL expression language

@@ -448,6 +448,15 @@
         skipped; any other value fails with SUTRA.RUNTIME.DATASTORE.QUERY_NOT_NUMERIC); @groupBy (a dotted value
         path) gives {groups: {value: {count, sum?}}}. No match gives zeros, never null. A query takes no locks,
         reads committed rows, bypasses the read cache, and cannot be combined with @forUpdate or used on a write.
+
+        Typed stores (0.6.13): a store whose datastores.yaml declares a structure (typed columns) is queried
+        the same way over its own table; each row's value is the typed record, exactly as a read of that key
+        returns it. On a typed store a q:aggregate @field and @groupBy each name exactly ONE declared field
+        (a nested path or an undeclared field is refused by sutra lint and at run time with
+        SUTRA.RUNTIME.DATASTORE.QUERY_UNSUPPORTED), and @field must be a decimal or integer field (sutra lint
+        refuses any other type). A NULL column (an absent optional field) is skipped by a sum and groups under
+        "null". The table's store_key column must sort bytewise and lead an index (its primary key), else the
+        query is refused with SUTRA.RUNTIME.DATASTORE.QUERY_KEY_ORDER / QUERY_KEY_INDEX.
         See the book's "Data stores" chapter.
       </xsd:documentation>
     </xsd:annotation>

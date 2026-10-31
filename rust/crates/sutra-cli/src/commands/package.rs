@@ -17,7 +17,9 @@ use crate::GlobalArgs;
 
 #[derive(Debug, clap::Args)]
 pub struct PackageArgs {
-    /// Deployment-package directory to seal into a `.sutra` archive.
+    /// Deployment-package directory to seal into a `.sutra` archive — or a deployment
+    /// manifest (a `.yaml`/`.yml` file naming the package labels and an ordered stack of
+    /// layer directories), sealed as `<manifest-file-stem>.sutra`.
     pub input: PathBuf,
 
     /// Output directory: receives the `.sutra` archive.
@@ -35,7 +37,7 @@ pub struct PackageArgs {
     /// Every overridden path is reported as a warning naming the layer that won. An overlay
     /// may not carry package.yaml (labels come from the package dir alone), may not contain
     /// symlinks, and cannot DELETE a file a lower layer provides — composition only adds and
-    /// replaces.
+    /// replaces. With a manifest, every --overlay stacks ABOVE the manifest's last layer.
     #[arg(long = "overlay", value_name = "DIR")]
     pub overlay: Vec<PathBuf>,
 }
@@ -48,6 +50,9 @@ pub fn execute(args: PackageArgs, global: &GlobalArgs, io: &mut Io<'_>) -> i32 {
             return exit::USAGE;
         }
     };
+    if crate::manifest::is_manifest_path(&args.input) {
+        return execute_manifest(&args, format, io);
+    }
     if !args.input.is_dir() {
         let _ = writeln!(
             io.err,
@@ -69,6 +74,31 @@ pub fn execute(args: PackageArgs, global: &GlobalArgs, io: &mut Io<'_>) -> i32 {
     execute_package(&args, format, io)
 }
 
+/// `sutra package <manifest.yaml>`: resolve the manifest, compose its stack (plus any
+/// `--overlay` above it) and seal the composed tree.
+fn execute_manifest(args: &PackageArgs, format: ReportFormat, io: &mut Io<'_>) -> i32 {
+    let manifest = match crate::manifest::load(&args.input, &args.overlay) {
+        Ok(m) => m,
+        Err(msg) => {
+            let _ = writeln!(io.err, "package: manifest {}: {msg}", args.input.display());
+            return exit::USAGE;
+        }
+    };
+    match seal_manifest(&manifest, &args.out) {
+        Ok(outcome) => render_outcome(&outcome, format, io),
+        Err(e) => render_refusal("package", e, format, io),
+    }
+}
+
+/// Seal a resolved manifest into `out_dir` — shared by `package` and `deploy`.
+pub(crate) fn seal_manifest(
+    manifest: &crate::manifest::DeploymentManifest,
+    out_dir: &std::path::Path,
+) -> Result<sutra_loader::PackageOutcome, sutra_loader::PackageError> {
+    sutra_loader::assemble_stack(&manifest.stack, out_dir, &Default::default())
+        .map(|(outcome, _)| outcome)
+}
+
 fn execute_package(args: &PackageArgs, format: ReportFormat, io: &mut Io<'_>) -> i32 {
     let outcome = match sutra_loader::assemble_dir_with_overlays(
         &args.input,
@@ -79,6 +109,14 @@ fn execute_package(args: &PackageArgs, format: ReportFormat, io: &mut Io<'_>) ->
         Ok(outcome) => outcome,
         Err(e) => return render_refusal("package", e, format, io),
     };
+    render_outcome(&outcome, format, io)
+}
+
+fn render_outcome(
+    outcome: &sutra_loader::PackageOutcome,
+    format: ReportFormat,
+    io: &mut Io<'_>,
+) -> i32 {
     let diagnostics: Vec<Diagnostic> = outcome
         .report
         .diagnostics
@@ -118,7 +156,7 @@ fn execute_package(args: &PackageArgs, format: ReportFormat, io: &mut Io<'_>) ->
 
 /// A refusal renders every diagnostic in the shared shape: validation findings exit 1,
 /// I/O and container failures exit 2.
-fn render_refusal(
+pub(crate) fn render_refusal(
     command: &str,
     error: sutra_loader::PackageError,
     format: ReportFormat,

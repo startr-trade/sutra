@@ -10,7 +10,10 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::OnceLock;
 
 use sqlx::mysql::MySqlPoolOptions;
-use sutra_datastore::{MysqlDataStore, ProjectedStore, StoreDefinition, StructureRef};
+use sutra_datastore::{
+    build_migration_scripts, MigrationPlaceholders, MigrationScript, MysqlDataStore,
+    ProjectedStore, StoreDefinition, StructureRef,
+};
 
 static CONTAINER: OnceLock<(Box<dyn Any + Send + Sync>, u16)> = OnceLock::new();
 static DB_SEQ: AtomicU32 = AtomicU32::new(0);
@@ -208,4 +211,57 @@ pub fn coverage_store(db: &str) -> sutra_datastore::CoverageStore {
         structure: None,
     };
     sutra_datastore::CoverageStore::from_definition(&def).expect("coverage store builds")
+}
+
+// ---- migration ledger helpers ----------------------------------------------
+
+/// The store definition `store_with_ddl` builds, for tests that pass their own migrations.
+pub fn definition(db: &str, name: &str) -> StoreDefinition {
+    let mut properties = BTreeMap::new();
+    properties.insert("sql.url".to_string(), db_url(db));
+    StoreDefinition {
+        name: name.to_string(),
+        store_type: "sql".to_string(),
+        properties,
+        structure: None,
+    }
+}
+
+/// `files` prepared as the engine prepares a package's scripts (labels acme/orders/1.0.0).
+pub fn ledger_scripts(store: &str, files: &[(&str, &str)]) -> Vec<MigrationScript> {
+    let placeholders = MigrationPlaceholders {
+        tenant: "acme".into(),
+        module: "orders".into(),
+        version: "1.0.0".into(),
+        store_name: store.into(),
+        store_table: "data_store".into(),
+    };
+    let files = files
+        .iter()
+        .map(|(f, sql)| (f.to_string(), sql.to_string()))
+        .collect();
+    build_migration_scripts(store, files, &placeholders).expect("scripts prepare")
+}
+
+/// A store over `db` that applies `scripts` through the migration ledger.
+pub fn ledger_store(db: &str, name: &str, scripts: Vec<MigrationScript>) -> MysqlDataStore {
+    MysqlDataStore::from_definition(&definition(db, name), scripts).expect("store builds")
+}
+
+/// The number of ledger rows recorded for `store` in `db` (0 when the ledger does not exist).
+pub async fn ledger_count(db: &str, store: &str) -> i64 {
+    let pool = MySqlPoolOptions::new()
+        .max_connections(1)
+        .connect(&db_url(db))
+        .await
+        .expect("direct connect");
+    let count = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM sutra_store_migrations WHERE store_name = ?",
+    )
+    .bind(store)
+    .fetch_one(&pool)
+    .await
+    .unwrap_or(0);
+    pool.close().await;
+    count
 }

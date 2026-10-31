@@ -110,7 +110,7 @@ resolve a different codec registry than the archive it had just sealed.
 ### `sutra lint`
 
 ```
-sutra lint <PACKAGE_DIR> [--overlay <DIR>]...
+sutra lint <PACKAGE_DIR | MANIFEST.yaml> [--overlay <DIR>]...
 ```
 
 Runs the full package-time validation suite (the same fail-closed checks `sutra package` runs)
@@ -119,6 +119,12 @@ and emits nothing on success. The fast pre-flight before every `package`.
 `--overlay` composes base layers underneath `<PACKAGE_DIR>` before validating — the same
 composition `package` performs, so you lint exactly what would be sealed. See
 [Composing a package from layers](../building/deployment-packages.md#composing-a-package-from-layers).
+
+Given a deployment manifest (a `.yaml` file) instead of a directory, `lint` first prints the
+resolved stack — each layer in order, each overridden file with the layer that won and the one it
+overrode, and each `.ignore` removal — then the findings; `--format json` carries the same under a
+`stack` key. See
+[Deployment manifests](../building/deployment-packages.md#deployment-manifests-customers-editions-environments).
 
 ### `sutra describe`
 
@@ -171,7 +177,7 @@ changes — a CI gate on process-contract compatibility between releases.
 ### `sutra package`
 
 ```
-sutra package <INPUT> [--overlay <DIR>]... [-o|--out <DIR>]
+sutra package <INPUT | MANIFEST.yaml> [--overlay <DIR>]... [-o|--out <DIR>]
 ```
 
 Seals a deployment-package directory into one immutable `.sutra` archive, running the full
@@ -184,6 +190,18 @@ per-variant folder seal into one archive without being copied together by hand. 
 contain `package.yaml`, overridden paths are reported, and nothing is ever deleted. The resulting
 deployment id is identical to sealing a hand-merged directory of the same content. See
 [Composing a package from layers](../building/deployment-packages.md#composing-a-package-from-layers).
+
+`<INPUT>` may instead be a **deployment manifest** — a `.yaml` / `.yml` file naming the package
+labels and an ordered stack of layer folders, each optionally mounted with `at:` and able to drop
+lower-layer files with a `.ignore`. It seals to `<manifest-file-name>.sutra`, byte-identical to
+sealing the same merged tree by hand; `--overlay` flags stack above its last layer:
+
+```bash
+sutra package deploy/customer-a.2026r1.prod.yaml -o dist/   # → dist/customer-a.2026r1.prod.sutra
+```
+
+See [Deployment manifests](../building/deployment-packages.md#deployment-manifests-customers-editions-environments)
+for the format and a worked customer / edition / environment example.
 
 ### `sutra deployments list`
 
@@ -233,6 +251,11 @@ sutra deploy [ARCHIVE] [flags]
 Hot-deploys a sealed `.sutra` archive onto a running engine. See
 [Deploy, hot-deploy, and rollback](../operating/deploy-rollback.md) and
 [Deployment model](../architecture/deployment-model.md) for the full mechanics.
+
+`[ARCHIVE]` may also be a deployment manifest (`.yaml`): it is packaged first, exactly as
+`sutra package` would, and its `target:` block supplies any of the flags below that the command
+line leaves out — the command line wins. See
+[Deployment manifests](../building/deployment-packages.md#deployment-manifests-customers-editions-environments).
 
 | Flag | Meaning |
 |---|---|
@@ -322,7 +345,7 @@ instance did, offline. See [Logging and audit](../operating/logging.md).
 ### `sutra version`
 
 ```
-sutra version            # sutra 0.6.12
+sutra version            # sutra 0.6.13
 sutra --version          # identical text
 sutra version --format json
 ```
@@ -334,14 +357,14 @@ binary name prints that name, and one that versions itself independently of the 
 
 ```
 <tool> 2.0.0
-sutra  0.6.12 (engine)
+sutra  0.6.13 (engine)
 ```
 
 `--format json` is the structured form and always separates the two — `version` is the
 reporting tool's own, `engine` the embedded engine's (equal for this binary):
 
 ```json
-{"name":"sutra","version":"0.6.12","engine":"0.6.12"}
+{"name":"sutra","version":"0.6.13","engine":"0.6.13"}
 ```
 
 ---

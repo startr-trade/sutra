@@ -607,3 +607,338 @@ async fn key_query_prefix_range_paging_and_aggregates() {
         "{e}"
     );
 }
+
+// ---- key queries on a typed (projected) store (0.6.13) -------------------------------------
+
+/// The typed table of a store that runs key queries: `store_key` leads the primary key in a
+/// bytewise collation.
+const TYPED_QUERY_DDL: &str = "IF OBJECT_ID('ledger_entries', 'U') IS NULL \
+  CREATE TABLE ledger_entries ( \
+    store_key  NVARCHAR(512) COLLATE Latin1_General_100_BIN2 NOT NULL, \
+    account_id VARCHAR(35)   NOT NULL, \
+    balance    DECIMAL(18,2) NOT NULL, \
+    seq_no     INT           NOT NULL, \
+    frozen     BIT           NOT NULL, \
+    opened_at  DATE          NULL, \
+    rev        BIGINT        NOT NULL DEFAULT 1, \
+    updated_at DATETIME2     NOT NULL DEFAULT SYSUTCDATETIME(), \
+    CONSTRAINT pk_ledger_entries PRIMARY KEY NONCLUSTERED (store_key) \
+  );";
+
+fn typed_query(
+    lower: &str,
+    upper: Option<String>,
+    row_limit: Option<u32>,
+    aggregates: Vec<sutra_datastore::KeyQueryAggregate>,
+) -> sutra_datastore::KeyRangeQuery {
+    sutra_datastore::KeyRangeQuery {
+        lower: lower.to_string(),
+        upper,
+        after: None,
+        row_limit,
+        aggregates,
+    }
+}
+
+fn typed_prefix(
+    prefix: &str,
+    row_limit: Option<u32>,
+    aggregates: Vec<sutra_datastore::KeyQueryAggregate>,
+) -> sutra_datastore::KeyRangeQuery {
+    typed_query(
+        prefix,
+        sutra_datastore::keyquery::prefix_upper_bound(prefix),
+        row_limit,
+        aggregates,
+    )
+}
+
+fn as_cents(text: &str) -> i64 {
+    let (whole, frac) = text.split_once('.').unwrap_or((text, "0"));
+    assert!(
+        format!("{frac:0<2}")[2..].chars().all(|c| c == '0'),
+        "no residue: {text}"
+    );
+    whole.parse::<i64>().unwrap() * 100 + format!("{frac:0<2}")[..2].parse::<i64>().unwrap()
+}
+
+/// The typed-store key-query contract the PostgreSQL suite pins: prefix and range over the
+/// store's own table in bytewise key order, rows as the typed records a get returns, paging with
+/// `after`, count and exact sums on typed columns grouped by a typed column (NULL under "null"),
+/// the non-numeric rule, zeros on no match, the path refusal — and the refusal of a key column
+/// that does not sort bytewise.
+#[ignore = "docker"]
+#[tokio::test(flavor = "multi_thread")]
+async fn typed_store_key_query_prefix_range_paging_and_aggregates() {
+    let db = fixture::fresh_db().await;
+    let store = fixture::projected_store(&db, "ledger", "ledger_entries", TYPED_QUERY_DDL);
+    let (mut frozen_c, mut thawed_c, mut frozen_n, mut seq_sum) = (0i64, 0i64, 0i64, 0i64);
+    for s in 0..120i64 {
+        let cents = (s * 7919) % 10_000 + 1;
+        let frozen = s % 3 == 0;
+        if frozen {
+            frozen_c += cents;
+            frozen_n += 1;
+        } else {
+            thawed_c += cents;
+        }
+        seq_sum += s % 5;
+        let opened = if s % 4 == 0 {
+            String::new()
+        } else {
+            format!(r#","openedAt":"2026-10-0{}""#, s % 7 + 1)
+        };
+        let record = format!(
+            r#"{{"accountId":"ACC-{s}","balance":{}.{:02},"seqNo":{},"frozen":{frozen}{opened}}}"#,
+            cents / 100,
+            cents % 100,
+            s % 5
+        );
+        store
+            .put(
+                &format!("acct-1|{s:06}"),
+                &serde_json::Value::from_str(&record).unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+    let decoy = fixture::account_record();
+    for key in ["acct-0|000001", "acct-1}", "acct-2|000001"] {
+        store.put(key, &decoy).await.unwrap();
+    }
+
+    let aggregates = vec![
+        agg(Some("balance"), Some("frozen")),
+        agg(None, Some("openedAt")),
+        agg(Some("balance"), None),
+        agg(Some("seqNo"), None),
+    ];
+    let mut query = typed_prefix("acct-1|", Some(50), aggregates);
+    let mut seen = Vec::new();
+    loop {
+        let page = store.query(&query).await.unwrap();
+        for (key, value) in page.rows.iter().take(2) {
+            let got = store.get(key).await.unwrap().expect("row exists");
+            assert_eq!(value, &got, "a query row is the record a typed get returns");
+        }
+        let sutra_datastore::KeyAggregateResult::Grouped(by_frozen) = &page.aggregates[0] else {
+            panic!("grouped")
+        };
+        assert_eq!(by_frozen.len(), 2, "{by_frozen:?}");
+        assert_eq!(by_frozen["true"].count, frozen_n);
+        assert_eq!(
+            as_cents(by_frozen["true"].sum.as_deref().unwrap()),
+            frozen_c
+        );
+        assert_eq!(
+            as_cents(by_frozen["false"].sum.as_deref().unwrap()),
+            thawed_c
+        );
+        let sutra_datastore::KeyAggregateResult::Grouped(by_day) = &page.aggregates[1] else {
+            panic!("grouped")
+        };
+        assert_eq!(by_day.len(), 8, "{by_day:?}");
+        assert_eq!(
+            by_day["null"].count, 30,
+            "an absent optional field groups under null"
+        );
+        assert!(by_day.contains_key("2026-10-02"), "{by_day:?}");
+        let sutra_datastore::KeyAggregateResult::Total(total) = &page.aggregates[2] else {
+            panic!("total")
+        };
+        assert_eq!(total.count, 120, "aggregates ignore the row limit");
+        assert_eq!(as_cents(total.sum.as_deref().unwrap()), frozen_c + thawed_c);
+        let sutra_datastore::KeyAggregateResult::Total(seq) = &page.aggregates[3] else {
+            panic!("total")
+        };
+        assert_eq!(seq.sum.as_deref(), Some(seq_sum.to_string().as_str()));
+        seen.extend(page.rows.iter().map(|(k, _)| k.clone()));
+        match page.next {
+            Some(next) => {
+                assert!(page.truncated);
+                query.after = Some(next);
+            }
+            None => break,
+        }
+    }
+    assert_eq!(seen.len(), 120);
+    assert!(seen.windows(2).all(|w| w[0] < w[1]));
+    assert!(seen.iter().all(|k| k.starts_with("acct-1|")));
+
+    // A range: from inclusive, to exclusive.
+    let range = typed_query(
+        "acct-0|000001",
+        Some("acct-1|000002".into()),
+        Some(10),
+        vec![agg(None, None)],
+    );
+    let page = store.query(&range).await.unwrap();
+    let keys: Vec<&str> = page.rows.iter().map(|(k, _)| k.as_str()).collect();
+    assert_eq!(
+        keys,
+        vec!["acct-0|000001", "acct-1|000000", "acct-1|000001"]
+    );
+    assert_eq!(page.rows[0].1, decoy);
+
+    // A text column sums nothing here and counts every value as non-numeric.
+    let page = store
+        .query(&typed_prefix(
+            "acct-1|",
+            None,
+            vec![agg(Some("accountId"), None)],
+        ))
+        .await
+        .unwrap();
+    let sutra_datastore::KeyAggregateResult::Total(text) = &page.aggregates[0] else {
+        panic!("total")
+    };
+    assert_eq!(
+        (text.count, text.sum.as_deref(), text.non_numeric),
+        (120, Some("0"), 120)
+    );
+
+    // No match: zeros, not null.
+    let page = store
+        .query(&typed_prefix(
+            "nobody|",
+            Some(10),
+            vec![
+                agg(Some("balance"), Some("frozen")),
+                agg(Some("balance"), None),
+            ],
+        ))
+        .await
+        .unwrap();
+    assert!(page.rows.is_empty() && page.next.is_none() && !page.truncated);
+    assert_eq!(
+        page.aggregates[0],
+        sutra_datastore::KeyAggregateResult::Grouped(Default::default())
+    );
+    let sutra_datastore::KeyAggregateResult::Total(total) = &page.aggregates[1] else {
+        panic!("total")
+    };
+    assert_eq!((total.count, total.sum.as_deref()), (0, Some("0")));
+
+    // A nested path or an undeclared field is refused.
+    for bad in [
+        sutra_datastore::KeyQueryAggregate {
+            sum_field: Some(vec!["balance".into(), "value".into()]),
+            group_by: None,
+        },
+        agg(None, Some("missing")),
+    ] {
+        let e = store
+            .query(&typed_prefix("acct-1|", Some(1), vec![bad]))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            e.code(),
+            Some(sutra_datastore::keyquery::codes::QUERY_UNSUPPORTED),
+            "{e}"
+        );
+    }
+
+    // The shipped projected DDL keys in a case-insensitive collation: refused, naming the table.
+    let other = fixture::fresh_db().await;
+    let linguistic = fixture::projected_store(&other, "ledger", "accounts", fixture::PROJECTED_DDL);
+    let e = linguistic
+        .query(&typed_prefix("acct-1|", Some(10), vec![]))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        e.code(),
+        Some(sutra_datastore::keyquery::codes::QUERY_KEY_ORDER),
+        "{e}"
+    );
+    assert!(e.to_string().contains("ALTER TABLE accounts"), "{e}");
+}
+
+// ---- the migration ledger (run once, checksums, adoption, placeholders) ------
+
+/// Deliberately NOT idempotent: a second run violates the primary key.
+const LEDGER_SEED: &str = "INSERT INTO data_store (store_name, store_key, store_value) \
+     VALUES ('${store.name}', 'seed-${package.tenant}', '{\"module\":\"${package.module}\"}');";
+const LEDGER_V3: &str = "INSERT INTO data_store (store_name, store_key, store_value) \
+     VALUES ('${store.name}', 'v3', '{\"version\":\"${package.version}\"}');";
+
+#[ignore = "docker"]
+#[tokio::test(flavor = "multi_thread")]
+async fn migration_ledger_runs_each_script_once_and_refuses_an_edited_one() {
+    let db = fixture::fresh_db().await;
+    let v1v2 = [
+        ("V1__table.sql", fixture::CUTOVER_DDL),
+        ("V2__seed.sql", LEDGER_SEED),
+    ];
+
+    // (1) + (6): first boot applies and records; the seed carries the substituted labels.
+    let first = fixture::ledger_store(&db, "ledger", fixture::ledger_scripts("ledger", &v1v2));
+    assert_eq!(
+        first.get("seed-acme").await.unwrap(),
+        Some(json!({"module": "orders"}))
+    );
+    assert_eq!(fixture::ledger_count(&db, "ledger").await, 2);
+    // A re-boot runs nothing — the seed would collide.
+    let reboot = fixture::ledger_store(&db, "ledger", fixture::ledger_scripts("ledger", &v1v2));
+    assert!(reboot.get("seed-acme").await.unwrap().is_some());
+    assert_eq!(fixture::ledger_count(&db, "ledger").await, 2);
+
+    // (2) adding V3 runs exactly V3, once.
+    let v1v3 = [v1v2[0], v1v2[1], ("V3__more.sql", LEDGER_V3)];
+    let upgraded = fixture::ledger_store(&db, "ledger", fixture::ledger_scripts("ledger", &v1v3));
+    assert_eq!(
+        upgraded.get("v3").await.unwrap(),
+        Some(json!({"version": "1.0.0"}))
+    );
+    let again = fixture::ledger_store(&db, "ledger", fixture::ledger_scripts("ledger", &v1v3));
+    assert!(again.get("v3").await.unwrap().is_some());
+    assert_eq!(fixture::ledger_count(&db, "ledger").await, 3);
+
+    // (3) an edited, already-applied script refuses the store.
+    let edited = [v1v2[0], ("V2__seed.sql", "SELECT 1;")];
+    let refused = fixture::ledger_store(&db, "ledger", fixture::ledger_scripts("ledger", &edited));
+    let err = refused.get("seed-acme").await.unwrap_err().to_string();
+    assert!(
+        err.contains("SUTRA.RUNTIME.DATASTORE.MIGRATION_CHECKSUM") && err.contains("V2__seed.sql"),
+        "{err}"
+    );
+
+    // (4) two replicas racing first use apply each script exactly once.
+    let a = fixture::ledger_store(&db, "race", fixture::ledger_scripts("race", &v1v2));
+    let b = fixture::ledger_store(&db, "race", fixture::ledger_scripts("race", &v1v2));
+    let (ra, rb) = tokio::join!(a.get("seed-acme"), b.get("seed-acme"));
+    assert!(ra.unwrap().is_some() && rb.unwrap().is_some());
+    assert_eq!(fixture::ledger_count(&db, "race").await, 2);
+
+    // (5) adoption: a table built before the ledger existed — the idempotent script runs once
+    // more and is recorded; existing rows survive.
+    let legacy = fixture::store(&db, "adopt");
+    legacy.put("kept", &json!({"old": true})).await.unwrap();
+    assert_eq!(fixture::ledger_count(&db, "adopt").await, 0);
+    let adopted = fixture::ledger_store(
+        &db,
+        "adopt",
+        fixture::ledger_scripts("adopt", &[("V1__table.sql", fixture::CUTOVER_DDL)]),
+    );
+    assert_eq!(
+        adopted.get("kept").await.unwrap(),
+        Some(json!({"old": true}))
+    );
+    assert_eq!(fixture::ledger_count(&db, "adopt").await, 1);
+
+    // A failed script is rolled back and records nothing (SQL Server DDL is transactional), so
+    // the fixed package re-creates the same table cleanly.
+    let bad = [
+        ("V1__table.sql", fixture::CUTOVER_DDL),
+        (
+            "V2__bad.sql",
+            "CREATE TABLE half_done (x INT); INSERT INTO no_such_table VALUES (1);",
+        ),
+    ];
+    let broken = fixture::ledger_store(&db, "broken", fixture::ledger_scripts("broken", &bad));
+    assert!(broken.get("k").await.is_err());
+    assert_eq!(fixture::ledger_count(&db, "broken").await, 1);
+    let good = [bad[0], ("V2__bad.sql", "CREATE TABLE half_done (x INT);")];
+    let fixed = fixture::ledger_store(&db, "broken", fixture::ledger_scripts("broken", &good));
+    assert_eq!(fixed.get("k").await.unwrap(), None);
+    assert_eq!(fixture::ledger_count(&db, "broken").await, 2);
+}

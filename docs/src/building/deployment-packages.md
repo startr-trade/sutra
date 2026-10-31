@@ -116,13 +116,124 @@ The rules, in the order they bite:
   inside an overlay is refused rather than quietly merged.
 - **Every overridden path is reported,** so a variant shadowing a shared file does it visibly.
 - **Nothing is deleted.** A variant can add to or replace shared content, never remove it. Content a
-  variant must not carry does not belong in `shared/`.
+  variant must not carry does not belong in `shared/` — or use a
+  [deployment manifest](#deployment-manifests-customers-editions-environments), whose layers can
+  drop files with `.ignore`.
 - **The package directory's name names the archive** (`acme--order-intake--1.0.0.sutra`), which is
   why variant directories are named after their labels.
 - **Composition happens at package time.** The sealed archive holds the merged file set and knows
   nothing about layers, and its deployment id is identical to sealing a hand-merged directory with
   the same content. Layering is an authoring convenience; it changes nothing about what deploys, or
   about how the engine loads it.
+
+## Deployment manifests — customers, editions, environments {#deployment-manifests-customers-editions-environments}
+
+`--overlay` covers one shared folder plus one variant. When a package is assembled from more
+dimensions — shared content, a product edition, a customer, an environment — write the stack down
+once in a **deployment manifest** and hand that file to `sutra lint`, `sutra package` or
+`sutra deploy` in place of the package directory:
+
+```text
+order-hub/
+├── shared/schemas/                  # used by several products; mounted at schemas/
+├── app/
+│   ├── shared/                      # bpmn/ rules/ templates/ channels.yaml
+│   └── editions/
+│       └── 2026r1/                  # what this edition changes (bpmn/intake.bpmn)
+├── customers/customer-a/
+│   ├── common/                      # this customer's templates
+│   └── envs/
+│       ├── dev/                     # channels.yaml + .ignore
+│       └── prod/                    # channels.yaml
+└── deploy/
+    ├── customer-a.2026r1.dev.yaml
+    └── customer-a.2026r1.prod.yaml
+```
+
+```yaml
+# deploy/customer-a.2026r1.dev.yaml
+deployment: customer-a-dev            # optional, informational
+package:                              # becomes the package's package.yaml
+  tenant: customer-a                  # tenant / module / version are label shorthands
+  module: order-hub
+  version: 1.1.0
+  engine: { minContract: 1 }
+layers:                               # lowest first; later wins; relative to this file
+  - path: ../shared/schemas
+    at: schemas                       # mount this folder under schemas/
+  - ../app/shared
+  - ../app/editions/2026r1
+  - ../customers/customer-a/common
+  - ../customers/customer-a/envs/dev
+target:                               # optional: sutra deploy's flags
+  engine-url: http://localhost:8088
+  api: true
+```
+
+`deploy/customer-a.2026r1.prod.yaml` is the same file with `envs/prod` as its last layer and its
+own `target:`. The dev layer overrides `channels.yaml` and drops a process dev does not run:
+
+```text
+# customers/customer-a/envs/dev/.ignore
+bpmn/reconcile.bpmn
+```
+
+```bash
+sutra lint    deploy/customer-a.2026r1.dev.yaml
+sutra package deploy/customer-a.2026r1.prod.yaml -o dist/     # → dist/customer-a.2026r1.prod.sutra
+sutra deploy  deploy/customer-a.2026r1.dev.yaml
+```
+
+`sutra lint` prints the resolved stack before its findings, so what will be sealed is never a
+guess:
+
+```text
+manifest deploy/customer-a.2026r1.dev.yaml (deployment customer-a-dev)
+  layer 1 ../shared/schemas (at schemas)
+  layer 2 ../app/shared
+  layer 3 ../app/editions/2026r1
+  layer 4 ../customers/customer-a/common
+  layer 5 ../customers/customer-a/envs/dev
+  override bpmn/intake.bpmn: layer 3 ../app/editions/2026r1 over layer 2 ../app/shared
+  override channels.yaml: layer 5 ../customers/customer-a/envs/dev over layer 2 ../app/shared
+  removed bpmn/reconcile.bpmn: by layer 5 ../customers/customer-a/envs/dev .ignore 'bpmn/reconcile.bpmn' (was from layer 2 ../app/shared)
+```
+
+The rules:
+
+- **It is only a shorthand.** The CLI turns the manifest into a generated `package.yaml` plus the
+  layer stack, then validates and seals exactly as for a directory. Sealing a manifest produces the
+  same archive bytes and the same deployment id as sealing a hand-merged directory holding the same
+  files and the same `package.yaml`. The archive is named after the manifest file
+  (`customer-a.2026r1.dev.sutra`).
+- **A closed schema.** The top-level keys are `deployment`, `package`, `layers` and `target`; any
+  other key is refused. `package:` takes the `package.yaml` keys (`labels`, `engine`,
+  `entryProcesses`, `audit`, `properties`) plus the `tenant`, `module` and `version` shorthands;
+  `module` and `version` are required.
+- **Layers** apply in order, a later layer's copy of a file replacing an earlier one's; every
+  override is reported. A layer may not carry `package.yaml` — the refusal names the layer. A
+  missing layer folder, or an `at:` that is absolute or climbs out with `..`, is refused.
+- **`--overlay` still works** and stacks above the manifest's last layer.
+- **`target:`** takes `sutra deploy`'s flag names (`context`, `namespace`, `configmap`,
+  `secret-name`, `engine-url`, `api`, `async`, `wait`, `wait-timeout`, `api-key-header`). A flag
+  given on the command line wins. Secrets never go in a manifest — pass them with `--secret` or
+  `--secret-from`.
+
+### `.ignore` — removing what a lower layer brought
+
+A layer may carry a `.ignore` file at its root. It uses gitignore syntax — `#` comments, `*`, `?`
+and `[…]` within a path segment, `**` across segments, a trailing `/` for a directory, a leading
+or inner `/` to anchor, `!` to re-include — and:
+
+- patterns are relative to the **package root**, not to the layer folder (nor to its `at:`);
+- when the layer is applied, its patterns first remove matching files contributed by the layers
+  **below** it, then the layer's own files are added — a layer never ignores its own files;
+- the last matching pattern decides, a pattern naming a directory covers everything under it, and a
+  `!` pattern can bring back a single file under an ignored directory;
+- `package.yaml` can never be ignored;
+- a pattern that removes nothing is reported as a warning (`SUTRA.DEPLOY.PACKAGE.IGNORE_UNMATCHED`)
+  — it is usually stale or mistyped;
+- `.ignore` files are never sealed into the archive.
 
 ## Referencing resources — convention over configuration
 
@@ -313,13 +424,14 @@ carries no `migrations:` key and a package carries no `migrations/coverage/` fol
 
 Three properties of how the package's own scripts run are worth designing around:
 
-- **Applied in `V<n>__` order, once per store instance**, before the store serves its first
-  operation — and serialized across replicas, so two engines booting at once don't race.
-- **There is no migration ledger.** The engine's own Flyway-style history table covers engine
-  tables only; a module store's scripts are simply re-run on the next boot. **Write them
-  idempotently** — `CREATE TABLE IF NOT EXISTS`, `INSERT … ON CONFLICT DO NOTHING`,
-  `CREATE INDEX IF NOT EXISTS` — because that is what makes the re-run a no-op rather than a
-  failure.
+- **Applied in `V<n>__` order, before the store serves its first operation** — and serialized
+  across replicas, so two engines booting at once don't race.
+- **Each script runs once per database.** Applied scripts are recorded in a history table,
+  `sutra_store_migrations`, in the store's own database; a recorded script is skipped on every
+  later boot, and editing one after it was applied refuses the store
+  (`SUTRA.RUNTIME.DATASTORE.MIGRATION_CHECKSUM`). A change is always a new, higher-numbered
+  script. See [Migrations run once](data-stores.md#migrations-run-once) for the full rules,
+  including the five `${…}` placeholders a script can use.
 - **A store's data carries across a version bump.** There is no `deployment_id` on a business
   store's rows: deploying `1.0.1` beside `1.0.0` doesn't fork the data, and that is the feature,
   not an oversight.

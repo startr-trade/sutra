@@ -414,14 +414,26 @@ fn structure_string(
 }
 
 /// Read a store's module-resident migrations — `properties["sql.migrations"]` resolved
-/// relative to the binding's version directory, `*.sql` in filename order. The idempotent
-/// SQL the provider runs once on first use.
+/// relative to the binding's version directory, `*.sql` in filename order, as raw text with no
+/// placeholder substitution and no ledger. The engine itself uses
+/// [`crate::migration::load_migration_scripts`]; this stays for callers that only want the text.
 /// Empty when the store declares no migrations folder; fails closed when it declares one
 /// that is not a directory.
 pub fn load_migrations(
     def: &StoreDefinition,
     binding_dir: &Path,
 ) -> Result<Vec<String>, DataStoreError> {
+    Ok(read_migration_files(def, binding_dir)?
+        .into_iter()
+        .map(|(_, sql)| sql)
+        .collect())
+}
+
+/// The `(file name, SQL)` pairs of a store's migrations folder, in filename order.
+pub(crate) fn read_migration_files(
+    def: &StoreDefinition,
+    binding_dir: &Path,
+) -> Result<Vec<(String, String)>, DataStoreError> {
     let Some(rel) = def
         .properties
         .get("sql.migrations")
@@ -451,13 +463,18 @@ pub fn load_migrations(
     files.sort();
     let mut scripts = Vec::new();
     for f in files {
-        scripts.push(std::fs::read_to_string(&f).map_err(|e| {
+        let sql = std::fs::read_to_string(&f).map_err(|e| {
             DataStoreError::new(format!(
                 "failed to read migrations for data store '{}' at '{}': {e}",
                 def.name,
                 f.display()
             ))
-        })?);
+        })?;
+        let name = f
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        scripts.push((name, sql));
     }
     Ok(scripts)
 }

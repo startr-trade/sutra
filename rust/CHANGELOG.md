@@ -13,6 +13,63 @@ This is the changelog for the **Rust-native** engine (`rust/` workspace). It beg
 
 Nothing yet.
 
+## [0.6.13] — 2026-10-31
+
+A **feature** release for authors who run one module in several combinations (customer, edition,
+environment) and keep typed data stores. Key queries work on typed stores, module-store migrations
+run once through a ledger and take placeholders, and `lint`/`package`/`deploy` accept a deployment
+manifest. No `urn:sutra:q:1.0` element or attribute change (annotation text only), no archive
+format, deploymentId or snapshot change. **Behaviour change:** module-store migration scripts now
+run once per database instead of on every first use; existing databases adopt the ledger on the
+first boot (see below).
+
+### Added
+
+- **Key queries and aggregates on typed (projected) stores.** `<q:store query="prefix|range">`
+  and its `<q:aggregate sum=… groupBy=…/>` children now run on a store that declares a
+  `structure`, not only on key/value stores. The query reads the store's own table on `store_key`
+  (bytewise order, paging with `next`), rows come back as the typed record, and `count`/`sum`/
+  `groupBy` are real SQL aggregates over declared columns. `sum` and `groupBy` name one declared
+  field; a nested path, an unknown field or a sum over a date/boolean/time column is refused by
+  `sutra lint` and at runtime (`SUTRA.RUNTIME.DATASTORE.QUERY_UNSUPPORTED`). Before its first
+  query the table is checked for a bytewise `store_key` collation and an index led by
+  `store_key` (`QUERY_KEY_ORDER`/`QUERY_KEY_INDEX`). PostgreSQL, MySQL/MariaDB and SQL Server.
+- **Migration ledger for module stores.** Each database gets a `sutra_store_migrations` table
+  (store, version, script, checksum, applied_at). A script runs exactly once, in order (`V<n>__`
+  files numerically), serialized across replicas under the existing migration lock; on PostgreSQL
+  and SQL Server a script and its ledger row commit in one transaction. An already-applied script
+  whose content changed is refused (`SUTRA.RUNTIME.DATASTORE.MIGRATION_CHECKSUM`): add a new
+  `V<n+1>__` script instead. Two files with one version are refused
+  (`SUTRA.CONFIG.DATASTORE.MIGRATION_VERSION_DUPLICATE`).
+  **Adoption:** a database with no ledger rows runs every script once more (they had to be
+  idempotent until now) and records it, so existing deployments keep working. A script that cannot
+  run inside a transaction (PostgreSQL `CREATE INDEX CONCURRENTLY`) now fails on PostgreSQL and SQL
+  Server.
+- **Migration placeholders.** `${package.tenant}`, `${package.module}`, `${package.version}`,
+  `${store.name}` and `${store.table}` are substituted in migration SQL before it runs and before
+  its checksum; `$${` writes a literal `${`; any other `${…}` is refused
+  (`SUTRA.CONFIG.DATASTORE.MIGRATION_PLACEHOLDER`). `sutra lint` replays migrations with the
+  substitution. A script using `${package.version}` changes checksum with every version bump, so
+  use it only in scripts written for one release.
+- **Deployment manifests.** `sutra lint`, `sutra package` and `sutra deploy` accept a manifest
+  file (`deploy/<any-name>.yaml`) in place of a package dir: a `package:` block (labels, engine,
+  properties — becomes the sealed `package.yaml`), ordered `layers:` (`path`, optional `at:`,
+  relative to the manifest) and an optional `target:` (the deploy flags). It is pure de-sugaring:
+  sealing from a manifest gives the same bytes and deploymentId as sealing the merged tree by
+  hand. A layer may carry a `.ignore` (gitignore syntax, relative to the package root, `!`
+  negation) that removes paths contributed by lower layers before the layer's own files are added;
+  `package.yaml` can't be ignored, an unmatched pattern warns
+  (`SUTRA.DEPLOY.PACKAGE.IGNORE_UNMATCHED`) and `.ignore` is never sealed. No layer may contain
+  `package.yaml`. Lint prints the resolved stack, every overridden path with the layer that won,
+  and every removal. `--overlay` flags stack above the manifest's layers; command-line deploy
+  flags win over `target:`.
+
+Tests: tier-2 typed-query suites on PostgreSQL (6,000 rows, EXPLAIN shows no sequential scan),
+MySQL, MariaDB and SQL Server; tier-2 ledger suites on all four (re-boot runs nothing, a new
+version runs once, an edited script is refused, a two-replica race applies once, adoption,
+placeholders); tier-1 manifest suite (seal equality, `.ignore`, order, `at:`, refusals, flag
+precedence, a mock-engine deploy).
+
 ## [0.6.12] — 2026-10-30
 
 A **patch** release: two outbox fixes found under load, a data-store first-use race, and resource

@@ -28,6 +28,7 @@ pub mod archive;
 pub mod coverage;
 pub mod ddl;
 pub mod error;
+pub mod layer_stack;
 pub mod lint;
 pub mod overlay;
 pub mod package;
@@ -41,6 +42,10 @@ pub use archive::{
 };
 pub use coverage::{BusinessCorrelation, CoverageFile, CoverageRoute, Hop};
 pub use error::LoaderError;
+pub use layer_stack::{
+    assemble_stack, compose_stack, lint_stack, LayerStack, StackLayer, StackOverride, StackRemoval,
+    StackResolution,
+};
 pub use lint::{LintDiagnostic, LintReport, LintSeverity};
 pub use overlay::{
     assemble_dir_with_overlays, compose_overlays, lint_dir_with_overlays, ComposedPackage,

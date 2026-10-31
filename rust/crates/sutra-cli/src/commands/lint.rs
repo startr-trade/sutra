@@ -15,7 +15,8 @@ use crate::GlobalArgs;
 
 #[derive(Debug, clap::Args)]
 pub struct LintArgs {
-    /// Deployment-package directory to validate (contains package.yaml).
+    /// Deployment-package directory to validate (contains package.yaml) — or a deployment
+    /// manifest (`.yaml`/`.yml`), whose resolved layer stack is printed before the findings.
     pub package_dir: PathBuf,
 
     /// Directory to compose UNDER the package dir; repeatable, lowest layer first.
@@ -29,7 +30,7 @@ pub struct LintArgs {
     /// Every overridden path is reported as a warning naming the layer that won. An overlay
     /// may not carry package.yaml (labels come from the package dir alone), may not contain
     /// symlinks, and cannot DELETE a file a lower layer provides — composition only adds and
-    /// replaces.
+    /// replaces. With a manifest, every --overlay stacks ABOVE the manifest's last layer.
     #[arg(long = "overlay", value_name = "DIR")]
     pub overlay: Vec<PathBuf>,
 }
@@ -55,7 +56,20 @@ pub fn execute(args: LintArgs, global: &GlobalArgs, io: &mut Io<'_>) -> i32 {
             return exit::USAGE;
         }
     };
-    if !args.package_dir.is_dir() {
+    let mut manifest = None;
+    if crate::manifest::is_manifest_path(&args.package_dir) {
+        match crate::manifest::load(&args.package_dir, &args.overlay) {
+            Ok(m) => manifest = Some(m),
+            Err(msg) => {
+                let _ = writeln!(
+                    io.err,
+                    "lint: manifest {}: {msg}",
+                    args.package_dir.display()
+                );
+                return exit::USAGE;
+            }
+        }
+    } else if !args.package_dir.is_dir() {
         let _ = writeln!(
             io.err,
             "lint: package directory not found: {}",
@@ -64,7 +78,7 @@ pub fn execute(args: LintArgs, global: &GlobalArgs, io: &mut Io<'_>) -> i32 {
         return exit::USAGE;
     }
     for overlay in &args.overlay {
-        if !overlay.is_dir() {
+        if manifest.is_none() && !overlay.is_dir() {
             let _ = writeln!(
                 io.err,
                 "lint: overlay directory not found: {}",
@@ -74,25 +88,40 @@ pub fn execute(args: LintArgs, global: &GlobalArgs, io: &mut Io<'_>) -> i32 {
         }
     }
 
-    let report = sutra_loader::lint_dir_with_overlays(&args.package_dir, &args.overlay);
+    let (report, resolution) = match &manifest {
+        Some(m) => {
+            let (report, resolution) = sutra_loader::lint_stack(&m.stack);
+            (report, Some(resolution))
+        }
+        None => (
+            sutra_loader::lint_dir_with_overlays(&args.package_dir, &args.overlay),
+            None,
+        ),
+    };
     let diagnostics: Vec<Diagnostic> = report.diagnostics.iter().map(diagnostic_of).collect();
     let errors = report.errors().count();
     let warnings = report.warnings().count();
 
     match format {
         ReportFormat::Text => {
+            if let (Some(m), Some(r)) = (&manifest, &resolution) {
+                let _ = write!(io.out, "{}", crate::manifest::render_resolution_text(m, r));
+            }
             for diagnostic in &diagnostics {
                 let _ = writeln!(io.out, "{}", diagnostic.render_text());
             }
             let _ = writeln!(io.out, "{errors} error(s), {warnings} warning(s)");
         }
         ReportFormat::Json => {
-            let payload = serde_json::json!({
+            let mut payload = serde_json::json!({
                 "packageDir": args.package_dir.display().to_string(),
                 "errors": errors,
                 "warnings": warnings,
                 "diagnostics": diagnostics.iter().map(Diagnostic::to_json).collect::<Vec<_>>(),
             });
+            if let (Some(m), Some(r)) = (&manifest, &resolution) {
+                payload["stack"] = crate::manifest::resolution_json(m, r);
+            }
             let _ = writeln!(io.out, "{payload}");
         }
     }

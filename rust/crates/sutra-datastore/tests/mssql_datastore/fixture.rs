@@ -7,7 +7,10 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::OnceLock;
 
-use sutra_datastore::{MssqlDataStore, ProjectedStore, StoreDefinition, StructureRef};
+use sutra_datastore::{
+    build_migration_scripts, MigrationPlaceholders, MigrationScript, MssqlDataStore,
+    ProjectedStore, StoreDefinition, StructureRef,
+};
 use testcontainers::runners::SyncRunner;
 use testcontainers::{Container, ImageExt};
 use testcontainers_modules::mssql_server::MssqlServer;
@@ -265,4 +268,74 @@ pub fn coverage_store(db: &str) -> sutra_datastore::CoverageStore {
         structure: None,
     };
     sutra_datastore::CoverageStore::from_definition(&def).expect("coverage store builds")
+}
+
+// ---- migration ledger helpers ----------------------------------------------
+
+/// The store definition `store_with_ddl` builds, for tests that pass their own migrations.
+pub fn definition(db: &str, name: &str) -> StoreDefinition {
+    let mut properties = BTreeMap::new();
+    properties.insert(
+        "sql.url".to_string(),
+        format!(
+            "sqlserver://127.0.0.1:{};databaseName={db};trustServerCertificate=true",
+            container_port()
+        ),
+    );
+    properties.insert("sql.username".to_string(), "sa".to_string());
+    properties.insert(
+        "sql.password".to_string(),
+        MssqlServer::DEFAULT_SA_PASSWORD.to_string(),
+    );
+    StoreDefinition {
+        name: name.to_string(),
+        store_type: "sql".to_string(),
+        properties,
+        structure: None,
+    }
+}
+
+/// `files` prepared as the engine prepares a package's scripts (labels acme/orders/1.0.0).
+pub fn ledger_scripts(store: &str, files: &[(&str, &str)]) -> Vec<MigrationScript> {
+    let placeholders = MigrationPlaceholders {
+        tenant: "acme".into(),
+        module: "orders".into(),
+        version: "1.0.0".into(),
+        store_name: store.into(),
+        store_table: "data_store".into(),
+    };
+    let files = files
+        .iter()
+        .map(|(f, sql)| (f.to_string(), sql.to_string()))
+        .collect();
+    build_migration_scripts(store, files, &placeholders).expect("scripts prepare")
+}
+
+/// A store over `db` that applies `scripts` through the migration ledger.
+pub fn ledger_store(db: &str, name: &str, scripts: Vec<MigrationScript>) -> MssqlDataStore {
+    MssqlDataStore::from_definition(&definition(db, name), scripts).expect("store builds")
+}
+
+/// The number of ledger rows recorded for `store` in `db` (0 when the ledger does not exist).
+pub async fn ledger_count(db: &str, store: &str) -> i32 {
+    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", container_port()))
+        .await
+        .expect("tcp connect");
+    tcp.set_nodelay(true).unwrap();
+    let mut client = tiberius::Client::connect(base_config(db), tcp.compat_write())
+        .await
+        .expect("db connect");
+    let sql = format!(
+        "IF OBJECT_ID('sutra_store_migrations', 'U') IS NULL SELECT 0 ELSE \
+         SELECT COUNT(*) FROM sutra_store_migrations WHERE store_name = '{store}'"
+    );
+    let row = client
+        .simple_query(sql)
+        .await
+        .expect("ledger count")
+        .into_row()
+        .await
+        .expect("ledger count row")
+        .expect("one row");
+    row.get::<i32, _>(0).expect("count")
 }

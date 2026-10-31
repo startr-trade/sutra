@@ -139,7 +139,7 @@ datastores:
       url-ref: env:ACCOUNTS_DB_URL
       username-ref: env:ACCOUNTS_DB_USER
       password-ref: env:ACCOUNTS_DB_PASSWORD
-      migrations: migrations/accounts     # idempotent SQL, run once on first use
+      migrations: migrations/accounts     # V<n>__*.sql, each run once per database
     dataClass: financial                  # sensitivity tag — redacted in audit/logs/traces
 ```
 
@@ -149,6 +149,67 @@ not one per store, because several stores often share one table and the same `CR
 EXISTS`. Before 0.6.12 the lock was per store, and two stores sharing a table that were first used
 at the same moment could fail that first request with HTTP 500
 (`pg_type_typname_nsp_index`); the next request succeeded.
+
+### Migrations run once {#migrations-run-once}
+
+The engine records every script it applies in a history table, `sutra_store_migrations`, created
+in the store's own database the first time a store there migrates. The table has one row per store
+and version: `store_name`, `version`, `script` (the file name), `checksum` (the SHA-256 of the
+script as it ran) and `applied_at`. On first use, under the lock described above, each script is
+checked against that table:
+
+- **Recorded with the same checksum**: skipped. A restart, a second replica or a redeploy of the
+  same package runs nothing.
+- **Not recorded**: it runs, then its row is written. On PostgreSQL and SQL Server the script and
+  its row commit in one transaction, so a script that fails leaves neither its changes nor a row
+  behind. MySQL and MariaDB commit DDL implicitly, so there the script runs first and its row is
+  written after it succeeds. Either way, a failed script records nothing and fails the store's first
+  use; the next use tries again.
+  Because of that transaction, a statement PostgreSQL refuses inside one (`CREATE INDEX
+  CONCURRENTLY`, for example) cannot be in a migration script; create such an index outside the
+  package's migrations.
+- **Recorded with a different checksum**: the store refuses to start with
+  `SUTRA.RUNTIME.DATASTORE.MIGRATION_CHECKSUM`, naming the store, the file, the version and both
+  checksums. A script that has been applied must not be edited. Restore it, and put the change in a
+  new script with the next version number.
+
+Rows for scripts the package no longer ships are ignored.
+
+**Versions and order.** `V<n>__<description>.sql` has version `<n>` with leading zeros dropped, so
+`V001__accounts.sql` and `V1__accounts.sql` are the same version, and two scripts of one store
+with the same version are refused (`SUTRA.CONFIG.DATASTORE.MIGRATION_VERSION_DUPLICATE`). When
+every script is named this way they run in numeric order, so `V2` runs before `V10`. A script with
+any other name still works: its version is its file name without `.sql`, and a folder that mixes
+the two styles runs in plain file-name order. `sutra lint` requires the `V<n>__` form.
+
+**Databases migrated before the history table existed.** Releases before 0.6.13 re-ran every
+script on every boot and kept no record, which is why those scripts had to be idempotent. Nothing
+special is needed to move such a database over: it has no rows for the store, so each script runs
+one more time, harmlessly, and is recorded. From then on it runs once.
+
+**Placeholders.** A script can use five placeholders, replaced before it runs and before its
+checksum is taken:
+
+| Placeholder | Replaced with |
+|---|---|
+| `${package.tenant}` | the package's `tenant` label |
+| `${package.module}` | the package's `module` label |
+| `${package.version}` | the package's `version` label |
+| `${store.name}` | the store's `name` in `datastores.yaml` |
+| `${store.table}` | the table the store writes: its `sql.table` (or its name) when it declares a `structure:`, otherwise `data_store` |
+
+```sql
+-- migrations/accounts/V002__seed.sql
+INSERT INTO data_store (store_name, store_key, store_value)
+VALUES ('${store.name}', 'settings', '{"owner":"${package.tenant}"}');
+```
+
+Any other `${…}` is an error, and so is a `${` with no `}` on the same line. Both are reported by
+`sutra lint` and again when the engine loads the package
+(`SUTRA.CONFIG.DATASTORE.MIGRATION_PLACEHOLDER`, naming the file, the line and the placeholder).
+Write `$${` to get a literal `${`. A lone `$` or `$$`, such as PostgreSQL dollar quoting, is left
+alone. Because `${package.version}` is part of the checksummed text, a script that uses it counts
+as edited when the version label changes. Use it only in scripts you add for a specific release.
 
 The engine's own datasource (instances, outbox, lease, audit, inbox) is **never** a store's
 backing connection — a `sql` store always resolves its own connection, and fails closed if it
@@ -519,8 +580,8 @@ this store) rather than a silent shape change. The evolution rules are in
 
 ## Querying rows by key {#querying-rows-by-key}
 
-*Since 0.6.10.* A data-task read can return every row of a key/value store whose key starts with a
-prefix, or lies in a range, together with aggregates over all of those rows. It suits append-only
+*Since 0.6.10* (typed-column stores since 0.6.13). A data-task read can return every row of a store
+whose key starts with a prefix, or lies in a range, together with aggregates over all of those rows. It suits append-only
 data — one row per event, keyed so that the rows you report on together share a prefix — where a
 single summary row would be a write hot spot.
 
@@ -569,7 +630,8 @@ The read's target variable receives:
 - **It is a plain read.** It takes no locks, reads committed rows, never uses the
   [read cache](#caching-reads), and does not see the uncommitted writes of an enclosing
   `<bpmn:transaction>`. It cannot be combined with `forUpdate`, cannot be a write, and runs on
-  key/value `sql` stores only (not on a [typed-column](#typed-columns-declaring-the-structure-a-store-holds) store).
+  `sql` stores — key/value or [typed-column](#typed-columns-declaring-the-structure-a-store-holds)
+  (see [Querying a typed-column store](#querying-a-typed-column-store)).
 
 ### The index a key query needs
 
@@ -600,6 +662,65 @@ DDL that fixes it. Stores that never run a key query are unaffected.
 On MySQL a JSON number is held as a double, exact to about 15 significant digits; store amounts
 with more digits as strings there. PostgreSQL keeps the inputs' decimal scale (`6.40`); MySQL and
 SQL Server report the sum without trailing zeros.
+
+### Querying a typed-column store {#querying-a-typed-column-store}
+
+*Since 0.6.13.* A store that declares a `structure:` is queried with the same `<q:store query=…>`,
+over its own table. Each row's `value` is the typed record, exactly as a plain read of that key
+returns it, and the aggregates are SQL `COUNT` and `SUM` over the declared columns, with
+`GROUP BY` the grouping column. For the `accounts` store from
+[Typed columns](#typed-columns-declaring-the-structure-a-store-holds):
+
+```xml
+<q:store key="'branch-7|'" query="prefix" limit="100" after="payload.after">
+  <q:aggregate fn="sum" field="balance" groupBy="active"/>
+  <q:aggregate fn="count" groupBy="note"/>
+</q:store>
+```
+
+```json
+{"rows": [{"key": "branch-7|alice",
+           "value": {"accountId": "alice", "balance": 100.50, "openedAt": "2026-01-01", "active": true}}],
+ "aggregates": [{"groups": {"true": {"count": 2, "sum": 250.50}, "false": {"count": 1, "sum": 0.00}}},
+                {"groups": {"null": {"count": 3}}}],
+ "truncated": false, "next": null}
+```
+
+- **`field` and `groupBy` name one declared field** — `balance`, not `balance.value`, and not a
+  field the structure does not declare. `sutra lint` refuses either, naming the structure and its
+  fields; at run time the same mistake fails with `SUTRA.RUNTIME.DATASTORE.QUERY_UNSUPPORTED`.
+- **A summed field must be numeric** — declared `xs:decimal` or an integer type. `sutra lint`
+  refuses a sum over a string, date or boolean field. (If one reaches the engine anyway, every
+  present value counts as not numeric and the task fails with
+  `SUTRA.RUNTIME.DATASTORE.QUERY_NOT_NUMERIC`, as on a key/value store.)
+- **Sums are exact.** They are computed on the column itself, so a `NUMERIC(18,2)` sums to two
+  decimal places on PostgreSQL. MySQL and SQL Server report the sum without trailing zeros.
+- **An absent optional field is a NULL column.** A sum skips it (the row still counts), and it
+  groups under `"null"`, just as a missing field does on a key/value store. Group keys read the way
+  the record does: `"true"`/`"false"` for a boolean, the decimal text for a number, `yyyy-mm-dd` for
+  a date.
+
+The index requirement is the same idea with one column: the table's first index column must be
+`store_key`, in a bytewise collation. A typed table normally already has `PRIMARY KEY (store_key)`;
+add the collation:
+
+```sql
+CREATE TABLE IF NOT EXISTS accounts (
+  store_key   VARCHAR(512)  COLLATE "C" NOT NULL,   -- MySQL: … COLLATE utf8mb4_bin; SQL Server: NVARCHAR … COLLATE Latin1_General_100_BIN2
+  account_id  VARCHAR(35)   NOT NULL,
+  balance     NUMERIC(18,2) NOT NULL,
+  opened_at   DATE          NOT NULL,
+  active      BOOLEAN       NOT NULL,
+  note        VARCHAR(140),
+  rev         BIGINT        NOT NULL DEFAULT 1,
+  updated_at  TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (store_key)
+);
+```
+
+The first query checks both and refuses with `SUTRA.RUNTIME.DATASTORE.QUERY_KEY_ORDER` or
+`SUTRA.RUNTIME.DATASTORE.QUERY_KEY_INDEX`, naming the table and the DDL that fixes it — for example
+a table whose primary key is `(account_id, store_key)`.
 
 ## Claiming a key once {#claiming-a-key-once}
 
@@ -694,7 +815,7 @@ docker run -d --name readings-engine --network readings-net -p 127.0.0.1::8080 \
   -e SUTRA_ADMIN_OIDC_DEV_DISABLED=true \
   -e READINGS_DB_URL=postgres://readings-db:5432/postgres \
   -e READINGS_DB_USER=sutra_engine -e READINGS_DB_PASSWORD=dev-only \
-  -e READINGS_API_KEY=dev-only-readings-key ghcr.io/startr-trade/sutra:0.6.12
+  -e READINGS_API_KEY=dev-only-readings-key ghcr.io/startr-trade/sutra:0.6.13
 PORT=$(docker port readings-engine 8080 | head -1 | cut -d: -f2)
 H=(-H 'Content-Type: application/json' -H 'X-Api-Key: dev-only-readings-key')
 ```

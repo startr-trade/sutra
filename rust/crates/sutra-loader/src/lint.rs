@@ -30,7 +30,9 @@ use sutra_channels::{load_channel_definitions, ChannelDefinition, CODEC_BUILTIN_
 use sutra_codec_spi::shape::{PathResolution, SchemaShape};
 use sutra_codec_spi::{AttributeSpec, PayloadCodec};
 use sutra_datastore::projection::Projection;
-use sutra_datastore::{parse_datastores, StoreDefinition, StructureRef};
+use sutra_datastore::{
+    parse_datastores, substitute_placeholders, MigrationPlaceholders, StoreDefinition, StructureRef,
+};
 use sutra_feel::paths::Usage;
 use sutra_templates::HandlebarsTemplateEngine;
 
@@ -2460,27 +2462,29 @@ fn check_store_references(
                     Node::DataTask { data_mapping, .. } => data_mapping,
                     _ => return,
                 };
-                // A key query runs on a key/value `sql` store only: a projected (typed-column)
-                // store has no `store_value` document to aggregate over.
-                for read in mapping.store_reads.iter().filter(|r| r.query.is_some()) {
+                // A key query runs on a `sql` store. On a projected (typed-column) store each
+                // aggregate's `field`/`groupBy` must name one declared field, and a summed field
+                // must be numeric.
+                for read in mapping.store_reads.iter() {
+                    let Some(query) = &read.query else { continue };
                     let Some(def) = stores.iter().find(|s| s.name == read.store) else {
                         continue; // undeclared: reported below
                     };
-                    let reason = if def.structure.is_some() {
-                        Some("declares a structure (typed columns)")
-                    } else if !def.store_type.eq_ignore_ascii_case("sql") {
-                        Some("is not a key/value `sql` store")
-                    } else {
-                        None
-                    };
-                    if let Some(reason) = reason {
+                    let mut faults: Vec<String> = Vec::new();
+                    if !def.store_type.eq_ignore_ascii_case("sql") {
+                        faults.push(
+                            "is not a `sql` store; key queries run on sql stores only".to_string(),
+                        );
+                    } else if let Some(structure) = &def.structure {
+                        faults = typed_query_faults(deployment, structure, &query.aggregates);
+                    }
+                    for fault in faults {
                         out.push(
                             LintDiagnostic::error(
                                 codes::CONFIG_DATASTORE_INVALID,
                                 format!(
                                     "deployment {dep_label}: process '{}' node '{}' runs a key \
-                                     query on data store '{}', which {reason}; key queries run \
-                                     on key/value sql stores only",
+                                     query on data store '{}', which {fault}",
                                     process.id,
                                     node.id(),
                                     read.store
@@ -2515,6 +2519,66 @@ fn check_store_references(
             });
         }
     }
+}
+
+/// The faults of a key query's aggregates on a projected (typed-column) store: a `field` or
+/// `groupBy` that is not exactly one declared field of the structure (a typed store aggregates
+/// one column), or a summed field whose declared type is not numeric. An unresolvable structure
+/// raises nothing here — [`check_store_structures`] reports it.
+fn typed_query_faults(
+    deployment: &LoadedDeployment,
+    structure: &StructureRef,
+    aggregates: &[sutra_bpmn::model::StoreQueryAggregate],
+) -> Vec<String> {
+    if aggregates.is_empty() {
+        return Vec::new();
+    }
+    let StructureFields::Fields(fields) = structure_fields(deployment, structure) else {
+        return Vec::new();
+    };
+    let Ok(projection) = structure.project(&fields) else {
+        return Vec::new();
+    };
+    let declared: Vec<&str> = projection.fields.iter().map(|f| f.field.as_str()).collect();
+    let mut faults = Vec::new();
+    for agg in aggregates {
+        let sum = agg.function == sutra_bpmn::model::StoreAggregateFunction::Sum;
+        for (role, path) in [("field", &agg.field), ("groupBy", &agg.group_by)] {
+            let Some(path) = path.as_deref() else {
+                continue;
+            };
+            if path.contains('.') {
+                faults.push(format!(
+                    "declares structure '{}' (typed columns): aggregate {role} '{path}' is a \
+                     nested path — name exactly one declared field",
+                    projection.type_name
+                ));
+                continue;
+            }
+            let Some(field) = projection.field(path) else {
+                faults.push(format!(
+                    "declares structure '{}' (typed columns): aggregate {role} '{path}' is not \
+                     one of its fields ({})",
+                    projection.type_name,
+                    declared.join(", ")
+                ));
+                continue;
+            };
+            if sum
+                && role == "field"
+                && sutra_datastore::ValueClass::of(field.builtin)
+                    != Some(sutra_datastore::ValueClass::Number)
+            {
+                faults.push(format!(
+                    "declares structure '{}' (typed columns): aggregate field '{path}' is \
+                     declared '{}', which is not numeric — sum needs a decimal or integer field",
+                    projection.type_name,
+                    field.builtin.name()
+                ));
+            }
+        }
+    }
+    faults
 }
 
 /// R14 security posture: a `.sutra` must reference datastore/broker credentials indirectly
@@ -2800,6 +2864,27 @@ fn check_migrations(
                 .at_file(format!("migrations/{key}")),
             ),
             Some(version) => {
+                // Placeholders are substituted exactly as the engine will (with this package's
+                // labels), so an unknown or unterminated `${…}` fails here, not at first use.
+                if let Some(store) = stores.iter().find(|s| s.name == store_dir) {
+                    let placeholders = MigrationPlaceholders::for_store(
+                        store,
+                        &deployment.tenant,
+                        &deployment.module,
+                        &deployment.version,
+                    );
+                    let file = format!("migrations/{key}");
+                    if let Err(e) = substitute_placeholders(&file, &artifact.content, &placeholders)
+                    {
+                        out.push(
+                            LintDiagnostic::error(
+                                codes::CONFIG_DATASTORE_MIGRATION_PLACEHOLDER,
+                                format!("deployment {dep_label}: {}", e.message()),
+                            )
+                            .at_file(format!("migrations/{key}")),
+                        );
+                    }
+                }
                 if artifact.content.trim().is_empty() {
                     out.push(
                         LintDiagnostic::error(
@@ -2936,7 +3021,7 @@ fn check_one_store_structure(
     }
 
     // ---- 3. the effective table shape, from the package's own migrations --------------
-    let scripts = store_migration_scripts(deployment, name);
+    let scripts = store_migration_scripts(deployment, store);
     if scripts.is_empty() {
         out.push(at(LintDiagnostic::warning(
             codes::CONFIG_DATASTORE_DDL_UNVERIFIABLE,
@@ -3054,19 +3139,28 @@ fn structure_fields(deployment: &LoadedDeployment, structure: &StructureRef) -> 
 /// This store's migration scripts, in migration-version order — `(archive path, SQL)` pairs.
 /// Scripts whose name is not `V<n>__<desc>.sql` are skipped here; `check_migrations` already
 /// reports them, and a second diagnostic would add nothing.
-fn store_migration_scripts(deployment: &LoadedDeployment, store: &str) -> Vec<(String, String)> {
-    let prefix = format!("{store}/");
+fn store_migration_scripts(
+    deployment: &LoadedDeployment,
+    store: &StoreDefinition,
+) -> Vec<(String, String)> {
+    let prefix = format!("{}/", store.name);
+    // Replay what the engine will run: the placeholder-substituted text. A script whose
+    // placeholders do not resolve is replayed raw — `check_migrations` already reports it.
+    let placeholders = MigrationPlaceholders::for_store(
+        store,
+        &deployment.tenant,
+        &deployment.module,
+        &deployment.version,
+    );
     let mut scripts: Vec<(u64, String, String)> = deployment
         .migrations
         .iter()
         .filter_map(|(key, artifact)| {
             let file_name = key.strip_prefix(&prefix)?;
             let version = parse_migration_version(file_name)?;
-            Some((
-                version,
-                format!("migrations/{key}"),
-                artifact.content.clone(),
-            ))
+            let sql = substitute_placeholders(key, &artifact.content, &placeholders)
+                .unwrap_or_else(|_| artifact.content.clone());
+            Some((version, format!("migrations/{key}"), sql))
         })
         .collect();
     scripts.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));

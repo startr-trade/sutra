@@ -35,6 +35,7 @@ use crate::coverage::{
 };
 use crate::error::DataStoreError;
 use crate::keyquery::{self, KeyAggregateResult, KeyQueryPage, KeyRangeQuery};
+use crate::migration::{self, LedgerAction, MigrationScript, StoreMigrations};
 use crate::projected::{ActualColumn, ProjectedStore, SqlDialect};
 
 /// This module's dialect, for the shared projected-store SQL builder.
@@ -232,7 +233,7 @@ pub struct MssqlDataStore {
 struct StoreInner {
     name: String,
     pool: MssqlPool,
-    migrations: Vec<String>,
+    migrations: StoreMigrations,
     migrated: tokio::sync::Mutex<bool>,
     legacy_namespace: Option<(String, String, String)>,
     /// The store's declared row structure (see [`crate::postgres`]): `Some` serves the store from
@@ -246,7 +247,7 @@ impl MssqlDataStore {
     /// Build a store from its declaration on the cutover table shape.
     pub fn from_definition(
         def: &StoreDefinition,
-        migrations: Vec<String>,
+        migrations: impl Into<StoreMigrations>,
     ) -> Result<MssqlDataStore, DataStoreError> {
         Self::from_definition_with_namespace(def, migrations, None)
     }
@@ -254,7 +255,7 @@ impl MssqlDataStore {
     /// [`Self::from_definition`] with the pre-cutover namespace triple (5-column tables).
     pub fn from_definition_with_namespace(
         def: &StoreDefinition,
-        migrations: Vec<String>,
+        migrations: impl Into<StoreMigrations>,
         legacy_namespace: Option<(String, String, String)>,
     ) -> Result<MssqlDataStore, DataStoreError> {
         Self::from_definition_projected(def, migrations, legacy_namespace, None)
@@ -264,12 +265,17 @@ impl MssqlDataStore {
     /// [`crate::postgres::PostgresDataStore::from_definition_projected`] for the contract.
     pub fn from_definition_projected(
         def: &StoreDefinition,
-        migrations: Vec<String>,
+        migrations: impl Into<StoreMigrations>,
         legacy_namespace: Option<(String, String, String)>,
         projected: Option<ProjectedStore>,
     ) -> Result<MssqlDataStore, DataStoreError> {
         Ok(MssqlDataStore {
-            inner: Arc::new(store_inner(def, migrations, legacy_namespace, projected)?),
+            inner: Arc::new(store_inner(
+                def,
+                migrations.into(),
+                legacy_namespace,
+                projected,
+            )?),
         })
     }
 
@@ -349,7 +355,7 @@ impl MssqlDataStore {
 /// in WHOSE migration scripts they carry.
 fn store_inner(
     def: &StoreDefinition,
-    migrations: Vec<String>,
+    migrations: StoreMigrations,
     legacy_namespace: Option<(String, String, String)>,
     projected: Option<ProjectedStore>,
 ) -> Result<StoreInner, DataStoreError> {
@@ -434,7 +440,7 @@ impl MssqlCoverageStore {
         Ok(MssqlCoverageStore {
             inner: Arc::new(store_inner(
                 def,
-                crate::coverage::shipped_ddl(DIALECT),
+                crate::coverage::shipped_ddl(DIALECT).into(),
                 None,
                 None,
             )?),
@@ -812,10 +818,13 @@ async fn store_query(
     query: KeyRangeQuery,
 ) -> Result<KeyQueryPage, DataStoreError> {
     let store = inner.name.clone();
-    if inner.projected.is_some() {
-        return Err(keyquery::projected_unsupported(&store));
+    // A projected store is queried over its own table (no `store_name` column), its rows read
+    // back as typed records; `None` is the key/value `data_store` path.
+    let typed = inner.projected.clone();
+    match &typed {
+        Some(projected) => keyquery::validate_typed(projected, &query)?,
+        None => keyquery::validate(&store, &query)?,
     }
-    keyquery::validate(&store, &query)?;
     ensure_migrated(&inner).await?;
     let q_err = |e: tiberius::error::Error| {
         DataStoreError::with_source(format!("key query on '{store}' failed"), e)
@@ -825,9 +834,19 @@ async fn store_query(
         .key_order_verified
         .load(std::sync::atomic::Ordering::Acquire)
     {
+        let (order_probe, index_probe) = match &typed {
+            Some(p) => (
+                keyquery::typed_key_order_probe_sql(DIALECT, p.table()),
+                keyquery::typed_key_index_probe_sql(DIALECT, p.table()),
+            ),
+            None => (
+                keyquery::key_order_probe_sql(DIALECT).to_string(),
+                keyquery::key_index_probe_sql(DIALECT).to_string(),
+            ),
+        };
         let row = conn
             .client()
-            .query(keyquery::key_order_probe_sql(DIALECT), &[])
+            .query(order_probe.as_str(), &[])
             .await
             .map_err(q_err)?
             .into_row()
@@ -838,15 +857,14 @@ async fn store_query(
             None => None,
         };
         if !keyquery::is_bytewise_collation(DIALECT, collation.as_deref()) {
-            return Err(keyquery::key_order_error(
-                &store,
-                DIALECT,
-                collation.as_deref(),
-            ));
+            return Err(match &typed {
+                Some(p) => keyquery::typed_key_order_error(p, DIALECT, collation.as_deref()),
+                None => keyquery::key_order_error(&store, DIALECT, collation.as_deref()),
+            });
         }
         let indexes = conn
             .client()
-            .query(keyquery::key_index_probe_sql(DIALECT), &[])
+            .query(index_probe.as_str(), &[])
             .await
             .map_err(q_err)?
             .into_row()
@@ -858,7 +876,10 @@ async fn store_query(
             .flatten()
             .unwrap_or(0);
         if indexes == 0 {
-            return Err(keyquery::key_index_error(&store));
+            return Err(match &typed {
+                Some(p) => keyquery::typed_key_index_error(p),
+                None => keyquery::key_index_error(&store),
+            });
         }
         inner
             .key_order_verified
@@ -867,8 +888,16 @@ async fn store_query(
     let (rows, truncated, next) = match query.row_limit {
         None => (Vec::new(), false, None),
         Some(limit) => {
-            let sql = keyquery::rows_sql(DIALECT, &query, limit);
-            let binds = keyquery::binds(&store, &query, true);
+            let (sql, binds) = match &typed {
+                Some(p) => (
+                    keyquery::typed_rows_sql(DIALECT, p, &query, limit),
+                    keyquery::typed_binds(&query, true),
+                ),
+                None => (
+                    keyquery::rows_sql(DIALECT, &query, limit),
+                    keyquery::binds(&store, &query, true),
+                ),
+            };
             let params: Vec<&dyn tiberius::ToSql> =
                 binds.iter().map(|b| b as &dyn tiberius::ToSql).collect();
             let fetched = conn
@@ -886,13 +915,28 @@ async fn store_query(
                     .map_err(q_err)?
                     .unwrap_or_default()
                     .to_string();
-                let text = r.try_get::<&str, _>(1).map_err(q_err)?.unwrap_or("null");
-                let value = serde_json::from_str(text).map_err(|e| {
-                    DataStoreError::with_source(
-                        format!("stored value at '{store}'[{key}] is not valid JSON"),
-                        e,
-                    )
-                })?;
+                let value = match &typed {
+                    Some(p) => {
+                        let mut cells = Vec::with_capacity(p.projection().fields.len());
+                        for i in 0..p.projection().fields.len() {
+                            cells.push(
+                                r.try_get::<&str, _>(i + 1)
+                                    .map_err(q_err)?
+                                    .map(str::to_string),
+                            );
+                        }
+                        p.row_to_json(&cells)
+                    }
+                    None => {
+                        let text = r.try_get::<&str, _>(1).map_err(q_err)?.unwrap_or("null");
+                        serde_json::from_str(text).map_err(|e| {
+                            DataStoreError::with_source(
+                                format!("stored value at '{store}'[{key}] is not valid JSON"),
+                                e,
+                            )
+                        })?
+                    }
+                };
                 rows.push((key, value));
             }
             keyquery::finish_page(rows, limit)
@@ -900,8 +944,16 @@ async fn store_query(
     };
     let mut aggregates = Vec::with_capacity(query.aggregates.len());
     for agg in &query.aggregates {
-        let sql = keyquery::aggregate_sql(DIALECT, &query, agg);
-        let binds = keyquery::binds(&store, &query, false);
+        let (sql, binds) = match &typed {
+            Some(p) => (
+                keyquery::typed_aggregate_sql(DIALECT, p, &query, agg)?,
+                keyquery::typed_binds(&query, false),
+            ),
+            None => (
+                keyquery::aggregate_sql(DIALECT, &query, agg),
+                keyquery::binds(&store, &query, false),
+            ),
+        };
         let params: Vec<&dyn tiberius::ToSql> =
             binds.iter().map(|b| b as &dyn tiberius::ToSql).collect();
         let fetched = conn
@@ -924,7 +976,10 @@ async fn store_query(
         if agg.group_by.is_some() {
             let mut groups = std::collections::BTreeMap::new();
             for r in &fetched {
-                let group = text(r, 0)?.unwrap_or_else(|| "null".to_string());
+                let mut group = text(r, 0)?.unwrap_or_else(|| "null".to_string());
+                if let Some(p) = &typed {
+                    group = keyquery::typed_group_key(p, agg, group);
+                }
                 groups.insert(
                     group,
                     keyquery::cell(agg, int(r, 1)?, sum(r, 2)?, int(r, 3)?),
@@ -947,10 +1002,11 @@ async fn store_query(
     })
 }
 
-/// Run the module-resident idempotent migrations once per store instance, serialised across
-/// replicas by an `sp_getapplock` session lock. tiberius batches (`simple_query`) run the
-/// scripts; SQL Server DDL is transactional but the scripts here are idempotent
-/// (`IF OBJECT_ID … CREATE`), so no ledger is kept — exactly as in the reference dialect.
+/// Apply the store's migrations once per store instance, serialised across replicas by an
+/// `sp_getapplock` session lock. tiberius batches (`simple_query`) run the scripts. Package
+/// scripts are recorded in the `sutra_store_migrations` ledger and run once per database (see
+/// [`crate::migration`]); the engine-owned coverage DDL (`IF OBJECT_ID … CREATE`) stays on the
+/// idempotent, ledger-less path.
 ///
 /// (Also the FIRST-USE gate for a projected store's table verification — same once-per-instance
 /// flag, so a projected store costs one extra catalog round-trip on first use and none after.)
@@ -972,13 +1028,12 @@ async fn ensure_migrated(inner: &StoreInner) -> Result<(), DataStoreError> {
             ),
         )
         .await?;
-        let mut result = Ok(());
-        for script in &inner.migrations {
-            if let Err(e) = run_batch(conn.client(), script).await {
-                result = Err(e);
-                break;
+        let result = match &inner.migrations {
+            StoreMigrations::Idempotent(scripts) => run_idempotent(conn.client(), scripts).await,
+            StoreMigrations::Recorded(scripts) => {
+                run_recorded(conn.client(), &inner.name, scripts).await
             }
-        }
+        };
         let _ = run_batch(
             conn.client(),
             &format!("EXEC sp_releaseapplock @Resource = N'{lock_key}', @LockOwner = 'Session'"),
@@ -991,6 +1046,85 @@ async fn ensure_migrated(inner: &StoreInner) -> Result<(), DataStoreError> {
     }
     *migrated = true;
     Ok(())
+}
+
+/// The ledger-less path: every script, every first use (engine-owned idempotent DDL).
+async fn run_idempotent(
+    client: &mut MssqlClient,
+    scripts: &[String],
+) -> Result<(), DataStoreError> {
+    for script in scripts {
+        run_batch(client, script).await?;
+    }
+    Ok(())
+}
+
+/// The ledger path (caller holds the migration lock). SQL Server DDL is transactional, so each
+/// unrecorded script runs in ONE transaction with its ledger row: a failed script is rolled back
+/// and records nothing. A database migrated before the ledger existed has no rows for the store,
+/// so its idempotent scripts simply run once more and are recorded.
+async fn run_recorded(
+    client: &mut MssqlClient,
+    name: &str,
+    scripts: &[MigrationScript],
+) -> Result<(), DataStoreError> {
+    run_batch(client, migration::ledger_ddl(DIALECT)).await?;
+    let owned_name = name.to_string();
+    let rows = client
+        .query(
+            "SELECT version, checksum FROM sutra_store_migrations WHERE store_name = @P1",
+            &[&owned_name],
+        )
+        .await
+        .map_err(|e| DataStoreError::with_source("mssql migration ledger read", e))?
+        .into_first_result()
+        .await
+        .map_err(|e| DataStoreError::with_source("mssql migration ledger read", e))?;
+    let recorded: std::collections::BTreeMap<String, String> = rows
+        .iter()
+        .map(|row| {
+            (
+                row.get::<&str, _>(0).unwrap_or_default().to_string(),
+                row.get::<&str, _>(1).unwrap_or_default().to_string(),
+            )
+        })
+        .collect();
+    for script in scripts {
+        if migration::ledger_action(name, script, &recorded)? == LedgerAction::Skip {
+            continue;
+        }
+        let applied = apply_recorded(client, name, script).await;
+        if let Err(e) = applied {
+            let _ = run_batch(client, "IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION").await;
+            return Err(DataStoreError::with_source(
+                format!(
+                    "migration '{}' (version {}) failed for data store '{name}'",
+                    script.file, script.version
+                ),
+                e,
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// One script + its ledger row, in one transaction (the caller rolls back on error).
+async fn apply_recorded(
+    client: &mut MssqlClient,
+    name: &str,
+    script: &MigrationScript,
+) -> Result<(), DataStoreError> {
+    run_batch(client, "BEGIN TRANSACTION").await?;
+    run_batch(client, &script.sql).await?;
+    client
+        .execute(
+            "INSERT INTO sutra_store_migrations (store_name, version, script, checksum) \
+             VALUES (@P1, @P2, @P3, @P4)",
+            &[&name, &script.version, &script.file, &script.checksum],
+        )
+        .await
+        .map_err(|e| DataStoreError::with_source("mssql migration ledger insert", e))?;
+    run_batch(client, "COMMIT TRANSACTION").await
 }
 
 /// First-use verification (design §4.5, RULED fail-closed) — see [`crate::postgres`]. SQL
@@ -1544,6 +1678,6 @@ mod tests {
             properties: std::collections::BTreeMap::new(),
             structure: None,
         };
-        assert!(MssqlDataStore::from_definition(&def, Vec::new()).is_err());
+        assert!(MssqlDataStore::from_definition(&def, Vec::<String>::new()).is_err());
     }
 }

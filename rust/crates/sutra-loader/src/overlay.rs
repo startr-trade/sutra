@@ -65,10 +65,10 @@ use crate::scanner;
 /// hands the directory over instead, leaving its removal to the caller.
 #[derive(Debug)]
 pub struct ComposedPackage {
-    root: PathBuf,
+    pub(crate) root: PathBuf,
     /// The temp parent to remove on drop; `None` once [`Self::into_path`] has disowned it.
-    temp_root: Option<PathBuf>,
-    overrides: Vec<LintDiagnostic>,
+    pub(crate) temp_root: Option<PathBuf>,
+    pub(crate) overrides: Vec<LintDiagnostic>,
 }
 
 impl ComposedPackage {
@@ -220,18 +220,21 @@ pub fn compose_overlays(
 // ---------------------------------------------------------------------------------------
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum LayerRole {
+pub(crate) enum LayerRole {
     Overlay,
     PackageDir,
+    /// A layer of a deployment-manifest stack ([`crate::layer_stack`]): `package.yaml` is
+    /// generated from the manifest, so the layer may not carry one.
+    Stack,
 }
 
 /// One scanned layer: its regular files and its directories, both keyed by the
 /// `'/'`-separated path relative to the layer root (deterministic order).
-struct Layer {
-    root: PathBuf,
-    role: LayerRole,
-    files: BTreeMap<String, PathBuf>,
-    dirs: BTreeSet<String>,
+pub(crate) struct Layer {
+    pub(crate) root: PathBuf,
+    pub(crate) role: LayerRole,
+    pub(crate) files: BTreeMap<String, PathBuf>,
+    pub(crate) dirs: BTreeSet<String>,
 }
 
 impl Layer {
@@ -240,11 +243,12 @@ impl Layer {
         match self.role {
             LayerRole::Overlay => format!("overlay {}", self.root.display()),
             LayerRole::PackageDir => format!("package directory {}", self.root.display()),
+            LayerRole::Stack => format!("layer {}", self.root.display()),
         }
     }
 }
 
-fn scan_layer(
+pub(crate) fn scan_layer(
     root: &Path,
     role: LayerRole,
     rejections: &mut Vec<LintDiagnostic>,
@@ -253,6 +257,7 @@ fn scan_layer(
         let what = match role {
             LayerRole::Overlay => "overlay directory",
             LayerRole::PackageDir => "package directory",
+            LayerRole::Stack => "layer directory",
         };
         return Err(PackageError::Io(LoaderError::new(
             codes::DEPLOY_PACKAGE_CONFIG_INVALID,
@@ -336,6 +341,19 @@ fn scan_layer(
         );
     }
 
+    if role == LayerRole::Stack && layer.files.contains_key(PACKAGE_FILE_NAME) {
+        refused.insert(
+            PACKAGE_FILE_NAME.to_string(),
+            format!(
+                "layer {} carries {PACKAGE_FILE_NAME} ({}) — with a deployment manifest the \
+                 package metadata is generated from the manifest's `package:` block, so no \
+                 layer may carry {PACKAGE_FILE_NAME}",
+                root.display(),
+                root.join(PACKAGE_FILE_NAME).display()
+            ),
+        );
+    }
+
     for message in refused.into_values() {
         rejections.push(LintDiagnostic::error(
             codes::DEPLOY_PACKAGE_CONFIG_INVALID,
@@ -375,7 +393,7 @@ fn check_kind_clashes(layers: &[Layer], rejections: &mut Vec<LintDiagnostic>) {
 
 /// A fresh, empty temp directory to compose inside. The composed package directory is a
 /// CHILD of it, because its own name is load-bearing (it names the archive).
-fn fresh_temp_root() -> Result<PathBuf, LoaderError> {
+pub(crate) fn fresh_temp_root() -> Result<PathBuf, LoaderError> {
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let unique = format!(
         "{}-{}-{}",
@@ -392,7 +410,7 @@ fn fresh_temp_root() -> Result<PathBuf, LoaderError> {
     Ok(root)
 }
 
-fn create_dir(dir: &Path) -> Result<(), LoaderError> {
+pub(crate) fn create_dir(dir: &Path) -> Result<(), LoaderError> {
     std::fs::create_dir_all(dir).map_err(|e| {
         LoaderError::new(
             codes::DEPLOY_PACKAGE_CONFIG_INVALID,
@@ -401,7 +419,7 @@ fn create_dir(dir: &Path) -> Result<(), LoaderError> {
     })
 }
 
-fn copy_file(source: &Path, target: &Path) -> Result<(), LoaderError> {
+pub(crate) fn copy_file(source: &Path, target: &Path) -> Result<(), LoaderError> {
     if let Some(parent) = target.parent() {
         create_dir(parent)?;
     }
@@ -416,7 +434,7 @@ fn copy_file(source: &Path, target: &Path) -> Result<(), LoaderError> {
     })
 }
 
-fn prepend(diagnostics: &mut Vec<LintDiagnostic>, overrides: &[LintDiagnostic]) {
+pub(crate) fn prepend(diagnostics: &mut Vec<LintDiagnostic>, overrides: &[LintDiagnostic]) {
     if overrides.is_empty() {
         return;
     }

@@ -16,8 +16,10 @@
 //! - `put_if_revision` is the compare-and-set behind `<q:store expect="unchanged">`:
 //!   `expected_rev <= 0` expects ABSENT (insert-only; a unique violation = conflict), else a
 //!   conditional `UPDATE … AND rev = ?` (0 rows = conflict);
-//! - module-resident migrations (`migrations/<store>/*.sql`, filename order, idempotent)
-//!   run once on first use against the store's own pool, under a PG advisory lock.
+//! - module-resident migrations (`migrations/<store>/*.sql`, see [`migration`] for order and
+//!   placeholders) run on first use against the store's own connection, under a cross-replica
+//!   lock, and are recorded in the per-database `sutra_store_migrations` ledger so each script
+//!   runs once.
 #![forbid(unsafe_code)]
 
 pub mod config;
@@ -27,9 +29,12 @@ pub mod config;
 /// three dialect modules execute them.
 pub mod coverage;
 pub mod error;
-/// Key queries (`<q:store query=…>`) on a key/value store — the statement text, bounds and
+/// Key queries (`<q:store query=…>`) on a key/value or typed store — the statement text, bounds and
 /// collation rules, pure like `projected`; the three dialect modules execute them.
 pub mod keyquery;
+/// Module-resident migrations — versions, placeholders, checksums and the migration ledger. Pure,
+/// so it rides the `--no-default-features` build; the dialect modules execute it.
+pub mod migration;
 /// PostgreSQL reference dialect (feature `providers`, on by default). The `config` loader above is
 /// pure and always compiles — the deploy-time lint needs only that, so a `--no-default-features`
 /// build carries no sqlx/tokio and targets `wasm32-*`.
@@ -65,6 +70,10 @@ pub use coverage::{
 pub use error::DataStoreError;
 pub use keyquery::{
     KeyAggregateCell, KeyAggregateResult, KeyQueryAggregate, KeyQueryPage, KeyRangeQuery,
+};
+pub use migration::{
+    build_migration_scripts, load_migration_scripts, substitute_placeholders,
+    MigrationPlaceholders, MigrationScript, StoreMigrations,
 };
 #[cfg(feature = "mssql")]
 pub use mssql::{MssqlDataStore, MssqlDataStoreTx};

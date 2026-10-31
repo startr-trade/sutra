@@ -158,6 +158,8 @@ struct Package {
     xsd: String,
     datastores: String,
     migrations: Vec<(&'static str, String)>,
+    /// A process whose data-store reference carries `store` (a `<q:store …>` element).
+    query: Option<String>,
 }
 
 impl Package {
@@ -167,7 +169,14 @@ impl Package {
             xsd: xsd(BASE_FIELDS, ""),
             datastores: datastores("", ""),
             migrations: vec![("V001__accounts.sql", PG_MIGRATION.to_string())],
+            query: None,
         }
+    }
+
+    /// Add a process reading the store through `store` (a `<q:store …>` element).
+    fn query(mut self, store: &str) -> Package {
+        self.query = Some(store.to_string());
+        self
     }
 
     fn with_migration(mut self, file: &'static str, sql: &str) -> Package {
@@ -204,6 +213,9 @@ impl Package {
         write(root, "datastores.yaml", &self.datastores);
         for (file, sql) in &self.migrations {
             write(root, &format!("migrations/accounts/{file}"), sql);
+        }
+        if let Some(store) = &self.query {
+            write(root, "bpmn/report.bpmn", &query_process(store));
         }
         lint_dir(root)
     }
@@ -890,4 +902,121 @@ fn the_shared_codes_are_string_identical_to_the_projection_s() {
         sutra_loader::error::codes::CONFIG_DATASTORE_COLUMN_UNMAPPED,
         UNMAPPED
     );
+}
+
+// ==========================================================================================
+// Key queries on a projected store
+// ==========================================================================================
+
+/// A process reading the `accounts` store through `store` into `report`.
+fn query_process(store: &str) -> String {
+    format!(
+        r#"<?xml version="1.0"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0" targetNamespace="urn:sutra:module:demo:1.0.0">
+  <bpmn:dataStore id="accountsStore" name="accounts"/>
+  <bpmn:process id="report" isExecutable="true">
+    <bpmn:dataStoreReference id="refAccounts" dataStoreRef="accountsStore">
+      <bpmn:extensionElements>{store}</bpmn:extensionElements>
+    </bpmn:dataStoreReference>
+    <bpmn:startEvent id="S"/>
+    <bpmn:serviceTask id="Query">
+      <bpmn:dataInputAssociation>
+        <bpmn:sourceRef>refAccounts</bpmn:sourceRef><bpmn:targetRef>report</bpmn:targetRef>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="E"/>
+    <bpmn:sequenceFlow id="f0" sourceRef="S" targetRef="Query"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="Query" targetRef="E"/>
+  </bpmn:process>
+</bpmn:definitions>"#
+    )
+}
+
+/// A key query on a projected store whose aggregates name declared fields — a numeric sum,
+/// grouped by a typed column, and a count grouped by an optional one — lints clean.
+#[test]
+fn a_key_query_on_declared_typed_fields_lints_clean() {
+    let report = Package::base()
+        .query(
+            r#"<q:store key="'acct|'" query="prefix" limit="50">
+                 <q:aggregate fn="sum" field="balance" groupBy="active"/>
+                 <q:aggregate fn="count" groupBy="note"/>
+               </q:store>"#,
+        )
+        .lint();
+    assert_silent(&report, "a key query on declared typed fields");
+}
+
+/// A nested path, an undeclared field, and a sum over a non-numeric field are each refused,
+/// naming the structure and the field.
+#[test]
+fn a_key_query_on_a_projected_store_refuses_nested_unknown_and_non_numeric_paths() {
+    for (aggregate, expect) in [
+        (
+            r#"<q:aggregate fn="sum" field="balance.value"/>"#,
+            "nested path",
+        ),
+        (
+            r#"<q:aggregate fn="count" groupBy="missing"/>"#,
+            "is not one of its fields",
+        ),
+        (r#"<q:aggregate fn="sum" field="note"/>"#, "not numeric"),
+        (r#"<q:aggregate fn="sum" field="openedAt"/>"#, "not numeric"),
+    ] {
+        let report = Package::base()
+            .query(&format!(
+                r#"<q:store key="'acct|'" query="prefix">{aggregate}</q:store>"#
+            ))
+            .lint();
+        let faults = of_code(&report, DATASTORE_INVALID);
+        assert!(
+            faults
+                .iter()
+                .any(|m| m.contains(expect) && m.contains("AccountRecord")),
+            "{aggregate}: {faults:#?}"
+        );
+    }
+}
+
+// ==========================================================================================
+// Migration placeholders
+// ==========================================================================================
+
+const MIGRATION_PLACEHOLDER: &str = "SUTRA.CONFIG.DATASTORE.MIGRATION_PLACEHOLDER";
+
+/// The structure check replays the SUBSTITUTED script: a table spelled `${store.table}` is the
+/// store's own table, and the package labels and the `$${` escape resolve without a diagnostic.
+#[test]
+fn migrations_are_replayed_with_placeholders_substituted() {
+    let sql = PG_MIGRATION.replacen(
+        "CREATE TABLE IF NOT EXISTS accounts",
+        "CREATE TABLE IF NOT EXISTS ${store.table}",
+        1,
+    ) + "\n-- seeded for ${package.tenant}/${package.module}@${package.version} into ${store.name}; \
+         literal $${not.a.placeholder}, dollar quote $$x$$\n";
+    let report = Package::base().migration(&sql).lint();
+    assert_silent(&report, "a migration using the five placeholders");
+}
+
+/// An unknown placeholder is an ERROR naming the file, the line and the placeholder; so is an
+/// unterminated one.
+#[test]
+fn an_unknown_or_unterminated_placeholder_is_an_error() {
+    let sql = format!("{PG_MIGRATION}\n-- owner: ${{env.OWNER}}\n");
+    let report = Package::base().migration(&sql).lint();
+    let messages = of_code(&report, MIGRATION_PLACEHOLDER);
+    assert_eq!(messages.len(), 1, "{report:#?}");
+    assert!(
+        messages[0].contains("migrations/accounts/V001__accounts.sql")
+            && messages[0].contains("${env.OWNER}")
+            && messages[0].contains("line "),
+        "{}",
+        messages[0]
+    );
+    assert!(error_codes(&report).contains(&MIGRATION_PLACEHOLDER));
+
+    let sql = format!("{PG_MIGRATION}\n-- owner: ${{package.tenant\n");
+    let report = Package::base().migration(&sql).lint();
+    assert!(fires(&report, MIGRATION_PLACEHOLDER), "{report:#?}");
 }

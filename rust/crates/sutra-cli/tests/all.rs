@@ -8,6 +8,8 @@ use sutra_transport_http as _;
 
 #[path = "all/coverage_golden.rs"]
 mod coverage_golden;
+#[path = "all/deployment_manifest_test.rs"]
+mod deployment_manifest_test;
 #[path = "all/deployments_list_it.rs"]
 mod deployments_list_it;
 #[path = "all/package_overlay_cli_test.rs"]

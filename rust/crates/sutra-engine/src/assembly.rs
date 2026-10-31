@@ -268,10 +268,11 @@ fn datastore_dialect(url: &str) -> Result<StoreDialect, DataStoreError> {
 /// is byte-for-byte the historical behaviour, which is the compatibility guarantee.
 pub(crate) fn build_store_backend(
     def: &StoreDefinition,
-    migrations: Vec<String>,
+    migrations: impl Into<sutra_datastore::StoreMigrations>,
     legacy_namespace: Option<(String, String, String)>,
     projected: Option<ProjectedStore>,
 ) -> Result<StoreBackend, DataStoreError> {
+    let migrations: sutra_datastore::StoreMigrations = migrations.into();
     let url = def
         .resolved("sql.url")?
         .filter(|s| !s.trim().is_empty())
@@ -1401,12 +1402,19 @@ pub(crate) fn plan_deployment(
             // Tree-scanned deployments read migrations off disk (relative to the binding
             // dir); a sealed archive has no backing directory — its `migrations/**`
             // travel in-memory on the LoadedDeployment (archive migrations are datastore-scoped).
+            // Either way the scripts are versioned, placeholder-substituted with the package
+            // labels and checksummed here, so the provider records each in the database's
+            // migration ledger and runs it once.
+            let placeholders = sutra_datastore::MigrationPlaceholders::for_store(
+                def, &d.tenant, &d.module, &d.version,
+            );
             let migrations = if d.binding_dir.as_os_str().is_empty() {
-                archive_migrations(d, def)?
+                archive_migrations(d, def, &placeholders)?
             } else {
-                sutra_datastore::load_migrations(def, &d.binding_dir).map_err(|e| {
-                    format!("migrations of store '{}' failed to load: {e}", def.name)
-                })?
+                sutra_datastore::load_migration_scripts(def, &d.binding_dir, &placeholders)
+                    .map_err(|e| {
+                        format!("migrations of store '{}' failed to load: {e}", def.name)
+                    })?
             };
             // A declared `structure` is resolved to its projection HERE, at plan time, and a
             // fault refuses the deploy (unlike an unresolvable connection below, which warns).
@@ -1608,12 +1616,13 @@ fn resolve_start_timer_expressions(
 
 /// A store's migrations from the archive's in-memory `migrations/**` map. The packager
 /// pins `sql.migrations` to the canonical `migrations/<store>` (datastore-scoped), and the map
-/// keys are `<store>/<file>.sql` relative to `migrations/` — scripts sort by filename,
-/// mirroring `sutra_datastore::load_migrations`.
+/// keys are `<store>/<file>.sql` relative to `migrations/` — prepared exactly as
+/// `sutra_datastore::load_migration_scripts` prepares a directory's scripts.
 fn archive_migrations(
     d: &LoadedDeployment,
     def: &sutra_datastore::StoreDefinition,
-) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    placeholders: &sutra_datastore::MigrationPlaceholders,
+) -> Result<Vec<sutra_datastore::MigrationScript>, Box<dyn std::error::Error>> {
     let Some(rel) = def
         .properties
         .get("sql.migrations")
@@ -1630,11 +1639,14 @@ fn archive_migrations(
         .into());
     };
     let prefix = format!("{}/", store_dir.trim_end_matches('/'));
-    let scripts: Vec<String> = d
+    let scripts: Vec<(String, String)> = d
         .migrations
         .iter()
-        .filter(|(key, _)| key.starts_with(&prefix) && key.ends_with(".sql"))
-        .map(|(_, artifact)| artifact.content.clone())
+        .filter_map(|(key, artifact)| {
+            let file = key.strip_prefix(&prefix)?;
+            file.ends_with(".sql")
+                .then(|| (file.to_string(), artifact.content.clone()))
+        })
         .collect();
     if scripts.is_empty() {
         return Err(format!(
@@ -1644,7 +1656,11 @@ fn archive_migrations(
         )
         .into());
     }
-    Ok(scripts)
+    Ok(sutra_datastore::build_migration_scripts(
+        &def.name,
+        scripts,
+        placeholders,
+    )?)
 }
 
 /// Fold `plan`'s archive-scoped `redactors/*.hbs` into `registry`, under the exact key
@@ -2508,7 +2524,7 @@ mod datastore_dispatch_tests {
             properties: std::collections::BTreeMap::new(),
             structure: None,
         };
-        assert!(build_store_backend(&def, Vec::new(), None, None).is_err());
+        assert!(build_store_backend(&def, Vec::<String>::new(), None, None).is_err());
     }
 
     /// The WP-5a proof: a module store whose connection scheme is `mysql://` dispatches to
@@ -3262,7 +3278,7 @@ mod projected_store_wiring_tests {
     async fn a_store_without_a_structure_carries_no_projection() {
         let def = store_def("accounts", None);
         assert!(def.structure.is_none());
-        let backend = build_store_backend(&def, Vec::new(), None, None).expect("builds");
+        let backend = build_store_backend(&def, Vec::<String>::new(), None, None).expect("builds");
         assert!(matches!(backend, StoreBackend::Pg(_)));
     }
 }

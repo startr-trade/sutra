@@ -141,7 +141,7 @@ impl SqlDialect {
 
     /// The expression a column of `class` is read back through — the dialect's canonical text
     /// rendering, which is what makes the round-trip lexical rather than float-mediated.
-    fn read_expr(self, class: ValueClass, column: &str) -> String {
+    pub(crate) fn read_expr(self, class: ValueClass, column: &str) -> String {
         match self {
             SqlDialect::Postgres => format!("CAST({column} AS TEXT)"),
             SqlDialect::Mysql => format!("CAST({column} AS CHAR)"),
@@ -367,16 +367,28 @@ impl ProjectedStore {
     // ---- statements. Bind order is ALWAYS statement-text order, so one binding sequence
     // ---- serves the positional dialects (`?`, `@Pn`) and the numbered one alike.
 
-    /// `SELECT <declared columns> FROM <table> WHERE store_key = ?` — binds `[key]`, and returns
-    /// the columns in declared order, so [`Self::row_to_json`] reads them positionally.
-    pub fn select_sql(&self, dialect: SqlDialect) -> String {
+    /// The declared field with this name and its marshalling class — what a key query's
+    /// `sum`/`groupBy` path resolves through (a typed store aggregates one declared column).
+    pub fn field_class(&self, name: &str) -> Option<(&ProjectedField, ValueClass)> {
+        self.fields().find(|(f, _)| f.field == name)
+    }
+
+    /// The declared columns read back through the dialect's canonical text rendering, in
+    /// declared order — the select list [`Self::row_to_json`] reads positionally.
+    pub fn read_list(&self, dialect: SqlDialect) -> String {
         let columns: Vec<String> = self
             .fields()
             .map(|(f, class)| dialect.read_expr(class, &f.column))
             .collect();
+        columns.join(", ")
+    }
+
+    /// `SELECT <declared columns> FROM <table> WHERE store_key = ?` — binds `[key]`, and returns
+    /// the columns in declared order, so [`Self::row_to_json`] reads them positionally.
+    pub fn select_sql(&self, dialect: SqlDialect) -> String {
         format!(
             "SELECT {} FROM {} WHERE {KEY_COLUMN} = {}",
-            columns.join(", "),
+            self.read_list(dialect),
             self.table,
             dialect.placeholder(1)
         )
@@ -729,7 +741,7 @@ fn parse_bool(text: &str) -> Option<bool> {
 }
 
 /// One cell's canonical text, back to the JSON shape the caller wrote.
-fn decode(class: ValueClass, text: &str) -> Json {
+pub(crate) fn decode(class: ValueClass, text: &str) -> Json {
     match class {
         ValueClass::Text | ValueClass::Date | ValueClass::Time => Json::String(text.to_string()),
         // `arbitrary_precision` keeps the DB's rendering verbatim, so a NUMERIC(18,2)'s "12.50"

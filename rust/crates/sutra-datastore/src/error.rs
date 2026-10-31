@@ -46,6 +46,11 @@ impl DataStoreError {
         }
     }
 
+    /// The message alone — no `[CODE] ` prefix and no source.
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
     /// The stable diagnostic code, when this failure has one.
     pub fn code(&self) -> Option<&'static str> {
         self.code

@@ -53,6 +53,11 @@ pub mod codes {
     /// WARNING — the table carries columns the projection never writes (usually fine: a legacy
     /// or operator column).
     pub const CONFIG_DATASTORE_COLUMN_UNMAPPED: &str = "SUTRA.CONFIG.DATASTORE.COLUMN_UNMAPPED";
+    /// A migration script uses a `${…}` placeholder other than `${package.tenant}`,
+    /// `${package.module}`, `${package.version}`, `${store.name}` or `${store.table}`, or leaves a
+    /// `${` unterminated (`$${` writes a literal `${`). The engine refuses the same script at load.
+    pub const CONFIG_DATASTORE_MIGRATION_PLACEHOLDER: &str =
+        sutra_datastore::migration::codes::MIGRATION_PLACEHOLDER;
     pub const CONFIG_CHANNEL_INERT: &str = "SUTRA.CONFIG.CHANNEL.INERT";
     pub const CONFIG_COVERAGE_STORE_MISSING: &str = "SUTRA.CONFIG.COVERAGE.STORE_MISSING";
 
@@ -275,6 +280,10 @@ pub mod codes {
     /// override that the author did not intend is otherwise invisible, and the composed tree
     /// is what gets sealed.
     pub const DEPLOY_PACKAGE_OVERLAY_OVERRIDE: &str = "SUTRA.DEPLOY.PACKAGE.OVERLAY_OVERRIDE";
+    /// WARNING — deployment-manifest stack: a pattern in a layer's `.ignore` matched no path
+    /// contributed by the layers below it (a stale or mistyped pattern). `package.yaml` is
+    /// never a candidate: the generated package metadata cannot be ignored.
+    pub const DEPLOY_PACKAGE_IGNORE_UNMATCHED: &str = "SUTRA.DEPLOY.PACKAGE.IGNORE_UNMATCHED";
     /// The package directory's `package.yaml` is missing, unparseable, or violates the
     /// closed schema (labels / engine.minContract / entryProcesses), or the
     /// directory itself cannot be scanned as a deployment package.

@@ -88,7 +88,10 @@ pub struct TargetArgs {
 
 #[derive(Debug, clap::Args)]
 pub struct DeployArgs {
-    /// Sealed `.sutra` archive to deploy (verified through the archive reader before upload).
+    /// Sealed `.sutra` archive to deploy (verified through the archive reader before upload),
+    /// or a deployment manifest (`.yaml`/`.yml`): it is packaged first, exactly as
+    /// `sutra package <manifest>` would, and its `target:` block fills in any target flag not
+    /// given on the command line (the command line wins).
     /// Required unless `--watch <dir>` is given (the watch loop packages the directory itself).
     pub archive: Option<PathBuf>,
 
@@ -256,7 +259,7 @@ fn is_not_found(e: &kube::Error) -> bool {
 // Entry points
 // ==================================================================================
 
-pub fn execute_deploy(args: DeployArgs, global: &GlobalArgs, io: &mut Io<'_>) -> i32 {
+pub fn execute_deploy(mut args: DeployArgs, global: &GlobalArgs, io: &mut Io<'_>) -> i32 {
     let format = match report_format(global.format.as_deref()) {
         Ok(f) => f,
         Err(msg) => {
@@ -277,6 +280,18 @@ pub fn execute_deploy(args: DeployArgs, global: &GlobalArgs, io: &mut Io<'_>) ->
             .map(|k| (args.api_key_header.clone(), k));
         return run_watch_loop(&pkg_dir, &engine_url, admin_key, io);
     }
+
+    // ---- a deployment manifest: package it first, fill unset target flags ---------------
+    // The guard keeps the freshly sealed archive alive for the rest of the deploy.
+    let _sealed_manifest = match args.archive.clone() {
+        Some(path) if crate::manifest::is_manifest_path(&path) => {
+            match seal_manifest_for_deploy(&mut args, &path, format, io) {
+                Ok(guard) => Some(guard),
+                Err(code) => return code,
+            }
+        }
+        _ => None,
+    };
 
     // ---- verify the archive through the engine's own fail-closed reader ----------------
     let Some(archive_path) = args.archive.clone() else {
@@ -425,6 +440,112 @@ pub fn execute_deploy(args: DeployArgs, global: &GlobalArgs, io: &mut Io<'_>) ->
         }
     }
 }
+
+/// Removes the temp directory a manifest deploy sealed its archive into.
+struct SealedManifestDir(PathBuf);
+
+impl Drop for SealedManifestDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// `sutra deploy <manifest.yaml>`: resolve the manifest, apply its `target:` to the flags the
+/// command line left unset, seal the stack into a temp dir and point `args.archive` at the
+/// sealed `.sutra`. A refusal is rendered here and returned as the exit code.
+fn seal_manifest_for_deploy(
+    args: &mut DeployArgs,
+    manifest_path: &Path,
+    format: ReportFormat,
+    io: &mut Io<'_>,
+) -> Result<SealedManifestDir, i32> {
+    let manifest = match crate::manifest::load(manifest_path, &[]) {
+        Ok(m) => m,
+        Err(msg) => {
+            let _ = writeln!(
+                io.err,
+                "deploy: manifest {}: {msg}",
+                manifest_path.display()
+            );
+            return Err(exit::USAGE);
+        }
+    };
+    apply_manifest_target(args, &manifest.target);
+    let unique = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default()
+    );
+    let out = std::env::temp_dir().join(format!("sutra-deploy-manifest-{unique}"));
+    let guard = SealedManifestDir(out.clone());
+    match crate::commands::package::seal_manifest(&manifest, &out) {
+        Ok(outcome) => {
+            if format == ReportFormat::Text {
+                for d in &outcome.report.diagnostics {
+                    let _ = writeln!(
+                        io.err,
+                        "{}",
+                        crate::commands::lint::diagnostic_of(d).render_text()
+                    );
+                }
+            }
+            args.archive = outcome.archives.first().map(|a| a.file_path.clone());
+            Ok(guard)
+        }
+        Err(e) => Err(crate::commands::package::render_refusal(
+            "deploy", e, format, io,
+        )),
+    }
+}
+
+/// Fill every deploy argument the command line left unset from the manifest's `target:`.
+/// The command line always wins; a flag with a default counts as unset while it still holds
+/// that default.
+pub(crate) fn apply_manifest_target(
+    args: &mut DeployArgs,
+    target: &crate::manifest::ManifestTarget,
+) {
+    if args.target.context.is_none() {
+        args.target.context = target.context.clone();
+    }
+    if args.target.namespace.is_none() {
+        args.target.namespace = target.namespace.clone();
+    }
+    if args.target.configmap == DEFAULT_CONFIGMAP {
+        if let Some(v) = &target.configmap {
+            args.target.configmap = v.clone();
+        }
+    }
+    if args.target.secret_name == DEFAULT_SECRET_NAME {
+        if let Some(v) = &target.secret_name {
+            args.target.secret_name = v.clone();
+        }
+    }
+    if args.engine_url.is_none() {
+        args.engine_url = target.engine_url.clone();
+    }
+    args.api |= target.api;
+    args.async_lro |= target.async_lro;
+    args.wait |= target.wait;
+    if args.wait_timeout == DEFAULT_WAIT_TIMEOUT_SECS {
+        if let Some(v) = target.wait_timeout {
+            args.wait_timeout = v;
+        }
+    }
+    if args.api_key_header == DEFAULT_API_KEY_HEADER {
+        if let Some(v) = &target.api_key_header {
+            args.api_key_header = v.clone();
+        }
+    }
+}
+
+const DEFAULT_CONFIGMAP: &str = "sutra-deployments";
+const DEFAULT_SECRET_NAME: &str = "sutra-secrets";
+const DEFAULT_API_KEY_HEADER: &str = "X-API-Key";
+const DEFAULT_WAIT_TIMEOUT_SECS: u64 = 180;
 
 pub fn execute_undeploy(args: UndeployArgs, global: &GlobalArgs, io: &mut Io<'_>) -> i32 {
     let format = match report_format(global.format.as_deref()) {

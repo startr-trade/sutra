@@ -64,6 +64,7 @@ pub mod compat;
 pub mod embedded;
 pub mod exit;
 pub mod gitref;
+pub mod manifest;
 pub mod output;
 pub mod routes;
 pub mod scaffold;

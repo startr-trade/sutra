@@ -6,8 +6,10 @@
 //! therefore the dialect, and the engine hosts nothing of coverage in its own database. What the
 //! author does NOT supply is coverage SQL — coverage tables are an in-built feature, so the
 //! engine ships their DDL ([`shipped_ddl`], embedded from `migrations/coverage/<dialect>/`) and
-//! applies it to that connection on first use, over the same idempotent, lock-serialised,
-//! ledger-less path a module's own `migrations/<store>/` scripts take.
+//! applies it to that connection on first use, under the same cross-replica lock a module's own
+//! `migrations/<store>/` scripts take — but on the idempotent, LEDGER-LESS path: the DDL is
+//! engine-owned and re-applied on every first use, so it is never recorded in the
+//! `sutra_store_migrations` ledger the package scripts are.
 //!
 //! Two tables, both keyed by `deployment_id` (a column AND a bound predicate on every statement —
 //! the isolation posture; no RLS on a user-owned connection, see the shipped DDL):
@@ -81,7 +83,8 @@ const DDL_MSSQL: [&str; 2] = [
 /// The engine-shipped coverage DDL for `dialect`, in apply order.
 ///
 /// These are the ENGINE's scripts, not the package's: they are handed to the store's ordinary
-/// first-use migration path (advisory/named/app-lock serialised across replicas, no ledger), which
+/// first-use migration path (advisory/named/app-lock serialised across replicas) as
+/// [`crate::migration::StoreMigrations::Idempotent`] — never recorded in the ledger — which
 /// is why every statement in them is idempotent. A deployment package ships no coverage SQL at
 /// all — `migrations/coverage/` does not exist any more.
 pub fn shipped_ddl(dialect: SqlDialect) -> Vec<String> {

@@ -29,6 +29,8 @@ mssql = ["providers", "dep:tiberius", "dep:tokio-util"]
 sutra-xsd = { path = "../sutra-xsd" }
 serde_json = { workspace = true }
 serde_yaml = "0.9"
+# Migration checksums (lowercase hex SHA-256 of the substituted script) — pure, wasm-safe.
+sha2 = { workspace = true }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres"], optional = true }
 tokio = { version = "1", features = ["sync", "rt", "net"], optional = true }
 # MSSQL dialect (feature `mssql`): TDS 7.3+ protocol client, TLS via rustls. The datastore
