@@ -48,6 +48,7 @@ use sutra_transport_spi::{
 
 pub mod callback;
 pub mod config;
+pub mod failure_reason;
 pub mod handle;
 pub mod inline;
 pub mod job_store;
@@ -64,6 +65,7 @@ pub use config::{
     DEFAULT_CALLBACK_POLL_INTERVAL_SECONDS, DEFAULT_CONCURRENCY, DEFAULT_FALLBACK_ON,
     DEFAULT_JOB_TIMEOUT_SECONDS, DEFAULT_POLL_INTERVAL_SECONDS, DEFAULT_TIMEOUT_SECONDS,
 };
+pub use failure_reason::{scrub_failure, LlmFailureReason, REASON_MESSAGE_LIMIT};
 pub use handle::{channel_handles, publish_channels, RoutedChannelHandle};
 pub use inline::LlmInlineCaller;
 pub use job_store::{JobClaim, JobStoreSlot, LlmJobRow, LlmJobStore, NewLlmJob};
@@ -74,9 +76,9 @@ pub use request::{
     MediaSlot,
 };
 pub use sink::{
-    build_reply, failure_outcome, reply_body, route, route_pipeline, route_streaming, route_submit,
-    structured_answer, structured_answer_error, LlmSink, ReplyPort, RouteFailure, RoutedAnswer,
-    SubmittedJob, MODEL_HEADER, PROVIDER_HEADER,
+    build_reply, failure_diagnostic, failure_outcome, reply_body, route, route_pipeline,
+    route_streaming, route_submit, structured_answer, structured_answer_error, LlmSink, ReplyPort,
+    RouteFailure, RoutedAnswer, SubmittedJob, MODEL_HEADER, PROVIDER_HEADER,
 };
 
 /// The `transport:` value and URI scheme.

@@ -14,6 +14,12 @@
 //!   `voice: pipeline` building blocks;
 //! - a live session over the Realtime WebSocket API (a model id containing `realtime`), see
 //!   [`realtime`].
+//!
+//! JSON output (`json: true` on a call) is `response_format: {type: json_object}` (Chat
+//! Completions) or `text.format` (Responses), with [`JSON_INSTRUCTION`] added to the system
+//! text when the request never says "JSON" (both modes refuse such a request). The audio chat
+//! models refuse `response_format` outright, so for them JSON is asked for in the system text
+//! only and the transport parses it from the answer ([`json_in_words`]).
 #![forbid(unsafe_code)]
 
 pub mod realtime;
@@ -157,6 +163,8 @@ impl LlmProvider for OpenAiProvider {
         let audio = self.audio_model();
         LlmCapabilities {
             tools: true,
+            // Every model answers JSON; an audio model is asked in words, not with
+            // `response_format` (see `json_in_words`).
             json_output: true,
             streaming: true,
             async_jobs: self.first_party,
@@ -688,7 +696,7 @@ fn responses_body(request: &LlmRequest) -> Value {
     // Not required by background mode (store=false keeps the response ~10 minutes for polling),
     // but an explicit true retains it beyond the polling window so a late webhook can still fetch it.
     body.insert("store".into(), json!(true));
-    if let Some(system) = &request.system {
+    if let Some(system) = system_text(request) {
         body.insert("instructions".into(), json!(system));
     }
     if let Some(max) = request.max_output_tokens {
@@ -712,7 +720,7 @@ fn responses_body(request: &LlmRequest) -> Value {
             .collect();
         body.insert("tools".into(), Value::Array(tools));
     }
-    if request.json_output {
+    if request.json_output && !json_in_words(&request.model) {
         body.insert("text".into(), json!({"format": {"type": "json_object"}}));
     }
     Value::Object(body)
@@ -859,10 +867,51 @@ fn verify_webhook(
         })
 }
 
+/// What a model asked for JSON is told, when the request must say it in words.
+pub const JSON_INSTRUCTION: &str = "Respond with a single JSON object and nothing else.";
+
+/// Whether `model` is asked for JSON in words only. The audio chat models (`gpt-audio…`,
+/// `gpt-4o-audio-preview`, any id containing `audio`) answer `response_format: json_object`
+/// with HTTP 400 ("… is not supported with this model"), so for them JSON is requested in the
+/// system message and read from the answer (the transport parses a bare or fenced JSON
+/// object). They still declare `json_output`, so a channel's `require: [json-output]` selects
+/// them.
+pub fn json_in_words(model: &str) -> bool {
+    model.contains("audio")
+}
+
+/// Whether the call needs [`JSON_INSTRUCTION`] added to its system text: always for a model
+/// asked in words ([`json_in_words`]); otherwise when nothing in the request says "JSON",
+/// because the JSON modes of Chat Completions and Responses refuse a request (HTTP 400) whose
+/// messages never mention the word.
+fn needs_json_instruction(request: &LlmRequest) -> bool {
+    if !request.json_output {
+        return false;
+    }
+    if json_in_words(&request.model) {
+        return true;
+    }
+    let mentions = |text: &str| text.to_ascii_lowercase().contains("json");
+    !(request.system.as_deref().is_some_and(mentions)
+        || request.messages.iter().any(|m| mentions(&m.content)))
+}
+
+/// The request's system text, with [`JSON_INSTRUCTION`] appended when
+/// [`needs_json_instruction`].
+fn system_text(request: &LlmRequest) -> Option<String> {
+    if !needs_json_instruction(request) {
+        return request.system.clone();
+    }
+    Some(match &request.system {
+        Some(text) => format!("{text}\n\n{JSON_INSTRUCTION}"),
+        None => JSON_INSTRUCTION.to_string(),
+    })
+}
+
 /// Map a provider-neutral request to a Chat Completions body.
 fn request_body(request: &LlmRequest) -> Value {
     let mut messages = Vec::new();
-    if let Some(system) = &request.system {
+    if let Some(system) = system_text(request) {
         messages.push(json!({"role": "system", "content": system}));
     }
     for message in &request.messages {
@@ -938,7 +987,7 @@ fn request_body(request: &LlmRequest) -> Value {
             .collect();
         body.insert("tools".into(), Value::Array(tools));
     }
-    if request.json_output {
+    if request.json_output && !json_in_words(&request.model) {
         body.insert("response_format".into(), json!({"type": "json_object"}));
     }
     if let Some(format) = request.audio_output {
@@ -1066,7 +1115,7 @@ mod tests {
     #[test]
     fn system_limits_tools_and_json_are_mapped() {
         let mut req = request();
-        req.system = Some("be brief".into());
+        req.system = Some("be brief; answer in JSON".into());
         req.max_output_tokens = Some(64);
         req.temperature = Some(0.5);
         req.json_output = true;
@@ -1076,9 +1125,10 @@ mod tests {
             parameters: json!({"type": "object"}),
         }];
         let body = request_body(&req);
+        // The request already says JSON, so the system text is left as it is.
         assert_eq!(
             body["messages"][0],
-            json!({"role": "system", "content": "be brief"})
+            json!({"role": "system", "content": "be brief; answer in JSON"})
         );
         assert_eq!(body["messages"][1]["role"], "user");
         assert_eq!(body["max_tokens"], 64);
@@ -1343,7 +1393,7 @@ mod tests {
         let body = responses_body(&req);
         assert_eq!(body["background"], true);
         assert_eq!(body["store"], true);
-        assert_eq!(body["instructions"], "sys");
+        assert_eq!(body["instructions"], format!("sys\n\n{JSON_INSTRUCTION}"));
         assert_eq!(body["max_output_tokens"], 9);
         assert_eq!(body["text"]["format"]["type"], "json_object");
         assert_eq!(body["tools"][0]["name"], "lookup");
@@ -1571,6 +1621,74 @@ mod tests {
                 "{id} must not advertise audio"
             );
         }
+    }
+
+    /// The audio chat models refuse `response_format: json_object` (HTTP 400, seen live on
+    /// `gpt-audio`): JSON is asked for in the system message instead, and the capability stays
+    /// declared so `require: [json-output]` still selects them.
+    #[test]
+    fn audio_model_json_is_asked_in_words_not_response_format() {
+        for model in ["gpt-audio", "gpt-audio-1.5", "gpt-4o-audio-preview"] {
+            let mut req = request();
+            req.model = model.into();
+            req.json_output = true;
+            req.messages = vec![LlmMessage {
+                audio: Some(LlmAudio {
+                    data: b"RIFF".to_vec(),
+                    format: AudioFormat::Wav,
+                }),
+                ..LlmMessage::user("rate the caller's mood as JSON")
+            }];
+            let body = request_body(&req);
+            assert!(body.get("response_format").is_none(), "{model}: {body}");
+            assert_eq!(
+                body["messages"][0],
+                json!({"role": "system", "content": JSON_INSTRUCTION}),
+                "{model}"
+            );
+            assert_eq!(body["messages"][1]["content"][1]["type"], "input_audio");
+
+            req.system = Some("You analyse calls.".into());
+            let body = request_body(&req);
+            assert_eq!(
+                body["messages"][0]["content"],
+                format!("You analyse calls.\n\n{JSON_INSTRUCTION}")
+            );
+            let responses = responses_body(&req);
+            assert!(responses.get("text").is_none(), "{model}: {responses}");
+            assert_eq!(
+                responses["instructions"],
+                format!("You analyse calls.\n\n{JSON_INSTRUCTION}")
+            );
+        }
+        let caps =
+            audio_provider("gpt-audio", "openai", "http://127.0.0.1:9/v1".into()).capabilities();
+        assert!(caps.json_output && caps.audio_understanding);
+    }
+
+    /// The JSON modes refuse a request whose messages never say "JSON" (HTTP 400), so the
+    /// instruction is added when nothing in the request mentions it; `response_format` stays.
+    #[test]
+    fn json_mode_adds_the_word_json_when_the_request_never_says_it() {
+        let mut req = request();
+        req.json_output = true;
+        let body = request_body(&req);
+        assert_eq!(body["response_format"], json!({"type": "json_object"}));
+        assert_eq!(
+            body["messages"][0],
+            json!({"role": "system", "content": JSON_INSTRUCTION})
+        );
+        let responses = responses_body(&req);
+        assert_eq!(responses["text"]["format"]["type"], "json_object");
+        assert_eq!(responses["instructions"], JSON_INSTRUCTION);
+
+        req.messages = vec![LlmMessage::user("reply as json please")];
+        let body = request_body(&req);
+        assert_eq!(body["messages"][0]["role"], "user", "{body}");
+        // No JSON asked for: nothing is added.
+        let body = request_body(&request());
+        assert!(body.get("response_format").is_none());
+        assert_eq!(body["messages"][0]["role"], "user");
     }
 
     #[test]

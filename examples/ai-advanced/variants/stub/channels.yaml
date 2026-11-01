@@ -18,6 +18,7 @@
 #   SYNC  POST /channels/voice              -> voice-model      audio in, spoken answer out (OpenAI audio model)
 #   SYNC  POST /channels/voice-pipeline     -> voice-pipeline-model  speech-to-text, a text model, text-to-speech
 #   SYNC  POST /channels/vision             -> vision-model     an image or video frames in, a JSON answer out (native Gemini)
+#   SYNC  POST /channels/hear-json          -> hear-json-model  audio in, a parsed JSON answer out (OpenAI audio model)
 #
 # The three sync channels declare `ack-mode: on-complete`: the call is inline and the HTTP caller
 # gets the answer on its own connection. The three job channels are `mode: job` on the outbound
@@ -304,6 +305,36 @@ channels:
           api-key: env:LLM_API_KEY
       require: [audio-understanding]   # skip any candidate that would flatten the voice
       output-voice: alloy
+      timeout-seconds: 30
+
+  # { requestId, audio: { data: <base64>, format: <media type> } } -> a parsed JSON answer
+  - name: hear-json
+    transport: http
+    bind: "POST /channels/hear-json"
+    codec: json
+    ack-mode: on-complete
+    cloudevents-mode: none
+    auth:
+      scheme: apikey
+      apikey:
+        value: env:AI_ADVANCED_API_KEY
+        header: X-Api-Key
+
+  # AUDIO UNDERSTANDING WITH A JSON ANSWER. An OpenAI audio model refuses the JSON mode
+  # (`response_format`), so the adapter asks for JSON in words and the transport parses it; the
+  # stub refuses `response_format` for an audio model exactly as the real API does.
+  - name: hear-json-model
+    direction: outbound
+    transport: llm
+    bind: "llm://hear-json-model"
+    ack-mode: on-complete
+    llm:
+      candidates:
+        - provider: openai
+          model: gpt-audio-stub
+          base-url: http://model-stub:8000/v1
+          api-key: env:LLM_API_KEY
+      require: [audio-understanding, json-output]
       timeout-seconds: 30
 
   # THE PIPELINE. `voice: pipeline` transcribes with `speech`, answers with the (text) candidate,

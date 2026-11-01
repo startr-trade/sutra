@@ -17,8 +17,9 @@ use tracing::field::Empty;
 use tracing::Instrument;
 
 use crate::config::{ChannelTable, LlmChannel};
+use crate::failure_reason::{scrub_failure, LlmFailureReason};
 use crate::request::CallRequest;
-use crate::sink::{route, RouteFailure};
+use crate::sink::{failure_diagnostic, route, warn_call_failed, RouteFailure};
 
 /// One live [`LlmChannel`], callable through [`LlmChannelHandle`].
 pub struct RoutedChannelHandle {
@@ -59,6 +60,7 @@ impl RoutedChannelHandle {
     }
 
     fn route_failure(&self, failure: RouteFailure) -> LlmFailure {
+        warn_call_failed(&failure_diagnostic(&self.channel, &failure), &failure, None);
         match failure {
             RouteFailure::NoEligibleCandidate => LlmFailure::Permanent {
                 detail: self.failure("no candidate has the capabilities this call needs"),
@@ -77,7 +79,7 @@ impl RoutedChannelHandle {
             } => {
                 let detail = self.failure(format_args!(
                     "every candidate failed; last ({provider}/{model}): {}",
-                    failure.detail()
+                    LlmFailureReason::of(&failure, None)
                 ));
                 match failure {
                     LlmFailure::Retryable {
@@ -200,17 +202,22 @@ impl RoutedChannelHandle {
                     })
                 }
                 Err(failure) => {
+                    let failure = scrub_failure(failure, candidate.config.api_key.as_deref());
                     let fall_back = matches!(
                         &failure,
                         LlmFailure::Retryable { class, .. } if channel.fallback_on.contains(class)
                     );
+                    let reason = LlmFailureReason::of(&failure, None);
                     tracing::warn!(
+                        code = %codes::CALL_FAILED,
                         channel = %channel.name,
                         provider = %candidate.provider,
                         model = %candidate.model(),
+                        candidate = index,
+                        http_status = %reason.status_field(),
+                        provider_code = %reason.code_field(),
                         fall_back,
-                        "llm candidate could not open a live session: {}",
-                        failure.detail()
+                        "llm candidate could not open a live session: {reason}"
                     );
                     last = Some((
                         candidate.provider.clone(),

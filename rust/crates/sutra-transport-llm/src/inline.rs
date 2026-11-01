@@ -112,7 +112,7 @@ impl LlmInlineCaller {
                     headers,
                 })
             }
-            Err(failure) => match failure_outcome(&channel, failure) {
+            Err(failure) => match failure_outcome(&channel, failure, message) {
                 SendOutcome::RetryableFailure(d) => Err(InlineFailure::Retryable(d)),
                 SendOutcome::PermanentFailure(d) => Err(InlineFailure::Permanent(d)),
                 SendOutcome::Delivered => unreachable!("failure_outcome never delivers"),

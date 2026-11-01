@@ -18,6 +18,7 @@ use tracing::field::Empty;
 use tracing::Instrument;
 
 use crate::config::{ChannelMode, ChannelTable, LlmCandidate, LlmChannel, SpeechStage, VoiceMode};
+use crate::failure_reason::{scrub_failure, LlmFailureReason};
 use crate::job_store::{JobStoreSlot, NewLlmJob};
 use crate::request::{parse_destination, parse_request_body, CallRequest};
 use crate::TRANSPORT;
@@ -206,20 +207,25 @@ where
         match outcome {
             Ok(value) => return Ok((index, candidate, value)),
             Err(failure) => {
+                // A credential a provider echoes goes no further than here.
+                let failure = scrub_failure(failure, candidate.config.api_key.as_deref());
                 let fall_back = matches!(
                     &failure,
                     LlmFailure::Retryable { class, .. } if channel.fallback_on.contains(class)
                 );
-                if let LlmFailure::Retryable { class, .. } = &failure {
-                    tracing::warn!(
-                        channel = %channel.name,
-                        provider = %candidate.provider,
-                        model = %candidate.model(),
-                        class = class.as_str(),
-                        fall_back,
-                        "llm candidate failed"
-                    );
-                }
+                let reason = LlmFailureReason::of(&failure, None);
+                tracing::warn!(
+                    code = %codes::CALL_FAILED,
+                    channel = %channel.name,
+                    provider = %candidate.provider,
+                    model = %candidate.model(),
+                    candidate = index,
+                    class = %failure_class(&failure),
+                    http_status = %reason.status_field(),
+                    provider_code = %reason.code_field(),
+                    fall_back,
+                    "llm candidate failed: {reason}"
+                );
                 last = RouteFailure::Failed {
                     provider: candidate.provider.clone(),
                     model: candidate.model().to_string(),
@@ -459,71 +465,180 @@ pub async fn route_submit<'c>(
     })
 }
 
-/// Map a routing failure to the delivery outcome: a retryable last failure defers the row,
-/// anything else poisons it. The diagnostic names channel/provider/model, never content.
-pub fn failure_outcome(channel: &LlmChannel, failure: RouteFailure) -> SendOutcome {
+/// `retryable` class spelling, or `permanent`.
+pub(crate) fn failure_class(failure: &LlmFailure) -> &'static str {
     match failure {
-        RouteFailure::Rejected { detail } => SendOutcome::PermanentFailure(
-            Diagnostic::error(
-                codes::AUDIO_UNSUPPORTED,
-                format!("llm channel '{}': {detail}", channel.name),
-            )
-            .with_attribute("channel", channel.name.clone()),
-        ),
-        RouteFailure::NoEligibleCandidate => SendOutcome::PermanentFailure(
-            Diagnostic::error(
-                codes::CALL_FAILED,
-                format!(
-                    "llm channel '{}': no candidate has the capabilities this call needs",
-                    channel.name
-                ),
-            )
-            .with_attribute("channel", channel.name.clone()),
-        ),
+        LlmFailure::Retryable { class, .. } => class.as_str(),
+        LlmFailure::Permanent { .. } => "permanent",
+    }
+}
+
+/// The diagnostic a routing failure ends the call with. It names channel/provider/model and the
+/// provider's reason ([`LlmFailureReason`]: HTTP status, provider error code, a truncated
+/// message), never content; the reason also rides as `http_status` / `provider_code`
+/// attributes.
+pub fn failure_diagnostic(channel: &LlmChannel, failure: &RouteFailure) -> Diagnostic {
+    match failure {
+        RouteFailure::Rejected { detail } => Diagnostic::error(
+            codes::AUDIO_UNSUPPORTED,
+            format!("llm channel '{}': {detail}", channel.name),
+        )
+        .with_attribute("channel", channel.name.clone()),
+        RouteFailure::NoEligibleCandidate => Diagnostic::error(
+            codes::CALL_FAILED,
+            format!(
+                "llm channel '{}': no candidate has the capabilities this call needs",
+                channel.name
+            ),
+        )
+        .with_attribute("channel", channel.name.clone()),
         RouteFailure::Failed {
             provider,
             model,
             failure,
         } => {
-            let diagnostic = Diagnostic::error(
+            let reason = LlmFailureReason::of(failure, None);
+            let mut diagnostic = Diagnostic::error(
                 codes::CALL_FAILED,
                 format!(
-                    "llm channel '{}': every candidate failed; last ({provider}/{model}): {}",
-                    channel.name,
-                    failure.detail()
+                    "llm channel '{}': every candidate failed; last ({provider}/{model}): \
+                     {reason}",
+                    channel.name
                 ),
             )
             .with_attribute("channel", channel.name.clone())
-            .with_attribute("provider", provider)
-            .with_attribute("model", model);
-            match failure {
-                LlmFailure::Retryable { class, .. } => SendOutcome::RetryableFailure(
-                    diagnostic.with_attribute("class", class.as_str()),
-                ),
-                LlmFailure::Permanent { .. } => SendOutcome::PermanentFailure(diagnostic),
+            .with_attribute("provider", provider.clone())
+            .with_attribute("model", model.clone());
+            if let Some(status) = reason.http_status {
+                diagnostic = diagnostic.with_attribute("http_status", status.to_string());
             }
+            if let Some(code) = reason.provider_code {
+                diagnostic = diagnostic.with_attribute("provider_code", code);
+            }
+            diagnostic
         }
+    }
+}
+
+/// The header value `name` (matched case-insensitively), when present and not blank.
+fn header_value<'m>(message: &'m OutboundMessage, name: &str) -> Option<&'m str> {
+    message
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(name))
+        .map(|(_, v)| v.trim())
+        .filter(|v| !v.is_empty())
+}
+
+/// Report a call that ended without an answer, at WARN, under the same `code` the engine's
+/// instance-failed line names as its `cause_code` — so one grep for the code finds both. The
+/// line carries the instance id when the engine stamped one (an audited process) and the
+/// trace id of the call; never the prompt, the answer or a credential.
+pub(crate) fn warn_call_failed(
+    diagnostic: &Diagnostic,
+    failure: &RouteFailure,
+    message: Option<&OutboundMessage>,
+) {
+    let attribute = |name: &str| {
+        diagnostic
+            .attributes
+            .get(name)
+            .map(String::as_str)
+            .unwrap_or("-")
+    };
+    let class = match failure {
+        RouteFailure::Failed { failure, .. } => failure_class(failure),
+        _ => "permanent",
+    };
+    let instance = message
+        .and_then(|m| header_value(m, sutra_channels::AUDIT_JOURNAL_INSTANCE_HEADER))
+        .unwrap_or("-");
+    let trace_id = message
+        .and_then(|m| m.traceparent.as_deref())
+        .and_then(|t| t.split('-').nth(1))
+        .unwrap_or("-");
+    tracing::warn!(
+        code = %diagnostic.code,
+        channel = %attribute("channel"),
+        provider = %attribute("provider"),
+        model = %attribute("model"),
+        class = %class,
+        http_status = %attribute("http_status"),
+        provider_code = %attribute("provider_code"),
+        instance = %instance,
+        trace_id = %trace_id,
+        "llm call failed: {}",
+        diagnostic.message
+    );
+}
+
+/// Map a routing failure to the delivery outcome: a retryable last failure defers the row,
+/// anything else poisons it. The diagnostic is [`failure_diagnostic`]; the failure is reported
+/// at WARN first (see [`warn_call_failed`]), with `message` the call that failed.
+pub fn failure_outcome(
+    channel: &LlmChannel,
+    failure: RouteFailure,
+    message: &OutboundMessage,
+) -> SendOutcome {
+    let diagnostic = failure_diagnostic(channel, &failure);
+    warn_call_failed(&diagnostic, &failure, Some(message));
+    match failure {
+        RouteFailure::Failed {
+            failure: LlmFailure::Retryable { class, .. },
+            ..
+        } => SendOutcome::RetryableFailure(diagnostic.with_attribute("class", class.as_str())),
+        _ => SendOutcome::PermanentFailure(diagnostic),
     }
 }
 
 /// The parsed answer of a call that asked for JSON (`json: true` on the request): the answer
 /// text as a JSON object or array, so a flow reads its fields directly (FEEL has no JSON
-/// parser). `None` when the call did not ask, or the text is not a JSON object or array.
+/// parser). The text may be the bare JSON, a fenced block (```` ```json … ``` ````), or
+/// prose around one fenced block — the shape a model asked for JSON in words (not through a
+/// JSON mode) tends to answer in. `None` when the call did not ask, or no JSON object or array
+/// is found.
 pub fn structured_answer(text: &str, request: &Value) -> Option<Value> {
     if request.get("json").and_then(Value::as_bool) != Some(true) {
         return None;
     }
     let trimmed = text.trim();
-    let trimmed = trimmed
+    let unfenced = trimmed
         .strip_prefix("```json")
         .or_else(|| trimmed.strip_prefix("```"))
         .and_then(|rest| rest.trim_end().strip_suffix("```"))
         .unwrap_or(trimmed)
         .trim();
-    match serde_json::from_str::<Value>(trimmed) {
+    json_container(unfenced).or_else(|| fenced_block(trimmed).and_then(json_container))
+}
+
+/// `text` parsed, when it is a JSON object or array.
+fn json_container(text: &str) -> Option<Value> {
+    match serde_json::from_str::<Value>(text) {
         Ok(value @ (Value::Object(_) | Value::Array(_))) => Some(value),
         _ => None,
     }
+}
+
+/// The body of the first fenced block in `text` (```` ```json ```` or a bare ```` ``` ````
+/// fence), trimmed.
+fn fenced_block(text: &str) -> Option<&str> {
+    let open = text.find("```")?;
+    let after = &text[open + 3..];
+    // The info string (`json`, `JSON`, nothing) runs to the end of the opening line.
+    let mut body_start = after.find('\n').map(|i| i + 1).unwrap_or(0);
+    let info = after[..body_start].trim();
+    if info.starts_with(['{', '[']) || body_start == 0 {
+        // A one-line block: the JSON starts right after the fence.
+        body_start = after.len()
+            - after
+                .trim_start_matches(|c: char| c.is_ascii_alphabetic())
+                .len();
+    } else if !(info.is_empty() || info.eq_ignore_ascii_case("json")) {
+        return None;
+    }
+    let body = &after[body_start..];
+    let close = body.find("```")?;
+    Some(body[..close].trim())
 }
 
 /// Why a call that asked for JSON got no parsed `json`: the answer was cut off at
@@ -698,7 +813,7 @@ impl LlmSink {
         );
         let submitted = match route_submit(channel, call).instrument(span).await {
             Ok(submitted) => submitted,
-            Err(failure) => return failure_outcome(channel, failure),
+            Err(failure) => return failure_outcome(channel, failure, message),
         };
         let job = NewLlmJob {
             deployment: channel.deployment.clone(),
@@ -800,7 +915,7 @@ impl LlmSink {
         drop(permit);
         let answer = match routed {
             Ok(answer) => answer,
-            Err(failure) => return failure_outcome(&channel, failure),
+            Err(failure) => return failure_outcome(&channel, failure, message),
         };
         span.record("finish", answer.response.finish.as_str());
         span.record("input_tokens", answer.response.usage.input_tokens);

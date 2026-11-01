@@ -22,16 +22,25 @@ pub const FAKE: &str = "test-fake";
 pub const TENANT: &str = "acme";
 pub const MODULE_KEY: &str = "acme/orders/1.0.0";
 pub const ANSWER_TEXT: &str = "THE-ANSWER-TEXT";
+/// The failure detail of the `http-400` fake: the body the OpenAI API answers an audio model
+/// asked for `response_format: json_object` with.
+pub const HTTP_400_DETAIL: &str = "HTTP 400: {\"error\": {\"message\": \"Invalid parameter: \
+    'response_format' of type 'json_object' is not supported with this model.\", \"type\": \
+    \"invalid_request_error\", \"param\": \"response_format\", \"code\": null}}";
 
 /// Behaviour is chosen by the model name:
 /// `ok*` answers; `rate-limited` / `unavailable` / `timeout` fail retryably; `permanent`
 /// fails permanently; `no-tools*` answers but lacks tool support; `slow-<tag>` answers after
 /// a pause, tracking peak concurrency under `<tag>`; `hang` never answers in time;
-/// `rate-limited-after-part` streams a piece before failing.
+/// `rate-limited-after-part` streams a piece before failing; `http-400` fails the way an
+/// OpenAI contract reject does ([`HTTP_400_DETAIL`]); `http-401-echo` fails with an error body
+/// that echoes the candidate's key.
 /// `job*` models support async jobs (`job-fail*` refuses the submit retryably) and, unless
 /// `job-poll*`, job callbacks; a job's state is set with [`set_job_state`].
 struct FakeProvider {
     model: String,
+    /// The candidate's resolved `api-key`, echoed by `http-401-echo`.
+    api_key: Option<String>,
 }
 
 #[derive(Default)]
@@ -166,6 +175,17 @@ impl LlmProvider for FakeProvider {
                 "timeout" => Err(retryable(RetryableClass::Timeout)),
                 "permanent" => Err(LlmFailure::Permanent {
                     detail: "fake contract reject".into(),
+                }),
+                "http-400" => Err(LlmFailure::Permanent {
+                    detail: HTTP_400_DETAIL.into(),
+                }),
+                "http-401-echo" => Err(LlmFailure::Permanent {
+                    detail: format!(
+                        "HTTP 401: {{\"error\": {{\"message\": \"Incorrect API key provided: \
+                         {}\", \"type\": \"invalid_request_error\", \"code\": \
+                         \"invalid_api_key\"}}}}",
+                        self.api_key.as_deref().unwrap_or("")
+                    ),
                 }),
                 "hang" => {
                     tokio::time::sleep(Duration::from_secs(3600)).await;
@@ -390,6 +410,7 @@ impl sutra_llm_spi::AudioSession for IdleSession {
 fn build_fake(config: &LlmProviderConfig) -> Result<Arc<dyn LlmProvider>, Diagnostic> {
     Ok(Arc::new(FakeProvider {
         model: config.model.clone(),
+        api_key: config.api_key.clone(),
     }))
 }
 

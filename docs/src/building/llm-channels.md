@@ -274,7 +274,7 @@ The channel-call task's input is a JSON object:
 | `prompt` | A single user message. |
 | `messages` | A conversation: `[{ "role": "user" \| "assistant" \| "tool", "content": "…", "toolCallId": "…" }]`. Use `prompt`, `messages`, or both (`prompt` is appended). |
 | `system` | Overrides the channel's `system`. |
-| `json` | `true` asks for a JSON object as the answer. |
+| `json` | `true` asks for a JSON object as the answer. The reply carries it parsed under `json`, or `jsonError` saying why it did not parse. The answer may be bare JSON or one fenced block (` ```json `), with or without prose around it. See [How JSON is asked for](#how-json-is-asked-for). |
 | `maxOutputTokens`, `temperature` | Override the channel's values. |
 | `tools` | `[{ "name", "description", "parameters": <JSON Schema> }]` the model may call. |
 | `messages[].audio` | Audio on a user turn: `{ "data": <base64>, "format": <media type> }`. See [Audio, images and video](#audio-images-and-video). |
@@ -286,6 +286,22 @@ The channel-call task's input is a JSON object:
 
 Build the prompt in the process — a template task, a FEEL string, or a `<q:param>` — so it is
 versioned with the flow that uses it.
+
+### How JSON is asked for
+
+Every provider declares `json-output`, but not every model has a JSON mode, so each adapter asks
+in the way its model accepts. Either way the transport parses the answer into `json`.
+
+| Provider / model | How `json: true` is sent |
+|---|---|
+| `openai` and the Chat Completions services, text models | `response_format: {type: json_object}` (`text.format` for a job). The JSON modes refuse a request that never says "JSON", so when neither `system` nor any message mentions it, *Respond with a single JSON object and nothing else.* is added to the system text. |
+| `openai` audio chat models (a model id containing `audio`: `gpt-audio…`, `gpt-4o-audio-preview`) | In words only: the instruction above in the system text, no `response_format`. These models refuse the JSON mode with HTTP 400 ("…`response_format` of type `json_object` is not supported with this model"). They often answer with the JSON in a fenced block inside prose; the transport finds and parses it. |
+| `gemini` (native) | `responseMimeType: application/json`; with tools, in words. |
+| `anthropic`, `aws-bedrock` | In words (neither has a JSON mode). |
+
+So a channel with `require: [audio-understanding, json-output]` still selects an OpenAI audio
+model. A model asked in words can still answer prose with no JSON in it: the reply then carries
+`jsonError`, and a flow that needs the object should check for it.
 
 ## The reply
 
@@ -663,6 +679,28 @@ engine in this repository ships none. The sutra-voice repository runs it end to 
 
 A sync retry never parks a durable backoff; a flow that needs one should use the async channel.
 
+### Finding the reason for a failed call
+
+The provider's reason for a failure is logged at `WARN`, for sync and async calls alike, under the
+code `SUTRA.LLM.CALL.FAILED`: the same code the engine's instance-failed line names as its
+`cause_code`, so one search for that code finds both. Two lines are written:
+
+- `llm candidate failed: <reason>`, once per candidate tried, with `channel`, `provider`, `model`,
+  `candidate` (its index), `class` (`rate-limited`, `unavailable`, `timeout` or `permanent`),
+  `http_status`, `provider_code` and `fall_back`;
+- `llm call failed: <diagnostic>`, once for the call, with the same fields plus `trace_id` (from
+  the call's `traceparent`) and `instance` (when the engine stamped the instance id on the call,
+  as it does for an audited process; `-` otherwise).
+
+The reason is the provider's HTTP status, its error code (`code`, `status` or `type` of its error
+object) and its message, on one line and cut to 300 characters, for example
+`HTTP 400 (invalid_request_error): Invalid parameter: 'response_format' of type 'json_object' is
+not supported with this model.` Every URL in it has its query values and credentials replaced
+by `<redacted>`, and the candidate's key is replaced wherever a provider echoes it. The same
+reason is in the failure diagnostic, which the engine stores with a failed instance (and with a
+dead-lettered start), with `http_status` and `provider_code` as attributes. No admin API is
+needed to read it.
+
 Duplicate calls. Async delivery is at-least-once: a crash after the model answered but before
 the delivery was recorded calls the model again; inbox deduplication absorbs the duplicate reply,
 but the call is paid for twice (a job channel likewise risks a duplicate provider job if the
@@ -680,7 +718,9 @@ loop back to the model task. Bound the loop with a counter and a non-interruptin
 ## What is not logged
 
 Prompts and answers are never written to spans, logs or diagnostics. Each call opens a
-`sutra.llm.call` span carrying the channel, provider, model, finish reason and token counts.
+`sutra.llm.call` span carrying the channel, provider, model, finish reason and token counts. A
+failure's log lines carry the provider's error message, never the request, and keys are redacted
+from it (see [Finding the reason for a failed call](#finding-the-reason-for-a-failed-call)).
 
 ## Examples
 
@@ -691,7 +731,7 @@ Runnable packages in the source tree. The two `ai-` examples keep their flows on
 | Example | Variants | Flows |
 |---|---|---|
 | `examples/ai-summarize` | `stub-openai`, `stub-anthropic`, `openai`, `anthropic`, `gemini` | sync, streamed (SSE), async |
-| `examples/ai-advanced` | `stub`, `live` | cross-provider fallback (Anthropic first, OpenAI second), JSON mode, a tool call, an OpenAI background job (polled), an OpenAI background job (webhook), an Anthropic Message Batch, audio in and out, the voice pipeline, images and video frames to native Gemini |
+| `examples/ai-advanced` | `stub`, `live` | cross-provider fallback (Anthropic first, OpenAI second), JSON mode, a tool call, an OpenAI background job (polled), an OpenAI background job (webhook), an Anthropic Message Batch, audio in and out, audio in with a parsed JSON answer out (an OpenAI audio model), the voice pipeline, images and video frames to native Gemini |
 | `examples/media-recordings` | — | a stored recording read by media reference from an object store, audited by reference, deleted on erasure and retention ([walkthrough](recordings-and-media.md)) |
 
 ```bash

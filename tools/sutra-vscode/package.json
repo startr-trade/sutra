@@ -141,5 +141,10 @@
     "eslint": "^8.55.0",
     "typescript": "^5.3.2",
     "vitest": "^4.0.0"
+  },
+  "overrides": {
+    "vscode-languageclient": {
+      "minimatch": "^11.0.1"
+    }
   }
 }

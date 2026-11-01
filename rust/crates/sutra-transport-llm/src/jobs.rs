@@ -12,6 +12,7 @@ use sutra_channels::OutboundMessage;
 use sutra_llm_spi::{codes, LlmFailure, LlmJobRef, LlmJobState, RetryableClass};
 
 use crate::config::{ChannelMode, ChannelTable, LlmCandidate, LlmChannel};
+use crate::failure_reason::LlmFailureReason;
 use crate::job_store::{JobClaim, LlmJobRow, LlmJobStore};
 use crate::sink::{build_reply, is_engine_unavailable, ReplyPort};
 
@@ -145,7 +146,7 @@ impl JobRunner {
     async fn unresolvable(&self, row: &LlmJobRow) -> JobOutcome {
         let detail = "the channel candidate that accepted the job is no longer configured";
         tracing::warn!(
-            code = codes::CALL_FAILED,
+            code = %codes::CALL_FAILED,
             channel = %row.job.channel,
             provider = %row.job.provider,
             "llm job failed: {detail}"
@@ -185,15 +186,17 @@ impl JobRunner {
             Ok(LlmJobState::Failed(failure)) | Err(failure) => failure,
         };
         // The flow's own timeout on the wait handles a job that never answers.
+        let reason = LlmFailureReason::of(&failure, candidate.config.api_key.as_deref());
         tracing::warn!(
-            code = codes::CALL_FAILED,
+            code = %codes::CALL_FAILED,
             channel = %channel.name,
             provider = %candidate.provider,
             model = %candidate.model(),
-            "llm job failed: {}",
-            failure.detail()
+            http_status = %reason.status_field(),
+            provider_code = %reason.code_field(),
+            "llm job failed: {reason}"
         );
-        self.mark_failed(row, failure.detail()).await
+        self.mark_failed(row, &reason.to_string()).await
     }
 
     async fn deliver(

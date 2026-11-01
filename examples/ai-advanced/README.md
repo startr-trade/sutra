@@ -13,6 +13,7 @@ ordinary channel-call task, so nothing in the BPMN is specific to models.
 | `job-webhook.bpmn` | `POST /channels/summarize-webhook` (202) | `webhook-model` | **An OpenAI background job completed by a signed webhook** on `POST /llm/openai-hooks`. |
 | `batch.bpmn` | `POST /channels/summarize-batch` (202) | `batch-model` | **An Anthropic Message Batch**, `mode: job`, polled. |
 | `voice.bpmn` | `POST /channels/voice` (sync) | `voice-model` | **Audio in, a spoken answer out**: an uploaded WAV recording to an audio model, the spoken answer in the format the request asked for; `audioPreserved: true`. |
+| `hear-json.bpmn` | `POST /channels/hear-json` (sync) | `hear-json-model` | **Audio in, a parsed JSON answer out**: a recording to an OpenAI audio model with `json: true` (`require: [audio-understanding, json-output]`). Those models refuse `response_format`, so the adapter asks for JSON in words; the reply carries the parsed `json`. |
 | `voice-pipeline.bpmn` | `POST /channels/voice-pipeline` (sync) | `voice-pipeline-model` | **`voice: pipeline`**: transcribed, answered by a text model (Anthropic), spoken; `audioPreserved: false`. |
 | `vision.bpmn` | `POST /channels/vision` (sync) | `vision-model` | **Images and video frames** (preview) to the native `gemini` provider with `json: true`; the flow reads the parsed answer under `json`. |
 
@@ -138,7 +139,7 @@ real voice. To check `gemini-3.8-live` there, record your own question
 **Just the OpenAI paths.** With only `OPENAI_API_KEY`, `ONLY=openai` runs every check that needs
 nothing else: the ai-summarize `openai` variant, JSON mode, the background job (polled, and by
 webhook when `OPENAI_WEBHOOK_SECRET` is set), audio understanding with a spoken answer (`voice`:
-the answer must say Paris, audio back, `audioPreserved: true`), the voice pipeline (transcribed,
+the answer must say Paris, audio back, `audioPreserved: true`), audio understanding with a JSON answer (`hear-json` on `gpt-audio`, or `OPENAI_AUDIO_MODEL`: the parsed `json` must say Paris), the voice pipeline (transcribed,
 answered by `gpt-4o-mini` in place of Anthropic, spoken; `audioPreserved: false`), the audio as a
 media reference read from MinIO (and a wrong SHA-256, refused before any call), and an OpenAI
 Realtime session through the adapter (the WAV up, audio and transcripts back, the key only in the

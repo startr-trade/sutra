@@ -1,0 +1,96 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  AUDIO IN, A STRUCTURED ANSWER OUT. A recorded question goes to an OpenAI audio chat model, which
+  hears the voice itself, and the request says `json: true`. Those models refuse the JSON mode
+  (`response_format`), so the adapter asks for JSON in the system text instead and the transport
+  parses the answer, bare or in a fenced block, into `json` (or says why not in `jsonError`).
+  `hear-json-model` declares `require: [audio-understanding, json-output]`: the audio models still
+  count as answering JSON.
+
+    startEvent (JSON on `hear-json`: { requestId, audio: { data, format } })
+      then BuildRequest : data task (FEEL) — requestBody := { messages: [ user turn + audio ], json: true }
+      then AskModel     : channel-call task on `hear-json-model` (sync)
+      then BuildReply   : data task (FEEL) — { requestId, json, jsonError, provider, model }
+      then End
+-->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI"
+                  xmlns:dc="http://www.omg.org/spec/DD/20100524/DC"
+                  xmlns:di="http://www.omg.org/spec/DD/20100524/DI"
+                  xmlns:q="urn:sutra:q:1.0"
+                  id="Definitions_hear_json"
+                  targetNamespace="urn:sutra:module:ai-advanced:1.0.0">
+
+  <bpmn:process id="hear-json" name="Answer a recorded question as a JSON object" isExecutable="true">
+
+    <bpmn:extensionElements>
+      <q:variables>
+        <q:variable name="requestBody" type="object"/>  <!-- what the model channel is sent -->
+        <q:variable name="answer" type="object"/>  <!-- the model's whole reply message -->
+        <q:variable name="responseObject" type="object"/>  <!-- what the HTTP caller gets back -->
+      </q:variables>
+    </bpmn:extensionElements>
+
+    <bpmn:startEvent id="Start" name="Request received">
+      <bpmn:extensionElements>
+        <q:source channel="hear-json"/>
+      </bpmn:extensionElements>
+      <bpmn:outgoing>F1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="F1" sourceRef="Start" targetRef="BuildRequest"/>
+
+    <bpmn:serviceTask id="BuildRequest" name="Build the prompt (FEEL)">
+      <bpmn:incoming>F1</bpmn:incoming><bpmn:outgoing>F2</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment>
+          <bpmn:from>{messages: [{role: "user", content: "Listen to this recording. Answer with an object with the keys question (the question asked, in English) and answer (a short answer to it).", audio: payload.audio}], json: true}</bpmn:from>
+          <bpmn:to>requestBody</bpmn:to>
+        </bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F2" sourceRef="BuildRequest" targetRef="AskModel"/>
+
+    <!-- Sync channel: the answer is in hand when the task completes. -->
+    <bpmn:serviceTask id="AskModel" name="Ask the listening model" implementation="channel:hear-json-model">
+      <bpmn:extensionElements>
+        <q:timeout duration="PT90S"/>
+      </bpmn:extensionElements>
+      <bpmn:incoming>F2</bpmn:incoming><bpmn:outgoing>F3</bpmn:outgoing>
+      <bpmn:dataOutputAssociation>
+        <bpmn:assignment><bpmn:from>payload</bpmn:from><bpmn:to>answer</bpmn:to></bpmn:assignment>
+      </bpmn:dataOutputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F3" sourceRef="AskModel" targetRef="BuildReply"/>
+
+    <!-- A structured reply: responseObject, rendered as JSON by mode="native". -->
+    <bpmn:serviceTask id="BuildReply" name="Build the reply (FEEL)">
+      <bpmn:extensionElements>
+        <q:reply mode="native" contentType="application/json"/>
+      </bpmn:extensionElements>
+      <bpmn:incoming>F3</bpmn:incoming><bpmn:outgoing>F4</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment>
+          <bpmn:from>{requestId: payload.requestId, json: answer.json, jsonError: answer.jsonError, provider: answer.provider, model: answer.model}</bpmn:from>
+          <bpmn:to>responseObject</bpmn:to>
+        </bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F4" sourceRef="BuildReply" targetRef="End"/>
+
+    <bpmn:endEvent id="End" name="Answer returned"><bpmn:incoming>F4</bpmn:incoming></bpmn:endEvent>
+  </bpmn:process>
+
+  <bpmndi:BPMNDiagram id="Diagram_hear_json">
+    <bpmndi:BPMNPlane id="Plane_hear_json" bpmnElement="hear-json">
+      <bpmndi:BPMNShape id="S_Start" bpmnElement="Start"><dc:Bounds x="100" y="100" width="36" height="36"/></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="S_BuildRequest" bpmnElement="BuildRequest"><dc:Bounds x="190" y="78" width="110" height="80"/></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="S_AskModel" bpmnElement="AskModel"><dc:Bounds x="350" y="78" width="110" height="80"/></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="S_BuildReply" bpmnElement="BuildReply"><dc:Bounds x="510" y="78" width="110" height="80"/></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="S_End" bpmnElement="End"><dc:Bounds x="670" y="100" width="36" height="36"/></bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="E_F1" bpmnElement="F1"><di:waypoint x="136" y="118"/><di:waypoint x="190" y="118"/></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="E_F2" bpmnElement="F2"><di:waypoint x="300" y="118"/><di:waypoint x="350" y="118"/></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="E_F3" bpmnElement="F3"><di:waypoint x="460" y="118"/><di:waypoint x="510" y="118"/></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="E_F4" bpmnElement="F4"><di:waypoint x="620" y="118"/><di:waypoint x="670" y="118"/></bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</bpmn:definitions>

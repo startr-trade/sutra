@@ -31,8 +31,11 @@
 #                         openai, JSON mode, the background jobs, audio, the voice pipeline, the
 #                         media reference, the Realtime session); the cross-provider checks
 #                         (fallback, tool call, Message Batch) and Gemini are SKIP
-#   OPENAI_AUDIO_MODEL    the audio chat model of the `voice` flow (default gpt-audio-1.5; it must
-#                         contain `audio`, which is how the adapter knows it hears and speaks)
+#   OPENAI_AUDIO_MODEL    the audio chat model of the `voice` flow (default gpt-audio-1.5) and of
+#                         the `hear-json` flow (default gpt-audio, the model the JSON-answer defect
+#                         was seen on); it must contain `audio`, which is how the adapter knows it
+#                         hears and speaks — and that it asks such a model for JSON in words, since
+#                         the audio models refuse `response_format: json_object`
 #   OPENAI_TRANSCRIBE_MODEL  speech to text, in the voice pipeline and the Realtime session
 #                         (default gpt-transcribe)
 #   OPENAI_TTS_MODEL      text to speech in the voice pipeline (default gpt-4o-mini-tts)
@@ -43,7 +46,7 @@
 #                         name; your account may offer other ids. Each variable is substituted into
 #                         a copy of the channels at deploy time (the committed YAML is unchanged).
 #                         A model-not-found failure names the variable to set.
-#   SUTRA_ENGINE_IMAGE    the engine image (default ghcr.io/startr-trade/sutra:0.6.13; to check this
+#   SUTRA_ENGINE_IMAGE    the engine image (default ghcr.io/startr-trade/sutra:0.6.14; to check this
 #                         tree instead, use sutra-rust-engine:dev built by `make image`)
 #   SUTRA_BIN             the `sutra` CLI, 0.5.0 or later (default: a build in rust/target, else PATH)
 #   GEMINI_LIVE_MODEL     the Gemini Live model (default gemini-3.8-live, the model the
@@ -80,7 +83,9 @@
 #                  JSON mode, an OpenAI background job (polled) and, when OPENAI_WEBHOOK_SECRET
 #                  is set, one completed by webhook; audio understanding with a spoken answer
 #                  (`voice`: sample/spoken-question.wav to the audio model, the answer must say
-#                  Paris, audio back, audioPreserved true); the voice pipeline (`voice-pipeline`:
+#                  Paris, audio back, audioPreserved true); audio understanding with a JSON
+#                  answer (`hear-json` on gpt-audio: no `response_format`, JSON asked in words,
+#                  the reply's parsed `json` must say Paris); the voice pipeline (`voice-pipeline`:
 #                  transcribed, answered in text, spoken; audioPreserved false — its text model is
 #                  Anthropic when ANTHROPIC_API_KEY is set and ONLY is not, else OpenAI
 #                  gpt-4o-mini); the same audio as a media reference {ref, sha256} read from MinIO,
@@ -132,10 +137,11 @@ only_openai() { [ "$ONLY" = openai ]; }
 # The OpenAI model ids, each overridable (see the header); substituted into a copy of the live
 # variant's channels. Checked here: each goes into YAML and a URL query.
 audio_model=${OPENAI_AUDIO_MODEL:-gpt-audio-1.5}
+json_audio_model=${OPENAI_AUDIO_MODEL:-gpt-audio}
 transcribe_model=${OPENAI_TRANSCRIBE_MODEL:-gpt-transcribe}
 tts_model=${OPENAI_TTS_MODEL:-gpt-4o-mini-tts}
 realtime_model=${OPENAI_REALTIME_MODEL:-gpt-realtime}
-for m in "$audio_model" "$transcribe_model" "$tts_model" "$realtime_model"; do
+for m in "$audio_model" "$json_audio_model" "$transcribe_model" "$tts_model" "$realtime_model"; do
     [[ "$m" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || { echo "model id '$m': only letters, digits, '.', '_' and '-'" >&2; exit 2; }
 done
 
@@ -167,7 +173,8 @@ GEMINI_CHECKS=("gemini: image understanding" "gemini: video understanding, frame
 skip_gemini() { local c; for c in "${GEMINI_CHECKS[@]}"; do skipped "$c" "$1"; done; }
 # The ai-advanced checks that need only OPENAI_API_KEY (ai-summarize/openai is its own loop).
 OPENAI_CHECKS=("JSON mode (OpenAI)" "OpenAI background job, polled" "OpenAI background job, webhook"
-    "openai: audio understanding, spoken answer" "openai: voice pipeline" "openai: media reference"
+    "openai: audio understanding, spoken answer" "openai: audio understanding, JSON answer"
+    "openai: voice pipeline" "openai: media reference"
     "openai: media reference, wrong sha256" "openai realtime: session round trip"
     "openai realtime: no key in any URL")
 # The ones that need ANTHROPIC_API_KEY as well.
@@ -206,8 +213,8 @@ if [ "$(printf '%s\n' 0.5.0 "$cli_version" | sort -V | head -1)" != 0.5.0 ]; the
     echo "and point SUTRA_BIN at it, e.g. SUTRA_BIN=\$PWD/rust/target/debug/sutra" >&2
     exit 2
 fi
-echo "using $("$sutra_bin" --version) ($sutra_bin); engine image ${SUTRA_ENGINE_IMAGE:-ghcr.io/startr-trade/sutra:0.6.13}"
-image=${SUTRA_ENGINE_IMAGE:-ghcr.io/startr-trade/sutra:0.6.13}
+echo "using $("$sutra_bin" --version) ($sutra_bin); engine image ${SUTRA_ENGINE_IMAGE:-ghcr.io/startr-trade/sutra:0.6.14}"
+image=${SUTRA_ENGINE_IMAGE:-ghcr.io/startr-trade/sutra:0.6.14}
 if ! docker image inspect "$image" >/dev/null 2>&1 && ! docker pull -q "$image" >/dev/null 2>&1; then
     echo "engine image $image is not available locally and cannot be pulled; build one (make image)" >&2
     echo "and set SUTRA_ENGINE_IMAGE, e.g. SUTRA_ENGINE_IMAGE=sutra-rust-engine:dev" >&2
@@ -402,9 +409,9 @@ live_tests() {
 live_variant() {  # live_variant <pipeline text provider: anthropic|openai>
     local dst="$work/variant-live"
     rm -rf "$dst"; cp -R "$examples/ai-advanced/variants/live" "$dst"
-    python3 - "$dst/channels.yaml" "$audio_model" "$transcribe_model" "$tts_model" "$1" <<'EOF'
+    python3 - "$dst/channels.yaml" "$audio_model" "$transcribe_model" "$tts_model" "$1" "$json_audio_model" <<'EOF'
 import sys
-path, audio, transcribe, tts, text_provider = sys.argv[1:6]
+path, audio, transcribe, tts, text_provider, json_audio = sys.argv[1:7]
 text = open(path).read()
 def swap(within, old, new):
     head, sep, rest = text.partition(within)
@@ -412,6 +419,7 @@ def swap(within, old, new):
     assert sep and body.count(old) == 1, f"{old!r} is not in {within!r} exactly once"
     return head + sep + body.replace(old, new) + nxt + tail
 text = swap("- name: voice-model\n", "model: gpt-audio-1.5\n", f"model: {audio}\n")
+text = swap("- name: hear-json-model\n", "model: gpt-audio\n", f"model: {json_audio}\n")
 text = swap("- name: voice-pipeline-model\n", "transcribe-model: gpt-transcribe\n", f"transcribe-model: {transcribe}\n")
 text = swap("- name: voice-pipeline-model\n", "speech-model: gpt-4o-mini-tts\n", f"speech-model: {tts}\n")
 if text_provider == "openai":
@@ -449,9 +457,12 @@ openai_call() {
         check "$name" ok "$(python3 -c 'import json, sys
 d = json.load(sys.stdin)
 a = d.get("audio") or {}
-print("text: %r, transcript: %r, audio: %d bytes %s, audioPreserved: %s, provider: %s" % (
-    str(d.get("text"))[:80], str(d.get("transcript"))[:80], len(a.get("data") or "") * 3 // 4,
-    a.get("format"), d.get("audioPreserved"), d.get("provider")))' <<<"$reply")"
+if "json" in d:
+    print("json: %s, provider: %s, model: %s" % (json.dumps(d["json"])[:160], d.get("provider"), d.get("model")))
+else:
+    print("text: %r, transcript: %r, audio: %d bytes %s, audioPreserved: %s, provider: %s" % (
+        str(d.get("text"))[:80], str(d.get("transcript"))[:80], len(a.get("data") or "") * 3 // 4,
+        a.get("format"), d.get("audioPreserved"), d.get("provider")))' <<<"$reply")"
     else
         local reason
         reason="HTTP $status: $(why "$reply")"
@@ -515,6 +526,12 @@ advanced() {
     openai_call "openai: audio understanding, spoken answer" voice \
         '{"requestId": "O-AUD-1", "audio": {"data": b64("spoken-question.wav"), "format": "audio/wav"}, "audioOutput": "audio/wav"}' \
         "$says_paris and $has_audio and d.get(\"audioPreserved\") is True and d.get(\"provider\") == \"openai\"" \
+        OPENAI_AUDIO_MODEL
+    # The audio models refuse the JSON mode (HTTP 400 "not supported with this model"): the
+    # adapter asks in words and the transport parses the answer, so `json` must be an object.
+    openai_call "openai: audio understanding, JSON answer" hear-json \
+        '{"requestId": "O-AUD-JSON-1", "audio": {"data": b64("spoken-question.wav"), "format": "audio/wav"}}' \
+        'isinstance(d.get("json"), dict) and "paris" in json.dumps(d["json"]).lower() and d.get("provider") == "openai"' \
         OPENAI_AUDIO_MODEL
     openai_call "openai: voice pipeline" voice-pipeline \
         '{"requestId": "O-PIPE-1", "audio": {"data": b64("spoken-question.wav"), "format": "audio/wav"}, "audioOutput": "audio/wav"}' \

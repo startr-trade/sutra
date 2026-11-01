@@ -11,7 +11,7 @@
 //! |---|---|---|
 //! | ai-summarize `stub-openai` | OpenAI Chat Completions | sync, SSE-streamed, async |
 //! | ai-summarize `stub-anthropic` | Anthropic Messages | sync, SSE-streamed, async |
-//! | ai-advanced `stub` | OpenAI, Anthropic, Gemini native | cross-provider fallback, JSON mode, tool call, OpenAI background job (polled), OpenAI background job (signed webhook), Anthropic Message Batch, audio in / spoken answer out, `voice: pipeline`, image / video frames / media-referenced image in, a parsed JSON answer out |
+//! | ai-advanced `stub` | OpenAI, Anthropic, Gemini native | cross-provider fallback, JSON mode, tool call, OpenAI background job (polled), OpenAI background job (signed webhook), Anthropic Message Batch, audio in / spoken answer out, audio in / a parsed JSON answer out (an OpenAI audio model, JSON asked in words), `voice: pipeline`, image / video frames / media-referenced image in, a parsed JSON answer out |
 //!
 //! THE STUB. `examples/ai-summarize/stub/model-stub.py` runs in `python:3.12-alpine` with the
 //! script bind-mounted. The packages address it as `http://model-stub:8000`, so it must answer to
@@ -752,6 +752,49 @@ async fn tc_ai_advanced_voice_audio_in_audio_out() {
         "the audio reached the model"
     );
     assert!(stub_count("chat-audio-out").await > spoke);
+}
+
+/// Audio understanding with a JSON answer on an OpenAI audio model (`require: [audio-
+/// understanding, json-output]`). The stub refuses `response_format` for an audio model with the
+/// real API's HTTP 400, so the call only succeeds because the adapter asks for JSON in words; the
+/// stub then answers the JSON in a fenced block inside prose, and the reply carries it parsed.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "docker"]
+async fn tc_ai_advanced_audio_understanding_json_answer() {
+    advanced();
+    let (in_words, refused, heard) = (
+        stub_count("chat-json-in-words").await,
+        stub_count("chat-json-mode-refused").await,
+        stub_count("chat-audio-in").await,
+    );
+    let reply = advanced_sync(
+        "hear-json",
+        json!({ "requestId": "AUDIO-JSON-1",
+                "audio": { "data": b64(&wav16k(500)), "format": "audio/wav" } }),
+    )
+    .await;
+    assert_eq!(reply["requestId"], "AUDIO-JSON-1", "{reply}");
+    assert_eq!(reply["provider"], "openai", "{reply}");
+    assert_eq!(reply["model"], "gpt-audio-stub", "{reply}");
+    assert_eq!(
+        reply["json"],
+        json!({ "category": "outage", "urgency": "high" }),
+        "the fenced answer is parsed: {reply}"
+    );
+    assert!(reply["jsonError"].is_null(), "{reply}");
+    assert!(
+        stub_count("chat-json-in-words").await > in_words,
+        "asked in words"
+    );
+    assert_eq!(
+        stub_count("chat-json-mode-refused").await,
+        refused,
+        "no response_format was sent to the audio model"
+    );
+    assert!(
+        stub_count("chat-audio-in").await > heard,
+        "the audio reached the model"
+    );
 }
 
 /// The same request on a `voice: pipeline` channel: transcribed by the speech provider, answered

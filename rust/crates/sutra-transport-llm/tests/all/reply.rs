@@ -101,6 +101,34 @@ fn a_json_call_gets_its_answer_parsed() {
     );
 }
 
+/// A model asked for JSON in words (an OpenAI audio model, which refuses `response_format`)
+/// answers with the JSON in a fenced block, often with prose around it: the reply still gets
+/// the parsed `json`.
+#[test]
+fn a_fenced_answer_in_prose_yields_json() {
+    use sutra_transport_llm::structured_answer;
+    let asked = json!({"prompt": "analyse the call", "json": true});
+    let reply = "Here is the analysis of the call:\n\n```json\n{\"sentiment\": \"positive\", \
+                 \"resolved\": true}\n```\n\nLet me know if you need more.";
+    assert_eq!(
+        structured_answer(reply, &asked),
+        Some(json!({"sentiment": "positive", "resolved": true}))
+    );
+    assert_eq!(
+        structured_answer("Result:\n```\n[1, 2]\n```", &asked),
+        Some(json!([1, 2]))
+    );
+    assert_eq!(
+        structured_answer("Result: ```{\"a\": 1}``` done", &asked),
+        Some(json!({"a": 1}))
+    );
+    // A fence of another language is not taken for the answer.
+    assert_eq!(
+        structured_answer("```python\n{\"a\": 1}\n```", &asked),
+        None
+    );
+}
+
 /// A JSON call without a parsed answer says why: cut off at the token limit (a reasoning
 /// model's thinking counts against it), or not JSON at all. A parsed answer, or a call that
 /// did not ask for JSON, says nothing.

@@ -20,6 +20,7 @@
 #   SYNC  POST /channels/vision             -> vision-model     an image or video frames in, a JSON answer out (native Gemini)
 #   SYNC  POST /channels/hear               -> hear-model       audio in (inline or a media reference), a text answer out (native Gemini)
 #   SYNC  POST /channels/extract            -> extract-model    a ticket in, a parsed JSON answer out (native Gemini)
+#   SYNC  POST /channels/hear-json          -> hear-json-model  audio in, a parsed JSON answer out (OpenAI audio model)
 #
 # `hear` and `extract` are this variant's own flows (./bpmn), which live-check.sh's Gemini checks
 # drive; `hear-model` and `voice-model` read media references from the object store `media`, which
@@ -307,6 +308,37 @@ channels:
           api-key: env:OPENAI_API_KEY
       require: [audio-understanding]
       output-voice: alloy
+      timeout-seconds: 60
+
+  # { requestId, audio: { data: <base64>, format: <media type> } } -> a parsed JSON answer
+  - name: hear-json
+    transport: http
+    bind: "POST /channels/hear-json"
+    codec: json
+    ack-mode: on-complete
+    cloudevents-mode: none
+    auth:
+      scheme: apikey
+      apikey:
+        value: env:AI_ADVANCED_API_KEY
+        header: X-Api-Key
+
+  # AUDIO UNDERSTANDING WITH A JSON ANSWER: the OpenAI audio chat models refuse the JSON mode
+  # (`response_format`: HTTP 400 "not supported with this model"), so the adapter asks for JSON in
+  # the system text and the transport parses the answer (bare or fenced) into `json`.
+  # live-check.sh substitutes OPENAI_AUDIO_MODEL (default here: gpt-audio) in the copy it deploys.
+  - name: hear-json-model
+    direction: outbound
+    transport: llm
+    bind: "llm://hear-json-model"
+    ack-mode: on-complete
+    llm:
+      candidates:
+        - provider: openai
+          model: gpt-audio
+          api-key: env:OPENAI_API_KEY
+      require: [audio-understanding, json-output]
+      max-output-tokens: 1024
       timeout-seconds: 60
 
   # THE PIPELINE: OpenAI transcribes and speaks, Anthropic (no audio) answers in text.

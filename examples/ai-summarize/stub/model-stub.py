@@ -5,7 +5,11 @@ Python 3 stdlib only. Every answer is fixed, so a run is deterministic and needs
 OpenAI wire (also every Chat Completions service: Gemini, Mistral, ...)
   POST /v1/chat/completions      a fixed answer; `stream: true` as server-sent events; `tools`
                                  -> a call of the first tool; `response_format: json_object` ->
-                                 a JSON object as the text
+                                 a JSON object as the text. As the real API does, the JSON mode is
+                                 refused (400) when no message says "json", and refused outright
+                                 for an audio model (a model id containing `audio`): such a model
+                                 asked for JSON in its system text answers the JSON in a fenced
+                                 block inside prose, as the real audio models do
                                  `modalities` with "audio" -> a spoken answer: a fixed WAV
                                  (24 kHz mono) plus its transcript; an `input_audio` part must
                                  be valid base64 (and a RIFF/WAVE file when its format is wav)
@@ -13,9 +17,9 @@ OpenAI wire (also every Chat Completions service: Gemini, Mistral, ...)
                                  a longer, audible answer (800 ms of 440 Hz): a greeting when the
                                  request carries no audio, "Transferring you to an agent now."
                                  when the caller's latest turn lasts 2.5 s or more, else a fixed
-                                 answer. A model id containing `analytics` with
-                                 `response_format: json_object` answers the post-call analysis
-                                 (customer emotion per turn) as a JSON object
+                                 answer. A model id containing `analytics` asked for JSON (the
+                                 JSON mode, or in words for an audio model) answers the post-call
+                                 analysis (customer emotion per turn) as a JSON object
   POST /v1/audio/transcriptions  multipart form (model + file) -> a fixed transcript
   POST /v1/audio/speech          {model, input, voice, response_format} -> the fixed WAV
                                  (`wav`) or its samples (`pcm`, 24 kHz 16-bit LE)
@@ -269,6 +273,48 @@ def input_audio_problem(request):
     return None
 
 
+def message_texts(request):
+    """The text of every message (string content and text parts)."""
+    for message in request.get("messages") or []:
+        content = message.get("content")
+        if isinstance(content, str):
+            yield content
+        for part in content if isinstance(content, list) else []:
+            if part.get("type") == "text":
+                yield part.get("text") or ""
+
+
+def json_mode(request):
+    return (request.get("response_format") or {}).get("type") == "json_object"
+
+
+def json_mode_problem(request):
+    """The real API's refusal of a JSON-mode request it cannot serve, else None."""
+    if not json_mode(request):
+        return None
+    if "audio" in request.get("model", ""):
+        return {"message": "Invalid parameter: 'response_format' of type 'json_object' is not "
+                           "supported with this model.", "type": "invalid_request_error",
+                "param": "response_format", "code": None}
+    if not any("json" in text.lower() for text in message_texts(request)):
+        return {"message": "'messages' must contain the word 'json' in some form, to use "
+                           "'response_format' of type 'json_object'.",
+                "type": "invalid_request_error", "param": "messages", "code": None}
+    return None
+
+
+def json_in_words(request):
+    """An audio model asked for JSON in its system text (it has no JSON mode)."""
+    return "audio" in request.get("model", "") and any(
+        message.get("role") == "system" and "json" in str(message.get("content")).lower()
+        for message in request.get("messages") or [])
+
+
+def fenced(value):
+    """The answer of a model asked for JSON in words: the JSON in a fenced block, in prose."""
+    return f"Here is the answer:\n\n```json\n{value}\n```\n"
+
+
 def chat_answer(request):
     model = request.get("model", "test-model")
     message = {"role": "assistant", "content": SUMMARY}
@@ -279,9 +325,13 @@ def chat_answer(request):
         message = {"role": "assistant", "content": None, "audio": {
             "id": "audio_stub_voice", "data": base64.b64encode(VOICE_WAV).decode(),
             "expires_at": int(time.time()) + 3600, "transcript": voice_transcript(request)}}
-    elif "analytics" in model and (request.get("response_format") or {}).get("type") == "json_object":
+    elif "analytics" in model and json_mode(request):
         count("chat-analytics")
         message["content"] = json.dumps(ANALYTICS)
+    elif "analytics" in model and json_in_words(request):
+        count("chat-analytics")
+        count("chat-json-in-words")
+        message["content"] = fenced(json.dumps(ANALYTICS))
     elif "audio" in (request.get("modalities") or []):
         count("chat-audio-out")
         message = {"role": "assistant", "content": None, "audio": {
@@ -295,8 +345,11 @@ def chat_answer(request):
                          "arguments": json.dumps(tool_arguments(function.get("parameters")))},
         }]}
         finish = "tool_calls"
-    elif (request.get("response_format") or {}).get("type") == "json_object":
+    elif json_mode(request):
         message["content"] = JSON_ANSWER
+    elif json_in_words(request):
+        count("chat-json-in-words")
+        message["content"] = fenced(JSON_ANSWER)
     return {
         "id": "chatcmpl-stub-1", "object": "chat.completion", "model": model,
         "choices": [{"index": 0, "message": message, "finish_reason": finish}],
@@ -721,8 +774,12 @@ class Handler(BaseHTTPRequestHandler):
             log(f"chat completion model={request.get('model')!r} "
                 f"stream={bool(request.get('stream'))} tools={len(request.get('tools') or [])}")
             problem = input_audio_problem(request)
+            refused = json_mode_problem(request)
             if problem:
                 self._send(400, {"error": {"message": f"model-stub: {problem}"}})
+            elif refused:
+                count("chat-json-mode-refused")
+                self._send(400, {"error": refused})
             elif request.get("stream"):
                 self._stream(chat_stream_events(request))
             else:

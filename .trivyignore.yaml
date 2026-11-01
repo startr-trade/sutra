@@ -54,6 +54,9 @@ vulnerabilities:
   - id: CVE-2026-6238
     statement: "libc6 (glibc) in the distroless base; Debian ships no fixed package."
     expired_at: 2026-11-09
+  - id: CVE-2026-84243
+    statement: "libc6 (glibc) in the distroless base; Debian ships no fixed package (2.36-9+deb12u14, status affected, 2026-10-31). Not reachable: the flaw is in message-catalog lookup driven by the LANGUAGE variable, which glibc consults only after setlocale() selects a non-C locale; the engine binary imports no setlocale, gettext or textdomain symbol (readelf --dyn-syms), so it runs in the C locale, and the base image carries no locale data. The variable is also set by the operator, not by input."
+    expired_at: 2026-11-09
   - id: CVE-2022-27943
     statement: "gcc-12-base / libgcc-s1 / libgomp1 / libstdc++6 in the distroless base; Debian ships no fixed package."
     expired_at: 2026-11-09
