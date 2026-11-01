@@ -29,6 +29,7 @@ use sutra_executor::{
     CollectingSink, DeploymentId, EmissionSink, OutboundChannelRegistry, ResolvedOutboundChannel,
     StatefulExecResult, TaskRegistry, TimerFire, TokenExecutor, Variables,
 };
+use sutra_feel::FeelValue;
 
 const NOW: &str = "2026-01-01T00:00:00Z";
 const IID: &str = "11111111-2222-4333-8444-555555555555";
@@ -327,6 +328,7 @@ async fn a_poison_failure_parks_the_backoff_with_the_delivery_exhausted_classifi
                 "Call",
                 POISON_CODE,
                 "the outbox terminally poisoned the request delivery",
+                "the outbox terminally poisoned the request delivery",
                 &["S".to_string()],
                 vars(&[("e2eId", string("E2E-1"))]),
                 dep(),
@@ -368,6 +370,7 @@ async fn a_poison_classification_can_be_declared_non_retryable() {
             IID,
             "Call",
             POISON_CODE,
+            "the outbox terminally poisoned the request delivery",
             "the outbox terminally poisoned the request delivery",
             &["S".to_string()],
             vars(&[("e2eId", string("E2E-1"))]),
@@ -521,4 +524,225 @@ async fn an_unrelated_resume_carries_the_backoff_marker_and_budget_forward() {
         "an unrelated resume must not clear the backoff marker"
     );
     assert!(sink.is_empty(), "the still-parked call must not re-send");
+}
+
+// ============================ a permanent failure raises a BPMN error =====================
+
+/// `Call` with `task_extras` in its extension elements (the `<q:timeout>` is always there), a
+/// boundary `Caught` (`boundary_def`) routed to `Rec`, then a further wait `Next`, so the
+/// variables and the attempt counts of the pass can be read off the park.
+fn caught_flow(task_extras: &str, boundary_def: &str) -> String {
+    format!(
+        r#"<?xml version="1.0"?>
+        <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                          xmlns:q="urn:sutra:q:1.0">
+          <bpmn:error id="refused" errorCode="SUTRA.TEST.REFUSED"/>
+          <bpmn:process id="p1">
+            <bpmn:startEvent id="S"/>
+            <bpmn:serviceTask id="Call" implementation="channel:out">
+              <bpmn:extensionElements>
+                <q:alias name="callKey" expression="e2eId"/>
+                <q:timeout duration="PT2S"/>
+                {task_extras}
+              </bpmn:extensionElements>
+            </bpmn:serviceTask>
+            <bpmn:boundaryEvent id="Caught" attachedToRef="Call">
+              {boundary_def}
+            </bpmn:boundaryEvent>
+            <bpmn:userTask id="Next"/>
+            <bpmn:endEvent id="E"/>
+            <bpmn:endEvent id="E2"/>
+            <bpmn:sequenceFlow id="f1" sourceRef="S" targetRef="Call"/>
+            <bpmn:sequenceFlow id="f2" sourceRef="Call" targetRef="E"/>
+            <bpmn:sequenceFlow id="f3" sourceRef="Caught" targetRef="Next"/>
+            <bpmn:sequenceFlow id="f4" sourceRef="Next" targetRef="E2"/>
+          </bpmn:process>
+        </bpmn:definitions>"#
+    )
+}
+
+async fn deliver_refusal(
+    process: &sutra_bpmn::model::ProcessDefinition,
+    attempts: &[(&str, u32)],
+) -> Result<StatefulExecResult, sutra_executor::ExecError> {
+    let sink = Rc::new(CollectingSink::new());
+    let attempts: BTreeMap<String, u32> =
+        attempts.iter().map(|(n, c)| (n.to_string(), *c)).collect();
+    executor(sink)
+        .resume_channel_call_failure(
+            process,
+            IID,
+            "Call",
+            "SUTRA.TEST.REFUSED",
+            "the full diagnostic",
+            "what the flow may read",
+            &["S".to_string()],
+            vars(&[("e2eId", string("E2E-1"))]),
+            dep(),
+            BTreeMap::new(),
+            None,
+            &["Call".to_string()],
+            &BTreeMap::new(),
+            &attempts,
+            &BTreeMap::new(),
+        )
+        .await
+}
+
+fn call_failure_field(result: &StatefulExecResult, field: &str) -> FeelValue {
+    let StatefulExecResult::Suspended { variables, .. } = result else {
+        panic!("expected the pass to park at Next, got {result:?}");
+    };
+    let Some(FeelValue::Map(failure)) = variables.get(sutra_executor::CALL_FAILURE_VARIABLE) else {
+        panic!("no {} variable", sutra_executor::CALL_FAILURE_VARIABLE);
+    };
+    failure[field].clone()
+}
+
+#[tokio::test]
+async fn a_failure_with_no_policy_is_raised_on_the_task_and_the_reason_is_readable() {
+    let process = proc(
+        &caught_flow("", r#"<bpmn:errorEventDefinition errorRef="refused"/>"#),
+        "p1",
+    );
+    let result = deliver_refusal(&process, &[]).await.expect("caught");
+    assert_eq!(
+        call_failure_field(&result, "code"),
+        string("SUTRA.TEST.REFUSED")
+    );
+    assert_eq!(
+        call_failure_field(&result, "message"),
+        string("what the flow may read")
+    );
+    assert_eq!(call_failure_field(&result, "node"), string("Call"));
+    let StatefulExecResult::Suspended {
+        waiting_nodes,
+        completed_nodes,
+        ..
+    } = &result
+    else {
+        unreachable!()
+    };
+    assert_eq!(waiting_nodes, &vec!["Next".to_string()]);
+    assert!(
+        completed_nodes.contains(&"Caught".to_string()),
+        "the route taken survives the park: {completed_nodes:?}"
+    );
+    assert!(
+        !completed_nodes.contains(&"Call".to_string()),
+        "the task did not complete: {completed_nodes:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_catch_all_boundary_catches_a_failure_of_any_code() {
+    let process = proc(&caught_flow("", "<bpmn:errorEventDefinition/>"), "p1");
+    let result = deliver_refusal(&process, &[]).await.expect("caught");
+    assert_eq!(
+        call_failure_field(&result, "code"),
+        string("SUTRA.TEST.REFUSED")
+    );
+}
+
+#[tokio::test]
+async fn a_failure_no_boundary_matches_fails_with_its_own_diagnostic() {
+    let process = proc(&flow_without_policy(), "p1");
+    let e = deliver_refusal(&process, &[])
+        .await
+        .expect_err("nothing catches it");
+    let d = e.to_diagnostic();
+    assert_eq!(d.code, "SUTRA.TEST.REFUSED", "{d:?}");
+    assert_eq!(d.message, "the full diagnostic");
+}
+
+fn flow_without_policy() -> String {
+    r#"<?xml version="1.0"?>
+    <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                      xmlns:q="urn:sutra:q:1.0">
+      <bpmn:process id="p1">
+        <bpmn:startEvent id="S"/>
+        <bpmn:serviceTask id="Call" implementation="channel:out">
+          <bpmn:extensionElements>
+            <q:alias name="callKey" expression="e2eId"/>
+            <q:timeout duration="PT2S"/>
+          </bpmn:extensionElements>
+        </bpmn:serviceTask>
+        <bpmn:endEvent id="E"/>
+        <bpmn:sequenceFlow id="f1" sourceRef="S" targetRef="Call"/>
+        <bpmn:sequenceFlow id="f2" sourceRef="Call" targetRef="E"/>
+      </bpmn:process>
+    </bpmn:definitions>"#
+        .to_string()
+}
+
+#[tokio::test]
+async fn a_policy_with_budget_left_still_parks_before_any_catch() {
+    let process = proc(
+        &caught_flow(
+            r#"<q:retry maxAttempts="3" initialDelay="PT10S" backoffCoefficient="2.0"/>"#,
+            "<bpmn:errorEventDefinition/>",
+        ),
+        "p1",
+    );
+    let parked = expect_parked(deliver_refusal(&process, &[]).await.expect("parks"));
+    assert_eq!(parked.waiting_nodes, vec!["Call".to_string()]);
+}
+
+#[tokio::test]
+async fn a_spent_budget_is_raised_on_the_task_and_its_count_goes_with_it() {
+    let process = proc(
+        &caught_flow(
+            r#"<q:retry maxAttempts="3" initialDelay="PT10S" backoffCoefficient="2.0"/>"#,
+            r#"<bpmn:errorEventDefinition errorRef="refused"/>"#,
+        ),
+        "p1",
+    );
+    let result = deliver_refusal(&process, &[("Call", 2)])
+        .await
+        .expect("caught");
+    assert_eq!(
+        call_failure_field(&result, "code"),
+        string("SUTRA.TEST.REFUSED"),
+        "the failure's own code, not the budget's"
+    );
+    let StatefulExecResult::Suspended { retry_attempts, .. } = &result else {
+        unreachable!()
+    };
+    assert!(retry_attempts.is_empty(), "{retry_attempts:?}");
+}
+
+#[tokio::test]
+async fn a_spent_budget_with_no_catch_stays_retry_exhausted() {
+    let process = proc(&flow(""), "p1");
+    let e = deliver_refusal(&process, &[("Call", 2)])
+        .await
+        .expect_err("nothing catches it");
+    let d = e.to_diagnostic();
+    assert_eq!(d.code, "SUTRA.RUNTIME.RETRY.EXHAUSTED", "{d:?}");
+    assert!(d.message.contains("the full diagnostic"), "{}", d.message);
+}
+
+#[tokio::test]
+async fn a_timeout_without_a_policy_leaves_its_reason_for_the_catching_path() {
+    let process = proc(&caught_flow("", "<bpmn:errorEventDefinition/>"), "p1");
+    let sink = Rc::new(CollectingSink::new());
+    let result = executor(sink)
+        .resume_timer(
+            &process,
+            &timeout_fire(),
+            &["S".to_string()],
+            vars(&[("e2eId", string("E2E-1"))]),
+            BTreeMap::new(),
+            None,
+            &["Call".to_string()],
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .await
+        .expect("caught");
+    assert_eq!(
+        call_failure_field(&result, "code"),
+        string("SUTRA.DISPATCH.CHANNEL_CALL.TIMEOUT")
+    );
 }

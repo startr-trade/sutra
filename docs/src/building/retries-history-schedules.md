@@ -138,8 +138,10 @@ silently absorbed or lost.
 
 ### Exhaustion
 
-A spent budget — or a `nonRetryableCodes` hit — fails the instance durably with
-`SUTRA.RUNTIME.RETRY.EXHAUSTED`. The instance becomes `FAILED`: retained, inspectable, blocking
+On a channel-call task whose failure the flow catches (a boundary or an error event sub-process), a
+spent budget raises the failure's own code as a BPMN error on the task; see
+[Catching a failed call](llm-channels.md#catching-a-failed-call). Otherwise a spent budget — or a
+`nonRetryableCodes` hit — fails the instance durably with `SUTRA.RUNTIME.RETRY.EXHAUSTED`. The instance becomes `FAILED`: retained, inspectable, blocking
 its deployment's retirement, and repairable through
 [instance migration](../operating/instance-migration.md). See
 [Replica semantics](../architecture/replicas.md#durable-failed-is-a-state-not-a-disappearance).

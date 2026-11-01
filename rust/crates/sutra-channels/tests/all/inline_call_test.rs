@@ -2029,3 +2029,765 @@ async fn a_sync_call_whose_retry_delay_cannot_be_armed_takes_the_durable_path() 
         "the request is an outbox row: {emissions:?}"
     );
 }
+
+// ---- a failed call raises a BPMN error on its task ----------------------------------------
+
+const REJECTED_CODE: &str = "UPSTREAM_REJECTED";
+
+fn rejected() -> Result<InlineResponse, InlineFailure> {
+    Err(InlineFailure::Permanent(Diagnostic::error(
+        REJECTED_CODE,
+        "HTTP 400 (bad_request): the counterpart refused it",
+    )))
+}
+
+/// Refused on every call.
+fn refusing() -> Arc<FakeCaller> {
+    FakeCaller::new(|_| Box::pin(async { rejected() }))
+}
+
+/// start → call `A` → reply → end; `Caught` on `A` for `UPSTREAM_REJECTED` → `Rec` → reply.
+const CAUGHT_BY_CODE: &str = r#"<?xml version="1.0"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0">
+  <bpmn:error id="refused" errorCode="UPSTREAM_REJECTED"/>
+  <bpmn:process id="caught">
+    <bpmn:startEvent id="S">
+      <bpmn:extensionElements><q:source channel="start-in" name="req"/></bpmn:extensionElements>
+    </bpmn:startEvent>
+    <bpmn:serviceTask id="A" implementation="channel:svc">
+      <bpmn:extensionElements>
+        <q:source channel="svc-answers" name="a"/>
+        <q:timeout duration="PT2S"/>
+      </bpmn:extensionElements>
+    </bpmn:serviceTask>
+    <bpmn:boundaryEvent id="Caught" attachedToRef="A">
+      <bpmn:errorEventDefinition errorRef="refused"/>
+    </bpmn:boundaryEvent>
+    <bpmn:serviceTask id="Rec">
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>{recovered: callFailure.code, reason: callFailure.message, at: callFailure.node}</bpmn:from><bpmn:to>a</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:serviceTask id="R" implementation="reply">
+      <bpmn:extensionElements><q:reply/></bpmn:extensionElements>
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="E"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="S" targetRef="A"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="A" targetRef="R"/>
+    <bpmn:sequenceFlow id="f3" sourceRef="R" targetRef="E"/>
+    <bpmn:sequenceFlow id="f4" sourceRef="Caught" targetRef="Rec"/>
+    <bpmn:sequenceFlow id="f5" sourceRef="Rec" targetRef="R"/>
+  </bpmn:process>
+</bpmn:definitions>"#;
+
+/// A catch-all (no code) boundary.
+const CAUGHT_BY_ANY: &str = r#"<?xml version="1.0"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0">
+  <bpmn:process id="caught">
+    <bpmn:startEvent id="S">
+      <bpmn:extensionElements><q:source channel="start-in" name="req"/></bpmn:extensionElements>
+    </bpmn:startEvent>
+    <bpmn:serviceTask id="A" implementation="channel:svc">
+      <bpmn:extensionElements>
+        <q:source channel="svc-answers" name="a"/>
+        <q:timeout duration="PT2S"/>
+      </bpmn:extensionElements>
+    </bpmn:serviceTask>
+    <bpmn:boundaryEvent id="Caught" attachedToRef="A">
+      <bpmn:errorEventDefinition/>
+    </bpmn:boundaryEvent>
+    <bpmn:serviceTask id="Rec">
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>{recovered: callFailure.code, reason: callFailure.message}</bpmn:from><bpmn:to>a</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:serviceTask id="R" implementation="reply">
+      <bpmn:extensionElements><q:reply/></bpmn:extensionElements>
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="E"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="S" targetRef="A"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="A" targetRef="R"/>
+    <bpmn:sequenceFlow id="f3" sourceRef="R" targetRef="E"/>
+    <bpmn:sequenceFlow id="f4" sourceRef="Caught" targetRef="Rec"/>
+    <bpmn:sequenceFlow id="f5" sourceRef="Rec" targetRef="R"/>
+  </bpmn:process>
+</bpmn:definitions>"#;
+
+/// A boundary for a DIFFERENT code: the failure is not caught.
+const CAUGHT_OTHER_CODE: &str = r#"<?xml version="1.0"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0">
+  <bpmn:error id="other" errorCode="SOMETHING_ELSE"/>
+  <bpmn:process id="caught">
+    <bpmn:startEvent id="S">
+      <bpmn:extensionElements><q:source channel="start-in" name="req"/></bpmn:extensionElements>
+    </bpmn:startEvent>
+    <bpmn:serviceTask id="A" implementation="channel:svc">
+      <bpmn:extensionElements>
+        <q:source channel="svc-answers" name="a"/>
+        <q:timeout duration="PT2S"/>
+      </bpmn:extensionElements>
+    </bpmn:serviceTask>
+    <bpmn:boundaryEvent id="Caught" attachedToRef="A">
+      <bpmn:errorEventDefinition errorRef="other"/>
+    </bpmn:boundaryEvent>
+    <bpmn:endEvent id="E"/>
+    <bpmn:endEvent id="E2"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="S" targetRef="A"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="A" targetRef="E"/>
+    <bpmn:sequenceFlow id="f3" sourceRef="Caught" targetRef="E2"/>
+  </bpmn:process>
+</bpmn:definitions>"#;
+
+/// No boundary on the task; a process-level error event sub-process (the enclosing scope).
+const CAUGHT_BY_EVENT_SUB_PROCESS: &str = r#"<?xml version="1.0"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0">
+  <bpmn:error id="refused" errorCode="UPSTREAM_REJECTED"/>
+  <bpmn:process id="caught">
+    <bpmn:startEvent id="S">
+      <bpmn:extensionElements><q:source channel="start-in" name="req"/></bpmn:extensionElements>
+    </bpmn:startEvent>
+    <bpmn:serviceTask id="A" implementation="channel:svc">
+      <bpmn:extensionElements>
+        <q:source channel="svc-answers" name="a"/>
+        <q:timeout duration="PT2S"/>
+      </bpmn:extensionElements>
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="E"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="S" targetRef="A"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="A" targetRef="E"/>
+    <bpmn:subProcess id="Esp" triggeredByEvent="true">
+      <bpmn:startEvent id="EspS"><bpmn:errorEventDefinition errorRef="refused"/></bpmn:startEvent>
+      <bpmn:serviceTask id="EspRec">
+        <bpmn:dataInputAssociation>
+          <bpmn:assignment><bpmn:from>{recovered: callFailure.code}</bpmn:from><bpmn:to>a</bpmn:to></bpmn:assignment>
+        </bpmn:dataInputAssociation>
+      </bpmn:serviceTask>
+      <bpmn:serviceTask id="EspR" implementation="reply">
+        <bpmn:extensionElements><q:reply/></bpmn:extensionElements>
+      </bpmn:serviceTask>
+      <bpmn:endEvent id="EspE"/>
+      <bpmn:sequenceFlow id="g1" sourceRef="EspS" targetRef="EspRec"/>
+      <bpmn:sequenceFlow id="g2" sourceRef="EspRec" targetRef="EspR"/>
+      <bpmn:sequenceFlow id="g3" sourceRef="EspR" targetRef="EspE"/>
+    </bpmn:subProcess>
+  </bpmn:process>
+</bpmn:definitions>"#;
+
+/// The call retries; a boundary catches what the retries could not fix.
+const RETRIED_THEN_CAUGHT: &str = r#"<?xml version="1.0"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0">
+  <bpmn:error id="busy" errorCode="UPSTREAM_BUSY"/>
+  <bpmn:error id="timedOut" errorCode="SUTRA.DISPATCH.CHANNEL_CALL.TIMEOUT"/>
+  <bpmn:process id="caught">
+    <bpmn:startEvent id="S">
+      <bpmn:extensionElements><q:source channel="start-in" name="req"/></bpmn:extensionElements>
+    </bpmn:startEvent>
+    <bpmn:serviceTask id="A" implementation="channel:svc">
+      <bpmn:extensionElements>
+        <q:source channel="svc-answers" name="a"/>
+        <q:timeout duration="PT0.5S"/>
+        <q:retry maxAttempts="3" initialDelay="PT0.01S" backoffCoefficient="1.0"/>
+      </bpmn:extensionElements>
+    </bpmn:serviceTask>
+    <bpmn:boundaryEvent id="Caught" attachedToRef="A">
+      <bpmn:errorEventDefinition errorRef="busy"/>
+    </bpmn:boundaryEvent>
+    <bpmn:boundaryEvent id="TooSlow" attachedToRef="A">
+      <bpmn:errorEventDefinition errorRef="timedOut"/>
+    </bpmn:boundaryEvent>
+    <bpmn:serviceTask id="Rec">
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>{recovered: callFailure.code, via: "busy"}</bpmn:from><bpmn:to>a</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:serviceTask id="Slow">
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>{recovered: callFailure.code, via: "slow"}</bpmn:from><bpmn:to>a</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:serviceTask id="R" implementation="reply">
+      <bpmn:extensionElements><q:reply/></bpmn:extensionElements>
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="E"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="S" targetRef="A"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="A" targetRef="R"/>
+    <bpmn:sequenceFlow id="f3" sourceRef="R" targetRef="E"/>
+    <bpmn:sequenceFlow id="f4" sourceRef="Caught" targetRef="Rec"/>
+    <bpmn:sequenceFlow id="f5" sourceRef="Rec" targetRef="R"/>
+    <bpmn:sequenceFlow id="f6" sourceRef="TooSlow" targetRef="Slow"/>
+    <bpmn:sequenceFlow id="f7" sourceRef="Slow" targetRef="R"/>
+  </bpmn:process>
+</bpmn:definitions>"#;
+
+/// Separate routes for a refusal and for the `<q:timeout>`'s error, on one policy-less call.
+const REFUSED_OR_TIMED_OUT: &str = r#"<?xml version="1.0"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0">
+  <bpmn:error id="timedOut" errorCode="SUTRA.DISPATCH.CHANNEL_CALL.TIMEOUT"/>
+  <bpmn:process id="caught">
+    <bpmn:startEvent id="S">
+      <bpmn:extensionElements><q:source channel="start-in" name="req"/></bpmn:extensionElements>
+    </bpmn:startEvent>
+    <bpmn:serviceTask id="A" implementation="channel:svc">
+      <bpmn:extensionElements>
+        <q:source channel="svc-answers" name="a"/>
+        <q:timeout duration="PT0.3S"/>
+      </bpmn:extensionElements>
+    </bpmn:serviceTask>
+    <bpmn:boundaryEvent id="TooSlow" attachedToRef="A">
+      <bpmn:errorEventDefinition errorRef="timedOut"/>
+    </bpmn:boundaryEvent>
+    <bpmn:boundaryEvent id="AnyOther" attachedToRef="A">
+      <bpmn:errorEventDefinition/>
+    </bpmn:boundaryEvent>
+    <bpmn:serviceTask id="Slow">
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>{route: "slow", code: callFailure.code}</bpmn:from><bpmn:to>a</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:serviceTask id="Other">
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>{route: "other", code: callFailure.code}</bpmn:from><bpmn:to>a</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:serviceTask id="R" implementation="reply">
+      <bpmn:extensionElements><q:reply/></bpmn:extensionElements>
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="E"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="S" targetRef="A"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="A" targetRef="R"/>
+    <bpmn:sequenceFlow id="f3" sourceRef="R" targetRef="E"/>
+    <bpmn:sequenceFlow id="f4" sourceRef="TooSlow" targetRef="Slow"/>
+    <bpmn:sequenceFlow id="f5" sourceRef="Slow" targetRef="R"/>
+    <bpmn:sequenceFlow id="f6" sourceRef="AnyOther" targetRef="Other"/>
+    <bpmn:sequenceFlow id="f7" sourceRef="Other" targetRef="R"/>
+  </bpmn:process>
+</bpmn:definitions>"#;
+
+/// An inline chain: `A` answers, `B` is refused and caught, `C` runs on the recovery path.
+const CHAIN_CAUGHT: &str = r#"<?xml version="1.0"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0">
+  <bpmn:process id="caught">
+    <bpmn:startEvent id="S">
+      <bpmn:extensionElements><q:source channel="start-in" name="req"/></bpmn:extensionElements>
+    </bpmn:startEvent>
+    <bpmn:serviceTask id="A" implementation="channel:svc">
+      <bpmn:extensionElements>
+        <q:source channel="svc-answers" name="a"/>
+        <q:timeout duration="PT2S"/>
+      </bpmn:extensionElements>
+    </bpmn:serviceTask>
+    <bpmn:serviceTask id="B" implementation="channel:svc">
+      <bpmn:extensionElements>
+        <q:source channel="svc-answers" name="b"/>
+        <q:timeout duration="PT2S"/>
+      </bpmn:extensionElements>
+    </bpmn:serviceTask>
+    <bpmn:boundaryEvent id="Caught" attachedToRef="B">
+      <bpmn:errorEventDefinition/>
+    </bpmn:boundaryEvent>
+    <bpmn:serviceTask id="C" implementation="channel:svc">
+      <bpmn:extensionElements>
+        <q:source channel="svc-answers" name="c"/>
+        <q:timeout duration="PT2S"/>
+      </bpmn:extensionElements>
+    </bpmn:serviceTask>
+    <bpmn:serviceTask id="R" implementation="reply">
+      <bpmn:extensionElements><q:reply/></bpmn:extensionElements>
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="E"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="S" targetRef="A"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="A" targetRef="B"/>
+    <bpmn:sequenceFlow id="f3" sourceRef="B" targetRef="R"/>
+    <bpmn:sequenceFlow id="f4" sourceRef="R" targetRef="E"/>
+    <bpmn:sequenceFlow id="f5" sourceRef="Caught" targetRef="C"/>
+    <bpmn:sequenceFlow id="f6" sourceRef="C" targetRef="R"/>
+  </bpmn:process>
+</bpmn:definitions>"#;
+
+/// A relay turn's call, caught: a stored instance finishes down the recovery path.
+const RELAY_CALL_CAUGHT: &str = r#"<?xml version="1.0"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0">
+  <bpmn:process id="turns">
+    <bpmn:startEvent id="S">
+      <bpmn:extensionElements>
+        <q:source channel="start-in" name="req"/>
+        <q:alias name="conv" expression="header.conv" onConflict="correlate"/>
+      </bpmn:extensionElements>
+    </bpmn:startEvent>
+    <bpmn:userTask id="U">
+      <bpmn:extensionElements><q:source channel="relay-in" name="turn"/></bpmn:extensionElements>
+    </bpmn:userTask>
+    <bpmn:serviceTask id="A" implementation="channel:svc">
+      <bpmn:extensionElements>
+        <q:source channel="svc-answers" name="a"/>
+        <q:timeout duration="PT2S"/>
+      </bpmn:extensionElements>
+    </bpmn:serviceTask>
+    <bpmn:boundaryEvent id="Caught" attachedToRef="A">
+      <bpmn:errorEventDefinition/>
+    </bpmn:boundaryEvent>
+    <bpmn:endEvent id="E"/>
+    <bpmn:endEvent id="Recovered"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="S" targetRef="U"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="U" targetRef="A"/>
+    <bpmn:sequenceFlow id="f3" sourceRef="A" targetRef="E"/>
+    <bpmn:sequenceFlow id="f4" sourceRef="Caught" targetRef="Recovered"/>
+  </bpmn:process>
+</bpmn:definitions>"#;
+
+/// The boundary loops back to the call, which carries a `<q:retry>`: every trip round has its
+/// own budget.
+const CAUGHT_THEN_LOOP: &str = r#"<?xml version="1.0"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0">
+  <bpmn:process id="caught">
+    <bpmn:startEvent id="S">
+      <bpmn:extensionElements><q:source channel="start-in" name="req"/></bpmn:extensionElements>
+    </bpmn:startEvent>
+    <bpmn:serviceTask id="A" implementation="channel:svc">
+      <bpmn:extensionElements>
+        <q:source channel="svc-answers" name="a"/>
+        <q:timeout duration="PT2S"/>
+        <q:retry maxAttempts="2" initialDelay="PT0.01S" backoffCoefficient="1.0"/>
+      </bpmn:extensionElements>
+    </bpmn:serviceTask>
+    <bpmn:boundaryEvent id="Caught" attachedToRef="A">
+      <bpmn:errorEventDefinition/>
+    </bpmn:boundaryEvent>
+    <bpmn:serviceTask id="R" implementation="reply">
+      <bpmn:extensionElements><q:reply/></bpmn:extensionElements>
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="E"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="S" targetRef="A"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="A" targetRef="R"/>
+    <bpmn:sequenceFlow id="f3" sourceRef="R" targetRef="E"/>
+    <bpmn:sequenceFlow id="f4" sourceRef="Caught" targetRef="A"/>
+  </bpmn:process>
+</bpmn:definitions>"#;
+
+/// A parallel branch's call is caught and reaches the join; the other branch parks durably and
+/// reaches the join on a later pass.
+const CAUGHT_THEN_JOIN: &str = r#"<?xml version="1.0"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0">
+  <bpmn:process id="turns">
+    <bpmn:startEvent id="S">
+      <bpmn:extensionElements>
+        <q:source channel="start-in" name="req"/>
+        <q:alias name="conv" expression="header.conv" onConflict="correlate"/>
+      </bpmn:extensionElements>
+    </bpmn:startEvent>
+    <bpmn:parallelGateway id="Fork"/>
+    <bpmn:serviceTask id="A" implementation="channel:svc">
+      <bpmn:extensionElements>
+        <q:source channel="svc-answers" name="a"/>
+        <q:timeout duration="PT2S"/>
+      </bpmn:extensionElements>
+    </bpmn:serviceTask>
+    <bpmn:boundaryEvent id="Caught" attachedToRef="A">
+      <bpmn:errorEventDefinition/>
+    </bpmn:boundaryEvent>
+    <bpmn:userTask id="U">
+      <bpmn:extensionElements><q:source channel="relay-in" name="turn"/></bpmn:extensionElements>
+    </bpmn:userTask>
+    <bpmn:exclusiveGateway id="Merge"/>
+    <bpmn:parallelGateway id="Join"/>
+    <bpmn:endEvent id="E"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="S" targetRef="Fork"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="Fork" targetRef="A"/>
+    <bpmn:sequenceFlow id="f3" sourceRef="Fork" targetRef="U"/>
+    <bpmn:sequenceFlow id="f4" sourceRef="Caught" targetRef="Merge"/>
+    <bpmn:sequenceFlow id="f5" sourceRef="A" targetRef="Merge"/>
+    <bpmn:sequenceFlow id="f8" sourceRef="Merge" targetRef="Join"/>
+    <bpmn:sequenceFlow id="f6" sourceRef="U" targetRef="Join"/>
+    <bpmn:sequenceFlow id="f7" sourceRef="Join" targetRef="E"/>
+  </bpmn:process>
+</bpmn:definitions>"#;
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_call_is_caught_by_a_boundary_on_its_code_and_the_flow_reads_the_reason() {
+    let caller = refusing();
+    let rig = rig(CAUGHT_BY_CODE, Arc::clone(&caller), None);
+
+    let outcome = rig
+        .handle
+        .dispatch(start("k-1"))
+        .await
+        .expect("the recovery path completes");
+
+    assert_eq!(
+        reply_json(&outcome),
+        serde_json::json!({"a": {
+            "recovered": REJECTED_CODE,
+            "reason": "HTTP 400 (bad_request): the counterpart refused it",
+            "at": "A",
+        }})
+    );
+    assert_eq!(caller.calls(), 1, "a permanent failure is never retried");
+    assert!(
+        trace(&rig).is_empty(),
+        "a fully inline chain stays out of the store: {:?}",
+        trace(&rig)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_call_is_caught_by_a_catch_all_boundary() {
+    let rig = rig(CAUGHT_BY_ANY, refusing(), None);
+    let outcome = rig
+        .handle
+        .dispatch(start("k-1"))
+        .await
+        .expect("the recovery path completes");
+    assert_eq!(
+        reply_json(&outcome)["a"]["recovered"],
+        serde_json::json!(REJECTED_CODE)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_boundary_on_another_code_leaves_the_failure_uncaught() {
+    let rig = rig(CAUGHT_OTHER_CODE, refusing(), None);
+    let outcome = rig
+        .handle
+        .dispatch(start("k-1"))
+        .await
+        .expect("handled failure");
+    let DispatchOutcome::DeadLettered {
+        cause_code, detail, ..
+    } = &outcome
+    else {
+        panic!("expected the failure path, got {outcome:?}");
+    };
+    assert_eq!(cause_code, REJECTED_CODE);
+    assert_eq!(
+        detail, "HTTP 400 (bad_request): the counterpart refused it",
+        "an uncaught failure surfaces exactly as it did"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_call_with_no_boundary_is_caught_by_the_process_event_sub_process() {
+    let rig = rig(CAUGHT_BY_EVENT_SUB_PROCESS, refusing(), None);
+    let outcome = rig
+        .handle
+        .dispatch(start("k-1"))
+        .await
+        .expect("the event sub-process completes");
+    let DispatchOutcome::Completed { outputs, .. } = &outcome else {
+        panic!("expected the flow to complete, got {outcome:?}");
+    };
+    assert_eq!(
+        outputs["a"],
+        serde_json::json!({"recovered": REJECTED_CODE})
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_exhausted_retry_raises_the_underlying_code_on_the_task() {
+    let caller = FakeCaller::new(|_| Box::pin(async { retryable("UPSTREAM_BUSY") }));
+    let rig = rig(RETRIED_THEN_CAUGHT, Arc::clone(&caller), None);
+    let outcome = rig
+        .handle
+        .dispatch(start("k-1"))
+        .await
+        .expect("the recovery path completes");
+    assert_eq!(caller.calls(), 3, "the budget is spent before the catch");
+    assert_eq!(
+        reply_json(&outcome),
+        serde_json::json!({"a": {"recovered": "UPSTREAM_BUSY", "via": "busy"}})
+    );
+    assert!(trace(&rig).is_empty(), "{:?}", trace(&rig));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_timeout_under_a_retry_policy_is_caught_on_the_timeout_code() {
+    let caller = FakeCaller::new(|_| {
+        Box::pin(async {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            json("{}")
+        })
+    });
+    let rig = rig(RETRIED_THEN_CAUGHT, caller, None);
+    let outcome = rig
+        .handle
+        .dispatch(start("k-1"))
+        .await
+        .expect("the recovery path completes");
+    assert_eq!(
+        reply_json(&outcome),
+        serde_json::json!({"a": {"recovered": TIMEOUT_CODE, "via": "slow"}})
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_timeout_still_takes_the_timeout_boundary_and_a_refusal_the_other() {
+    let slow = FakeCaller::new(|_| {
+        Box::pin(async {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            json("{}")
+        })
+    });
+    let rig_slow = rig(REFUSED_OR_TIMED_OUT, slow, None);
+    let outcome = rig_slow
+        .handle
+        .dispatch(start("k-1"))
+        .await
+        .expect("the timeout route completes");
+    assert_eq!(
+        reply_json(&outcome),
+        serde_json::json!({"a": {"route": "slow", "code": TIMEOUT_CODE}})
+    );
+
+    let rig_refused = rig(REFUSED_OR_TIMED_OUT, refusing(), None);
+    let outcome = rig_refused
+        .handle
+        .dispatch(start("k-2"))
+        .await
+        .expect("the catch-all route completes");
+    assert_eq!(
+        reply_json(&outcome),
+        serde_json::json!({"a": {"route": "other", "code": REJECTED_CODE}})
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_caught_failure_keeps_an_inline_chain_going() {
+    let caller = FakeCaller::new(|n| {
+        Box::pin(async move {
+            match n {
+                1 => rejected(),
+                _ => json(&format!(r#"{{"n":{n}}}"#)),
+            }
+        })
+    });
+    let rig = rig(CHAIN_CAUGHT, Arc::clone(&caller), None);
+    let outcome = rig
+        .handle
+        .dispatch(start("k-1"))
+        .await
+        .expect("the chain completes");
+    assert_eq!(caller.calls(), 3, "A, then B refused, then C");
+    assert_eq!(
+        reply_json(&outcome),
+        serde_json::json!({"a": {"n": 0}, "c": {"n": 2}})
+    );
+    assert!(trace(&rig).is_empty(), "{:?}", trace(&rig));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_caught_failure_in_a_relay_turn_completes_the_stored_instance_once() {
+    let caller = refusing();
+    let rig = rig_over(
+        RELAY_CALL_CAUGHT,
+        Arc::clone(&caller),
+        None,
+        Some(parked("turns", "U")),
+    );
+    let outcome = rig
+        .handle
+        .dispatch(turn("t-1"))
+        .await
+        .expect("the turn completes");
+    assert!(
+        matches!(outcome, DispatchOutcome::Completed { .. }),
+        "{outcome:?}"
+    );
+    let steps = trace(&rig);
+    assert!(!steps.contains(&"commit_failed".to_string()), "{steps:?}");
+    assert_eq!(
+        steps.iter().filter(|s| *s == "commit_complete").count(),
+        1,
+        "{steps:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_replayed_delivery_of_a_caught_failure_does_not_run_again() {
+    let caller = refusing();
+    let rig = rig(CAUGHT_BY_ANY, Arc::clone(&caller), None);
+    rig.handle
+        .dispatch(start("k-1"))
+        .await
+        .expect("the recovery path completes");
+    let replay = rig.handle.dispatch(start("k-1")).await.expect("dedup");
+    assert!(matches!(replay, DispatchOutcome::Duplicate), "{replay:?}");
+    assert_eq!(caller.calls(), 1, "no second call, no second completion");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_loop_after_the_catch_runs_the_call_again_with_a_fresh_budget() {
+    // Trip 1 spends its two attempts and is caught; trip 2 has two attempts of its own.
+    let caller = FakeCaller::new(|n| {
+        Box::pin(async move {
+            match n {
+                0..=2 => retryable("UPSTREAM_BUSY"),
+                _ => json(r#"{"v":1}"#),
+            }
+        })
+    });
+    let rig = rig(CAUGHT_THEN_LOOP, Arc::clone(&caller), None);
+    let outcome = rig
+        .handle
+        .dispatch(start("k-1"))
+        .await
+        .expect("the loop completes");
+    assert_eq!(caller.calls(), 4);
+    assert_eq!(reply_json(&outcome), serde_json::json!({"a": {"v": 1}}));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_caught_branch_still_counts_at_a_join_reached_on_a_later_pass() {
+    // The first pass: `A` is refused and caught, reaching the join; `U` parks.
+    let rig_first = rig(CAUGHT_THEN_JOIN, refusing(), None);
+    rig_first
+        .handle
+        .dispatch(start("k-1"))
+        .await
+        .expect("the instance parks at U");
+    let snapshot = rig_first.observed.lock().unwrap().parks[0].0.clone();
+    assert_eq!(snapshot.waiting_nodes, vec!["U".to_string()]);
+
+    // The later pass, over what that park stored: `U` completes the join.
+    let rig_later = rig_over(CAUGHT_THEN_JOIN, refusing(), None, Some(snapshot));
+    let outcome = rig_later
+        .handle
+        .dispatch(turn("t-1"))
+        .await
+        .expect("the join completes");
+    assert!(
+        matches!(outcome, DispatchOutcome::Completed { .. }),
+        "{outcome:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_caller_waiting_on_http_gets_the_recovery_reply_when_caught() {
+    let rig = http_rig(CAUGHT_BY_ANY, refusing(), HTTP_CHANNELS, None);
+    let reply = post(&rig, "/channels/start-in", "c-1", r#"{"hi":1}"#).await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    let reply: serde_json::Value = serde_json::from_str(&reply.body).expect("json");
+    assert_eq!(reply["a"]["recovered"], serde_json::json!(REJECTED_CODE));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_caller_waiting_on_http_gets_the_failure_when_uncaught() {
+    let rig = http_rig(SINGLE, refusing(), HTTP_CHANNELS, None);
+    let reply = post(&rig, "/channels/start-in", "c-1", r#"{"hi":1}"#).await;
+    assert_eq!(reply.status, 500, "{}", reply.body);
+    let problem: serde_json::Value = serde_json::from_str(&reply.body).expect("json");
+    assert_eq!(problem["code"], serde_json::json!(REJECTED_CODE));
+    assert_eq!(
+        problem["detail"],
+        serde_json::json!("HTTP 400 (bad_request): the counterpart refused it")
+    );
+}
+
+#[test]
+fn a_call_inside_a_sub_process_is_refused_at_load_so_no_catch_is_needed_there() {
+    let bpmn = r#"<?xml version="1.0"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0">
+  <bpmn:process id="nested">
+    <bpmn:startEvent id="S"/>
+    <bpmn:subProcess id="Sub">
+      <bpmn:startEvent id="SubS"/>
+      <bpmn:serviceTask id="A" implementation="channel:svc">
+        <bpmn:extensionElements><q:timeout duration="PT2S"/></bpmn:extensionElements>
+      </bpmn:serviceTask>
+      <bpmn:endEvent id="SubE"/>
+      <bpmn:sequenceFlow id="g1" sourceRef="SubS" targetRef="A"/>
+      <bpmn:sequenceFlow id="g2" sourceRef="A" targetRef="SubE"/>
+    </bpmn:subProcess>
+    <bpmn:endEvent id="E"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="S" targetRef="Sub"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="Sub" targetRef="E"/>
+  </bpmn:process>
+</bpmn:definitions>"#;
+    let refused = BpmnModelLoader::new().load(bpmn.as_bytes()).err();
+    let refused = refused.expect("the loader refuses a channel call inside a sub-process");
+    assert!(
+        format!("{refused:?}").contains("SUTRA.DISPATCH.TIMER.UNSUPPORTED"),
+        "{refused:?}"
+    );
+}
+
+/// The call's output mapping cannot be evaluated: its answer is refused.
+const ANSWER_REFUSED: &str = r#"<?xml version="1.0"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0">
+  <bpmn:process id="caught">
+    <bpmn:startEvent id="S">
+      <bpmn:extensionElements><q:source channel="start-in" name="req"/></bpmn:extensionElements>
+    </bpmn:startEvent>
+    <bpmn:serviceTask id="A" implementation="channel:svc">
+      <bpmn:extensionElements>
+        <q:source channel="svc-answers" name="a"/>
+        <q:timeout duration="PT2S"/>
+      </bpmn:extensionElements>
+      <bpmn:dataOutputAssociation>
+        <bpmn:assignment><bpmn:from>noSuchFunction(a)</bpmn:from><bpmn:to>b</bpmn:to></bpmn:assignment>
+      </bpmn:dataOutputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:boundaryEvent id="Caught" attachedToRef="A">
+      <bpmn:errorEventDefinition/>
+    </bpmn:boundaryEvent>
+    <bpmn:serviceTask id="Rec">
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>{recovered: callFailure.code, reason: callFailure.message}</bpmn:from><bpmn:to>a</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:serviceTask id="R" implementation="reply">
+      <bpmn:extensionElements><q:reply/></bpmn:extensionElements>
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="E"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="S" targetRef="A"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="A" targetRef="R"/>
+    <bpmn:sequenceFlow id="f3" sourceRef="R" targetRef="E"/>
+    <bpmn:sequenceFlow id="f4" sourceRef="Caught" targetRef="Rec"/>
+    <bpmn:sequenceFlow id="f5" sourceRef="Rec" targetRef="R"/>
+  </bpmn:process>
+</bpmn:definitions>"#;
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_answer_is_caught_and_the_flow_never_reads_the_answer() {
+    let caller = FakeCaller::new(|_| {
+        Box::pin(async {
+            Ok(InlineResponse {
+                body: br#"{"text":"ANSWER-TEXT"}"#.to_vec(),
+                content_type: Some("application/json".to_string()),
+                headers: BTreeMap::new(),
+            })
+        })
+    });
+    let rig = rig(ANSWER_REFUSED, caller, None);
+    let outcome = rig
+        .handle
+        .dispatch(start("k-1"))
+        .await
+        .expect("the recovery path completes");
+    let reply = reply_json(&outcome);
+    let reason = reply["a"]["reason"].as_str().expect("the reason is text");
+    assert!(reason.contains("refused"), "{reason}");
+    assert!(!reason.contains("ANSWER-TEXT"), "{reason}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_request_never_reaches_the_reason_a_flow_reads() {
+    let rig = rig(CAUGHT_BY_ANY, refusing(), None);
+    let outcome = rig
+        .handle
+        .dispatch(start("k-1"))
+        .await
+        .expect("the recovery path completes");
+    let reply = reply_json(&outcome).to_string();
+    assert!(!reply.contains("o-1"), "the order in the request: {reply}");
+}

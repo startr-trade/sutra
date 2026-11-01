@@ -62,16 +62,15 @@ impl HttpInlineCaller {
 
     async fn call_once(&self, message: &OutboundMessage) -> Result<InlineResponse, InlineFailure> {
         let destination = &message.destination;
+        let shown = redact_destination(destination);
         let permanent =
             |text: String| InlineFailure::Permanent(Diagnostic::error(OUTBOUND_SEND_FAILED, text));
         let retryable =
             |text: String| InlineFailure::Retryable(Diagnostic::error(OUTBOUND_SEND_FAILED, text));
 
-        let uri: hyper::Uri = destination.parse().map_err(|e| {
-            permanent(format!(
-                "destination '{destination}' is not a valid URI: {e}"
-            ))
-        })?;
+        let uri: hyper::Uri = destination
+            .parse()
+            .map_err(|e| permanent(format!("destination '{shown}' is not a valid URI: {e}")))?;
         let method_text = method_for(message);
         let method: hyper::Method = method_text.parse().map_err(|_| {
             permanent(format!(
@@ -107,11 +106,7 @@ impl HttpInlineCaller {
         }
         let request = builder
             .body(Full::new(Bytes::from(message.body.clone())))
-            .map_err(|e| {
-                permanent(format!(
-                    "HTTP request to {destination} could not be built: {e}"
-                ))
-            })?;
+            .map_err(|e| permanent(format!("HTTP request to {shown} could not be built: {e}")))?;
 
         let exchange = async {
             let response = self.client.request(request).await?;
@@ -122,11 +117,11 @@ impl HttpInlineCaller {
         let (parts, bytes) = match tokio::time::timeout(self.request_timeout, exchange).await {
             Err(_) => {
                 return Err(retryable(format!(
-                    "HTTP call to {destination} timed out after {:?}",
+                    "HTTP call to {shown} timed out after {:?}",
                     self.request_timeout
                 )))
             }
-            Ok(Err(e)) => return Err(retryable(format!("HTTP call to {destination} failed: {e}"))),
+            Ok(Err(e)) => return Err(retryable(format!("HTTP call to {shown} failed: {e}"))),
             Ok(Ok(done)) => done,
         };
 
@@ -149,13 +144,33 @@ impl HttpInlineCaller {
             .chars()
             .take(BODY_EXCERPT_MAX)
             .collect();
-        let text = format!("HTTP call to {destination} failed with status {code}: {excerpt}");
+        let text = format!("HTTP call to {shown} failed with status {code}: {excerpt}");
         if code == 408 || code == 429 || code >= 500 {
             Err(retryable(text))
         } else {
             Err(permanent(text))
         }
     }
+}
+
+/// `destination` fit for a failure reason, which is stored and readable by a catching flow: no
+/// credentials before the host, no query values.
+fn redact_destination(destination: &str) -> String {
+    let (base, query) = match destination.split_once('?') {
+        Some((base, _)) => (base, "?<redacted>"),
+        None => (destination, ""),
+    };
+    let base = match base.split_once("://") {
+        Some((scheme, rest)) => match rest.split_once('/') {
+            Some((authority, path)) => {
+                let host = authority.rsplit('@').next().unwrap_or(authority);
+                format!("{scheme}://{host}/{path}")
+            }
+            None => format!("{scheme}://{}", rest.rsplit('@').next().unwrap_or(rest)),
+        },
+        None => base.to_string(),
+    };
+    format!("{base}{query}")
 }
 
 impl Default for HttpInlineCaller {
@@ -209,6 +224,21 @@ mod tests {
     use tokio::net::TcpListener;
 
     use super::*;
+
+    #[test]
+    fn a_reason_names_the_destination_without_its_secrets() {
+        for (destination, shown) in [
+            ("http://svc:8080/call", "http://svc:8080/call"),
+            ("http://svc:8080", "http://svc:8080"),
+            (
+                "https://user:pw@svc/call?key=s3cret",
+                "https://svc/call?<redacted>",
+            ),
+            ("https://user:pw@svc?key=s3cret", "https://svc?<redacted>"),
+        ] {
+            assert_eq!(redact_destination(destination), shown);
+        }
+    }
 
     /// Serve one canned response; resolves to the raw request text.
     async fn stub(response: &'static str) -> (String, tokio::task::JoinHandle<String>) {

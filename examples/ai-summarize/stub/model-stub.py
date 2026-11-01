@@ -19,7 +19,8 @@ OpenAI wire (also every Chat Completions service: Gemini, Mistral, ...)
                                  when the caller's latest turn lasts 2.5 s or more, else a fixed
                                  answer. A model id containing `analytics` asked for JSON (the
                                  JSON mode, or in words for an audio model) answers the post-call
-                                 analysis (customer emotion per turn) as a JSON object
+                                 analysis (customer emotion per turn) as a JSON object. A model id
+                                 containing `refuses` is refused outright (400, `model_refuses`)
   POST /v1/audio/transcriptions  multipart form (model + file) -> a fixed transcript
   POST /v1/audio/speech          {model, input, voice, response_format} -> the fixed WAV
                                  (`wav`) or its samples (`pcm`, 24 kHz 16-bit LE)
@@ -775,7 +776,14 @@ class Handler(BaseHTTPRequestHandler):
                 f"stream={bool(request.get('stream'))} tools={len(request.get('tools') or [])}")
             problem = input_audio_problem(request)
             refused = json_mode_problem(request)
-            if problem:
+            if "refuses" in str(request.get("model")):
+                count("chat-model-refused")
+                self._send(400, {"error": {
+                    "message": "This model refuses the request.",
+                    "type": "invalid_request_error",
+                    "code": "model_refuses",
+                }})
+            elif problem:
                 self._send(400, {"error": {"message": f"model-stub: {problem}"}})
             elif refused:
                 count("chat-json-mode-refused")

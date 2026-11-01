@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  THE SAME REFUSAL ON A STORED INSTANCE, UNCAUGHT. The instance is FAILED durably, with the failure's
+  code as its failureCode.
+-->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0"
+                  id="Definitions_refused-later-unguarded"
+                  targetNamespace="urn:sutra:module:ai-advanced:1.0.0">
+
+  <bpmn:process id="refused-later-unguarded" name="The model refuses a stored instance; nothing catches it" isExecutable="true">
+
+    <bpmn:extensionElements>
+      <q:variables>
+        <q:variable name="requestBody" type="object"/>  <!-- what the model channel is sent -->
+        <q:variable name="answer" type="object"/>  <!-- the model's reply, when there is one -->
+        <q:variable name="responseObject" type="object"/>  <!-- what the HTTP caller gets back -->
+      </q:variables>
+    </bpmn:extensionElements>
+
+    <bpmn:startEvent id="Start" name="Request received">
+      <bpmn:extensionElements>
+        <q:source channel="refused-later-unguarded"/>
+      </bpmn:extensionElements>
+      <bpmn:outgoing>F1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="F1" sourceRef="Start" targetRef="Wait"/>
+    <!-- The timer stores the instance, so the call below runs on a resumed instance. -->
+    <bpmn:intermediateCatchEvent id="Wait" name="A moment later">
+      <bpmn:incoming>F1</bpmn:incoming><bpmn:outgoing>F1b</bpmn:outgoing>
+      <bpmn:timerEventDefinition><bpmn:timeDuration>PT1S</bpmn:timeDuration></bpmn:timerEventDefinition>
+    </bpmn:intermediateCatchEvent>
+    <bpmn:sequenceFlow id="F1b" sourceRef="Wait" targetRef="BuildRequest"/>
+
+    <bpmn:serviceTask id="BuildRequest" name="Build the prompt (FEEL)">
+      <bpmn:incoming>F1</bpmn:incoming><bpmn:outgoing>F2</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment>
+          <bpmn:from>{prompt: "Summarize this ticket: " + payload.description}</bpmn:from>
+          <bpmn:to>requestBody</bpmn:to>
+        </bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F2" sourceRef="BuildRequest" targetRef="AskModel"/>
+
+    <bpmn:serviceTask id="AskModel" name="Ask the model" implementation="channel:refusing-model">
+      <bpmn:extensionElements>
+        <q:timeout duration="PT30S"/>
+      </bpmn:extensionElements>
+      <bpmn:incoming>F2</bpmn:incoming><bpmn:outgoing>F3</bpmn:outgoing>
+      <bpmn:dataOutputAssociation>
+        <bpmn:assignment><bpmn:from>payload</bpmn:from><bpmn:to>answer</bpmn:to></bpmn:assignment>
+      </bpmn:dataOutputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F3" sourceRef="AskModel" targetRef="End"/>
+    <bpmn:endEvent id="End" name="Answered"><bpmn:incoming>F3</bpmn:incoming></bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>

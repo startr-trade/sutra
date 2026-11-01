@@ -635,11 +635,12 @@ impl TokenExecutor {
     /// one caller: the outbox terminally POISONED the node's request delivery
     /// (`sutra.outbox.retry.max-attempts` exhausted), so the in-flight attempt can never be
     /// answered. The resume re-enters the parked node and offers the failure to its `<q:retry>`
-    /// policy: budget left ⇒ a backoff park (the re-drive later RE-EMITS the request); budget
-    /// spent or `code` non-retryable ⇒ the pass fails fatally and the dispatcher stamps the
-    /// durable FAILED snapshot. The caller gates on the policy existing and on the durable
-    /// poison evidence — a policy-less node is never routed here (its posture is unchanged:
-    /// parked until its timeout boundary fires).
+    /// policy: budget left ⇒ a backoff park (the re-drive later RE-EMITS the request). Budget
+    /// spent, `code` non-retryable or no policy ⇒ a BPMN error `failure_code` on the task when a
+    /// boundary or error event sub-process catches it, with `failure_reason` readable under
+    /// [`CALL_FAILURE_VARIABLE`]; uncaught, the pass fails fatally and the dispatcher stamps the
+    /// durable FAILED snapshot. `failure_reason` is what a flow may read, so it never carries a
+    /// request or an answer.
     #[allow(clippy::too_many_arguments)]
     pub async fn resume_channel_call_failure(
         &self,
@@ -648,6 +649,7 @@ impl TokenExecutor {
         failed_node: &str,
         failure_code: &str,
         failure_message: &str,
+        failure_reason: &str,
         completed_nodes: &[String],
         prior_variables: Variables,
         deployment: DeploymentId,
@@ -677,6 +679,7 @@ impl TokenExecutor {
                 node_id: failed_node.to_string(),
                 code: failure_code.to_string(),
                 message: failure_message.to_string(),
+                reason: failure_reason.to_string(),
             }),
             false,
             CoverageCorrelation::default(),
@@ -1586,8 +1589,34 @@ impl TokenExecutor {
             | Node::LinkCatchEvent { .. }
             | Node::BoundaryEvent { .. }
             | Node::IntermediateThrowEvent { .. } => self.enqueue_outgoing(node_id, state),
-            _ if state.prior_completed.contains(node_id) => self.enqueue_outgoing(node_id, state),
-            _ => return Ok(true),
+            _ => {
+                // A token left this node normally, through a boundary that caught its error, or
+                // both (a loop). A token that did neither is still out, or never came.
+                let caught: Vec<String> = state
+                    .process
+                    .nodes()
+                    .iter()
+                    .filter(|n| {
+                        matches!(n, Node::BoundaryEvent {
+                            kind: BoundaryKind::Error,
+                            attached_to_ref,
+                            ..
+                        } if attached_to_ref == node_id)
+                            && state.prior_completed.contains(n.id())
+                    })
+                    .map(|n| n.id().to_string())
+                    .collect();
+                let left = state.prior_completed.contains(node_id);
+                if !left && caught.is_empty() {
+                    return Ok(true);
+                }
+                if left {
+                    self.enqueue_outgoing(node_id, state);
+                }
+                for boundary in &caught {
+                    self.enqueue_outgoing(boundary, state);
+                }
+            }
         }
         state.visited.insert(node_id.to_string());
         Ok(true)
@@ -1995,6 +2024,7 @@ impl TokenExecutor {
                 implementation,
                 &failure.code,
                 &failure.message,
+                &failure.reason,
                 state,
             );
         }
@@ -2011,15 +2041,17 @@ impl TokenExecutor {
         if let Some(fired) = state.take_fired_timer_for(id) {
             let route_less = state.process.outgoing(&fired.boundary_id).is_empty();
             if route_less && state.process.has_retry_policy(id) {
+                let detail = format!(
+                    "channel-call task '{id}' timed out waiting for its correlated response \
+                     (timer boundary '{}' fired)",
+                    fired.boundary_id
+                );
                 return self.park_or_fail_channel_call_retry(
                     id,
                     implementation,
                     codes::DISPATCH_CHANNEL_CALL_TIMEOUT,
-                    &format!(
-                        "channel-call task '{id}' timed out waiting for its correlated \
-                         response (timer boundary '{}' fired)",
-                        fired.boundary_id
-                    ),
+                    &detail,
+                    &detail,
                     state,
                 );
             }
@@ -2122,19 +2154,19 @@ impl TokenExecutor {
     /// its only fresh row, the durable attempt count advances, and the `retry_backoff` marker
     /// records the dead attempt (the dispatcher resolves the attempt's response wait /
     /// timeout rows and refuses its late relays on that marker; the re-drive at due-time
-    /// RE-EMITS the request). Returns `Ok(true)` — the token did not leave. Budget spent or
-    /// `code` declared non-retryable ⇒ the pass fails fatally
-    /// (`SUTRA.RUNTIME.RETRY.EXHAUSTED`), and the dispatcher stamps the durable FAILED
-    /// snapshot exactly as it does for an exhausted registered-task retry.
+    /// RE-EMITS the request). Returns `Ok(true)` — the token did not leave.
     ///
-    /// `NoPolicy` is unreachable by construction — both callers gate on the policy — and
-    /// fails loudly rather than silently re-parking if that invariant ever breaks.
+    /// Budget spent, `code` declared non-retryable, or no policy at all ⇒ the failure is
+    /// permanent: see [`Self::raise_channel_call_failure`]. Uncaught with a policy it is
+    /// `SUTRA.RUNTIME.RETRY.EXHAUSTED`, and the dispatcher stamps the durable FAILED snapshot
+    /// exactly as it does for an exhausted registered-task retry.
     fn park_or_fail_channel_call_retry(
         &self,
         id: &str,
         implementation: &str,
         code: &str,
         detail: &str,
+        reason: &str,
         state: &mut ExecutionState<'_>,
     ) -> Result<bool, Signal> {
         // The classification convention `plan_retry` already speaks: a leading "CODE:" token.
@@ -2159,16 +2191,40 @@ impl TokenExecutor {
                 self.record_timer_wait(id, due_at, state);
                 Ok(true)
             }
-            RetryDisposition::Fail(fatal) => Err(Signal::Fatal(fatal)),
-            RetryDisposition::NoPolicy => Err(fatal_diag(
-                codes::RUNTIME_UNEXPECTED,
-                format!(
-                    "channel-call task '{id}' was offered failure '{code}' for its <q:retry> \
-                     policy, but it declares none; the caller must gate on the policy — this \
-                     is an engine-internal inconsistency."
-                ),
-            )),
+            RetryDisposition::Fail(fatal) => {
+                self.raise_channel_call_failure(id, code, reason, Signal::Fatal(fatal), state)
+            }
+            RetryDisposition::NoPolicy => {
+                self.raise_channel_call_failure(id, code, reason, fatal_diag(code, detail), state)
+            }
         }
+    }
+
+    /// A channel call failed for good: raise `code` as a BPMN error on the task, exactly as a
+    /// registered task's BPMN error, when a boundary or error event sub-process catches it. The
+    /// flow then reads `reason` under [`CALL_FAILURE_VARIABLE`], and the attempt count goes with
+    /// the attempt, so a loop back to the call starts on a fresh budget.
+    ///
+    /// Uncaught, `uncaught` is returned as it stands: the instance fails with the failure's own
+    /// diagnostic rather than a generic "uncaught BPMN error", which would hide the reason.
+    fn raise_channel_call_failure(
+        &self,
+        id: &str,
+        code: &str,
+        reason: &str,
+        uncaught: Signal,
+        state: &mut ExecutionState<'_>,
+    ) -> Result<bool, Signal> {
+        if !channel_call_failure_is_caught(state.process, id, code) {
+            return Err(uncaught);
+        }
+        state.retry_attempts.remove(id);
+        state.retry_backoff.remove(id);
+        record_call_failure(id, code, reason, state);
+        Err(Signal::BpmnError {
+            source: id.to_string(),
+            code: code.to_string(),
+        })
     }
 
     /// Arm every timer boundary attached to `host_id` — the host is parking a NEW wait, so its
@@ -2232,6 +2288,15 @@ impl TokenExecutor {
     ) -> Result<(), Signal> {
         let outgoing = state.process.outgoing(boundary_id);
         if outgoing.is_empty() {
+            record_call_failure(
+                host_id,
+                codes::DISPATCH_CHANNEL_CALL_TIMEOUT,
+                &format!(
+                    "channel-call task '{host_id}' timed out waiting for its response \
+                     (timer boundary '{boundary_id}' fired)"
+                ),
+                state,
+            );
             return Err(Signal::BpmnError {
                 source: host_id.to_string(),
                 code: codes::DISPATCH_CHANNEL_CALL_TIMEOUT.to_string(),
@@ -3989,6 +4054,9 @@ impl TokenExecutor {
             for flow in process.outgoing(&boundary_id) {
                 state.fire(flow);
             }
+            // Durable, because the host never completed: a later pass's reconstruction walk
+            // reaches the boundary's route only through this record.
+            state.completed_activities.push(boundary_id.clone());
             state.visited.insert(boundary_id);
             return Ok(());
         }
@@ -5087,6 +5155,8 @@ struct FiredTimer {
 /// `<q:retry>` policy when it re-enters it.
 #[derive(Debug, Clone)]
 struct ChannelCallFailure {
+    /// What the flow may read when the failure is caught.
+    reason: String,
     node_id: String,
     /// The stable classification code (`<q:retry nonRetryableCodes>` matches against it).
     code: String,
@@ -5726,6 +5796,38 @@ fn find_error_event_sub_process(process: &ProcessDefinition, code: &str) -> Opti
         }
     }
     None
+}
+
+/// The process variable a channel call's caught failure is readable under: a context of `code`
+/// (what the boundary matched), `message` (the reason) and `node` (the call's task id).
+pub const CALL_FAILURE_VARIABLE: &str = "callFailure";
+
+/// Whether a permanent failure `code` of the channel-call task `node_id` is caught: by a boundary
+/// on the task, or by an error event sub-process of the process. Channel calls only exist at the
+/// top level of a process (the loader refuses them inside a sub-process), so there is no further
+/// enclosing scope to look in.
+pub fn channel_call_failure_is_caught(
+    process: &ProcessDefinition,
+    node_id: &str,
+    code: &str,
+) -> bool {
+    find_error_boundary(process, node_id, code).is_some()
+        || find_error_event_sub_process(process, code).is_some()
+}
+
+/// Leave a channel call's failure where the flow's catching path can read it.
+fn record_call_failure(node_id: &str, code: &str, reason: &str, state: &ExecutionState<'_>) {
+    let text = |value: &str| FeelValue::String(value.to_string());
+    let failure = BTreeMap::from([
+        ("code".to_string(), text(code)),
+        ("message".to_string(), text(reason)),
+        ("node".to_string(), text(node_id)),
+    ]);
+    state
+        .ctx
+        .borrow_mut()
+        .variables
+        .insert(CALL_FAILURE_VARIABLE, FeelValue::Map(failure));
 }
 
 /// True for the task activities an ad-hoc sub-process runs.

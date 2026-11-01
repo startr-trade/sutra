@@ -19,6 +19,9 @@
 #   SYNC  POST /channels/voice-pipeline     -> voice-pipeline-model  speech-to-text, a text model, text-to-speech
 #   SYNC  POST /channels/vision             -> vision-model     an image or video frames in, a JSON answer out (native Gemini)
 #   SYNC  POST /channels/hear-json          -> hear-json-model  audio in, a parsed JSON answer out (OpenAI audio model)
+#   SYNC  POST /channels/refused-guarded    -> refusing-model   the model refuses (HTTP 400); a boundary catches it
+#   SYNC  POST /channels/refused-unguarded  -> refusing-model   the same, uncaught: the caller gets the failure
+#   ASYNC POST /channels/refused-later-*    -> refusing-model   the same on a stored instance, caught / uncaught
 #
 # The three sync channels declare `ack-mode: on-complete`: the call is inline and the HTTP caller
 # gets the answer on its own connection. The three job channels are `mode: job` on the outbound
@@ -39,6 +42,58 @@ channels:
     bind: "POST /channels/fallback"
     codec: json
     ack-mode: on-complete
+    cloudevents-mode: none
+    auth:
+      scheme: apikey
+      apikey:
+        value: env:AI_ADVANCED_API_KEY
+        header: X-Api-Key
+
+  # A model that refuses the request (./bpmn): caught; the caller gets the recovery reply.
+  - name: refused-guarded
+    transport: http
+    bind: "POST /channels/refused-guarded"
+    codec: json
+    ack-mode: on-complete
+    cloudevents-mode: none
+    auth:
+      scheme: apikey
+      apikey:
+        value: env:AI_ADVANCED_API_KEY
+        header: X-Api-Key
+
+  # The same refusal, uncaught; the caller gets the failure.
+  - name: refused-unguarded
+    transport: http
+    bind: "POST /channels/refused-unguarded"
+    codec: json
+    ack-mode: on-complete
+    cloudevents-mode: none
+    auth:
+      scheme: apikey
+      apikey:
+        value: env:AI_ADVANCED_API_KEY
+        header: X-Api-Key
+
+  # The same refusal on a stored instance, caught: it completes.
+  - name: refused-later-guarded
+    transport: http
+    bind: "POST /channels/refused-later-guarded"
+    codec: json
+    ack-mode: on-persist
+    cloudevents-mode: none
+    auth:
+      scheme: apikey
+      apikey:
+        value: env:AI_ADVANCED_API_KEY
+        header: X-Api-Key
+
+  # The same refusal on a stored instance, uncaught: it is FAILED.
+  - name: refused-later-unguarded
+    transport: http
+    bind: "POST /channels/refused-later-unguarded"
+    codec: json
+    ack-mode: on-persist
     cloudevents-mode: none
     auth:
       scheme: apikey
@@ -137,6 +192,21 @@ channels:
 
   # JSON MODE. Nothing on the channel: the flow's request says `json: true`.
   # `require: [json-output]` would skip a candidate that cannot do it.
+  - name: refusing-model
+    direction: outbound
+    transport: llm
+    bind: "llm://refusing-model"
+    ack-mode: on-complete
+    llm:
+      candidates:
+        - provider: openai
+          # The stub answers HTTP 400 to any model id containing `refuses`.
+          model: refuses-everything
+          base-url: http://model-stub:8000/v1
+          api-key: env:LLM_API_KEY
+      max-output-tokens: 200
+      timeout-seconds: 30
+
   - name: classify-model
     direction: outbound
     transport: llm

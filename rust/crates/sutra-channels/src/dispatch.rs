@@ -3742,7 +3742,17 @@ impl ChannelEngine {
                 Ok(Node::ServiceTask { implementation, .. })
                     if implementation.starts_with(CHANNEL_CALL_PREFIX)
             );
-            if !is_call || process.retry_policy(&fire.node_id).is_none() {
+            // A policy-less call stays parked until its timeout, unless the flow catches the
+            // poison: then nothing is gained by waiting for an answer that cannot come.
+            let failure_code = codes::OUTBOUND_DELIVERY_ATTEMPTS_EXHAUSTED;
+            if !is_call
+                || (process.retry_policy(&fire.node_id).is_none()
+                    && !sutra_executor::channel_call_failure_is_caught(
+                        &process,
+                        &fire.node_id,
+                        failure_code,
+                    ))
+            {
                 return Ok(ChannelCallPoisonOutcome::NotApplicable);
             }
             // The durable evidence gate: no poisoned row for (instance, node) ⇒ no failure.
@@ -3763,19 +3773,21 @@ impl ChannelEngine {
                 Some(snapshot.start_node.as_str())
             };
             self.seed_audit(&fire.instance_id, snapshot.audit_seq);
+            let failure_message = format!(
+                "the outbox terminally poisoned the request delivery of channel-call task '{}' \
+                 (sutra.outbox.retry.max-attempts exhausted); the in-flight attempt can never \
+                 be answered",
+                fire.node_id
+            );
             let result = self
                 .executor
                 .resume_channel_call_failure(
                     &process,
                     &fire.instance_id,
                     &fire.node_id,
-                    codes::OUTBOUND_DELIVERY_ATTEMPTS_EXHAUSTED,
-                    &format!(
-                        "the outbox terminally poisoned the request delivery of channel-call \
-                         task '{}' (sutra.outbox.retry.max-attempts exhausted); the in-flight \
-                         attempt can never be answered",
-                        fire.node_id
-                    ),
+                    failure_code,
+                    &failure_message,
+                    &failure_message,
                     &snapshot.completed_nodes,
                     prior,
                     pinned.clone(),
@@ -4337,6 +4349,7 @@ impl ChannelEngine {
         chain.in_flight.remove(&node_id);
         let process = Arc::clone(&chain.process);
         let policy = process.retry_policy(&node_id).cloned();
+        let mut flow_reason = None;
         let failure = match result {
             InlineCallResult::Answered(response) => {
                 match self.inline_response_variables(&chain, &node_id, response) {
@@ -4345,8 +4358,16 @@ impl ChannelEngine {
                             .resume_chain_pass(chain, &node_id, ChainPass::Answer(answer))
                             .await
                     }
-                    // An answer the call's own contract rejects is a failed call.
-                    Err(d) => d,
+                    // An answer the call's own contract rejects is a failed call. Its diagnostic
+                    // may quote the answer, so a catching flow is told only that it was refused.
+                    Err(d) => {
+                        flow_reason = Some(format!(
+                            "the answer to channel-call task '{node_id}' was refused by the \
+                             call's own contract ({})",
+                            d.code
+                        ));
+                        d
+                    }
                 }
             }
             InlineCallResult::TimedOut => {
@@ -4371,13 +4392,18 @@ impl ChannelEngine {
             InlineCallResult::Failed(InlineFailure::Permanent(d))
             | InlineCallResult::Failed(InlineFailure::Retryable(d)) => d,
         };
-        if policy.is_some() {
-            // The policy already ran inline; the failure path of the task rules on what is left.
+        let caught =
+            sutra_executor::channel_call_failure_is_caught(&process, &node_id, &failure.code);
+        if policy.is_some() || caught {
+            // The policy already ran inline; the failure path of the task rules on what is left:
+            // the BPMN error on the task when the flow catches it.
+            let reason = flow_reason.unwrap_or_else(|| failure.message.clone());
             return self
-                .resume_chain_pass(chain, &node_id, ChainPass::Failure(failure))
+                .resume_chain_pass(chain, &node_id, ChainPass::Failure(failure, reason))
                 .await;
         }
-        // No policy: an uncaught task failure fails the flow, as a registered task's does.
+        // No policy and nothing catches it: an uncaught task failure fails the flow, as a
+        // registered task's does.
         self.fail_chain(chain, failure).await
     }
 
@@ -4454,7 +4480,7 @@ impl ChannelEngine {
                     .await;
                 (boundary, result)
             }
-            ChainPass::Failure(failure) => {
+            ChainPass::Failure(failure, reason) => {
                 // The inline attempts spent the budget, so the policy must not park a durable
                 // backoff: offer the failure as the LAST attempt.
                 let mut attempts = chain.retry_attempts.clone();
@@ -4469,6 +4495,7 @@ impl ChannelEngine {
                         node_id,
                         &failure.code,
                         &failure.message,
+                        &reason,
                         &chain.completed_nodes,
                         chain.variables.clone(),
                         chain.deployment.clone(),
@@ -5773,8 +5800,9 @@ enum ChainPass {
     Answer(Variables),
     /// The call's timeout: fire this timer boundary.
     Timeout(String),
-    /// The call failed (its inline retries, if any, spent): the task's failure path.
-    Failure(Diagnostic),
+    /// The call failed (its inline retries, if any, spent): the task's failure path, with what
+    /// a catching flow may read.
+    Failure(Diagnostic, String),
 }
 
 /// A capacity-pool slot a start took, still keyed by its admission key.

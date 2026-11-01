@@ -515,7 +515,7 @@ until curl -sf "http://127.0.0.1:$PORT/sutra/deployments" | grep -q '"phase":"Ac
 then:
 
 ```text
-packaged examples/ai-advanced/deploy/deployments/stub.sutra (deploymentId dep-8846c16308ee3b0f46c89bbd)
+packaged examples/ai-advanced/deploy/deployments/stub.sutra (deploymentId dep-163c73f2de054d4963d7812b)
 ```
 
 **2. Audio in, a spoken answer out.** The sample recording is a quarter-second WAV. The request
@@ -674,10 +674,146 @@ engine in this repository ships none. The sutra-voice repository runs it end to 
 
 | What happened | Sync (`on-complete`) | Async (`on-persist`) |
 |---|---|---|
-| Every candidate failed transiently, or the call timed out | With `<q:retry>`: the call is re-issued inline with the policy's backoff, all within the `<q:timeout>` budget; once spent, the task fails. Without it: a timeout fires the task's `#timeout` boundary; any other failure fails the instance. | The delivery is retried with the outbox's backoff. If it never succeeds, the task's `<q:timeout>` fires, or the outbox attempt ceiling poisons it — both are retryable failures under `<q:retry>`. |
-| The request was rejected (bad key, unknown model, malformed request) | A permanent failure: no retry; the task fails (an error boundary can catch it). | The delivery is poisoned (`SUTRA.LLM.CALL.FAILED`), which `<q:retry>` treats as a channel-call failure. |
+| Every candidate failed transiently, or the call timed out | With `<q:retry>`: the call is re-issued inline with the policy's backoff, all within the `<q:timeout>` budget; once spent, the failure's code (`SUTRA.LLM.CALL.FAILED`, or `SUTRA.DISPATCH.CHANNEL_CALL.TIMEOUT`) is raised as a BPMN error on the task. Without it: a timeout fires the task's `#timeout` boundary, which raises `SUTRA.DISPATCH.CHANNEL_CALL.TIMEOUT`; any other failure raises `SUTRA.LLM.CALL.FAILED`. Uncaught, the instance fails. | The delivery is retried with the outbox's backoff. If it never succeeds, the task's `<q:timeout>` fires, or the outbox attempt ceiling poisons it — both are retryable failures under `<q:retry>`. |
+| The request was rejected (bad key, unknown model, malformed request) | A permanent failure: no retry. `SUTRA.LLM.CALL.FAILED` is raised as a BPMN error on the task; a boundary on that code, a boundary with no code, or an error event sub-process catches it. Uncaught, the instance fails. | The delivery is poisoned and stays redrivable; the provider's code does not reach the task. The task's `<q:timeout>` fires (`SUTRA.DISPATCH.CHANNEL_CALL.TIMEOUT`). With `sutra.outbox.retry.max-attempts` set, the row turns terminal first and the task gets `SUTRA.OUTBOUND.DELIVERY_ATTEMPTS_EXHAUSTED`: through `<q:retry>` when it has one, then as a BPMN error when something catches it. |
 
 A sync retry never parks a durable backoff; a flow that needs one should use the async channel.
+
+### Catching a failed call
+
+A sync call's permanent failure is a BPMN error on its task, so a flow that can carry on without the
+answer says so with a boundary:
+
+```xml
+<bpmn:error id="callFailed" errorCode="SUTRA.LLM.CALL.FAILED"/>
+...
+<bpmn:boundaryEvent id="ModelRefused" attachedToRef="AskModel">
+  <bpmn:outgoing>F5</bpmn:outgoing>
+  <bpmn:errorEventDefinition errorRef="callFailed"/>
+</bpmn:boundaryEvent>
+```
+
+An empty `<bpmn:errorEventDefinition/>` catches any failure. Boundaries are tried in document order,
+so declare one on a specific code before a catch-all. With no boundary on the task, a process-level
+error event sub-process is next; a channel call cannot sit inside a sub-process, so there is no
+scope between them. A `<q:reply>` inside an event sub-process does not answer a waiting HTTP caller,
+so when a caller waits, use a boundary and reply on its route. With nothing to catch it, the instance
+fails as it always did.
+
+The catching path reads `callFailure`, a context the engine sets when the failure is raised:
+
+| Field | What it holds |
+|---|---|
+| `callFailure.code` | The code the boundary matched. |
+| `callFailure.message` | The reason: for a model call the channel, provider and model, the HTTP status, the provider's code and its message cut to 300 characters, with credentials redacted. Never the prompt or the answer. |
+| `callFailure.node` | The id of the task whose call failed. |
+
+An answer the call's own contract refuses (an output mapping that cannot be evaluated) is caught the
+same way, and its `message` says only that the answer was refused, since the diagnostic may quote it.
+A `<q:timeout>` that fires with no modelled route sets `callFailure` too. The variable stays set
+after the catch, like any other, until the next failure replaces it. A flow's own `callFailure`
+variable is overwritten.
+
+A failure under `<q:retry>` is caught only when the budget is spent, under the failure's code, not
+`SUTRA.RUNTIME.RETRY.EXHAUSTED` (which stays the code of the failed instance when nothing catches
+it). A loop from the boundary back to the call starts on a fresh budget.
+
+The same holds for any synchronous channel, not only `llm`: the HTTP transport's code is
+`SUTRA.OUTBOUND.SEND.FAILED`.
+
+### Try it: a model that refuses the request
+
+This runs four flows of the `examples/ai-advanced` stub variant against a stub model that answers
+every call with HTTP 400:
+
+| Flow | Channel | The call | What catches it |
+|---|---|---|---|
+| `variants/stub/bpmn/refused-guarded.bpmn` | `POST /channels/refused-guarded` | With the HTTP caller waiting | A boundary on `SUTRA.LLM.CALL.FAILED` |
+| `variants/stub/bpmn/refused-unguarded.bpmn` | `POST /channels/refused-unguarded` | With the HTTP caller waiting | Nothing |
+| `variants/stub/bpmn/refused-later-guarded.bpmn` | `POST /channels/refused-later-guarded` | On a stored instance, after a timer | A boundary with no code |
+| `variants/stub/bpmn/refused-later-unguarded.bpmn` | `POST /channels/refused-later-unguarded` | On a stored instance, after a timer | Nothing |
+
+**Prerequisites:** [Before you try a walkthrough](../whats-new-0-6.md#before-you-try-a-walkthrough). No key is needed.
+
+**1. Package the stub variant and start the stack:**
+
+```bash
+C=examples/ai-advanced/deploy/compose.yaml
+sutra package examples/ai-advanced/variants/stub --overlay examples/ai-advanced/shared \
+    --out examples/ai-advanced/deploy/deployments
+docker compose -f $C up -d --wait
+PORT=$(docker compose -f $C port engine 8080 | cut -d: -f2)
+H=(-H 'Content-Type: application/json' -H 'X-Api-Key: dev-only-advanced-key')
+until curl -sf "http://127.0.0.1:$PORT/sutra/deployments" | grep -q '"phase":"Active"'; do sleep 1; done
+```
+
+**2. Caught, with the caller waiting.** The boundary routes to a task that answers from
+`callFailure`:
+
+```xml
+<bpmn:from>{ticketId: payload.ticketId, recovered: true, code: callFailure.code, reason: callFailure.message}</bpmn:from>
+```
+
+```bash
+curl -s -X POST "http://127.0.0.1:$PORT/channels/refused-guarded" "${H[@]}" \
+    -d '{"ticketId":"T-1","description":"My parcel never arrived."}' | python3 -m json.tool
+```
+
+The caller gets the recovery path's reply, with HTTP 200:
+
+```json
+{
+    "code": "SUTRA.LLM.CALL.FAILED",
+    "reason": "llm channel 'refusing-model': every candidate failed; last (openai/refuses-everything): HTTP 400 (model_refuses): This model refuses the request.",
+    "recovered": true,
+    "ticketId": "T-1"
+}
+```
+
+**3. Uncaught, with the caller waiting.** The same flow without the boundary:
+
+```bash
+curl -s -w '\nHTTP %{http_code}\n' -X POST "http://127.0.0.1:$PORT/channels/refused-unguarded" "${H[@]}" \
+    -d '{"ticketId":"T-2","description":"My parcel never arrived."}'
+```
+
+The caller gets the failure:
+
+```text
+{"type":"urn:bpm:diag:SUTRA.LLM.CALL.FAILED","title":"SUTRA.LLM.CALL.FAILED","status":500,"detail":"llm channel 'refusing-model': every candidate failed; last (openai/refuses-everything): HTTP 400 (model_refuses): This model refuses the request.","code":"SUTRA.LLM.CALL.FAILED","attributes":{"incident":"SUTRA.INBOUND.NON_IDEMPOTENT_FAILURE"}}
+HTTP 500
+```
+
+**4. On a stored instance.** No caller waits here, which is the case that used to lose work: a timer
+stores the instance, then the call runs. The guarded flow's boundary hands the reason to the stub's
+sink and completes; the unguarded flow fails durably:
+
+```bash
+for flow in refused-later-guarded refused-later-unguarded; do
+  curl -s -o /dev/null -w "$flow: HTTP %{http_code}\n" -X POST "http://127.0.0.1:$PORT/channels/$flow" "${H[@]}" \
+      -d '{"ticketId":"T-3","description":"My parcel never arrived."}'
+done
+sleep 12
+docker compose -f $C exec model-stub wget -qO- http://127.0.0.1:8000/sink; echo
+curl -s "http://127.0.0.1:$PORT/sutra/instances?status=COMPLETED" | grep -o '"status":"[A-Z]*"'
+curl -s "http://127.0.0.1:$PORT/sutra/instances?status=FAILED" | grep -o '"status":"[A-Z]*"'
+docker compose -f $C logs engine | grep INSTANCE_FAILED | grep -o '"process":"[^"]*","cause_code":"[^"]*"'
+```
+
+```text
+refused-later-guarded: HTTP 202
+refused-later-unguarded: HTTP 202
+["{\"code\":\"SUTRA.LLM.CALL.FAILED\",\"reason\":\"llm channel 'refusing-model': every candidate failed; last (openai/refuses-everything): HTTP 400 (model_refuses): This model refuses the request.\",\"ticketId\":\"T-3\"}"]
+"status":"COMPLETED"
+"status":"FAILED"
+"process":"refused-later-unguarded","cause_code":"SUTRA.LLM.CALL.FAILED"
+```
+
+**5. Clean up:**
+
+```bash
+docker compose -p sutra-ai-advanced down -v
+```
 
 ### Finding the reason for a failed call
 

@@ -30,6 +30,7 @@ server, so no provider key is needed.
 | **Outbox renewal never waits; audit resource attributes** (0.6.12) | The claim-lease renewal no longer deadlocks with the batch delete of delivered rows (0.6.8–0.6.11) and no longer takes seconds when the engine falls behind. Data stores that share a table no longer race their first use. OTLP audit records carry `OTEL_RESOURCE_ATTRIBUTES` and the new `sutra.telemetry.resource-attributes`. | [Outbox processing](architecture/replicas.md#outbox-processing-skip-locked-and-a-claim-lease), [Resource attributes on audit records](operating/logging.md#resource-attributes-on-audit-records) |
 | **Typed-store queries, a migration ledger, deployment manifests** (0.6.13) | `<q:store query=…>` and `<q:aggregate>` run on typed-column stores as SQL aggregates. Module-store migrations run once, recorded in `sutra_store_migrations`, refuse an edited script, and take `${package.*}`/`${store.*}` placeholders. `sutra lint`/`package`/`deploy` accept a `deploy/<name>.yaml` manifest that stacks layers, with per-layer `.ignore`. | [Querying a typed-column store](building/data-stores.md#querying-a-typed-column-store), [Migrations run once](building/data-stores.md#migrations-run-once), [Deployment manifests](building/deployment-packages.md#deployment-manifests-customers-editions-environments) |
 | **JSON from OpenAI audio models; the reason for a failed model call** (0.6.14) | An OpenAI audio model (`gpt-audio…`) asked for JSON is asked in words, since it refuses `response_format`; a fenced JSON answer inside prose is parsed. A failed `llm` call logs the provider's HTTP status, error code and message at `WARN` under `SUTRA.LLM.CALL.FAILED`, keys redacted, and the failed instance's stored diagnostic carries it. | [How JSON is asked for](building/llm-channels.md#how-json-is-asked-for), [Finding the reason for a failed call](building/llm-channels.md#finding-the-reason-for-a-failed-call) |
+| **A failed synchronous channel call can be caught** (0.6.15) | A permanent failure of a synchronous channel call is a BPMN error on its task, under the failure's own code: a boundary or an error event sub-process catches it, and the catching path reads `callFailure` (`code`, `message`, `node`). Uncaught, it fails as before. | [Catching a failed call](building/llm-channels.md#catching-a-failed-call) |
 | **Live audio sessions** (preview) | `AudioSession` and `require: [realtime]`, opened through an `llm` channel by a media transport, not by a process. | [Live audio sessions](building/llm-channels.md#live-audio-sessions-preview) |
 
 Telephony, IVRs, meetings and WebRTC are not part of this engine. They live in the separate
@@ -44,7 +45,7 @@ Every walkthrough runs from the root of a checkout of this repository. It needs:
   `base64 -i <file>` wherever a walkthrough says `base64 -w0 <file>`);
 - an engine image and the `sutra` CLI, both **0.6.0 or later**.
 
-The compose files default to the published `ghcr.io/startr-trade/sutra:0.6.14` image, and
+The compose files default to the published `ghcr.io/startr-trade/sutra:0.6.15` image, and
 [Installation](getting-started/installation.md) installs the CLI. To run a walkthrough against
 your own checkout instead, build both from it:
 

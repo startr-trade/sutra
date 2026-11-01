@@ -591,6 +591,137 @@ async fn tc_ai_advanced_json_mode() {
     assert_eq!(object, json!({ "category": "outage", "urgency": "high" }));
 }
 
+// ---- a model that refuses the request (HTTP 400) --------------------------------------------
+
+const REFUSAL_PROMPT: &str = "PROMPT-MARKER the customer's words";
+
+fn refused_ticket(id: &str) -> Value {
+    json!({ "ticketId": id, "description": REFUSAL_PROMPT })
+}
+
+/// The caller waits on the call: the boundary on `SUTRA.LLM.CALL.FAILED` routes to the recovery
+/// path, whose reply answers the caller and shows what the flow can read.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "docker"]
+async fn tc_ai_refused_model_is_caught_and_the_caller_gets_the_recovery_reply() {
+    let refused = stub_count("chat-model-refused").await;
+    let (status, _, text) = post(
+        advanced(),
+        ADVANCED_KEY,
+        "refused-guarded",
+        &refused_ticket("AI-REFUSED-1"),
+    )
+    .await;
+    assert_eq!(status, 200, "{text}");
+    let reply: Value = serde_json::from_str(&text).expect("a JSON reply");
+    assert_eq!(reply["ticketId"], "AI-REFUSED-1");
+    assert_eq!(reply["recovered"], true, "{reply}");
+    assert_eq!(reply["code"], "SUTRA.LLM.CALL.FAILED", "{reply}");
+    let reason = reply["reason"].as_str().expect("the reason is text");
+    assert!(
+        reason.contains("HTTP 400 (model_refuses): This model refuses the request."),
+        "{reason}"
+    );
+    assert!(!reason.contains("PROMPT-MARKER"), "{reason}");
+    assert!(!reason.contains("LLM_API_KEY"), "{reason}");
+    assert_eq!(
+        stub_count("chat-model-refused").await,
+        refused + 1,
+        "a refusal is never retried"
+    );
+}
+
+/// The same refusal with no boundary: the caller gets the failure, as before.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "docker"]
+async fn tc_ai_refused_model_uncaught_fails_the_call_as_before() {
+    let (status, _, text) = post(
+        advanced(),
+        ADVANCED_KEY,
+        "refused-unguarded",
+        &refused_ticket("AI-REFUSED-2"),
+    )
+    .await;
+    assert_eq!(status, 500, "{text}");
+    let problem: Value = serde_json::from_str(&text).expect("a problem document");
+    assert_eq!(problem["code"], "SUTRA.LLM.CALL.FAILED", "{problem}");
+    assert!(
+        problem["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("HTTP 400 (model_refuses)"),
+        "{problem}"
+    );
+}
+
+/// The durable status of the instance that handled `ticket_id`, once it reaches `status`.
+async fn instance_reaching(fixture: &Fixture, ticket_id: &str, status: &str) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(45);
+    loop {
+        let ids = instance_ids_for(fixture, ticket_id);
+        if ids.len() == 1 {
+            let detail: Value = reqwest::get(format!(
+                "http://127.0.0.1:{}/sutra/instances/{}",
+                fixture.engine.http_port, ids[0]
+            ))
+            .await
+            .expect("GET instance")
+            .json()
+            .await
+            .expect("instance JSON");
+            if detail["status"] == status {
+                return detail;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{ticket_id}: no instance reached {status}: {ids:?}",
+            ids = ids
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// On a STORED instance (the real report: a post-call analysis, after the caller hung up) the
+/// catch keeps the instance alive: it hands the reason to the sink and COMPLETES.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "docker"]
+async fn tc_ai_refused_model_on_a_stored_instance_is_caught_and_it_completes() {
+    let fixture = advanced();
+    let (status, _, text) = post(
+        fixture,
+        ADVANCED_KEY,
+        "refused-later-guarded",
+        &refused_ticket("AI-REFUSED-3"),
+    )
+    .await;
+    assert_eq!(status, 202, "{text}");
+    let note = sink_delivery("AI-REFUSED-3", Duration::from_secs(60)).await;
+    assert_eq!(note["code"], "SUTRA.LLM.CALL.FAILED", "{note}");
+    let reason = note["reason"].as_str().expect("the reason is text");
+    assert!(reason.contains("HTTP 400 (model_refuses)"), "{reason}");
+    assert!(!reason.contains("PROMPT-MARKER"), "{reason}");
+    let detail = instance_reaching(fixture, "AI-REFUSED-3", "COMPLETED").await;
+    assert!(detail.get("failureCode").is_none(), "{detail}");
+}
+
+/// The same with no boundary: the instance is FAILED durably, under the failure's own code.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "docker"]
+async fn tc_ai_refused_model_on_a_stored_instance_uncaught_is_failed_durably() {
+    let fixture = advanced();
+    let (status, _, text) = post(
+        fixture,
+        ADVANCED_KEY,
+        "refused-later-unguarded",
+        &refused_ticket("AI-REFUSED-4"),
+    )
+    .await;
+    assert_eq!(status, 202, "{text}");
+    let detail = instance_reaching(fixture, "AI-REFUSED-4", "FAILED").await;
+    assert_eq!(detail["failureCode"], "SUTRA.LLM.CALL.FAILED", "{detail}");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "docker"]
 async fn tc_ai_advanced_tool_call() {

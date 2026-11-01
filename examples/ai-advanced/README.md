@@ -27,7 +27,7 @@ The three job flows park on their task, are resumed by the job's result on the c
 |---|---|
 | `shared/bpmn/` | the nine flows (commented, with diagram interchange) |
 | `sample/` | `question.wav` (a 0.25 s tone) and two 8×8 PNG frames, for the audio and vision flows; for the real-provider checks, `spoken-question.wav` (a synthetic voice asking "What is the capital of France?", 16 kHz mono) and `moving-square.mp4` (a 2 s clip) |
-| `variants/stub/` | `package.yaml` + `channels.yaml`: every model is the stub. Needs no key; the engine's tier-2 tests deploy this one. |
+| `variants/stub/` | `package.yaml` + `channels.yaml`: every model is the stub. Needs no key; the engine's tier-2 tests deploy this one. Its own `bpmn/refused-*.bpmn` flows call a model the stub refuses (HTTP 400): caught by a boundary, and uncaught, with the HTTP caller waiting and on a stored instance. |
 | `variants/live/` | the same channels against the real OpenAI, Anthropic and Gemini APIs, plus two Gemini-only flows in `variants/live/bpmn/`: `hear.bpmn` (audio in, inline or as a media reference, a text answer out) and `extract.bpmn` (`json: true`, the parsed answer out) |
 | `deploy/compose.yaml` | engine + PostgreSQL + the stub (from `examples/ai-summarize/stub`), project name `sutra-ai-advanced` |
 | `deploy/compose.media.yaml` | adds a MinIO object store, declared to the engine as the store `media`, which `vision-model` (stub) and `hear-model` (live) read media references `{ref, sha256, format}` from |
@@ -88,6 +88,18 @@ docker compose -f examples/ai-advanced/deploy/compose.yaml logs model-stub | gre
 #    ... (job-poll and batch likewise)
 
 docker compose -p sutra-ai-advanced down -v
+```
+
+A model that refuses the request, caught by a boundary (`SUTRA.LLM.CALL.FAILED`) and uncaught; run this
+before `down -v`:
+
+```bash
+curl -s -X POST "http://127.0.0.1:$PORT/channels/refused-guarded" "${H[@]}" \
+    -d '{"ticketId":"T-1","description":"My parcel never arrived."}'
+# => {"code":"SUTRA.LLM.CALL.FAILED","reason":"llm channel 'refusing-model': every candidate failed; last (openai/refuses-everything): HTTP 400 (model_refuses): This model refuses the request.","recovered":true,"ticketId":"T-1"}
+curl -s -o /dev/null -w '%{http_code}\n' -X POST "http://127.0.0.1:$PORT/channels/refused-unguarded" "${H[@]}" \
+    -d '{"ticketId":"T-2","description":"My parcel never arrived."}'
+# => 500
 ```
 
 What the stub does for each: a fixed answer per wire format; a background job or batch that is in

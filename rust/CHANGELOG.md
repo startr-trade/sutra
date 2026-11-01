@@ -13,6 +13,56 @@ This is the changelog for the **Rust-native** engine (`rust/` workspace). It beg
 
 Nothing yet.
 
+## [0.6.15] — 2026-11-01
+
+**2026-11-01.** A patch release with one engine fix, found on a real phone line: a failed synchronous channel call can now be caught. There is no `urn:sutra:q:1.0` change, no archive format, deploymentId or snapshot format change, and no migration. A flow with a boundary on such a call behaves differently: the boundary now fires. A flow with no boundary behaves as before.
+
+## Fixed
+
+- **A failed synchronous channel call could not be caught.** The book said a rejected model call
+  "fails the task (an error boundary can catch it)". It did not: the failure failed the whole
+  flow, and a boundary error event on the task never fired. A stored instance went `FAILED`
+  (`SUTRA.DISPATCH.INSTANCE_FAILED`); a start was dead-lettered or requeued, and its HTTP caller got
+  a 500. On a real call, a refused post-call analysis lost the call's record. Now a permanent failure of any synchronous channel call (`on-complete`), or a retry
+  budget spent on one, raises a BPMN error on the task:
+  - the code is the failure's own diagnostic code: `SUTRA.LLM.CALL.FAILED` for a model call,
+    `SUTRA.OUTBOUND.SEND.FAILED` for an HTTP call, `SUTRA.DISPATCH.CHANNEL_CALL.TIMEOUT` for a timeout
+    under `<q:retry>`;
+  - a boundary on that code, a boundary with no code, or a process-level error event sub-process
+    catches it, as for any BPMN error;
+  - the HTTP caller waiting on the flow gets the recovery path's reply;
+  - a loop from the boundary back to the call starts on a fresh `<q:retry>` budget.
+
+  With nothing to catch it, nothing changes: the same code and message, the same durable `FAILED`
+  instance, the same HTTP 500, and `SUTRA.RUNTIME.RETRY.EXHAUSTED` when a policy was spent.
+- **The flow can read the reason.** The engine had no error-data mechanism, so the catching path now
+  reads a new variable, `callFailure`, with `code`, `message` and `node`. For a model call `message`
+  is what 0.6.14 stores: channel, provider and model, HTTP status, the provider's code and its
+  message cut to 300 characters, with credentials redacted. Prompts and answers never appear: when a
+  call's own contract refuses its answer, `message` says only that. A flow's own variable of that
+  name is overwritten. The HTTP caller's failure reason no longer shows a destination's credentials
+  or query values.
+- **A caught branch was lost at a later join.** A branch that left a task through an error boundary
+  was not counted when a later pass of the instance rebuilt a converging gateway's arrivals, so the
+  join never fired and the instance failed with `SUTRA.RUNTIME.UNEXPECTED`. This affected every
+  error boundary, including those on timeouts and registered tasks. The route a boundary took is now
+  kept in the instance's completed nodes.
+- **A poisoned async delivery, partly.** With `sutra.outbox.retry.max-attempts` set, a terminally
+  poisoned channel-call request is now caught the same way, under
+  `SUTRA.OUTBOUND.DELIVERY_ATTEMPTS_EXHAUSTED`, once any `<q:retry>` is spent; a call with no policy
+  is woken at once when something catches it. Without that setting a refused async delivery stays
+  redrivable and the task's `<q:timeout>` is what the flow catches. The provider's own code does not
+  reach an async task.
+
+## Changed
+
+- `examples/ai-advanced`'s stub variant has four `refused-*` flows, and the stub model server refuses
+  any model id containing `refuses` with HTTP 400.
+- The book's Failures table is corrected, with a new section and walkthrough on catching a failed
+  call.
+- The public export takes file modes from the source's git index, so it gives the same tree from a
+  worktree as from the main checkout.
+
 ## [0.6.14] — 2026-10-31
 
 A **patch** release with two `llm` transport fixes, both found on a real phone line: OpenAI audio

@@ -263,7 +263,10 @@ fn row(kind: NodeKind) -> Row {
             xml: "`<boundaryEvent>`",
             variant: "BoundaryEvent",
             wait: Wait::No,
-            notes: "Attached to an activity. `BoundaryKind`: Error, Compensation, Escalation, \
+            notes:
+                "Attached to an activity. An error boundary with no code catches any error; on a \
+                    channel-call task it catches the call's permanent failure under the failure's \
+                    own diagnostic code. `BoundaryKind`: Error, Compensation, Escalation, \
                     Cancel, Timer. A timer boundary needs a wait-capable host (channel-call \
                     serviceTask / userTask) — it fires when the host's park outlives the \
                     duration. `@cancelActivity=\"false\"` makes it non-interrupting. A \

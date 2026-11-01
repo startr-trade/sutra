@@ -42,7 +42,10 @@ pub use datastore::{
 pub use deployment::{ArtifactType, DeploymentId};
 pub use emission::{CollectingSink, Emission, EmissionKind, EmissionSink};
 pub use error::ExecError;
-pub use executor::{ExecResult, StatefulExecResult, TimerWait, TokenExecutor};
+pub use executor::{
+    channel_call_failure_is_caught, ExecResult, StatefulExecResult, TimerWait, TokenExecutor,
+    CALL_FAILURE_VARIABLE,
+};
 pub use listener::{TimerEvent, TimerFire};
 pub use registry::{
     AuthRef, DecisionEngine, DecisionEngineRegistry, DecisionRegistry, DmnEngine,

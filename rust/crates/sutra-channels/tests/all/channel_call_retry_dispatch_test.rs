@@ -190,8 +190,12 @@ impl InstanceBridge for FakeBridge {
 }
 
 fn engine_with(bridge: Rc<FakeBridge>) -> ChannelEngine {
+    engine_over(bridge, CALL_RETRY_BPMN)
+}
+
+fn engine_over(bridge: Rc<FakeBridge>, bpmn: &str) -> ChannelEngine {
     let module = BpmnModelLoader::new()
-        .load(CALL_RETRY_BPMN.as_bytes())
+        .load(bpmn.as_bytes())
         .expect("BPMN loads");
     let mut outbound = OutboundChannelRegistry::new();
     outbound.register(
@@ -515,4 +519,83 @@ fn a_poison_wake_on_a_spent_budget_commits_durable_failed_state() {
         failed[0].2
     );
     assert!(bridge.reparks.borrow().is_empty());
+}
+
+// ============================ a caught poison ============================================
+
+/// `Call` (with `{retry}`) and a catch-all boundary that ends the flow on its own end event.
+fn caught_poison_bpmn(retry: &str) -> String {
+    format!(
+        r#"<?xml version="1.0"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0">
+  <bpmn:process id="callflow">
+    <bpmn:startEvent id="S">
+      <bpmn:extensionElements>
+        <q:source channel="start-in" name="payload"/>
+      </bpmn:extensionElements>
+    </bpmn:startEvent>
+    <bpmn:serviceTask id="Call" implementation="channel:out">
+      <bpmn:extensionElements>
+        <q:source channel="call-resp" name="payload"/>
+        <q:alias name="ccKey" expression="payload"/>
+        <q:timeout duration="PT2S"/>
+        {retry}
+      </bpmn:extensionElements>
+    </bpmn:serviceTask>
+    <bpmn:boundaryEvent id="Caught" attachedToRef="Call">
+      <bpmn:errorEventDefinition/>
+    </bpmn:boundaryEvent>
+    <bpmn:endEvent id="E"/>
+    <bpmn:endEvent id="Recovered"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="S" targetRef="Call"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="Call" targetRef="E"/>
+    <bpmn:sequenceFlow id="f3" sourceRef="Caught" targetRef="Recovered"/>
+  </bpmn:process>
+</bpmn:definitions>"#
+    )
+}
+
+fn wake_on(engine: &ChannelEngine) -> ChannelCallPoisonOutcome {
+    drive(engine.fail_channel_call(&ChannelCallPoisonFire {
+        deployment: deployment(),
+        instance_id: INSTANCE.to_string(),
+        node_id: "Call".to_string(),
+    }))
+    .expect("a handled outcome, not a wake error")
+}
+
+#[test]
+fn a_poison_wake_on_a_spent_budget_is_caught_by_a_boundary() {
+    let bridge = Rc::new(FakeBridge {
+        loaded: Some(parked_on_call(2, None)),
+        poisoned_exists: true,
+        ..Default::default()
+    });
+    let bpmn = caught_poison_bpmn(
+        r#"<q:retry maxAttempts="3" initialDelay="PT10S" backoffCoefficient="2.0"/>"#,
+    );
+    let engine = engine_over(Rc::clone(&bridge), &bpmn);
+    wake_on(&engine);
+    assert!(
+        *bridge.completed.borrow(),
+        "the recovery path ended the flow"
+    );
+    assert!(bridge.failed_commits.borrow().is_empty());
+}
+
+#[test]
+fn a_poison_wake_with_no_policy_is_caught_by_a_boundary_at_once() {
+    let bridge = Rc::new(FakeBridge {
+        loaded: Some(parked_on_call(0, None)),
+        poisoned_exists: true,
+        ..Default::default()
+    });
+    let engine = engine_over(Rc::clone(&bridge), &caught_poison_bpmn(""));
+    wake_on(&engine);
+    assert!(
+        *bridge.completed.borrow(),
+        "the recovery path ended the flow"
+    );
+    assert!(bridge.failed_commits.borrow().is_empty());
 }
