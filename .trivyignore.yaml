@@ -165,6 +165,15 @@ vulnerabilities:
   - id: CVE-2026-95619
     statement: "libstdc++ integer overflow in the aligned operator new. Same position as CVE-2026-102010: the engine links no libstdc++ and calls no C++ allocator. Debian defers the fix (status: fix_deferred)."
     expired_at: 2026-11-09
+  - id: CVE-2026-114690
+    statement: "libstdc++ out-of-bounds read/write in a parallel-mode algorithm, reported against gcc-12-base / libgcc-s1 / libgomp1 / libstdc++6. Same position as CVE-2026-102010: readelf on the 0.6.16 engine shows libgcc_s, libm, libc and the loader as its only libraries, and no GLIBCXX, CXXABI or GOMP import. Debian ships no fixed package (status: affected)."
+    expired_at: 2026-11-09
+  - id: CVE-2026-114691
+    statement: "libstdc++ integer wrap, reported against the same four packages. Same position as CVE-2026-114690: the engine links no libstdc++ and imports no C++ symbol. Debian ships no fixed package (status: affected)."
+    expired_at: 2026-11-09
+  - id: CVE-2026-115455
+    statement: "libstdc++ stack overflow in std::bitset, reported against the same four packages. Same position as CVE-2026-114690: the engine links no libstdc++ and imports no C++ symbol. Debian ships no fixed package (status: affected)."
+    expired_at: 2026-11-09
 
   # tzdata — a data refresh, and the only finding here with a fix we would take if we could.
   - id: DLA-4792-1
