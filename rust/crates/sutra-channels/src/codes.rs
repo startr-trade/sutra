@@ -80,6 +80,15 @@ pub const INBOUND_PERSISTENCE_REQUIRED: &str = "SUTRA.INBOUND.PERSISTENCE_REQUIR
 /// was processed exactly once. An in-process delivery treats it as delivered; a transport caller
 /// gets it as a conflict.
 pub const INBOUND_DUPLICATE_CONCURRENT: &str = "SUTRA.INBOUND.DUPLICATE_CONCURRENT";
+/// A delivery with an explicit event id or a declared body-path dedup key could not be checked for
+/// a duplicate, because the dedup store did not answer. It is refused, not processed: nothing ran and nothing was recorded, so a
+/// retry is safe. HTTP answers 503; a broker delivery goes back for redelivery.
+pub const INBOUND_DEDUP_CHECK_UNAVAILABLE: &str = "SUTRA.INBOUND.DEDUP_CHECK_UNAVAILABLE";
+/// An earlier delivery of this event has a dedup record, but a synchronous-call chain still holds
+/// it: that delivery is running, or it failed and could not release the record. Whether it was
+/// processed is not known yet, so this delivery is refused and retried, never swallowed as a
+/// duplicate. HTTP answers 503; a broker delivery goes back for redelivery.
+pub const INBOUND_DEDUP_IN_DOUBT: &str = "SUTRA.INBOUND.DEDUP_IN_DOUBT";
 pub const INBOUND_ALIAS_CONFLICT_REJECT: &str = "SUTRA.INBOUND.ALIAS_CONFLICT_REJECT";
 /// A NON-IDEMPOTENT process (`<q:process idempotent="false">`, the default) failed during
 /// execution. Blind redelivery-and-reprocess would duplicate side effects, so the inbound is

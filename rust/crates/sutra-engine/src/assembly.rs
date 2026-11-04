@@ -1997,8 +1997,14 @@ pub(crate) fn build_engine(
     // The runtime's enqueue → dispatcher link, handed to this lane's persistence bridge.
     outbox_signal: sutra_channels::OutboxSignal,
 ) -> ChannelEngine {
-    let prior_deployments: Vec<DeploymentId> =
-        draining.iter().map(|plan| plan.dep.clone()).collect();
+    let prior_deployments: Vec<(DeploymentId, sutra_channels::Namespace)> = draining
+        .iter()
+        .map(|plan| (plan.dep.clone(), plan.namespace.clone()))
+        .collect();
+    let active_owners: HashMap<DeploymentId, sutra_channels::Namespace> = active
+        .iter()
+        .map(|plan| (plan.dep.clone(), plan.namespace.clone()))
+        .collect();
     // The read-only registries (processes, codecs, validators, templates, scripts, decisions,
     // outbound channels) are NOT built here any more: `build_shared_registries` built them once
     // for this activation and `shared` is a pointer to that one set — see [`SharedRegistries`].
@@ -2390,7 +2396,7 @@ pub(crate) fn build_engine(
     // COUNT(*) at admission — replica-coherent and crash-safe.
     .with_concurrency_store(concurrency_store)
     // DRAINING scopes for relay correlation — pinned instances resume.
-    .with_prior_deployments(prior_deployments)
+    .with_prior_deployments(prior_deployments, active_owners)
     // Synchronous outbound calls: every transport's inline caller, and the same secret
     // resolution the outbox uses for the async path.
     .with_inline_callers(inline_callers())

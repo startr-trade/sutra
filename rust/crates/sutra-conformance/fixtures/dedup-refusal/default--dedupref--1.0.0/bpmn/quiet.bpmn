@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Takes an event and does nothing durable: no step, so nothing but the check needs the database. -->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0"
+                  id="Definitions_quiet"
+                  targetNamespace="urn:sutra:module:dedupref:1.0.0">
+  <bpmn:process id="quiet" name="Persist nothing" isExecutable="true">
+    <bpmn:startEvent id="Start" name="Event received">
+      <bpmn:extensionElements>
+        <q:source channel="quiet-in"/>
+      </bpmn:extensionElements>
+    </bpmn:startEvent>
+    <bpmn:endEvent id="End" name="Done"/>
+    <bpmn:sequenceFlow id="F1" sourceRef="Start" targetRef="End"/>
+  </bpmn:process>
+</bpmn:definitions>

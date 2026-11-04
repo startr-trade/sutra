@@ -781,7 +781,7 @@ fn parse_deployment(
             .labels
             .get(key)
             .cloned()
-            .unwrap_or_else(|| "unlabeled".to_string())
+            .unwrap_or_else(|| sutra_channels::UNLABELED_LABEL.to_string())
     };
 
     let mut deployment = LoadedDeployment {

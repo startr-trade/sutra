@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL" targetNamespace="urn:example:diagrams">
+  <process id="gateways" isExecutable="true">
+    <startEvent id="s"/>
+    <exclusiveGateway id="xor" name="Which?"/>
+    <manualTask id="a" name="Path A"/>
+    <manualTask id="b" name="A task with a rather longer label than the others"/>
+    <inclusiveGateway id="or" name="Any"/>
+    <manualTask id="c" name="Path C"/>
+    <manualTask id="d" name="Path D"/>
+    <inclusiveGateway id="or-join"/>
+    <parallelGateway id="and" name="All"/>
+    <manualTask id="e" name="Path E"/>
+    <manualTask id="f" name="Path F"/>
+    <parallelGateway id="and-join"/>
+    <complexGateway id="complex" name="Complex"/>
+    <exclusiveGateway id="xor-join"/>
+    <manualTask id="again" name="Again"/>
+    <eventBasedGateway id="race" name="First wins"/>
+    <intermediateCatchEvent id="race-timer"><timerEventDefinition><timeDuration>PT1M</timeDuration></timerEventDefinition></intermediateCatchEvent>
+    <intermediateCatchEvent id="race-message"><messageEventDefinition/></intermediateCatchEvent>
+    <endEvent id="end"/>
+    <sequenceFlow id="f1" sourceRef="s" targetRef="xor"/>
+    <sequenceFlow id="f2" sourceRef="xor" targetRef="a"/>
+    <sequenceFlow id="f3" sourceRef="xor" targetRef="b"/>
+    <sequenceFlow id="f4" sourceRef="a" targetRef="or"/>
+    <sequenceFlow id="f5" sourceRef="b" targetRef="or"/>
+    <sequenceFlow id="f6" sourceRef="or" targetRef="c"/>
+    <sequenceFlow id="f7" sourceRef="or" targetRef="d"/>
+    <sequenceFlow id="f8" sourceRef="c" targetRef="or-join"/>
+    <sequenceFlow id="f9" sourceRef="d" targetRef="or-join"/>
+    <sequenceFlow id="f10" sourceRef="or-join" targetRef="and"/>
+    <sequenceFlow id="f11" sourceRef="and" targetRef="e"/>
+    <sequenceFlow id="f12" sourceRef="and" targetRef="f"/>
+    <sequenceFlow id="f13" sourceRef="e" targetRef="and-join"/>
+    <sequenceFlow id="f14" sourceRef="f" targetRef="and-join"/>
+    <sequenceFlow id="f15" sourceRef="and-join" targetRef="complex"/>
+    <sequenceFlow id="f16" sourceRef="complex" targetRef="xor-join"/>
+    <sequenceFlow id="f17" sourceRef="xor-join" targetRef="again"/>
+    <sequenceFlow id="f18" sourceRef="again" targetRef="xor-join"/>
+    <sequenceFlow id="f19" sourceRef="again" targetRef="race"/>
+    <sequenceFlow id="f20" sourceRef="race" targetRef="race-timer"/>
+    <sequenceFlow id="f21" sourceRef="race" targetRef="race-message"/>
+    <sequenceFlow id="f22" sourceRef="race-timer" targetRef="end"/>
+    <sequenceFlow id="f23" sourceRef="race-message" targetRef="end"/>
+  </process>
+</definitions>

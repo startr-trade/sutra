@@ -1,16 +1,18 @@
-# Crates: `sutra-feel` and `sutra-dmn`
+# Crates: `sutra-feel`, `sutra-dmn` and `bpmn-svg`
 
 Every crate in the workspace is unpublished by default (`publish = false` at the workspace level)
-except two, which are deliberately carved out as standalone, embeddable libraries:
-[`sutra-feel`](https://crates.io/crates/sutra-feel) and
-[`sutra-dmn`](https://crates.io/crates/sutra-dmn). Both are pure Rust, `#![forbid(unsafe_code)]`,
-and have no dependency on BPMN, channels, or persistence — you can use either in a project that has
-nothing to do with workflow engines at all.
+except three, which are deliberately carved out as standalone, embeddable libraries:
+[`sutra-feel`](https://crates.io/crates/sutra-feel),
+[`sutra-dmn`](https://crates.io/crates/sutra-dmn) and
+[`bpmn-svg`](https://crates.io/crates/bpmn-svg). All are pure Rust, `#![forbid(unsafe_code)]`,
+and have no dependency on channels or persistence — you can use any of them in a project that has
+nothing to do with this engine at all.
 
 ```toml
 [dependencies]
-sutra-feel = "0.6.16"
-sutra-dmn  = "0.6.16"   # depends on sutra-feel directly; use it alone if you only need DMN
+sutra-feel = "0.6.17"
+sutra-dmn  = "0.6.17"   # depends on sutra-feel directly; use it alone if you only need DMN
+bpmn-svg   = "0.1"      # versioned on its own; depends on neither
 ```
 
 ## `sutra-feel` — the FEEL expression language
@@ -79,14 +81,24 @@ validation without evaluation, see `DmnRulesetValidator`.
 **Conformance is measured, not asserted** — see [DMN-TCK conformance](dmn-tck.md) for the current
 standing and what it does and doesn't cover.
 
-## Why these two and not the rest of the workspace
+## `bpmn-svg` — BPMN diagrams as SVG
+
+`bpmn-svg` draws BPMN 2.0 process diagrams as self-contained SVG, with a layered auto-layout for
+files that carry no BPMN-DI. `parse` reads standard BPMN into a small model and ignores BPMN-DI and
+vendor extensions, and `render` draws it. The same input always gives byte-identical SVG, and an
+option writes colours as CSS variables for light and dark themes. `sutra docgen` draws through it.
+Its [README](https://github.com/startr-trade/sutra/blob/main/rust/crates/bpmn-svg/README.md) has a
+runnable example and its known limits.
+
+## Why these and not the rest of the workspace
 
 Everything else in the workspace — the BPMN model and executor, the channel/transport layer, the
 persistence layer, the CLI — is Sutra-engine-internal: coupled to the engine's own conventions
 (diagnostics, deployment packages, the `q:` namespace) in a way that wouldn't make sense as a
 general-purpose crate. FEEL and DMN evaluation, by contrast, are useful on their own to anyone
 building rules or decision logic in Rust, independent of whether BPMN or Sutra is anywhere in the
-picture — so those two are published, versioned, and supported as standalone libraries.
+picture, and drawing a BPMN file is useful to anything that handles one — so those three are
+published, versioned, and supported as standalone libraries.
 
 ## The model-call crates
 

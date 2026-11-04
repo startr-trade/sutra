@@ -26,12 +26,16 @@ mod tc_ai_examples;
 mod tc_approval_hold;
 #[path = "all/tc_audit_sinks.rs"]
 mod tc_audit_sinks;
+#[path = "all/tc_dedup_refusal.rs"]
+mod tc_dedup_refusal;
 #[path = "all/tc_early_reply_refused.rs"]
 mod tc_early_reply_refused;
 #[path = "all/tc_lane_leak.rs"]
 mod tc_lane_leak;
 #[path = "all/tc_listen_window.rs"]
 mod tc_listen_window;
+#[path = "all/tc_masking.rs"]
+mod tc_masking;
 #[path = "all/tc_money_transfer.rs"]
 mod tc_money_transfer;
 #[path = "all/tc_multi_replica.rs"]

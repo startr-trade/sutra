@@ -97,6 +97,40 @@ impl PgInflightChainStore {
         Ok(())
     }
 
+    /// [`Self::begin`], with `dedup_keys` written to the inbox in the same transaction. A key that
+    /// another delivery already recorded fails it with [`PersistenceError::InboxDuplicate`] and
+    /// leaves nothing behind, so a marker only ever names records its own chain wrote.
+    pub async fn begin_recording(
+        &self,
+        deployment: &DeploymentId,
+        instance: Uuid,
+        dedup_keys: &[(String, String)],
+        holder: &str,
+    ) -> Result<()> {
+        let keys = serde_json::to_string(dedup_keys).map_err(|e| {
+            PersistenceError::InvalidArgument(format!("in-flight marker keys: {e}"))
+        })?;
+        let mut tx = begin_deployment_tx(&self.pool, deployment).await?;
+        crate::step::record_inbox_seen_in(&mut tx, deployment, dedup_keys).await?;
+        sqlx::query(SQL_BEGIN)
+            .bind(deployment.as_str())
+            .bind(instance)
+            .bind(keys)
+            .bind(holder)
+            .bind(OffsetDateTime::now_utc())
+            .execute(&mut *tx)
+            .await
+            .map_err(PersistenceError::db("inflight begin"))?;
+        tx.commit()
+            .await
+            .map_err(PersistenceError::db("inflight begin commit"))?;
+        live_markers()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(marker_key(deployment, instance));
+        Ok(())
+    }
+
     /// Delete the marker on a caller's (deployment-scoped) transaction — what every final step
     /// of an instance runs, so the step and the marker's end commit together. A no-op when
     /// there is no marker — and then no statement is issued at all (see [`live_markers`]).

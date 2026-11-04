@@ -4,7 +4,8 @@
 
 use std::time::Duration;
 
-use sutra_persistence::stores::{InboxStore, PgInboxStore, PgInflightChainStore};
+use sutra_persistence::stores::{InboxSeenState, InboxStore, PgInboxStore, PgInflightChainStore};
+use sutra_persistence::PersistenceError;
 use uuid::Uuid;
 
 use crate::fixture::{dep_a, fresh_pool};
@@ -90,4 +91,99 @@ async fn forget_releases_one_dedup_row() {
     assert!(inbox.forget(&dep_a(), "in", "evt-1").await.unwrap());
     assert!(!inbox.forget(&dep_a(), "in", "evt-1").await.unwrap());
     assert!(inbox.record_seen(&dep_a(), "in", "evt-1").await.unwrap());
+}
+
+#[ignore = "docker"]
+#[tokio::test]
+async fn a_chain_records_its_keys_with_its_marker_and_a_recorded_key_refuses_both() {
+    let pool = fresh_pool().await;
+    let inbox = PgInboxStore::new(pool.clone());
+    let store = PgInflightChainStore::new(pool.clone());
+    let keys = [("in".to_string(), "evt-1".to_string())];
+
+    store
+        .begin_recording(&dep_a(), Uuid::new_v4(), &keys, "host-1-111-aaaa")
+        .await
+        .unwrap();
+    assert_eq!(markers(&pool).await, 1);
+    assert_eq!(
+        inbox.check(&dep_a(), "in", "evt-1").await.unwrap(),
+        InboxSeenState::InDoubt,
+        "written, and held by the chain that wrote it"
+    );
+
+    let refused = store
+        .begin_recording(&dep_a(), Uuid::new_v4(), &keys, "host-1-111-aaaa")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(refused, PersistenceError::InboxDuplicate { .. }),
+        "{refused:?}"
+    );
+    assert_eq!(
+        markers(&pool).await,
+        1,
+        "the loser leaves no marker naming the key"
+    );
+}
+
+#[ignore = "docker"]
+#[tokio::test]
+async fn a_record_is_in_doubt_only_while_a_marker_names_it() {
+    let pool = fresh_pool().await;
+    let inbox = PgInboxStore::new(pool.clone());
+    let store = PgInflightChainStore::new(pool.clone());
+    let chain = Uuid::new_v4();
+    let quoted = "ev\"t'2";
+    let keys = [("in".to_string(), quoted.to_string())];
+
+    assert_eq!(
+        inbox.check(&dep_a(), "in", quoted).await.unwrap(),
+        InboxSeenState::Absent
+    );
+    store
+        .begin_recording(&dep_a(), chain, &keys, "host-1-111-aaaa")
+        .await
+        .unwrap();
+    assert_eq!(
+        inbox.check(&dep_a(), "in", quoted).await.unwrap(),
+        InboxSeenState::InDoubt,
+        "a key that needs JSON escaping still matches"
+    );
+    // Another channel's record under the same id is not held.
+    assert!(inbox.record_seen(&dep_a(), "other", quoted).await.unwrap());
+    assert_eq!(
+        inbox.check(&dep_a(), "other", quoted).await.unwrap(),
+        InboxSeenState::Recorded
+    );
+
+    store.clear(&dep_a(), chain).await.unwrap();
+    assert_eq!(
+        inbox.check(&dep_a(), "in", quoted).await.unwrap(),
+        InboxSeenState::Recorded,
+        "the chain finished and its record stands"
+    );
+}
+
+#[ignore = "docker"]
+#[tokio::test]
+async fn the_sweep_resolves_a_failed_release_so_the_redelivery_runs() {
+    let pool = fresh_pool().await;
+    let inbox = PgInboxStore::new(pool.clone());
+    let store = PgInflightChainStore::new(pool.clone());
+    let keys = [("in".to_string(), "evt-3".to_string())];
+    // The chain failed and could not forget: the record and the marker both stayed.
+    store
+        .begin_recording(&dep_a(), Uuid::new_v4(), &keys, "host-1-111-aaaa")
+        .await
+        .unwrap();
+    store
+        .sweep(&dep_a(), "elsewhere", "elsewhere-1", Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(
+        inbox.check(&dep_a(), "in", "evt-3").await.unwrap(),
+        InboxSeenState::Absent,
+        "the delivery that did nothing leaves nothing that swallows its retry"
+    );
 }

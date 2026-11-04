@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL" targetNamespace="urn:example:diagrams">
+  <process id="tasks" isExecutable="true">
+    <startEvent id="begin" name="Begin"/>
+    <serviceTask id="service" name="Call service" implementation="do-work"/>
+    <scriptTask id="script" name="Run script"><script>1 + 1</script></scriptTask>
+    <manualTask id="manual" name="Do by hand"/>
+    <task id="untyped" name="Untyped"/>
+    <userTask id="user" name="Ask a person"/>
+    <businessRuleTask id="rule" name="Apply rule" implementation="decide.dmn"/>
+    <callActivity id="call" name="Call another" calledElement="other"/>
+    <manualTask id="looped" name="Repeat"><standardLoopCharacteristics/></manualTask>
+    <manualTask id="parallel-mi" name="Fan out"><multiInstanceLoopCharacteristics isSequential="false"><loopCardinality>2</loopCardinality></multiInstanceLoopCharacteristics></manualTask>
+    <manualTask id="sequential-mi" name="One by one"><multiInstanceLoopCharacteristics isSequential="true"><loopCardinality>2</loopCardinality></multiInstanceLoopCharacteristics></manualTask>
+    <manualTask id="&#x0065;scaped" name="A &amp; B &lt;c&gt;"/>
+    <endEvent id="finish" name="Finish"/>
+    <sequenceFlow id="f1" sourceRef="begin" targetRef="service"/>
+    <sequenceFlow id="f2" sourceRef="service" targetRef="script"/>
+    <sequenceFlow id="f3" sourceRef="script" targetRef="manual"/>
+    <sequenceFlow id="f4" sourceRef="manual" targetRef="untyped"/>
+    <sequenceFlow id="f5" sourceRef="untyped" targetRef="user"/>
+    <sequenceFlow id="f6" sourceRef="user" targetRef="rule"/>
+    <sequenceFlow id="f7" sourceRef="rule" targetRef="call"/>
+    <sequenceFlow id="f8" sourceRef="call" targetRef="looped"/>
+    <sequenceFlow id="f9" sourceRef="looped" targetRef="parallel-mi"/>
+    <sequenceFlow id="f10" sourceRef="parallel-mi" targetRef="sequential-mi"/>
+    <sequenceFlow id="f11" sourceRef="sequential-mi" targetRef="escaped"/>
+    <sequenceFlow id="f12" sourceRef="escaped" targetRef="finish"/>
+  </process>
+</definitions>

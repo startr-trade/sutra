@@ -21,6 +21,8 @@ mod lint_navigation_test;
 mod lint_never_init_test;
 #[path = "all/lint_output_conformance_test.rs"]
 mod lint_output_conformance_test;
+#[path = "all/lint_raw_body_test.rs"]
+mod lint_raw_body_test;
 #[path = "all/lint_relay_channel_test.rs"]
 mod lint_relay_channel_test;
 #[path = "all/lint_selector_test.rs"]

@@ -5,7 +5,7 @@
 pub mod bpmn;
 pub mod channels;
 pub mod coverage;
-pub mod diagram;
+pub mod diagram_model;
 pub mod dmn;
 pub mod srl;
 pub mod templates;

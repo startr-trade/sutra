@@ -102,7 +102,7 @@ pub const PACKAGE_FILE_NAME: &str = "package.yaml";
 
 /// The label placeholder used when a package declares no `tenant`/`module`/`version`
 /// label (labels are opaque — these three are conventions, not requirements).
-const UNLABELED: &str = "unlabeled";
+const UNLABELED: &str = sutra_channels::UNLABELED_LABEL;
 
 /// The compiled-schema seam: compiled schema artifacts (SchemaShape et al.) emitted into the
 /// archive's `schemas/**` once the `sutra-xsd` crate lands. `sutra package` works

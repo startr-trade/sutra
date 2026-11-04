@@ -1,0 +1,8 @@
+# Deployment package for the dedup-refusal conformance suite: deliveries with an explicit event id,
+# refused while the dedup store cannot answer. Labels are opaque selectors.
+labels:
+  "tenant": "default"
+  "module": "dedupref"
+  "version": "1.0.0"
+engine:
+  minContract: 1

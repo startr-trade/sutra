@@ -208,6 +208,151 @@ impl PayloadCodec for MessageTypeEchoCodec {
     }
 }
 
+/// Locates `/card` in any payload.
+struct CardRedactor;
+
+impl sutra_channels::ContentRedactor for CardRedactor {
+    fn name(&self) -> &str {
+        "card"
+    }
+    fn locate(
+        &self,
+        _payload: &FeelValue,
+        _variables: &Variables,
+    ) -> Result<Vec<sutra_redactor_spi::RedactionLocator>, String> {
+        Ok(vec![sutra_redactor_spi::RedactionLocator::new(
+            "/card", "test",
+        )])
+    }
+}
+
+fn card_redactors() -> sutra_channels::RedactorRegistry {
+    let mut registry = sutra_channels::RedactorRegistry::new();
+    registry.register_under("urn:sutra:redactor:card:internal", CardRedactor);
+    registry
+}
+
+fn masking_flow(variables: &str, source_children: &str) -> String {
+    format!(
+        r#"<?xml version="1.0"?>
+        <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                          xmlns:q="urn:sutra:q:1.0">
+          <bpmn:process id="echo">
+            <bpmn:extensionElements><q:variables>{variables}</q:variables></bpmn:extensionElements>
+            <bpmn:startEvent id="S">
+              <bpmn:extensionElements>
+                <q:source channel="orders-in" name="payload" dedupKey="body.ref">{source_children}</q:source>
+              </bpmn:extensionElements>
+            </bpmn:startEvent>
+            <bpmn:serviceTask id="T" implementation="capture"/>
+            <bpmn:endEvent id="E"/>
+            <bpmn:sequenceFlow id="f1" sourceRef="S" targetRef="T"/>
+            <bpmn:sequenceFlow id="f2" sourceRef="T" targetRef="E"/>
+          </bpmn:process>
+        </bpmn:definitions>"#
+    )
+}
+
+const RAW_BODY: &[u8] = br#"{"ref":"r-1","card":"4111-RAW"}"#;
+
+const RAW_HEADERS: [(&str, &str); 3] = [
+    ("X-Api-Key", "RAW-API-KEY"),
+    ("Authorization", "Bearer RAW-TOKEN"),
+    ("X-Custom", "RAW-CUSTOM"),
+];
+
+struct MessageViews {
+    event: FeelValue,
+    masked_event: Option<FeelValue>,
+    header: FeelValue,
+    masked_header: Option<FeelValue>,
+}
+
+/// Run `bpmn` over [`RAW_BODY`] and [`RAW_HEADERS`], and answer what the flow saw.
+fn message_views(bpmn: &str) -> MessageViews {
+    let h = build_harness(bpmn, "json", |_, _| {});
+    let mut message = inbound("orders-in", RAW_BODY, "application/json");
+    for (name, value) in RAW_HEADERS {
+        message.headers.insert(name.to_string(), value.to_string());
+    }
+    drive(h.engine.dispatch(&message)).expect("dispatch succeeds");
+    MessageViews {
+        event: captured_var(&h, "event").expect("event"),
+        masked_event: captured_var(&h, "event.redacted"),
+        header: captured_var(&h, "header").expect("header"),
+        masked_header: captured_var(&h, "header.redacted"),
+    }
+}
+
+fn field(event: &FeelValue, name: &str) -> FeelValue {
+    match event {
+        FeelValue::Map(m) => m.get(name).cloned().expect("field"),
+        other => panic!("not a map: {other:?}"),
+    }
+}
+
+fn marker() -> FeelValue {
+    FeelValue::String(sutra_channels::REDACTED_MARKER.to_string())
+}
+
+fn assert_message_masked(views: &MessageViews) {
+    let masked_event = views.masked_event.as_ref().expect("event.redacted");
+    let masked_header = views.masked_header.as_ref().expect("header.redacted");
+    assert_eq!(field(masked_event, "body"), marker());
+    assert_eq!(field(masked_event, "dedupKey"), marker());
+    assert_eq!(field(masked_event, "idempotencyKey"), marker());
+    let masked_headers = field(masked_event, "headers");
+    for (name, value) in RAW_HEADERS {
+        assert_eq!(
+            field(&masked_headers, name),
+            marker(),
+            "event.headers {name}"
+        );
+        assert_eq!(field(masked_header, name), marker(), "header {name}");
+        // The flow itself still reads the real values.
+        assert_eq!(
+            field(&views.header, name),
+            FeelValue::String(value.to_string())
+        );
+        assert_eq!(
+            field(&field(&views.event, "headers"), name),
+            FeelValue::String(value.to_string())
+        );
+    }
+    assert_eq!(
+        field(&views.event, "body"),
+        FeelValue::String(String::from_utf8_lossy(RAW_BODY).into_owned())
+    );
+    assert_eq!(
+        field(&views.event, "dedupKey"),
+        FeelValue::String("r-1".to_string()),
+        "the flow still reads the real key"
+    );
+}
+
+#[test]
+fn a_redactor_masks_the_body_and_every_header() {
+    assert_message_masked(&message_views(&masking_flow(
+        "",
+        r#"<q:redactors><q:redactor ref="card"/></q:redactors>"#,
+    )));
+}
+
+#[test]
+fn a_sensitive_payload_masks_the_body_and_every_header_with_no_redactor() {
+    assert_message_masked(&message_views(&masking_flow(
+        r#"<q:variable name="payload" type="object" sensitive="true"/>"#,
+        "",
+    )));
+}
+
+#[test]
+fn a_flow_that_declares_no_masking_has_no_message_companions() {
+    let views = message_views(&masking_flow("", ""));
+    assert_eq!(views.masked_event, None);
+    assert_eq!(views.masked_header, None);
+}
+
 fn build_harness(
     bpmn: &str,
     codec: &str,
@@ -245,7 +390,8 @@ fn build_harness(
             codecs,
             sutra_channels::FormatRegistry::with_builtins(),
             validators,
-        ),
+        )
+        .with_redactors(card_redactors()),
     )
     .with_binding(ChannelBinding::new(
         "orders-in",
@@ -1319,11 +1465,13 @@ fn sha_fallback_key_never_suppresses_a_repost() {
         ));
     }
     // The inbox never even saw the sha fallback key.
-    assert!(drive(h.inbox.record_seen(
-        &deployment(),
-        "orders-in",
-        &msg.idempotency_key
-    )));
+    assert_eq!(
+        drive(
+            h.inbox
+                .record_seen(&deployment(), "orders-in", &msg.idempotency_key)
+        ),
+        sutra_channels::DedupCheckOutcome::First
+    );
 }
 
 // ===== Guards: tenant agreement, payload cap, ambiguity, broadcast, wait states =====

@@ -80,7 +80,52 @@ impl PgInboxStore {
     }
 }
 
+/// What the store holds for one `(deployment, channel, event_id)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InboxSeenState {
+    /// No record.
+    Absent,
+    /// A record, and the delivery that wrote it finished.
+    Recorded,
+    /// A record that an in-flight chain's marker still names: that chain is running, or it failed
+    /// and could not release the record. The sweep resolves a marker nobody ends.
+    InDoubt,
+}
+
+const SQL_HELD_BY_CHAIN: &str = "SELECT 1 FROM inflight_sync_chain \
+     WHERE deployment_id = $1 AND dedup_keys::jsonb @> $2::jsonb LIMIT 1";
+
 impl PgInboxStore {
+    /// [`Self::seen`], and when a record exists, whether a chain's marker still holds it. The marker
+    /// is only read for a key that has a record, so a first delivery pays for one query.
+    pub async fn check(
+        &self,
+        deployment: &DeploymentId,
+        channel: &str,
+        event_id: &str,
+    ) -> Result<InboxSeenState> {
+        if !self.seen(deployment, channel, event_id).await? {
+            return Ok(InboxSeenState::Absent);
+        }
+        let key = serde_json::to_string(&[[channel, event_id]])
+            .map_err(|e| PersistenceError::InvalidArgument(format!("inbox check key: {e}")))?;
+        let mut tx = begin_deployment_tx(&self.pool, deployment).await?;
+        let held: Option<i32> = sqlx::query_scalar(SQL_HELD_BY_CHAIN)
+            .bind(deployment.as_str())
+            .bind(key)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(PersistenceError::db("inbox check marker"))?;
+        tx.commit()
+            .await
+            .map_err(PersistenceError::db("inbox check marker commit"))?;
+        Ok(if held.is_some() {
+            InboxSeenState::InDoubt
+        } else {
+            InboxSeenState::Recorded
+        })
+    }
+
     /// Whether `(deployment, channel, event_id)` is already recorded — a read, no write. The
     /// engine checks before it processes a delivery and writes the record in the step that
     /// processes it (`crate::step::record_inbox_seen_in`), so record and effects commit together.

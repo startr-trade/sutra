@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL" targetNamespace="urn:example:diagrams">
+  <process id="boundaries" isExecutable="true">
+    <startEvent id="s"/>
+    <subProcess id="host" name="Host">
+      <startEvent id="h-s"/>
+      <endEvent id="h-e"/>
+      <sequenceFlow id="h1" sourceRef="h-s" targetRef="h-e"/>
+    </subProcess>
+    <boundaryEvent id="on-error" name="Failed" attachedToRef="host"><errorEventDefinition errorRef="err"/></boundaryEvent>
+    <boundaryEvent id="on-escalation" attachedToRef="host" cancelActivity="false"><escalationEventDefinition escalationRef="esc"/></boundaryEvent>
+    <boundaryEvent id="on-compensate" attachedToRef="next"><compensateEventDefinition/></boundaryEvent>
+    <boundaryEvent id="on-timer" attachedToRef="wait"><timerEventDefinition><timeDuration>PT1M</timeDuration></timerEventDefinition></boundaryEvent>
+    <transaction id="tx" name="Paid for">
+      <startEvent id="x-s"/>
+      <endEvent id="x-e"><cancelEventDefinition/></endEvent>
+      <sequenceFlow id="x1" sourceRef="x-s" targetRef="x-e"/>
+    </transaction>
+    <boundaryEvent id="on-cancel" attachedToRef="tx"><cancelEventDefinition/></boundaryEvent>
+    <manualTask id="next" name="Next"/>
+    <userTask id="wait" name="Wait for a person"/>
+    <manualTask id="recover" name="Recover"/>
+    <manualTask id="escalated" name="Escalated"/>
+    <manualTask id="timed-out" name="Timed out"/>
+    <manualTask id="cancelled" name="Cancelled"/>
+    <endEvent id="end"/>
+    <sequenceFlow id="f1" sourceRef="s" targetRef="host"/>
+    <sequenceFlow id="f2" sourceRef="host" targetRef="next"/>
+    <sequenceFlow id="f3" sourceRef="next" targetRef="wait"/>
+    <sequenceFlow id="f4" sourceRef="wait" targetRef="tx"/>
+    <sequenceFlow id="f5" sourceRef="tx" targetRef="end"/>
+    <sequenceFlow id="f6" sourceRef="on-error" targetRef="recover"/>
+    <sequenceFlow id="f7" sourceRef="recover" targetRef="end"/>
+    <sequenceFlow id="f8" sourceRef="on-escalation" targetRef="escalated"/>
+    <sequenceFlow id="f9" sourceRef="escalated" targetRef="end"/>
+    <sequenceFlow id="f10" sourceRef="on-timer" targetRef="timed-out"/>
+    <sequenceFlow id="f11" sourceRef="timed-out" targetRef="end"/>
+    <sequenceFlow id="f12" sourceRef="on-cancel" targetRef="cancelled"/>
+    <sequenceFlow id="f13" sourceRef="cancelled" targetRef="end"/>
+  </process>
+  <error id="err" errorCode="E1"/>
+  <escalation id="esc" escalationCode="ESC"/>
+</definitions>

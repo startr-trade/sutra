@@ -121,7 +121,9 @@ An inbound message's `(tenant, channel, event_id)` triple is inserted with `ON C
 NOTHING`; whichever replica's insert actually produced a row owns starting that instance, and any
 other replica that raced it (or a genuine redelivery) sees nothing came back and treats it as a
 dedup hit. This is a plain unique-index conflict — no application-level locking, and it works
-identically whichever replica happens to receive the redelivered copy.
+identically whichever replica happens to receive the redelivered copy. A delivery that can't be
+checked because the database doesn't answer is refused and retried, not run
+([details](../operating/ack-modes.md#when-a-delivery-cant-be-checked-for-a-duplicate)).
 
 ## Outbox processing: `SKIP LOCKED` and a claim lease {#outbox-processing-skip-locked-and-a-claim-lease}
 

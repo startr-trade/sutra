@@ -1,0 +1,37 @@
+# Channels for the dedup-refusal package.
+#
+#   event-in      HTTP intake with an explicit event id. Its flow sends on callback-out.
+#   quiet-in      HTTP intake with an explicit event id. Its flow persists nothing.
+#   callback-out  outbound HTTP to the host recorder.
+channels:
+  - name: event-in
+    transport: http
+    bind: "POST /channels/event-in"
+    codec: json
+    ack-mode: on-persist
+    cloudevents-mode: none
+    idempotency-key-header: X-Event-Id
+    auth:
+      scheme: apikey
+      apikey:
+        value: env:DEDUP_REFUSAL_API_KEY
+        header: X-Api-Key
+
+  - name: quiet-in
+    transport: http
+    bind: "POST /channels/quiet-in"
+    codec: json
+    ack-mode: on-persist
+    cloudevents-mode: none
+    idempotency-key-header: X-Event-Id
+    auth:
+      scheme: apikey
+      apikey:
+        value: env:DEDUP_REFUSAL_API_KEY
+        header: X-Api-Key
+
+  - name: callback-out
+    direction: outbound
+    transport: http
+    bind: "${DEDUP_REFUSAL_CALLBACK_URL}"
+    cloudevents-mode: none

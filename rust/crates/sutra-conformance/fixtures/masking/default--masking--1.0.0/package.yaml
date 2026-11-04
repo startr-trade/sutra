@@ -1,0 +1,8 @@
+# Deployment package for the masking conformance suite: a flow whose payload is declared sensitive,
+# audited with its payload, and parked, so every surface that can show event.body has it to show.
+labels:
+  "tenant": "default"
+  "module": "masking"
+  "version": "1.0.0"
+engine:
+  minContract: 1

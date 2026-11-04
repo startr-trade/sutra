@@ -175,7 +175,7 @@ Walks the JSONL audit stream for one instance id and prints its events in order 
 reconstructing what a specific production instance did without needing direct database access.
 `--until` stops replay after a given event type (e.g. `INSTANCE_COMPLETED`).
 
-## Sensitive data never appears in the clear
+## How sensitive data is masked
 
 A variable tagged `sensitive` (via `q:variables`, see [The q: namespace](../building/q-namespace.md))
 or read from a `dataClass`-tagged data store (see [Data stores](../building/data-stores.md)) is
@@ -183,6 +183,23 @@ redacted on every one of the surfaces above — audit sinks, structured logs, an
 the same redactor mechanism described in
 [Domain neutrality and the SPI model](../architecture/neutrality-and-spi.md). The flow itself
 still sees the real value; only what the engine *emits* is masked.
+
+A source that declares masking, with `q:redactors` or a `sensitive` payload variable, masks the rest
+of the inbound message as well: `event.body` and every header value in `event.headers` and `header`,
+whole, because they carry the same data and can carry credentials. The flow still reads the real values.
+This has limits you should know:
+
+- With no master key, a snapshot holds values unencrypted.
+- **A flow that declares no masking shows all of it**, including a credential sent in a header such as an
+  API key, on inspect, in the snapshot, and in audit output with `capture="payload"`. To avoid that, declare
+  a `sensitive` payload variable, avoid `capture="payload"`, limit access to the inspect API and the
+  database, or end authentication at a gateway that strips the header.
+- A `q:alias` value is stored in clear, so an alias built from a header holds its value. An explicit event
+  id is stored in clear too, and so is the trace id with an outbound send.
+- A copy of the body in another variable is only masked if that variable is `sensitive`. `sutra lint`
+  warns about this with `SUTRA.CONFIG.BPMN.RAW_BODY_UNMASKED`. Writing the body to a data store warns with
+  `SUTRA.CONFIG.BPMN.RAW_BODY_STORED`, because store columns have no at-rest encryption. The lint doesn't
+  cover copies of a header.
 
 ## Next
 

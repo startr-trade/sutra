@@ -63,8 +63,9 @@ use sutra_persistence::step::{
     StepTimerWait, StepWait, StepWrite,
 };
 use sutra_persistence::stores::{
-    DeadLetterRow, InboxStore, InstanceStore, OutboxEntry, PgDeadLetterStore, PgInboxStore,
-    PgInflightChainStore, PgInstanceStore, PgOutboxStore, ReplyMode as PersistReplyMode,
+    DeadLetterRow, InboxSeenState, InboxStore, InstanceStore, OutboxEntry, PgDeadLetterStore,
+    PgInboxStore, PgInflightChainStore, PgInstanceStore, PgOutboxStore,
+    ReplyMode as PersistReplyMode,
 };
 use sutra_persistence::{DeploymentId as PersistDeploymentId, PersistenceError};
 
@@ -975,14 +976,19 @@ impl InstanceBridge for PersistenceBridge {
         &self,
         deployment: &sutra_executor::DeploymentId,
         instance_id: &str,
-        dedup_keys: &[(String, String)],
-    ) -> Result<(), Diagnostic> {
+        _dedup_keys: &[(String, String)],
+    ) -> Result<Vec<(String, String)>, Diagnostic> {
         let dep = persist_dep(deployment)?;
         let instance = parse_instance(instance_id)?;
+        // The chain has made no call yet, so this is the point to catch a delivery that was already
+        // recorded. Record and marker are one transaction: the marker names exactly what this
+        // chain wrote, and only that can ever be released.
+        let keys = self.pending_for(&dep);
         PgInflightChainStore::new(self.pool.clone())
-            .begin(&dep, instance, dedup_keys, sutra_channels::replica_id())
+            .begin_recording(&dep, instance, &keys, sutra_channels::replica_id())
             .await
-            .map_err(|e| persistence_diag("in-flight chain marker write failed", &e))
+            .map_err(|e| persistence_diag("in-flight chain marker write failed", &e))?;
+        Ok(keys)
     }
 
     async fn end_inline_chain(&self, deployment: &sutra_executor::DeploymentId, instance_id: &str) {
@@ -1064,18 +1070,28 @@ impl ChannelInboxStore for PersistenceBridge {
         deployment: &sutra_executor::DeploymentId,
         channel: &str,
         event_id: &str,
-    ) -> bool {
+    ) -> sutra_channels::DedupCheckOutcome {
+        use sutra_channels::DedupCheckOutcome as Check;
         let Ok(dep) = PersistDeploymentId::new(deployment.value()) else {
-            return true; // malformed id — proceed (fail-open on dedup, logged below)
+            // A deployment id the store cannot hold has no record to check or write. Refusing would
+            // be permanent, not retryable, and any step of this delivery fails on the same id.
+            warn!(
+                channel,
+                event_id,
+                deployment = deployment.value(),
+                "inbox dedup skipped: the deployment id is malformed; proceeding with no record"
+            );
+            return Check::First;
         };
         // Read, don't write: the record is written by the step that processes this delivery, in
         // that step's own transaction, so it exists iff the step's effects do. A crash before the
         // commit leaves no record and the redelivery runs; a concurrent delivery of the same
         // event that commits first makes this delivery's step roll back
         // (SUTRA.INBOUND.DUPLICATE_CONCURRENT).
-        match self.inbox.seen(&dep, channel, event_id).await {
-            Ok(true) => false,
-            Ok(false) => {
+        match self.inbox.check(&dep, channel, event_id).await {
+            Ok(InboxSeenState::Recorded) => Check::Duplicate,
+            Ok(InboxSeenState::InDoubt) => Check::InDoubt,
+            Ok(InboxSeenState::Absent) => {
                 self.pending_seen
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -1084,11 +1100,11 @@ impl ChannelInboxStore for PersistenceBridge {
                         channel: channel.to_string(),
                         event_id: event_id.to_string(),
                     });
-                true
+                Check::First
             }
             Err(e) => {
-                warn!(channel, event_id, error = %e, "inbox dedup failed — proceeding (fail-open)");
-                true
+                warn!(channel, event_id, error = %e, "inbox dedup check failed; refusing the delivery");
+                Check::Unavailable
             }
         }
     }
@@ -1110,10 +1126,26 @@ impl ChannelInboxStore for PersistenceBridge {
             let Ok(dep) = PersistDeploymentId::new(p.deployment.value()) else {
                 continue;
             };
-            if let Err(e) = self.inbox.record_seen(&dep, &p.channel, &p.event_id).await {
-                warn!(channel = %p.channel, event_id = %p.event_id, error = %e, "inbox dedup write failed");
+            match self.inbox.record_seen(&dep, &p.channel, &p.event_id).await {
+                Ok(true) => {}
+                // Only a delivery that raced another gets here: no step wrote its key, so what it
+                // did was not durable, and it has already run.
+                Ok(false) => {
+                    warn!(channel = %p.channel, event_id = %p.event_id, "a delivery that was already recorded ran with no step to catch it");
+                }
+                Err(e) => {
+                    warn!(channel = %p.channel, event_id = %p.event_id, error = %e, "inbox dedup write failed");
+                }
             }
         }
+    }
+
+    fn has_pending(&self) -> bool {
+        !self
+            .pending_seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
     }
 
     fn take_pending(&self) -> Vec<sutra_channels::PendingDedup> {
@@ -1136,14 +1168,18 @@ impl ChannelInboxStore for PersistenceBridge {
         deployment: &sutra_executor::DeploymentId,
         channel: &str,
         event_id: &str,
-    ) {
+    ) -> bool {
         let Ok(dep) = PersistDeploymentId::new(deployment.value()) else {
-            return;
+            return true; // no record can exist under an id the store cannot hold
         };
-        if let Err(e) = self.inbox.forget(&dep, channel, event_id).await {
-            // The row then keeps suppressing a redelivery until it is pruned — the same
-            // outcome as a crash mid-chain; logged so the stuck key is findable.
-            warn!(channel, event_id, error = %e, "inbox dedup release failed");
+        match self.inbox.forget(&dep, channel, event_id).await {
+            Ok(_) => true,
+            Err(e) => {
+                // The caller keeps the chain's marker, so a redelivery stays in doubt rather than
+                // swallowed, until the sweep releases the record.
+                warn!(channel, event_id, error = %e, "inbox dedup release failed");
+                false
+            }
         }
     }
 }
@@ -1193,5 +1229,46 @@ impl IncidentSink for PersistenceBridge {
         if let Err(e) = store.insert(&row).await {
             warn!(error = %e, "durable dead-letter write failed (best-effort; the tracing::error! floor already recorded it)");
         }
+    }
+}
+
+#[cfg(test)]
+mod dedup_tests {
+    use std::time::Duration;
+
+    use sutra_channels::{DedupCheckOutcome, InboxStore as _};
+
+    use super::*;
+
+    /// A bridge whose database never answers: nothing listens on this port.
+    fn bridge_with_no_database() -> PersistenceBridge {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(Duration::from_millis(200))
+            .connect_lazy("postgres://sutra@127.0.0.1:1/none")
+            .expect("a lazy pool never connects here");
+        PersistenceBridge::new(pool)
+    }
+
+    fn deployment() -> sutra_executor::DeploymentId {
+        sutra_executor::DeploymentId::of("dep-0000000000000000000000d1").expect("valid")
+    }
+
+    #[tokio::test]
+    async fn a_failed_check_reports_it_and_leaves_no_key_behind() {
+        let bridge = bridge_with_no_database();
+        assert_eq!(
+            bridge.record_seen(&deployment(), "in", "evt-1").await,
+            DedupCheckOutcome::Unavailable
+        );
+        assert!(
+            !bridge.has_pending(),
+            "the delivery is refused, so no step will write it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_forget_the_store_cannot_answer_says_so() {
+        let bridge = bridge_with_no_database();
+        assert!(!bridge.forget(&deployment(), "in", "evt-1").await);
     }
 }

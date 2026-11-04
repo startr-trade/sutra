@@ -1015,3 +1015,161 @@ async fn boot_survives_multiple_draining_revisions_of_one_slot() {
     );
     engine.shutdown().await;
 }
+
+// ---- a draining deployment's instances belong to its owner ------------------------------------
+
+/// `<path>/start` parks an instance on the alias `heldKey`, and the channel `shared-name` at
+/// `<path>/resume` answers it, which reports to `/<tenant>-<module>-<version>-done`.
+fn held_package(
+    tenant: &str,
+    module: &str,
+    version: &str,
+    path: &str,
+    sink: SocketAddr,
+) -> PathBuf {
+    let root = temp_root("owner-pkg");
+    let done = format!("{tenant}-{module}-{version}-done");
+    write(
+        &root,
+        "bpmn/held.bpmn",
+        &format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0"
+                  id="Definitions_held"
+                  targetNamespace="urn:sutra:module:{module}:{version}">
+  <bpmn:process id="held" name="Held" isExecutable="true">
+    <bpmn:extensionElements><q:variables>
+      <q:variable name="answer" type="object"/>
+    </q:variables></bpmn:extensionElements>
+    <bpmn:startEvent id="Start">
+      <bpmn:extensionElements><q:source channel="start"/></bpmn:extensionElements>
+    </bpmn:startEvent>
+    <bpmn:serviceTask id="Arm" name="Arm the wait">
+      <bpmn:dataInputAssociation><bpmn:assignment>
+        <bpmn:from>{{key: payload.key}}</bpmn:from><bpmn:to>answer</bpmn:to>
+      </bpmn:assignment></bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:receiveTask id="Await" name="Await">
+      <bpmn:extensionElements>
+        <q:source channel="shared-name" name="answer"/>
+        <q:alias name="heldKey" expression="answer.key" unique="true"/>
+      </bpmn:extensionElements>
+    </bpmn:receiveTask>
+    <bpmn:sendTask id="Report" name="Report">
+      <bpmn:extensionElements><q:send destination="http://{sink}/{done}"/></bpmn:extensionElements>
+    </bpmn:sendTask>
+    <bpmn:endEvent id="End"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="Start" targetRef="Arm"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="Arm" targetRef="Await"/>
+    <bpmn:sequenceFlow id="f3" sourceRef="Await" targetRef="Report"/>
+    <bpmn:sequenceFlow id="f4" sourceRef="Report" targetRef="End"/>
+  </bpmn:process>
+</bpmn:definitions>
+"#
+        ),
+    );
+    let auth = format!(
+        "    auth:\n      scheme: apikey\n      apikey:\n        value: {API_KEY}\n        header: X-Api-Key\n"
+    );
+    write(
+        &root,
+        "channels.yaml",
+        &format!(
+            "channels:\n  - name: start\n    transport: http\n    bind: \"POST {path}/start\"\n    codec: json\n{auth}  - name: shared-name\n    transport: http\n    bind: \"POST {path}/resume\"\n    codec: json\n{auth}"
+        ),
+    );
+    write(
+        &root,
+        "package.yaml",
+        &format!(
+            "labels:\n  \"tenant\": \"{tenant}\"\n  \"module\": \"{module}\"\n  \"version\": \"{version}\"\nengine:\n  minContract: 1\n"
+        ),
+    );
+    root
+}
+
+fn problem_code(body: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(body.trim()).expect("problem json")["code"]
+        .as_str()
+        .expect("a code")
+        .to_string()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "docker"]
+async fn a_message_on_one_owners_channel_never_resumes_another_owners_draining_instance() {
+    let (pool, url) = fresh_db().await;
+    let (sink, capture) = capture_server().await;
+    let victim = package(&held_package("t2", "victim", "1.0.0", "/victim", sink));
+    let mine = package(&held_package("t1", "caller", "1.0.0", "/caller", sink));
+    let engine = boot_db_engine(url).await;
+    let addr = engine.local_addr;
+    let (status, body) = post(addr, "/admin/deployments", &victim).await;
+    assert_eq!(status, 200, "t2 deploys: {body}");
+    let (status, body) = post(addr, "/victim/start", br#"{"key":"SAME"}"#).await;
+    assert_eq!(status, 200, "t2 parks: {body}");
+    // Undeployed with an instance parked: t2's deployment is now draining.
+    let (status, body) = tokio::task::spawn_blocking(move || {
+        http_request(addr, "DELETE", "/admin/deployments/t2--victim--1.0.0", b"")
+    })
+    .await
+    .expect("delete task");
+    assert_eq!(status, 200, "t2 undeploys: {body}");
+    let (status, body) = post(addr, "/admin/deployments", &mine).await;
+    assert_eq!(status, 200, "t1 deploys: {body}");
+
+    // A message on t1's channel with t2's alias value, and one with a value nobody parked on.
+    let (same_status, same_body) = post(addr, "/caller/resume", br#"{"key":"SAME"}"#).await;
+    let (none_status, none_body) = post(addr, "/caller/resume", br#"{"key":"NOBODY"}"#).await;
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    assert_eq!(
+        capture.delivered("/t2-victim-1.0.0-done"),
+        0,
+        "t2's instance must not run: {same_status} {same_body}"
+    );
+    let parked: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM waiting_event WHERE status = 'WAITING' AND node_id = 'Await'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("count");
+    assert_eq!(parked, 1, "t2's instance is still parked");
+    assert_eq!(
+        (same_status, problem_code(&same_body)),
+        (none_status, problem_code(&none_body)),
+        "the same answer as any message that correlates to nothing"
+    );
+
+    // t2's instance is still there for t2: nothing about this took it away.
+    engine.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "docker"]
+async fn a_same_owners_parked_version_still_resumes_after_the_next_takes_the_route() {
+    let (_pool, url) = fresh_db().await;
+    let (sink, capture) = capture_server().await;
+    let v1 = package(&held_package("t1", "app", "1.0.0", "/app", sink));
+    let v2 = package(&held_package("t1", "app", "2.0.0", "/app", sink));
+    let engine = boot_db_engine(url).await;
+    let addr = engine.local_addr;
+    let (status, body) = post(addr, "/admin/deployments", &v1).await;
+    assert_eq!(status, 200, "v1: {body}");
+    let (status, body) = post(addr, "/app/start", br#"{"key":"K1"}"#).await;
+    assert_eq!(status, 200, "park on v1: {body}");
+    let (status, body) = post(addr, "/admin/deployments", &v2).await;
+    assert_eq!(status, 200, "v2 takes the route: {body}");
+
+    let (status, body) = post(addr, "/app/resume", br#"{"key":"K1"}"#).await;
+    assert_eq!(status, 200, "the resume reaches v1: {body}");
+    assert!(
+        wait_until(15, || async {
+            capture.delivered("/t1-app-1.0.0-done") == 1
+        })
+        .await,
+        "v1's instance completed on v1"
+    );
+    assert_eq!(capture.delivered("/t1-app-2.0.0-done"), 0);
+    engine.shutdown().await;
+}

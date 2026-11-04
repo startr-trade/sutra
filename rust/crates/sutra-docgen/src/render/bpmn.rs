@@ -11,7 +11,7 @@ use std::fmt::Write as _;
 use anyhow::{Context, Result};
 use sutra_bpmn::{BpmnModelLoader, Node, ProcessDefinition};
 
-use crate::render::diagram;
+use crate::render::diagram_model;
 use crate::util::cell;
 
 /// A rendered BPMN page: the markdown body, plus the standalone diagram the page links to.
@@ -51,9 +51,9 @@ pub fn render_bpmn_page(bytes: &[u8], rel: &str, svg_href: &str) -> Result<Rende
 
     // The diagram comes before the tables: the picture is the fastest way to read a flow, and
     // the tables are the detail behind it. Authored BPMN carries no BPMNDI, so it is auto-laid
-    // out from the semantic model (see `render::diagram`).
-    let processes: Vec<&ProcessDefinition> = module.processes().iter().collect();
-    let svg = diagram::render_module_svg(&processes);
+    // out from the semantic model (see `render::diagram_model` and the `bpmn-svg` crate).
+    let diagram = diagram_model::to_diagram_model(module.processes());
+    let svg = bpmn_svg::render(&diagram, &bpmn_svg::Options::default());
     if let Some(svg) = &svg {
         out.push_str("## Diagram\n\n");
         // Raw HTML is fine in GFM and mdBook, so the SVG inlines directly — scaled to the column

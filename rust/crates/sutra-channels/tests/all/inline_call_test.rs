@@ -425,6 +425,46 @@ struct Observed {
     reparks: Vec<(SuspendedInstance, Vec<String>)>,
     /// In-flight marker writes, apart from `trace`: `begin <keys>` / `end`.
     markers: Vec<String>,
+    /// What every dedup check answers, in place of the in-memory store.
+    scripted_check: Option<sutra_channels::DedupCheckOutcome>,
+    /// `begin_inline_chain` finds this delivery's key already recorded by another.
+    key_already_recorded: bool,
+    /// `begin_inline_chain` hands the chain no keys, as when it wrote none of them itself.
+    chain_owns_no_keys: bool,
+    /// Every `forget`, and whether the store answers it.
+    forgets: Vec<String>,
+    forget_fails: bool,
+}
+
+/// The in-memory store, observable and scriptable through [`Observed`].
+struct RecordingInbox {
+    seen: InMemoryInboxStore,
+    observed: Arc<Mutex<Observed>>,
+}
+
+#[async_trait::async_trait(?Send)]
+impl sutra_channels::InboxStore for RecordingInbox {
+    async fn record_seen(
+        &self,
+        deployment: &DeploymentId,
+        channel: &str,
+        event_id: &str,
+    ) -> sutra_channels::DedupCheckOutcome {
+        let scripted = self.observed.lock().unwrap().scripted_check;
+        match scripted {
+            Some(answer) => answer,
+            None => self.seen.record_seen(deployment, channel, event_id).await,
+        }
+    }
+
+    async fn forget(&self, deployment: &DeploymentId, channel: &str, event_id: &str) -> bool {
+        let fails = {
+            let mut observed = self.observed.lock().unwrap();
+            observed.forgets.push(event_id.to_string());
+            observed.forget_fails
+        };
+        !fails && self.seen.forget(deployment, channel, event_id).await
+    }
 }
 
 struct RecordingBridge(Arc<Mutex<Observed>>);
@@ -506,13 +546,20 @@ impl InstanceBridge for RecordingBridge {
         _deployment: &DeploymentId,
         _instance_id: &str,
         dedup_keys: &[(String, String)],
-    ) -> Result<(), Diagnostic> {
-        self.0
-            .lock()
-            .unwrap()
-            .markers
-            .push(format!("begin {dedup_keys:?}"));
-        Ok(())
+    ) -> Result<Vec<(String, String)>, Diagnostic> {
+        let mut observed = self.0.lock().unwrap();
+        if observed.key_already_recorded {
+            return Err(Diagnostic::error(
+                sutra_channels::codes::INBOUND_DUPLICATE_CONCURRENT,
+                "recorded by another delivery",
+            ));
+        }
+        observed.markers.push(format!("begin {dedup_keys:?}"));
+        Ok(if observed.chain_owns_no_keys {
+            Vec::new()
+        } else {
+            dedup_keys.to_vec()
+        })
     }
 
     async fn end_inline_chain(&self, _deployment: &DeploymentId, _instance_id: &str) {
@@ -591,6 +638,194 @@ fn said(what: &str) -> FeelValue {
 struct Rig {
     handle: EngineHandle,
     observed: Arc<Mutex<Observed>>,
+}
+
+// ---- a dedup check that fails, and who owns a chain's dedup rows ---------------------------
+
+fn rejecting_upstream() -> Arc<FakeCaller> {
+    FakeCaller::new(|_| {
+        Box::pin(async move {
+            Err(InlineFailure::Permanent(Diagnostic::error(
+                "UPSTREAM_REJECTED",
+                "422 from the counterpart",
+            )))
+        })
+    })
+}
+
+fn answering_upstream() -> Arc<FakeCaller> {
+    FakeCaller::new(|_| Box::pin(async move { json(r#"{"v":1}"#) }))
+}
+
+fn body_keyed_flow() -> &'static str {
+    Box::leak(
+        SINGLE
+            .replace(
+                r#"<q:source channel="start-in" name="req"/>"#,
+                r#"<q:source channel="start-in" name="req" dedupKey="body.order"/>"#,
+            )
+            .into_boxed_str(),
+    )
+}
+
+fn assert_retryable_refusal(refused: &Diagnostic, code: &str) {
+    assert_eq!(refused.code, code);
+    assert_eq!(
+        refused
+            .attributes
+            .get(sutra_channels::ACK_DISPOSITION_ATTR)
+            .map(String::as_str),
+        Some(sutra_channels::ACK_DISPOSITION_REQUEUE),
+        "a broker delivery goes back for redelivery"
+    );
+    assert_eq!(
+        refused
+            .attributes
+            .get(sutra_channels::TRANSIENT_ATTR)
+            .map(String::as_str),
+        Some("true"),
+        "the in-process sink retries"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn an_explicit_id_whose_check_fails_is_refused_and_never_processed() {
+    let caller = answering_upstream();
+    let rig = rig(SINGLE, Arc::clone(&caller), None);
+    rig.observed.lock().unwrap().scripted_check =
+        Some(sutra_channels::DedupCheckOutcome::Unavailable);
+
+    let refused = rig
+        .handle
+        .dispatch(start("k-1"))
+        .await
+        .expect_err("refused");
+    assert_retryable_refusal(
+        &refused,
+        sutra_channels::codes::INBOUND_DEDUP_CHECK_UNAVAILABLE,
+    );
+    assert_eq!(caller.calls(), 0, "nothing ran");
+    assert!(trace(&rig).is_empty(), "nothing was persisted");
+
+    // Once the store answers, the retry of the same id runs, once.
+    rig.observed.lock().unwrap().scripted_check = None;
+    let retried = rig.handle.dispatch(start("k-1")).await.expect("the retry");
+    assert_eq!(reply_json(&retried), serde_json::json!({"a": {"v": 1}}));
+    assert_eq!(caller.calls(), 1);
+    let again = rig.handle.dispatch(start("k-1")).await.expect("dedup");
+    assert!(matches!(again, DispatchOutcome::Duplicate), "{again:?}");
+    assert_eq!(caller.calls(), 1, "processed once");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_declared_key_with_no_explicit_id_is_refused_when_its_check_fails() {
+    let caller = answering_upstream();
+    let rig = rig(body_keyed_flow(), Arc::clone(&caller), None);
+    rig.observed.lock().unwrap().scripted_check =
+        Some(sutra_channels::DedupCheckOutcome::Unavailable);
+    let mut message = start("sha256-fallback");
+    message.explicit_event_id = false;
+    let refused = rig.handle.dispatch(message).await.expect_err("refused");
+    assert_retryable_refusal(
+        &refused,
+        sutra_channels::codes::INBOUND_DEDUP_CHECK_UNAVAILABLE,
+    );
+    assert_eq!(caller.calls(), 0, "nothing ran");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_delivery_with_no_key_to_protect_never_reaches_the_check() {
+    let caller = answering_upstream();
+    let rig = rig(SINGLE, Arc::clone(&caller), None);
+    rig.observed.lock().unwrap().scripted_check =
+        Some(sutra_channels::DedupCheckOutcome::Unavailable);
+    let mut message = start("sha256-fallback");
+    message.explicit_event_id = false;
+    let outcome = rig.handle.dispatch(message).await.expect("it runs");
+    assert_eq!(reply_json(&outcome), serde_json::json!({"a": {"v": 1}}));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn an_explicit_id_is_refused_when_its_declared_key_cannot_be_checked() {
+    // Both keys of one delivery go through the same check, so the second site refuses too.
+    let caller = answering_upstream();
+    let rig = rig(body_keyed_flow(), Arc::clone(&caller), None);
+    rig.observed.lock().unwrap().scripted_check =
+        Some(sutra_channels::DedupCheckOutcome::Unavailable);
+    let refused = rig
+        .handle
+        .dispatch(start("k-1"))
+        .await
+        .expect_err("refused");
+    assert_retryable_refusal(
+        &refused,
+        sutra_channels::codes::INBOUND_DEDUP_CHECK_UNAVAILABLE,
+    );
+    assert_eq!(caller.calls(), 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_record_in_doubt_is_refused_whatever_the_delivery_carries() {
+    let caller = answering_upstream();
+    let rig = rig(body_keyed_flow(), Arc::clone(&caller), None);
+    rig.observed.lock().unwrap().scripted_check = Some(sutra_channels::DedupCheckOutcome::InDoubt);
+    let mut message = start("sha256-fallback");
+    message.explicit_event_id = false;
+    let refused = rig.handle.dispatch(message).await.expect_err("refused");
+    assert_retryable_refusal(&refused, sutra_channels::codes::INBOUND_DEDUP_IN_DOUBT);
+    assert_eq!(caller.calls(), 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_chain_whose_key_is_already_recorded_makes_no_call_and_releases_nothing() {
+    let caller = answering_upstream();
+    let rig = rig(SINGLE, Arc::clone(&caller), None);
+    rig.observed.lock().unwrap().key_already_recorded = true;
+    let refused = rig
+        .handle
+        .dispatch(start("k-1"))
+        .await
+        .expect_err("a duplicate");
+    assert_eq!(
+        refused.code,
+        sutra_channels::codes::INBOUND_DUPLICATE_CONCURRENT
+    );
+    assert_eq!(caller.calls(), 0, "the chain was abandoned before any call");
+    assert!(
+        rig.observed.lock().unwrap().forgets.is_empty(),
+        "the record is the earlier delivery's, so it stays"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_failed_chain_never_releases_a_key_it_does_not_own() {
+    let rig = rig(SINGLE, rejecting_upstream(), None);
+    rig.observed.lock().unwrap().chain_owns_no_keys = true;
+    rig.handle.dispatch(start("k-1")).await.expect("handled");
+    assert!(rig.observed.lock().unwrap().forgets.is_empty());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_failed_chain_releases_its_own_key_and_then_its_marker() {
+    let rig = rig(SINGLE, rejecting_upstream(), None);
+    rig.handle.dispatch(start("k-1")).await.expect("handled");
+    let observed = rig.observed.lock().unwrap();
+    assert_eq!(observed.forgets, ["k-1"]);
+    assert_eq!(observed.markers.last().map(String::as_str), Some("end"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_forget_that_fails_keeps_the_marker_so_a_redelivery_is_not_swallowed() {
+    let rig = rig(SINGLE, rejecting_upstream(), None);
+    rig.observed.lock().unwrap().forget_fails = true;
+    rig.handle.dispatch(start("k-1")).await.expect("handled");
+    let observed = rig.observed.lock().unwrap();
+    assert_eq!(observed.forgets, ["k-1"]);
+    assert!(
+        !observed.markers.iter().any(|m| m == "end"),
+        "the marker is what makes the store answer in doubt: {:?}",
+        observed.markers
+    );
 }
 
 /// One engine lane serving `bpmn`, with `svc` a SYNCHRONOUS outbound channel served by
@@ -789,8 +1024,13 @@ fn build_engine(
     };
     builder
         .with_module(&deployment(), &module)
-        .with_instance_bridge(Rc::new(RecordingBridge(bridge_state)) as Rc<dyn InstanceBridge>)
-        .with_inbox(Rc::new(InMemoryInboxStore::new()))
+        .with_instance_bridge(
+            Rc::new(RecordingBridge(Arc::clone(&bridge_state))) as Rc<dyn InstanceBridge>
+        )
+        .with_inbox(Rc::new(RecordingInbox {
+            seen: InMemoryInboxStore::new(),
+            observed: bridge_state,
+        }))
         .with_alias_store(Rc::new(sutra_channels::InMemoryAliasStore::new()))
         .with_concurrency_store(Rc::new(InMemoryConcurrencyStore::new()))
         .with_inline_callers(callers)

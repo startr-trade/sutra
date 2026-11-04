@@ -31,6 +31,8 @@ server, so no provider key is needed.
 | **Typed-store queries, a migration ledger, deployment manifests** (0.6.13) | `<q:store query=…>` and `<q:aggregate>` run on typed-column stores as SQL aggregates. Module-store migrations run once, recorded in `sutra_store_migrations`, refuse an edited script, and take `${package.*}`/`${store.*}` placeholders. `sutra lint`/`package`/`deploy` accept a `deploy/<name>.yaml` manifest that stacks layers, with per-layer `.ignore`. | [Querying a typed-column store](building/data-stores.md#querying-a-typed-column-store), [Migrations run once](building/data-stores.md#migrations-run-once), [Deployment manifests](building/deployment-packages.md#deployment-manifests-customers-editions-environments) |
 | **JSON from OpenAI audio models; the reason for a failed model call** (0.6.14) | An OpenAI audio model (`gpt-audio…`) asked for JSON is asked in words, since it refuses `response_format`; a fenced JSON answer inside prose is parsed. A failed `llm` call logs the provider's HTTP status, error code and message at `WARN` under `SUTRA.LLM.CALL.FAILED`, keys redacted, and the failed instance's stored diagnostic carries it. | [How JSON is asked for](building/llm-channels.md#how-json-is-asked-for), [Finding the reason for a failed call](building/llm-channels.md#finding-the-reason-for-a-failed-call) |
 | **A failed synchronous channel call can be caught** (0.6.15) | A permanent failure of a synchronous channel call is a BPMN error on its task, under the failure's own code: a boundary or an error event sub-process catches it, and the catching path reads `callFailure` (`code`, `message`, `node`). Uncaught, it fails as before. | [Catching a failed call](building/llm-channels.md#catching-a-failed-call) |
+| **A delivery that can't be checked is refused; `event.body` is masked** (0.6.17) | A delivery with an explicit event id or a declared `dedupKey` is refused and retried while its duplicate check can't answer, instead of running unchecked. See [Acknowledgement modes](operating/ack-modes.md#when-a-delivery-cant-be-checked-for-a-duplicate). A flow that declares masking now masks `event.body` and every inbound header too: it used to show them in audit, inspect and snapshots. |
+| **A draining deployment's instances stay its owner's** (0.6.17) | A message only falls back to draining deployments with the same tenant and module labels as its channel's deployment. It could previously resume another owner's draining instance. A package without both labels no longer falls back at all. |
 | **Live audio sessions** (preview) | `AudioSession` and `require: [realtime]`, opened through an `llm` channel by a media transport, not by a process. | [Live audio sessions](building/llm-channels.md#live-audio-sessions-preview) |
 
 Telephony, IVRs, meetings and WebRTC are not part of this engine. They live in the separate
@@ -45,7 +47,7 @@ Every walkthrough runs from the root of a checkout of this repository. It needs:
   `base64 -i <file>` wherever a walkthrough says `base64 -w0 <file>`);
 - an engine image and the `sutra` CLI, both **0.6.0 or later**.
 
-The compose files default to the published `ghcr.io/startr-trade/sutra:0.6.16` image, and
+The compose files default to the published `ghcr.io/startr-trade/sutra:0.6.17` image, and
 [Installation](getting-started/installation.md) installs the CLI. To run a walkthrough against
 your own checkout instead, build both from it:
 

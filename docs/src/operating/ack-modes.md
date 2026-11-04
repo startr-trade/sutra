@@ -157,6 +157,50 @@ Omitting `ack-mode` entirely preserves today's behavior exactly: a broker channe
 deferred ack, or an HTTP channel's async intake, is a one-line addition to `channels.yaml` and
 takes effect on the next deployment poll.
 
+## When a delivery can't be checked for a duplicate {#when-a-delivery-cant-be-checked-for-a-duplicate}
+
+Before it runs a delivery with an explicit event id or a declared `dedupKey="body.<path>"`, the engine
+checks whether that key was already processed. If the database doesn't answer the check, the delivery
+is **refused and nothing runs**,
+with `SUTRA.INBOUND.DEDUP_CHECK_UNAVAILABLE`. This holds even for a flow that never touches the
+database, because a duplicate can't be undone afterwards: a data task's store write commits before
+the step that would have caught it.
+
+A delivery also gets refused, with `SUTRA.INBOUND.DEDUP_IN_DOUBT`, when an earlier delivery of the
+same event is recorded but a synchronous-call chain still holds that record. That chain is either
+running, or it failed and couldn't release the record. The refusal stops the retry being swallowed
+as a duplicate of work that may never have finished. It also applies to a retry during a healthy,
+running chain, which gets a refusal until the chain ends. If the chain's process is gone, or it could
+not release the record, the sweep resolves it within `sutra.instance.inflight-chain-max-age`, 15 minutes
+by default, so the refusal can last that long.
+
+A refused delivery is safe to repeat with the same id. What the sender sees depends on the transport:
+
+| Transport | What happens |
+|---|---|
+| HTTP | `503` with a problem document carrying the code. There's no `Retry-After` header. |
+| Dapr, Knative | `500`, which the sender's own retry policy treats as retryable. |
+| RabbitMQ | `basic.nack(requeue=true)`. |
+| AMQP 1.0 | The delivery is released, so the broker redelivers it. |
+| Kafka | The consumer seeks back to the record, so the next poll reads it again. |
+| SQS | The message stays in flight, and returns after its visibility timeout. |
+| Pub/Sub | The message is nacked, and redelivered after its ack deadline. |
+| File | The file moves back to the spool root for a later poll. |
+| `local://` hops | Retried with the outbox's backoff. |
+
+**What counts as an explicit event id:**
+
+- On HTTP, Dapr and Knative: the channel's `idempotency-key-header`, or a CloudEvent `id`.
+- On a queue transport: the engine's own outbox key. A message from another producer doesn't have one.
+- On the file transport: the file name.
+- `local://` hops and external-task completions always have one.
+
+**A delivery with neither isn't refused.** It never reaches the check, and a repeat of it is simply a
+new delivery. That includes a message from another producer on a queue transport, unless its flow
+declares a `dedupKey`.
+
+While a database is down, expect more retries, not lost work: nothing was accepted that wasn't run.
+
 ## Next
 
 - **[The money-transfer worked example](../building/worked-example.md)** uses `singleton` +

@@ -10,7 +10,7 @@
 #
 # WHY. A tag is only a name for a commit. Nothing stops one being pushed while CI is still running,
 # or after CI has failed, and release.yml then builds the engine image, the CLI binaries and the
-# GitHub Release from that tree — and publishes sutra-feel and sutra-dmn to crates.io, where a
+# GitHub Release from that tree — and publishes sutra-feel, sutra-dmn and bpmn-svg to crates.io, where a
 # version is immutable and can never be replaced. The workflow's own `test` job runs lint + tier-1
 # on the tagged tree, which is worth having, but it is not the same question: CI also runs the
 # formatter, the audit and the scanners, and until this gate existed nothing asked whether the

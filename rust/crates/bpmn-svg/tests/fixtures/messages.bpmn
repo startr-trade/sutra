@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL" targetNamespace="urn:example:diagrams">
+  <process id="messages" isExecutable="true">
+    <startEvent id="s"/>
+    <sendTask id="send" name="Send"/>
+    <intermediateThrowEvent id="notify" name="Notify"><messageEventDefinition/></intermediateThrowEvent>
+    <receiveTask id="receive" name="Receive"/>
+    <endEvent id="end"/>
+    <sequenceFlow id="f1" sourceRef="s" targetRef="send"/>
+    <sequenceFlow id="f2" sourceRef="send" targetRef="notify"/>
+    <sequenceFlow id="f3" sourceRef="notify" targetRef="receive"/>
+    <sequenceFlow id="f4" sourceRef="receive" targetRef="end"/>
+  </process>
+</definitions>

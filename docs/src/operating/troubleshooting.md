@@ -289,6 +289,25 @@ in the audit trail means the relay's `q:alias` expression didn't match any parke
 — run `sutra explain` with the relay payload's variables against the exact alias expression from
 the BPMN to see what key it actually produces, and compare it to what the original request set.
 
+**"Senders get a 503 with `SUTRA.INBOUND.DEDUP_CHECK_UNAVAILABLE`."** The delivery carries an event
+id, and the database didn't answer the duplicate check, so nothing ran. Fix the database, or wait for
+it: a retry with the same id is safe, and it runs once. Stopping the database and posting with an
+event id gives this answer:
+
+```json
+{"type":"urn:bpm:diag:SUTRA.INBOUND.DEDUP_CHECK_UNAVAILABLE","title":"SUTRA.INBOUND.DEDUP_CHECK_UNAVAILABLE","status":503,"detail":"event 'outage-1' on channel 'event-in' could not be checked for a duplicate because the dedup store did not answer; it was not processed, and a retry is safe","code":"SUTRA.INBOUND.DEDUP_CHECK_UNAVAILABLE"}
+```
+
+The document also carries an `attributes` object. Once the database is back, the same POST succeeds,
+and repeating it succeeds without running the flow again. See
+[Acknowledgement modes](ack-modes.md#when-a-delivery-cant-be-checked-for-a-duplicate) for what each
+transport does.
+
+**"Senders get a 503 with `SUTRA.INBOUND.DEDUP_IN_DOUBT`."** An earlier delivery of the same event is
+recorded, but a synchronous-call chain still holds that record. It clears when the chain ends. If the
+chain's process is gone, or the chain couldn't release the record, it clears when the sweep runs, within
+`sutra.instance.inflight-chain-max-age` (15 minutes by default). Keep retrying.
+
 **"A gateway takes the wrong branch."** `sutra explain` the condition expression directly, with a
 `--context` file built from the actual variable values at that point (read them off the audit
 trail or a trace span if you're not sure) — this isolates a FEEL semantics surprise from a

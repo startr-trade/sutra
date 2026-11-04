@@ -100,6 +100,7 @@ pub use capacity::{
 };
 pub use config::{
     load_channel_definitions, ChannelBinding, ChannelDefinition, Namespace, SessionEnd,
+    UNLABELED_LABEL,
 };
 pub use diag::Diagnostic;
 #[cfg(feature = "transport")]
@@ -155,8 +156,8 @@ pub use source::{
     TriggerSource,
 };
 pub use stores::{
-    AliasStore, CollectingOutbox, InMemoryAliasStore, InMemoryInboxStore, InMemoryIncidentSink,
-    InboundIncident, InboxStore, IncidentSink, OutboxSink, PendingDedup,
+    AliasStore, CollectingOutbox, DedupCheckOutcome, InMemoryAliasStore, InMemoryInboxStore,
+    InMemoryIncidentSink, InboundIncident, InboxStore, IncidentSink, OutboxSink, PendingDedup,
 };
 pub use transport_audit::{
     is_transport_event_type, transport_audit, transport_audit_payload, transport_event_type,

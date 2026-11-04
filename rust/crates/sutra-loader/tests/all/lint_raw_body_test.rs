@@ -1,0 +1,137 @@
+//! The raw-body masking warnings (`check_raw_body_masking`). In a process that declares masking, a
+//! plain variable holding raw `event.body` text, or a store write of it, is a WARNING: the engine
+//! masks `event.body` itself but cannot see through a copy. Neither is an error yet.
+
+use std::path::Path;
+
+use sutra_loader::{lint_dir, LintReport, LintSeverity};
+
+const PACKAGE_YAML: &str =
+    "labels:\n  \"tenant\": \"t1\"\n  \"module\": \"demo\"\n  \"version\": \"1.0.0\"\nengine:\n  minContract: 1\n";
+
+const UNMASKED: &str = "SUTRA.CONFIG.BPMN.RAW_BODY_UNMASKED";
+const STORED: &str = "SUTRA.CONFIG.BPMN.RAW_BODY_STORED";
+
+fn write(root: &Path, rel: &str, content: &str) {
+    let path = root.join(rel);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, content).unwrap();
+}
+
+/// A process with `variables`, whose task assigns `expression` to `copy`, then `copy` to `second`.
+fn lint(variables: &str, expression: &str) -> LintReport {
+    lint_with(variables, expression, "", "")
+}
+
+/// [`lint`], with `reference` beside the task and `output` inside it.
+fn lint_with(variables: &str, expression: &str, reference: &str, output: &str) -> LintReport {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "package.yaml", PACKAGE_YAML);
+    write(
+        root,
+        "channels.yaml",
+        "channels:\n  - name: ch\n    transport: http\n    bind: \"POST /channels/ch\"\n    codec: json\n",
+    );
+    write(
+        root,
+        "bpmn/flow.bpmn",
+        &format!(
+            r#"<?xml version="1.0"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0" targetNamespace="urn:sutra:module:demo:1.0.0">
+  <bpmn:process id="p1">
+    <bpmn:extensionElements><q:variables>{variables}</q:variables></bpmn:extensionElements>
+    <bpmn:startEvent id="S">
+      <bpmn:extensionElements><q:source channel="ch"/></bpmn:extensionElements>
+    </bpmn:startEvent>
+    {reference}
+    <bpmn:serviceTask id="T">
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>{expression}</bpmn:from><bpmn:to>copy</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>copy</bpmn:from><bpmn:to>second</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+      {output}
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="E"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="S" targetRef="T"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="T" targetRef="E"/>
+  </bpmn:process>
+</bpmn:definitions>
+"#
+        ),
+    );
+    lint_dir(root)
+}
+
+const MASKING: &str = r#"<q:variable name="payload" type="object" sensitive="true"/>"#;
+
+fn warnings_with(report: &LintReport, code: &str) -> Vec<String> {
+    let found: Vec<_> = report
+        .diagnostics
+        .iter()
+        .filter(|d| d.code == code)
+        .collect();
+    for d in &found {
+        assert_eq!(d.severity, LintSeverity::Warning, "{}", d.message);
+    }
+    found.iter().map(|d| d.message.clone()).collect()
+}
+
+#[test]
+fn a_plain_copy_of_the_raw_body_in_a_masking_flow_warns_through_every_assignment() {
+    let found = warnings_with(&lint(MASKING, "event.body"), UNMASKED);
+    assert_eq!(found.len(), 2, "{found:?}");
+    assert!(found.iter().any(|m| m.contains("'copy'")), "{found:?}");
+    assert!(found.iter().any(|m| m.contains("'second'")), "{found:?}");
+}
+
+#[test]
+fn reading_event_whole_counts_as_the_raw_body() {
+    let found = warnings_with(&lint(MASKING, "string(event)"), UNMASKED);
+    assert_eq!(found.len(), 2, "{found:?}");
+}
+
+#[test]
+fn a_sensitive_copy_does_not_warn() {
+    let variables = format!(
+        r#"{MASKING}<q:variable name="copy" sensitive="true"/><q:variable name="second" sensitive="true"/>"#
+    );
+    assert!(warnings_with(&lint(&variables, "event.body"), UNMASKED).is_empty());
+}
+
+#[test]
+fn a_flow_that_declares_no_masking_does_not_warn() {
+    assert!(warnings_with(&lint("", "event.body"), UNMASKED).is_empty());
+}
+
+#[test]
+fn another_part_of_the_event_does_not_warn() {
+    assert!(warnings_with(&lint(MASKING, "event.channel"), UNMASKED).is_empty());
+}
+
+const STORE_REFERENCE: &str = r#"<bpmn:dataStoreReference id="rows" dataStoreRef="messages">
+      <bpmn:extensionElements><q:store key="'k'"/></bpmn:extensionElements>
+    </bpmn:dataStoreReference>"#;
+
+#[test]
+fn writing_the_raw_body_to_a_store_warns() {
+    let output = r#"<bpmn:dataOutputAssociation>
+        <bpmn:sourceRef>second</bpmn:sourceRef><bpmn:targetRef>rows</bpmn:targetRef>
+      </bpmn:dataOutputAssociation>"#;
+    let report = lint_with(MASKING, "event.body", STORE_REFERENCE, output);
+    let found = warnings_with(&report, STORED);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(found[0].contains("'messages'"), "{found:?}");
+}
+
+#[test]
+fn writing_something_else_to_a_store_does_not_warn() {
+    let output = r#"<bpmn:dataOutputAssociation>
+        <bpmn:sourceRef>second</bpmn:sourceRef><bpmn:targetRef>rows</bpmn:targetRef>
+      </bpmn:dataOutputAssociation>"#;
+    let report = lint_with(MASKING, "event.channel", STORE_REFERENCE, output);
+    assert!(warnings_with(&report, STORED).is_empty());
+}

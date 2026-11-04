@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL" targetNamespace="urn:example:diagrams">
+  <process id="first" isExecutable="true">
+    <startEvent id="a-s"/>
+    <manualTask id="a-t" name="First"/>
+    <endEvent id="a-e"/>
+    <sequenceFlow id="a1" sourceRef="a-s" targetRef="a-t"/>
+    <sequenceFlow id="a2" sourceRef="a-t" targetRef="a-e"/>
+  </process>
+  <process id="second" isExecutable="true">
+    <startEvent id="b-s"/>
+    <endEvent id="b-e"/>
+    <sequenceFlow id="b1" sourceRef="b-s" targetRef="b-e"/>
+  </process>
+  <process id="third" isExecutable="true">
+    <startEvent id="c-s"/>
+    <endEvent id="c-e" name="Third"/>
+    <sequenceFlow id="c1" sourceRef="c-s" targetRef="c-e"/>
+  </process>
+</definitions>

@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/sutra-feel",
     "crates/sutra-dmn",
+    "crates/bpmn-svg",
     "crates/sutra-srl",
     "crates/sutra-bpmn",
     "crates/sutra-templates",
@@ -79,11 +80,11 @@ lto = false
 codegen-units = 16
 
 [workspace.package]
-version = "0.6.16"
+version = "0.6.17"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/startr-trade/sutra"
-# Workspace default stays unpublished; sutra-feel and sutra-dmn are the two crates that
+# Workspace default stays unpublished; sutra-feel, sutra-dmn and bpmn-svg are the crates that
 # override this with `publish = true` in their own [package] (crates.io-facing surface —
 # everything else in this workspace is engine-internal and stays off crates.io).
 publish = false

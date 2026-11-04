@@ -11,6 +11,8 @@ publish.workspace = true
 sutra-bpmn = { path = "../sutra-bpmn" }
 sutra-dmn = { path = "../sutra-dmn" }
 sutra-srl = { path = "../sutra-srl" }
+# The diagrams. The crate parses too, but docs draw from the engine's own loaded model.
+bpmn-svg = { path = "../bpmn-svg" }
 # channels.yaml / package.yaml / rules-manifest.yaml / template-manifest.yaml are plain,
 # loosely-typed authoring YAML — parsed generically here rather than pulling in
 # sutra-loader/sutra-channels (which would drag the whole engine's dependency graph, incl.

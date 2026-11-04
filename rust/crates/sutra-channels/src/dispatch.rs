@@ -9,7 +9,7 @@
 //! wait-state process fails fast with `SUTRA.INBOUND.PERSISTENCE_REQUIRED` (the
 //! posture when no `InstanceStore` is wired).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -327,9 +327,11 @@ pub struct ChannelEngine {
     /// `session-end: on-message` → the session channels it ends.
     session_end_targets: BTreeMap<(String, String), Vec<String>>,
     /// DRAINING deployments (the deployment lifecycle), most recently drained first: relay
-    /// correlation falls back to these scopes so an instance pinned to a flipped-away
-    /// deployment keeps resuming until it retires. New intake never starts here.
-    prior_deployments: Vec<DeploymentId>,
+    /// correlation falls back to these scopes, for the same owner only, so an instance pinned to
+    /// a flipped-away deployment keeps resuming until it retires. New intake never starts here.
+    prior_deployments: Vec<(DeploymentId, Namespace)>,
+    /// The owner of each ACTIVE deployment, to compare a draining one's with.
+    active_owners: HashMap<DeploymentId, Namespace>,
     /// The engine-wide deferred-ack registry (`ack-mode: on-complete` broker
     /// transports). Shared (`Arc`) with the executor's listener bus, the sweep task and
     /// across activation flips; `None` = no deferral capability (tests / bare builders):
@@ -416,6 +418,7 @@ impl ChannelEngine {
                 session_releases: std::cell::RefCell::new(Vec::new()),
                 session_end_targets: BTreeMap::new(),
                 prior_deployments: Vec::new(),
+                active_owners: HashMap::new(),
                 deferred_acks: None,
                 pending_settle: std::cell::RefCell::new(None),
                 intake_counter: std::cell::RefCell::new(0),
@@ -716,11 +719,11 @@ impl ChannelEngine {
         // a new delivery — the MoneyTransfer isolation semantics).
         if message.explicit_event_id && !message.idempotency_key.is_empty() {
             if let Some(inbox) = &self.inbox {
-                let first = inbox
+                let check = inbox
                     .record_seen(&deployment, &message.channel, &message.idempotency_key)
                     .await;
                 self.dedup_touched.set(true);
-                if !first {
+                if !proceed_after_dedup_check(check, message, &message.idempotency_key)? {
                     return Ok(DispatchOutcome::Duplicate);
                 }
                 self.dispatch_dedup
@@ -920,11 +923,11 @@ impl ChannelEngine {
         // it only re-projected `event.idempotencyKey`, never driving inbox dedup).
         if let Some(body_key) = apply_body_path_dedup_key(process, start_id, &mut variables) {
             if let Some(inbox) = &self.inbox {
-                let first = inbox
+                let check = inbox
                     .record_seen(deployment, &message.channel, &body_key)
                     .await;
                 self.dedup_touched.set(true);
-                if !first {
+                if !proceed_after_dedup_check(check, message, &body_key)? {
                     return Ok(DispatchOutcome::Duplicate);
                 }
                 self.dispatch_dedup
@@ -1450,11 +1453,21 @@ impl ChannelEngine {
     }
 
     /// The deployment scopes an instance correlated through `deployment` can live in: the live
-    /// one first, then the DRAINING ones.
+    /// one first, then the DRAINING ones of the same owner. Another owner's instance is never in
+    /// scope, whatever its channel is called and whatever its alias holds.
     fn session_scopes(&self, deployment: &DeploymentId) -> Vec<DeploymentId> {
         let mut scopes = vec![deployment.clone()];
-        for prior in &self.prior_deployments {
-            if !scopes.contains(prior) {
+        let owner = self.active_owners.get(deployment).or_else(|| {
+            self.prior_deployments
+                .iter()
+                .find(|(prior, _)| prior == deployment)
+                .map(|(_, owner)| owner)
+        });
+        let Some(owner) = owner else {
+            return scopes;
+        };
+        for (prior, prior_owner) in &self.prior_deployments {
+            if owner.same_owner(prior_owner) && !scopes.contains(prior) {
                 scopes.push(prior.clone());
             }
         }
@@ -2360,16 +2373,11 @@ impl ChannelEngine {
         let Some(bridge) = self.bridge.clone() else {
             return Ok(None);
         };
-        // Scope order: the channel's LIVE deployment first, then the DRAINING
+        // Scope order: the channel's LIVE deployment first, then its owner's DRAINING
         // prior deployments (most recently drained first). An instance parked under a
         // deployment that has since been flipped away stays resumable — its alias rows
         // and snapshot are deployment-scoped, so correlation must look where it parked.
-        let mut scopes: Vec<DeploymentId> = vec![deployment.clone()];
-        for prior in &self.prior_deployments {
-            if !scopes.contains(prior) {
-                scopes.push(prior.clone());
-            }
-        }
+        let scopes = self.session_scopes(deployment);
         let mut first_failure: Option<Diagnostic> = None;
         for scope in &scopes {
             match self
@@ -4127,6 +4135,13 @@ impl ChannelEngine {
         drained: Vec<sutra_executor::Emission>,
         sites: Vec<SyncCallSite>,
     ) -> Result<DispatchOutcome, Diagnostic> {
+        // With a durable bridge a key is written, and so owned, only by `begin_inline_chain`
+        // below. Until then a failure here must not release it: it may be an earlier delivery's.
+        let unowned_keys = if self.bridge.is_some() {
+            std::mem::take(&mut chain.dedup_keys)
+        } else {
+            Vec::new()
+        };
         if let Some(store) = &self.aliases {
             for row in chain.alias_rows.iter().filter(|r| r.unique) {
                 chain.held_aliases = true;
@@ -4185,13 +4200,18 @@ impl ChannelEngine {
         // release (the delivery's dedup rows, an admission slot). Only written when there is
         // something to release.
         if let Some(bridge) = &self.bridge {
-            if !chain.dedup_keys.is_empty() || chain.counted || chain.pooled {
-                if let Err(d) = bridge
-                    .begin_inline_chain(&chain.deployment, &chain.instance_id, &chain.dedup_keys)
+            // Keys handed over from another lane are pending without being in this dispatch's list.
+            let keys_pending = self.inbox.as_ref().is_some_and(|i| i.has_pending());
+            if !unowned_keys.is_empty() || keys_pending || chain.counted || chain.pooled {
+                match bridge
+                    .begin_inline_chain(&chain.deployment, &chain.instance_id, &unowned_keys)
                     .await
                 {
-                    self.release_chain(&chain, ChainEnd::Aborted).await;
-                    return Err(d);
+                    Ok(owned) => chain.dedup_keys = owned,
+                    Err(d) => {
+                        self.release_chain(&chain, ChainEnd::Aborted).await;
+                        return Err(d);
+                    }
                 }
                 chain.marked = true;
             }
@@ -4987,19 +5007,28 @@ impl ChannelEngine {
             ChainEnd::Failed => chain.stored.is_none(),
             ChainEnd::Parked | ChainEnd::Completed => false,
         };
+        let mut records_released = true;
         if unpersisted {
             if let Some(inbox) = &self.inbox {
                 for (channel, key) in &chain.dedup_keys {
-                    inbox.forget(&chain.deployment, channel, key).await;
+                    records_released &= inbox.forget(&chain.deployment, channel, key).await;
                 }
             }
         }
         if let Some(bridge) = &self.bridge {
-            if chain.marked {
+            if chain.marked && records_released {
                 // Idempotent: the final step already cleared it inside its own transaction.
                 bridge
                     .end_inline_chain(&chain.deployment, &chain.instance_id)
                     .await;
+            } else if chain.marked {
+                // The record of a delivery that did nothing is still there. While the marker
+                // names it, a redelivery is in doubt and retried rather than swallowed as a
+                // duplicate, and the sweep releases both.
+                tracing::warn!(
+                    instance_id = %chain.instance_id,
+                    "a failed chain could not release its dedup record; its marker stays for the sweep"
+                );
             }
             if let Some(stored) = &chain.stored {
                 let released_in_tx = stored.claim_scope == chain.deployment
@@ -5484,12 +5513,18 @@ impl ChannelEngineBuilder {
         self
     }
 
-    /// Declare the DRAINING deployments (most recently drained first):
-    /// relay correlation falls back to these scopes so instances pinned to a
-    /// flipped-away deployment keep resuming until it retires. Their processes /
-    /// artifacts must still be registered under their own deployment ids.
-    pub fn with_prior_deployments(mut self, prior: Vec<DeploymentId>) -> Self {
+    /// Declare the DRAINING deployments (most recently drained first), each with its owner:
+    /// relay correlation falls back to these scopes, for the same owner only, so instances pinned
+    /// to a flipped-away deployment keep resuming until it retires. Their processes / artifacts
+    /// must still be registered under their own deployment ids. `active` names the owner of each
+    /// active deployment, to compare with.
+    pub fn with_prior_deployments(
+        mut self,
+        prior: Vec<(DeploymentId, Namespace)>,
+        active: HashMap<DeploymentId, Namespace>,
+    ) -> Self {
         self.engine.prior_deployments = prior;
+        self.engine.active_owners = active;
         self
     }
 
@@ -6645,6 +6680,52 @@ fn cloud_event_to_feel(ce: &crate::cloudevents::CloudEvent) -> FeelValue {
         );
     }
     FeelValue::Map(map)
+}
+
+/// A refusal the sender should repeat: HTTP answers 503, a broker delivery goes back for
+/// redelivery, and the in-process sink retries with the outbox's backoff.
+fn dedup_refusal(code: &str, detail: String, message: &InboundMessage) -> Diagnostic {
+    Diagnostic::error(code, detail)
+        .with_attribute("channel", &message.channel)
+        .with_attribute(TRANSIENT_ATTR, "true")
+        .with_attribute(ACK_DISPOSITION_ATTR, ACK_DISPOSITION_REQUEUE)
+}
+
+/// What a dedup check means for this delivery: `Ok(true)` run it, `Ok(false)` it is a duplicate,
+/// `Err` refuse it.
+///
+/// Only a delivery with a key to protect reaches a check: an explicit event id, or a declared
+/// `dedupKey="body.<path>"`. Neither is ever processed unchecked, because its effects can't all be
+/// undone afterwards: a data task's store write commits before the step whose insert would catch
+/// the duplicate.
+fn proceed_after_dedup_check(
+    check: crate::stores::DedupCheckOutcome,
+    message: &InboundMessage,
+    key: &str,
+) -> Result<bool, Diagnostic> {
+    use crate::stores::DedupCheckOutcome as Check;
+    match check {
+        Check::First => Ok(true),
+        Check::Duplicate => Ok(false),
+        Check::InDoubt => Err(dedup_refusal(
+            codes::INBOUND_DEDUP_IN_DOUBT,
+            format!(
+                "event '{key}' on channel '{}' has an earlier delivery whose outcome is not known \
+                 yet; it was not processed, and a retry is safe",
+                message.channel
+            ),
+            message,
+        )),
+        Check::Unavailable => Err(dedup_refusal(
+            codes::INBOUND_DEDUP_CHECK_UNAVAILABLE,
+            format!(
+                "event '{key}' on channel '{}' could not be checked for a duplicate because the \
+                 dedup store did not answer; it was not processed, and a retry is safe",
+                message.channel
+            ),
+            message,
+        )),
+    }
 }
 
 /// Apply a `<q:source dedupKey="body.<path>">` spec against the DECODED payload:

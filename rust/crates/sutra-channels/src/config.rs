@@ -36,11 +36,25 @@ impl Namespace {
         }
     }
 
+    /// Whether `other` belongs to the same owner: the same tenant and module, both labelled. The
+    /// version doesn't count, because an upgrade changes it. A missing or empty label never matches,
+    /// not even itself, so unlabelled packages never count as one owner.
+    pub fn same_owner(&self, other: &Namespace) -> bool {
+        let labelled = |label: &str| !label.trim().is_empty() && label != UNLABELED_LABEL;
+        labelled(&self.tenant)
+            && labelled(&self.module)
+            && self.tenant == other.tenant
+            && self.module == other.module
+    }
+
     /// The version-bearing string view — `"<tenant>/<module>/<version>"`.
     pub fn module_key(&self) -> String {
         format!("{}/{}/{}", self.tenant, self.module, self.version)
     }
 }
+
+/// What a package's missing `tenant`, `module` or `version` label reads as.
+pub const UNLABELED_LABEL: &str = "unlabeled";
 
 /// Routing binding for an inbound channel — the channel-binding record.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -681,6 +695,38 @@ fn flatten(out: &mut BTreeMap<String, String>, prefix: &str, value: &serde_yaml_
                 .map(|s| s.trim_end().to_string())
                 .unwrap_or_default();
             out.insert(prefix.to_string(), s);
+        }
+    }
+}
+
+#[cfg(test)]
+mod owner_tests {
+    use super::*;
+
+    #[test]
+    fn the_same_tenant_and_module_are_one_owner_across_versions() {
+        let v1 = Namespace::new("t1", "app", "1.0.0");
+        assert!(v1.same_owner(&Namespace::new("t1", "app", "2.0.0")));
+    }
+
+    #[test]
+    fn another_tenant_or_module_is_another_owner() {
+        let mine = Namespace::new("t1", "app", "1.0.0");
+        assert!(!mine.same_owner(&Namespace::new("t2", "app", "1.0.0")));
+        assert!(!mine.same_owner(&Namespace::new("t1", "other", "1.0.0")));
+    }
+
+    #[test]
+    fn a_missing_or_empty_label_matches_nothing_not_even_itself() {
+        for (tenant, module) in [
+            (UNLABELED_LABEL, "app"),
+            ("t1", UNLABELED_LABEL),
+            ("", "app"),
+            ("t1", ""),
+            ("  ", "app"),
+        ] {
+            let package = Namespace::new(tenant, module, "1.0.0");
+            assert!(!package.same_owner(&package.clone()), "{package:?}");
         }
     }
 }

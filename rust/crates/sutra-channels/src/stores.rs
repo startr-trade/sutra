@@ -8,6 +8,20 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use sutra_executor::{DeploymentId, Emission};
 
+/// What a dedup check found for one delivery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DedupCheckOutcome {
+    /// Not recorded: this delivery is the first.
+    First,
+    /// Recorded, and the delivery that recorded it finished: this one is a duplicate.
+    Duplicate,
+    /// Recorded, but held by a chain that is running or could not release it. Whether the event
+    /// was processed is not known yet.
+    InDoubt,
+    /// The store did not answer, so nothing is known and the delivery is refused.
+    Unavailable,
+}
+
 /// Inbox dedup substrate — pipeline step 1, `(deployment, channel, event_id)`
 /// first-observer-wins.
 ///
@@ -16,14 +30,25 @@ use sutra_executor::{DeploymentId, Emission};
 /// because the consumer is the `Rc`-based dispatcher.
 #[async_trait::async_trait(?Send)]
 pub trait InboxStore {
-    /// Records the triple; `true` on first sight, `false` on a duplicate.
-    async fn record_seen(&self, deployment: &DeploymentId, channel: &str, event_id: &str) -> bool;
+    /// Check the triple and, on first sight, record it (or hold it back for the step that
+    /// processes the delivery).
+    async fn record_seen(
+        &self,
+        deployment: &DeploymentId,
+        channel: &str,
+        event_id: &str,
+    ) -> DedupCheckOutcome;
 
     /// Release a triple recorded by [`Self::record_seen`], so a redelivery of the same event runs
     /// again. Called when an in-memory (synchronous-call) chain fails: nothing of it was
     /// persisted, so keeping the dedup row would turn the client's retry into a silent
-    /// duplicate. Best-effort; the default is a no-op for stores that cannot release.
-    async fn forget(&self, _deployment: &DeploymentId, _channel: &str, _event_id: &str) {}
+    /// duplicate. Answers whether the record is gone; `false` means the store did not answer, so
+    /// the caller must keep the chain's marker, which keeps a redelivery in doubt instead of
+    /// swallowed until the sweep releases the record. The default is for stores that cannot
+    /// release.
+    async fn forget(&self, _deployment: &DeploymentId, _channel: &str, _event_id: &str) -> bool {
+        true
+    }
 
     /// End of a dispatch that recorded dedup keys: a store that holds a key back until the step
     /// that processes the delivery commits (so the record and the effects are one transaction)
@@ -40,6 +65,11 @@ pub trait InboxStore {
 
     /// Adopt keys handed over by [`Self::take_pending`] on another lane. Default: ignored.
     fn restore_pending(&self, _pending: Vec<PendingDedup>) {}
+
+    /// Whether any key is recorded but not yet written. Default: none.
+    fn has_pending(&self) -> bool {
+        false
+    }
 }
 
 /// A dedup key recorded by one lane and written by the step of another (see
@@ -65,20 +95,31 @@ impl InMemoryInboxStore {
 
 #[async_trait::async_trait(?Send)]
 impl InboxStore for InMemoryInboxStore {
-    async fn record_seen(&self, deployment: &DeploymentId, channel: &str, event_id: &str) -> bool {
-        self.seen.borrow_mut().insert((
+    async fn record_seen(
+        &self,
+        deployment: &DeploymentId,
+        channel: &str,
+        event_id: &str,
+    ) -> DedupCheckOutcome {
+        let first = self.seen.borrow_mut().insert((
             deployment.value().to_string(),
             channel.to_string(),
             event_id.to_string(),
-        ))
+        ));
+        if first {
+            DedupCheckOutcome::First
+        } else {
+            DedupCheckOutcome::Duplicate
+        }
     }
 
-    async fn forget(&self, deployment: &DeploymentId, channel: &str, event_id: &str) {
+    async fn forget(&self, deployment: &DeploymentId, channel: &str, event_id: &str) -> bool {
         self.seen.borrow_mut().remove(&(
             deployment.value().to_string(),
             channel.to_string(),
             event_id.to_string(),
         ));
+        true
     }
 }
 

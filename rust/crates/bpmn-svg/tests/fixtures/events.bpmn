@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL" targetNamespace="urn:example:diagrams">
+  <process id="events" isExecutable="true">
+    <startEvent id="plain-start"/>
+    <startEvent id="timer-start" name="Every hour"><timerEventDefinition><timeCycle>R/PT1H</timeCycle></timerEventDefinition></startEvent>
+    <manualTask id="work" name="Work"/>
+    <intermediateCatchEvent id="wait-timer" name="Wait"><timerEventDefinition><timeDuration>PT1M</timeDuration></timerEventDefinition></intermediateCatchEvent>
+    <intermediateCatchEvent id="wait-message" name="Hear back"><messageEventDefinition/></intermediateCatchEvent>
+    <intermediateThrowEvent id="throw-none" name="Pass"/>
+    <intermediateThrowEvent id="throw-signal" name="Signal"><signalEventDefinition signalRef="sig"/></intermediateThrowEvent>
+    <intermediateThrowEvent id="throw-escalation" name="Escalate"><escalationEventDefinition escalationRef="esc"/></intermediateThrowEvent>
+    <intermediateThrowEvent id="throw-compensate" name="Compensate"><compensateEventDefinition/></intermediateThrowEvent>
+    <intermediateThrowEvent id="throw-link" name="Jump"><linkEventDefinition name="onward"/></intermediateThrowEvent>
+    <intermediateCatchEvent id="catch-link" name="Landed"><linkEventDefinition name="onward"/></intermediateCatchEvent>
+    <exclusiveGateway id="how"/>
+    <endEvent id="end-plain" name="Done"/>
+    <endEvent id="end-terminate" name="Stop"><terminateEventDefinition/></endEvent>
+    <endEvent id="end-error" name="Fail"><errorEventDefinition errorRef="err"/></endEvent>
+    <sequenceFlow id="f1" sourceRef="plain-start" targetRef="work"/>
+    <sequenceFlow id="f2" sourceRef="work" targetRef="wait-timer"/>
+    <sequenceFlow id="f3" sourceRef="wait-timer" targetRef="wait-message"/>
+    <sequenceFlow id="f4" sourceRef="wait-message" targetRef="throw-none"/>
+    <sequenceFlow id="f5" sourceRef="throw-none" targetRef="throw-signal"/>
+    <sequenceFlow id="f7" sourceRef="throw-signal" targetRef="throw-escalation"/>
+    <sequenceFlow id="f8" sourceRef="throw-escalation" targetRef="throw-compensate"/>
+    <sequenceFlow id="f9" sourceRef="throw-compensate" targetRef="throw-link"/>
+    <sequenceFlow id="t1" sourceRef="timer-start" targetRef="work"/>
+    <sequenceFlow id="l1" sourceRef="catch-link" targetRef="how"/>
+    <sequenceFlow id="e1" sourceRef="how" targetRef="end-plain"/>
+    <sequenceFlow id="e2" sourceRef="how" targetRef="end-terminate"/>
+    <sequenceFlow id="e3" sourceRef="how" targetRef="end-error"/>
+  </process>
+  <error id="err" errorCode="E1"/>
+  <signal id="sig" name="sig"/>
+  <escalation id="esc" escalationCode="ESC"/>
+</definitions>

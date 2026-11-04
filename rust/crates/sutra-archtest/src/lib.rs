@@ -57,6 +57,9 @@ pub const NEUTRAL_CORE_CRATES: &[&str] = &[
     // The model-provider SPI behind the `llm` transport — neutral types + trait; the provider
     // adapters (`sutra-llm-<provider>`) live above it and are excluded like the transports.
     "sutra-llm-spi",
+    // The BPMN diagram crate: published on its own, and knows no engine at all (see
+    // `bpmn_svg_stays_standalone`).
+    "bpmn-svg",
 ];
 
 /// The assembly / binding-layer crates — domain-literal-free since the codec/format + transport
@@ -239,6 +242,43 @@ mod tests {
     }
 
     /// Guard: the gate is not silently a no-op — each gated crate's `src/` is present + scanned.
+    /// `bpmn-svg` is published for other projects to use without the rest of this workspace: it
+    /// has one third-party dependency, none from here, and nothing in its folder names the project.
+    #[test]
+    fn bpmn_svg_stays_standalone() {
+        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+            for entry in fs::read_dir(dir).expect("read crate folder") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else {
+                    out.push(path);
+                }
+            }
+        }
+        let root = crates_dir().join("bpmn-svg");
+        let mut files = Vec::new();
+        walk(&root, &mut files);
+        assert!(files.len() > 10, "the crate's folder was walked");
+        for file in &files {
+            let text = fs::read_to_string(file).expect("every file in the crate is text");
+            assert!(
+                !text.to_lowercase().contains("sutra"),
+                "{} names the project",
+                file.display()
+            );
+        }
+        let manifest = fs::read_to_string(root.join("Cargo.toml")).expect("manifest");
+        let dependencies: Vec<&str> = manifest
+            .lines()
+            .skip_while(|line| *line != "[dependencies]")
+            .skip(1)
+            .take_while(|line| !line.starts_with('['))
+            .filter(|line| !line.trim().is_empty())
+            .collect();
+        assert_eq!(dependencies, ["quick-xml = { workspace = true }"]);
+    }
+
     #[test]
     fn every_gated_crate_is_scanned() {
         for crate_name in NEUTRAL_CORE_CRATES.iter().chain(GATED_ASSEMBLY_CRATES) {

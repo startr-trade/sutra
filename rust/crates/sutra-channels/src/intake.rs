@@ -26,6 +26,49 @@ use crate::registry::{codec_not_found, CodecRegistry, FormatRegistry};
 use crate::validators::{run_validator, ValidatorRegistry, ValidatorTier};
 use crate::{mask_projection, run_redactor, ContentRedactor, RedactorRegistry};
 
+/// Store `event.redacted` and `header.redacted`: the inbound message with what it carried masked.
+/// In `event` that is the body, every header, the CloudEvent attributes (in binary mode those are
+/// headers), and the dedup key, which is a header's value or derived from the payload. The names of
+/// the headers stay.
+fn mask_inbound_message(variables: &mut Variables) {
+    fn every_value(value: &FeelValue) -> FeelValue {
+        match value {
+            FeelValue::Map(map) => FeelValue::Map(
+                map.iter()
+                    .map(|(name, inner)| (name.clone(), every_value(inner)))
+                    .collect(),
+            ),
+            _ => FeelValue::String(crate::REDACTED_MARKER.to_string()),
+        }
+    }
+    if let Some(FeelValue::Map(event)) = variables.get("event") {
+        let mut masked = event.clone();
+        for field in [
+            "body",
+            "headers",
+            "cloudEvent",
+            "dedupKey",
+            "idempotencyKey",
+        ] {
+            if let Some(value) = masked.get(field) {
+                let value = every_value(value);
+                masked.insert(field.to_string(), value);
+            }
+        }
+        variables.insert(
+            format!("event{}", sutra_bpmn::REDACTION_COMPANION_SUFFIX),
+            FeelValue::Map(masked),
+        );
+    }
+    if let Some(header) = variables.get("header") {
+        let masked = every_value(header);
+        variables.insert(
+            format!("header{}", sutra_bpmn::REDACTION_COMPANION_SUFFIX),
+            masked,
+        );
+    }
+}
+
 /// Outcome of the inbound chain — `Proceed` starts the instance; the other two halt the
 /// dispatch with the carried diagnostic.
 #[derive(Debug, Clone)]
@@ -420,6 +463,18 @@ impl InboundChain {
                 format!("{}{}", source.name, sutra_bpmn::REDACTION_COMPANION_SUFFIX),
                 mask_projection(&typed_payload, &outcomes),
             );
+        }
+
+        // `event.body` is the same message as the payload, as raw text, and the inbound headers
+        // can carry credentials, so a source that masks its payload masks those too, whole. The
+        // companions are what the audit and inspect surfaces show, and they put `event` and
+        // `header` in the at-rest encrypt-set. The flow itself still reads the real values.
+        let source_sensitive = process
+            .declared_variables
+            .iter()
+            .any(|d| d.sensitive && d.name == source.name);
+        if !source.redactors.is_empty() || source_sensitive {
+            mask_inbound_message(variables);
         }
 
         // Tier-1: codec-side issues are the first entries (STRUCTURAL by definition).

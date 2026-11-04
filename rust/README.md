@@ -70,6 +70,7 @@ air-gapped spooling. Secret references resolve the same way — `sutra-envref-sp
 | `sutra-lint-core` | The pure, I/O-free deploy-time lint core, carved out so it compiles to WASM and the VS Code extension runs the *same* checks as `sutra lint`. |
 | `sutra-openapi` | Projects a deployment's parsed manifest into an OpenAPI 3.1 document, served live per deployment and emitted offline by the CLI. |
 | `sutra-catalog-gen`, `sutra-docgen` | Documentation generators: the source-file impact-analysis catalog, and the authored-artifact pages (BPMN, rules, templates, channel and package manifests). |
+| `bpmn-svg` | Draws BPMN 2.0 process diagrams as self-contained SVG with a layered auto-layout, for files with no BPMN-DI. A standalone library, published on its own, with no dependency on any other crate here. `sutra-docgen` draws through it. |
 | `sutra-testkit` | Shared test harness — container fixtures, the exit-time reaper, and the conformance helpers the integration suites reuse. |
 | `sutra-conformance` | The cross-cutting integration suites: container-backed (tier-2) and Kubernetes (tier-3). |
 | `sutra-archtest` | The domain-neutrality gate. A structural test that fails the build when a business-domain literal leaks into the neutral core — it must name the words it bans, which is why they appear in that crate and nowhere else. |

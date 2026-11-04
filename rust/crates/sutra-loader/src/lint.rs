@@ -537,6 +537,7 @@ pub fn validate_deployment_with_manifests(
     out.extend(timer_expression_name_faults(deployment, &dep_label));
     check_template_inputs(deployment, &definitions, &dep_label, out);
     check_transient_reads(deployment, &dep_label, out);
+    check_raw_body_masking(deployment, &dep_label, out);
     check_never_initialized(deployment, &dep_label, out);
     check_validation_posture(deployment, &definitions, &dep_label, out);
     check_codec_manifests(deployment, &dep_label, out);
@@ -4340,6 +4341,119 @@ fn nodes_after_wait(process: &ProcessDefinition) -> BTreeSet<String> {
 /// template — the primary read surface. (A transient read in a downstream FEEL flow-condition or
 /// `<q:param>` expression is not caught here; it degrades safely to null at runtime rather than
 /// leaking or corrupting — the persistence layer never carries the value across the wait.)
+fn check_raw_body_masking(
+    deployment: &LoadedDeployment,
+    dep_label: &str,
+    out: &mut Vec<LintDiagnostic>,
+) {
+    let mut seen = BTreeSet::new();
+    for module in deployment.processes.values() {
+        for process in module.processes() {
+            if seen.insert(process.id.clone()) {
+                check_process_raw_body(process, dep_label, out);
+            }
+        }
+    }
+}
+
+/// Raw `event.body` text copied into a plain variable of a process that declares masking: the
+/// engine masks `event.body` itself, but cannot see through the copy. Taint starts at an assignment
+/// reading `event.body` or `event` whole, and spreads through assignments to a fixpoint.
+fn check_process_raw_body(
+    process: &ProcessDefinition,
+    dep_label: &str,
+    out: &mut Vec<LintDiagnostic>,
+) {
+    let sensitive: BTreeSet<&str> = process
+        .declared_variables
+        .iter()
+        .filter(|d| d.sensitive)
+        .map(|d| d.name.as_str())
+        .collect();
+    let mut declares_masking = false;
+    let mut assignments: Vec<(String, sutra_bpmn::model::Assignment)> = Vec::new();
+    let mut writes: Vec<(String, sutra_bpmn::model::StoreWrite)> = Vec::new();
+    visit_nodes(process, &mut |owner, node| {
+        declares_masking |= owner
+            .bindings_for(node.id())
+            .sources
+            .iter()
+            .any(|s| !s.redactors.is_empty() || sensitive.contains(s.name.as_str()));
+        let mapping = match node {
+            Node::ServiceTask { data_mapping, .. } | Node::DataTask { data_mapping, .. } => {
+                data_mapping
+            }
+            _ => return,
+        };
+        for assignment in &mapping.assignments {
+            assignments.push((node.id().to_string(), assignment.clone()));
+        }
+        for write in &mapping.store_writes {
+            writes.push((node.id().to_string(), write.clone()));
+        }
+    });
+    if !declares_masking {
+        return;
+    }
+
+    let mut tainted: BTreeSet<String> = BTreeSet::new();
+    loop {
+        let before = tainted.len();
+        for (_, assignment) in &assignments {
+            let Ok(paths) = sutra_feel::expressions::paths(&assignment.expression) else {
+                continue;
+            };
+            let raw = paths.iter().any(|path| {
+                let dotted = path.dotted();
+                dotted == "event" || dotted == "event.body" || tainted.contains(path.root())
+            });
+            if raw {
+                tainted.insert(assignment.target_var.clone());
+            }
+        }
+        if tainted.len() == before {
+            break;
+        }
+    }
+
+    let mut warned = BTreeSet::new();
+    for (node, assignment) in &assignments {
+        let name = assignment.target_var.as_str();
+        if tainted.contains(name) && !sensitive.contains(name) && warned.insert(name) {
+            out.push(
+                LintDiagnostic::warning(
+                    codes::CONFIG_BPMN_RAW_BODY_UNMASKED,
+                    format!(
+                        "deployment {dep_label}: process '{}' declares masking, but variable \
+                         '{name}' holds raw event.body text and is not sensitive, so the raw message \
+                         shows in audit and inspect and is stored unencrypted. Declare it \
+                         <q:variable name=\"{name}\" sensitive=\"true\"/>. This becomes an error in a \
+                         later release.",
+                        process.id
+                    ),
+                )
+                .at_node(&process.id, node),
+            );
+        }
+    }
+    for (node, write) in &writes {
+        if tainted.contains(&write.value_var) {
+            out.push(
+                LintDiagnostic::warning(
+                    codes::CONFIG_BPMN_RAW_BODY_STORED,
+                    format!(
+                        "deployment {dep_label}: process '{}' declares masking, but writes raw \
+                         event.body text to data store '{}' through variable '{}'. A store column \
+                         has no at-rest encryption, and sensitive does not reach it.",
+                        process.id, write.store, write.value_var
+                    ),
+                )
+                .at_node(&process.id, node),
+            );
+        }
+    }
+}
+
 fn check_transient_reads(
     deployment: &LoadedDeployment,
     dep_label: &str,

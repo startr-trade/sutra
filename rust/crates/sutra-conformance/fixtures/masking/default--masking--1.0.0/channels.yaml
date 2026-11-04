@@ -1,0 +1,64 @@
+# Channels for the masking package.
+#
+#   masked-in   HTTP intake. Starts `masked`, whose payload is sensitive.
+#   plain-in    HTTP intake. Starts `plain`, which declares no masking.
+#   header-in   HTTP intake. Starts `by-header`, which masks and correlates on a header.
+#   status-in   HTTP. Answers the wait of either flow, correlated on the ref.
+channels:
+  - name: masked-in
+    transport: http
+    bind: "POST /channels/masked-in"
+    codec: json
+    cloudevents-mode: none
+    idempotency-key-header: X-Event-Id
+    auth:
+      scheme: apikey
+      apikey:
+        value: env:MASKING_API_KEY
+        header: X-Api-Key
+  - name: plain-in
+    transport: http
+    bind: "POST /channels/plain-in"
+    codec: json
+    cloudevents-mode: none
+    auth:
+      scheme: apikey
+      apikey:
+        value: env:MASKING_API_KEY
+        header: X-Api-Key
+  # Nothing listens here, so a send stays in the outbox with its trace context to be read.
+  - name: trace-out
+    direction: outbound
+    transport: http
+    bind: "http://127.0.0.1:1/never"
+    cloudevents-mode: none
+  - name: header-in
+    transport: http
+    bind: "POST /channels/header-in"
+    codec: json
+    cloudevents-mode: none
+    auth:
+      scheme: apikey
+      apikey:
+        value: env:MASKING_API_KEY
+        header: X-Api-Key
+  - name: header-status-in
+    transport: http
+    bind: "POST /channels/header-status-in"
+    codec: json
+    cloudevents-mode: none
+    auth:
+      scheme: apikey
+      apikey:
+        value: env:MASKING_API_KEY
+        header: X-Api-Key
+  - name: status-in
+    transport: http
+    bind: "POST /channels/status-in"
+    codec: json
+    cloudevents-mode: none
+    auth:
+      scheme: apikey
+      apikey:
+        value: env:MASKING_API_KEY
+        header: X-Api-Key

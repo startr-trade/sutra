@@ -43,7 +43,7 @@ pub use deployment_archive::{
     ServedArchiveRow,
 };
 pub use external_task::{ExternalTaskRow, ExternalTaskStore, PgExternalTaskStore};
-pub use inbox::{InboxStore, PgInboxStore};
+pub use inbox::{InboxSeenState, InboxStore, PgInboxStore};
 pub use inflight::PgInflightChainStore;
 pub use instance::{
     InstanceFilter, InstanceState, InstanceStore, InstanceSummary, OwnedInstanceState,

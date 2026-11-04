@@ -1,10 +1,9 @@
 //! BPMN diagrams **without BPMN-DI** — a layered auto-layout over the semantic model, emitted as
 //! self-contained SVG in BPMN notation.
 //!
-//! Authored and scaffolded BPMN carries no `<bpmndi:BPMNDiagram>`: coordinates are layout, not
-//! source, and `sutra create bpmn` has no business inventing them. So the diagram is computed
-//! from what the file *does* say — flow nodes and sequence flows, via
-//! [`sutra_bpmn::BpmnModelLoader`], never raw XML.
+//! Authored and generated BPMN often carries no `<bpmndi:BPMNDiagram>`: coordinates are layout,
+//! not source. So the diagram is computed from what the file *does* say — flow nodes and sequence
+//! flows, from the neutral [`crate::Model`], never raw XML.
 //!
 //! The pipeline, per scope (a process, or a sub-process recursively):
 //!
@@ -24,7 +23,8 @@
 //!    each stays on its own row through empty space.
 //!
 //! Everything is deterministic — document order drives node order and every tie-break — so a
-//! regenerated catalog is byte-stable.
+//! regenerated diagram is byte-stable. The `HashMap`s here are lookups only and are never iterated
+//! into output.
 //!
 //! The SVG is BPMN notation: thin-stroke circles for start events, thick for end, double rings for
 //! intermediate/boundary, diamonds with the X/+/O/✳ marker for gateways, rounded rects for
@@ -34,9 +34,9 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 
-use sutra_bpmn::{Node, ProcessDefinition};
+use crate::model::{FlowNode, GatewayType, NodeKind, Process, SubProcessKind};
 
-// ---- geometry constants (ported 1:1 from the Java renderer) ----------------------------------
+// ---- geometry constants ----------------------------------------------------------------------
 
 const PADDING: f64 = 28.0;
 const COL_GAP: f64 = 120.0; // horizontal gap between rank columns (room for edge id labels)
@@ -99,7 +99,7 @@ struct Visual<'a> {
     /// Bottom-centre activity markers (`loop` / `parallel-mi` / `sequential-mi` / `ad-hoc`).
     markers: Vec<&'static str>,
     /// The enclosed scope of an expanded container.
-    inner: Option<&'a ProcessDefinition>,
+    inner: Option<&'a Process>,
 }
 
 /// A plain shape with no glyphs or markers — every arm starts here and adds what it needs.
@@ -123,176 +123,85 @@ fn opt(o: &Option<String>) -> Option<&str> {
     o.as_deref().filter(|s| !s.trim().is_empty())
 }
 
-fn classify(n: &Node) -> Visual<'_> {
-    match n {
-        Node::StartEvent { name, timer, .. } => {
-            let mut v = base(Class::StartEvent, opt(name));
-            v.icon = if timer.is_some() { "timer" } else { "message" };
+fn classify(n: &FlowNode) -> Visual<'_> {
+    let label = opt(&n.label);
+    let mut v = match &n.kind {
+        NodeKind::StartEvent(glyph) => {
+            let mut v = base(Class::StartEvent, label);
+            v.icon = glyph.as_str();
             v
         }
-        Node::EndEvent { name, .. } => base(Class::EndEvent, opt(name)),
-        Node::TerminateEndEvent { name, .. } => {
-            let mut v = base(Class::EndEvent, opt(name));
-            v.icon = "terminate";
+        NodeKind::EndEvent(glyph) => {
+            let mut v = base(Class::EndEvent, label);
+            if let Some(glyph) = glyph {
+                v.icon = glyph.as_str();
+                v.throwing = true;
+            }
+            v
+        }
+        NodeKind::IntermediateThrowEvent(glyph) => {
+            let mut v = base(Class::IntermediateEvent, label);
+            v.icon = glyph.as_str();
             v.throwing = true;
             v
         }
-        Node::ErrorEvent { name, .. } => {
-            let mut v = base(Class::EndEvent, opt(name));
-            v.icon = "error";
-            v.throwing = true;
+        NodeKind::IntermediateCatchEvent(glyph) => {
+            let mut v = base(Class::IntermediateEvent, label);
+            v.icon = glyph.as_str();
             v
         }
-        Node::CancelEndEvent { name, .. } => {
-            let mut v = base(Class::EndEvent, opt(name));
-            v.icon = "cancel";
-            v.throwing = true;
+        NodeKind::BoundaryEvent { glyph, .. } => {
+            let mut v = base(Class::BoundaryEvent, label);
+            v.icon = glyph.as_str();
             v
         }
-        Node::IntermediateThrowEvent { name, kind, .. } => {
-            let mut v = base(Class::IntermediateEvent, opt(name));
-            v.icon = match format!("{kind:?}").as_str() {
-                k if k.starts_with("Signal") => "signal",
-                k if k.starts_with("Escalation") => "escalation",
-                k if k.starts_with("Link") => "link",
-                k if k.starts_with("Compensat") => "compensate",
-                _ => "message",
-            };
-            v.throwing = true;
+        NodeKind::Task(task) => {
+            let mut v = base(Class::Task, label);
+            v.task_icon = task.glyph();
             v
         }
-        Node::LinkCatchEvent { name, .. } => {
-            let mut v = base(Class::IntermediateEvent, opt(name));
-            v.icon = "link";
-            v
-        }
-        Node::MessageCatchEvent { name, .. } => {
-            let mut v = base(Class::IntermediateEvent, opt(name));
-            v.icon = "message";
-            v
-        }
-        Node::TimerCatchEvent { name, .. } => {
-            let mut v = base(Class::IntermediateEvent, opt(name));
-            v.icon = "timer";
-            v
-        }
-        Node::BoundaryEvent { name, kind, .. } => {
-            let mut v = base(Class::BoundaryEvent, opt(name));
-            v.icon = match format!("{kind:?}").as_str() {
-                k if k.starts_with("Timer") => "timer",
-                k if k.starts_with("Escalation") => "escalation",
-                k if k.starts_with("Cancel") => "cancel",
-                k if k.starts_with("Compensat") => "compensate",
-                _ => "error",
-            };
-            v
-        }
-        Node::ServiceTask { name, .. } => {
-            let mut v = base(Class::Task, opt(name));
-            v.task_icon = "service";
-            v
-        }
-        Node::DataTask { name, .. } => base(Class::Task, opt(name)),
-        Node::ScriptTask { name, .. } => {
-            let mut v = base(Class::Task, opt(name));
-            v.task_icon = "script";
-            v
-        }
-        Node::ManualTask { name, .. } => {
-            let mut v = base(Class::Task, opt(name));
-            v.task_icon = "manual";
-            v
-        }
-        Node::SendTask { name, .. } => {
-            let mut v = base(Class::Task, opt(name));
-            v.task_icon = "send";
-            v
-        }
-        Node::BusinessRuleTask { name, .. } => {
-            let mut v = base(Class::Task, opt(name));
-            v.task_icon = "rule";
-            v
-        }
-        Node::UserTask { name, .. } => {
-            let mut v = base(Class::Task, opt(name));
-            v.task_icon = "user";
-            v
-        }
-        // BPMN draws a receive task with a (non-throwing) message envelope — the same marker as
-        // a message catch event, on a task shape, which is exactly what it is.
-        Node::ReceiveTask { name, .. } => {
-            let mut v = base(Class::Task, opt(name));
-            v.task_icon = "message";
-            v
-        }
-        Node::CallActivity { name, .. } => {
-            let mut v = base(Class::Task, opt(name));
+        NodeKind::CallActivity => {
+            let mut v = base(Class::Task, label);
             v.thick = true;
             v
         }
-        Node::SubProcess { name, inner, .. } => {
-            let mut v = base(Class::Task, opt(name));
+        NodeKind::SubProcess { kind, inner } => {
+            let mut v = base(Class::Task, label);
             v.inner = Some(inner);
+            match kind {
+                SubProcessKind::Transaction => v.transaction = true,
+                SubProcessKind::AdHoc => v.markers.push("ad-hoc"),
+                SubProcessKind::Embedded | SubProcessKind::Event => {}
+            }
             v
         }
-        Node::TransactionSubProcess { name, inner, .. } => {
-            let mut v = base(Class::Task, opt(name));
-            v.inner = Some(inner);
-            v.transaction = true;
-            v
-        }
-        Node::AdHocSubProcess { name, inner, .. } => {
-            let mut v = base(Class::Task, opt(name));
-            v.inner = Some(inner);
-            v.markers.push("ad-hoc");
-            v
-        }
-        Node::EventSubProcess { name, inner, .. } => {
-            let mut v = base(Class::Task, opt(name));
-            v.inner = Some(inner);
-            v
-        }
-        Node::ExclusiveGateway { name, .. } => base(Class::Gateway, opt(name)),
+        NodeKind::Gateway(GatewayType::Exclusive) => base(Class::Gateway, label),
         // BPMN marks the event-based gateway with a message pentagon inside a double ring; the
         // closest marker this renderer has is the message icon on a gateway shape.
-        Node::EventBasedGateway { name, .. } => {
-            let mut v = base(Class::Gateway, opt(name));
+        NodeKind::Gateway(GatewayType::EventBased) => {
+            let mut v = base(Class::Gateway, label);
             v.icon = "message";
             v
         }
-        Node::InclusiveGateway { name, .. } => {
-            let mut v = base(Class::Gateway, opt(name));
+        NodeKind::Gateway(GatewayType::Inclusive) => {
+            let mut v = base(Class::Gateway, label);
             v.gateway = Gw::Inclusive;
             v
         }
-        Node::ParallelGateway { name, .. } => {
-            let mut v = base(Class::Gateway, opt(name));
+        NodeKind::Gateway(GatewayType::Parallel) => {
+            let mut v = base(Class::Gateway, label);
             v.gateway = Gw::Parallel;
             v
         }
-        Node::ComplexGateway { name, .. } => {
-            let mut v = base(Class::Gateway, opt(name));
+        NodeKind::Gateway(GatewayType::Complex) => {
+            let mut v = base(Class::Gateway, label);
             v.gateway = Gw::Complex;
             v
         }
-        // A loop wrapper decorates the activity it wraps: draw the inner shape, add the marker.
-        Node::MultiInstance {
-            inner, sequential, ..
-        } => {
-            let mut v = classify(inner);
-            v.markers.push(if *sequential {
-                "sequential-mi"
-            } else {
-                "parallel-mi"
-            });
-            v
-        }
-        Node::StandardLoop { inner, .. } => {
-            let mut v = classify(inner);
-            v.markers.push("loop");
-            v
-        }
-    }
+    };
+    // A loop decorates the activity it wraps: draw the shape, add the marker.
+    v.markers.extend(n.markers.iter().map(|m| m.as_str()));
+    v
 }
 
 // ---- draw model -------------------------------------------------------------------------------
@@ -375,9 +284,9 @@ struct BoxInfo {
 
 // ---- public entry ------------------------------------------------------------------------------
 
-/// Render every process in `module` as one self-contained SVG document, or `None` when the file
-/// declares no flow nodes at all (an empty diagram is worse than none).
-pub fn render_module_svg(processes: &[&ProcessDefinition]) -> Option<String> {
+/// Render every process as one self-contained SVG document, or `None` when they declare no flow
+/// nodes at all (an empty diagram is worse than none).
+pub(crate) fn render_module_svg(processes: &[Process]) -> Option<String> {
     let mut shapes: Vec<Shape> = Vec::new();
     let mut edges: Vec<Edge> = Vec::new();
     let mut bounds = Bounds::default();
@@ -413,37 +322,32 @@ pub fn render_module_svg(processes: &[&ProcessDefinition]) -> Option<String> {
 /// Lay out one scope from its direct nodes. Containers recurse and are drawn expanded around their
 /// content; boundary events are pinned to the bottom edge of the box they attach to. The result is
 /// normalised so its min corner is `(0, 0)`, ready for a parent to offset.
-fn layout_scope(p: &ProcessDefinition) -> ScopeLayout {
+fn layout_scope(p: &Process) -> ScopeLayout {
     let mut out = ScopeLayout::default();
 
     // Boundary events are pinned to a host edge, never laid out as free graph nodes.
     let mut boundary_host: BTreeMap<String, String> = BTreeMap::new();
     let mut boundary_order: Vec<String> = Vec::new();
-    for n in p.nodes() {
-        if let Node::BoundaryEvent {
-            id,
-            attached_to_ref,
-            ..
-        } = n
+    for n in &p.nodes {
+        if let NodeKind::BoundaryEvent {
+            attached_to_ref, ..
+        } = &n.kind
         {
-            boundary_host.insert(id.clone(), attached_to_ref.clone());
-            boundary_order.push(id.clone());
+            boundary_host.insert(n.id.clone(), attached_to_ref.clone());
+            boundary_order.push(n.id.clone());
         }
     }
 
     // Boxes in document order.
     let mut ids: Vec<String> = Vec::new();
     let mut boxes: HashMap<String, BoxInfo> = HashMap::new();
-    for n in p.nodes() {
-        let id = n.id().to_string();
+    for n in &p.nodes {
+        let id = n.id.clone();
         if boundary_host.contains_key(&id) {
             continue;
         }
         let v = classify(n);
-        let inner = v
-            .inner
-            .filter(|ip| !ip.nodes().is_empty())
-            .map(layout_scope);
+        let inner = v.inner.filter(|ip| !ip.nodes.is_empty()).map(layout_scope);
         let label = v.label.unwrap_or("").to_string();
         let (w, h) = match &inner {
             Some(il) if !il.shapes.is_empty() => {
@@ -480,7 +384,7 @@ fn layout_scope(p: &ProcessDefinition) -> ScopeLayout {
     // box reached only via a boundary event still ranks after its host.
     let mut adj: HashMap<String, Vec<String>> = ids.iter().map(|i| (i.clone(), vec![])).collect();
     let mut indeg: HashMap<String, i64> = ids.iter().map(|i| (i.clone(), 0)).collect();
-    for f in p.flows() {
+    for f in &p.flows {
         if boxes.contains_key(&f.source_ref) && boxes.contains_key(&f.target_ref) {
             adj.get_mut(&f.source_ref)
                 .unwrap()
@@ -529,7 +433,7 @@ fn layout_scope(p: &ProcessDefinition) -> ScopeLayout {
     // Widen the gap after a rank to fit the widest edge-id caption crossing it, so a straight
     // edge's "(id)" always has room on the line rather than bailing far from its edge.
     let mut gap_after = vec![COL_GAP; max_rank + 1];
-    for f in p.flows() {
+    for f in &p.flows {
         if !boxes.contains_key(&f.source_ref) || !boxes.contains_key(&f.target_ref) {
             continue;
         }
@@ -645,7 +549,7 @@ fn layout_scope(p: &ProcessDefinition) -> ScopeLayout {
         for (i, be_id) in bes.iter().enumerate() {
             let bcx = left + host.w * (i as f64 + 1.0) / (n + 1.0);
             boundary_pos.insert(be_id.clone(), (bcx, bottom_y, BOUNDARY_SIZE, BOUNDARY_SIZE));
-            let v = p.nodes().iter().find(|n| n.id() == be_id).map(classify);
+            let v = p.nodes.iter().find(|n| n.id == *be_id).map(classify);
             out.shapes.push(Shape {
                 id: be_id.clone(),
                 class: Class::BoundaryEvent,
@@ -667,7 +571,7 @@ fn layout_scope(p: &ProcessDefinition) -> ScopeLayout {
     }
 
     // Sequence flows, orthogonally routed right-edge → left-edge.
-    for f in p.flows() {
+    for f in &p.flows {
         if boundary_host.contains_key(&f.target_ref) {
             continue; // never draw an edge INTO a boundary event
         }
@@ -732,7 +636,7 @@ fn layout_scope(p: &ProcessDefinition) -> ScopeLayout {
 /// Distribute leaf sources that all feed one target, centred on it and spaced by their caption
 /// footprint — so every edge still enters straight and no caption is overlaid by the next node.
 fn straighten_leaf_fan_in(
-    p: &ProcessDefinition,
+    p: &Process,
     boxes: &mut HashMap<String, BoxInfo>,
     boundary_host: &BTreeMap<String, String>,
     indeg: &HashMap<String, i64>,
@@ -740,7 +644,7 @@ fn straighten_leaf_fan_in(
     let mut in_total: BTreeMap<String, usize> = BTreeMap::new();
     let mut all_leaf: BTreeMap<String, bool> = BTreeMap::new();
     let mut leaf_sources: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for f in p.flows() {
+    for f in &p.flows {
         if boundary_host.contains_key(&f.target_ref) || !boxes.contains_key(&f.target_ref) {
             continue;
         }
@@ -778,13 +682,13 @@ fn straighten_leaf_fan_in(
 /// Drop a box reached only via a boundary edge to that boundary's exit level, so the flow is a
 /// single clean drop-then-straight through the empty band beside a tall host.
 fn drop_boundary_only_targets(
-    p: &ProcessDefinition,
+    p: &Process,
     boxes: &mut HashMap<String, BoxInfo>,
     boundary_host: &BTreeMap<String, String>,
 ) {
     let mut only_boundary_in: BTreeMap<String, bool> = BTreeMap::new();
     let mut route_y: BTreeMap<String, f64> = BTreeMap::new();
-    for f in p.flows() {
+    for f in &p.flows {
         if !boxes.contains_key(&f.target_ref) {
             continue;
         }

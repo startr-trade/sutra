@@ -124,6 +124,12 @@ pub mod codes {
     /// typed `<task>` has written a step that silently does nothing, and silence is the one
     /// outcome worth preventing. So it loads, and lint says so.
     pub const CONFIG_BPMN_UNTYPED_TASK: &str = "SUTRA.CONFIG.BPMN.UNTYPED_TASK";
+    /// A variable holds raw `event.body` text in a process that declares masking, and is not
+    /// `@sensitive`, so it shows the raw message on every surface. A warning for now.
+    pub const CONFIG_BPMN_RAW_BODY_UNMASKED: &str = "SUTRA.CONFIG.BPMN.RAW_BODY_UNMASKED";
+    /// A process that declares masking writes raw `event.body` text to a data store, whose columns
+    /// have no at-rest encryption.
+    pub const CONFIG_BPMN_RAW_BODY_STORED: &str = "SUTRA.CONFIG.BPMN.RAW_BODY_STORED";
     /// One variable name is declared twice over: once in BPMN's own data vocabulary
     /// (`<property>`, `<dataObject>`) and once as a `<q:variable>`.
     ///

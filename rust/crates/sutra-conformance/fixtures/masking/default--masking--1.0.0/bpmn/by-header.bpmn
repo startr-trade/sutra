@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- A masking flow that still uses a header: it correlates on one and copies one to a sensitive variable. -->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0"
+                  id="Definitions_by_header"
+                  targetNamespace="urn:sutra:module:masking:1.0.0">
+  <bpmn:process id="by-header" name="Masked, by header" isExecutable="true">
+    <bpmn:extensionElements>
+      <q:audit sink="jsonl" capture="payload"/>
+      <q:variables>
+        <q:variable name="payload" type="object" sensitive="true"/>
+        <q:variable name="kept" type="string" sensitive="true"/>
+      </q:variables>
+    </bpmn:extensionElements>
+    <bpmn:startEvent id="Start">
+      <bpmn:extensionElements>
+        <q:source channel="header-in"/>
+        <q:alias name="headerCase" expression="header.xcase" unique="true"/>
+      </bpmn:extensionElements>
+    </bpmn:startEvent>
+    <bpmn:serviceTask id="Keep" name="Copy a header (FEEL)">
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>header.xcase</bpmn:from><bpmn:to>kept</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sendTask id="Notify" name="Send, carrying the trace context">
+      <bpmn:extensionElements>
+        <q:send channel="trace-out"/>
+      </bpmn:extensionElements>
+    </bpmn:sendTask>
+    <bpmn:receiveTask id="Wait" name="Wait for a status">
+      <bpmn:extensionElements>
+        <q:source channel="header-status-in" name="status"/>
+        <q:alias name="headerCase" expression="status.ref"/>
+      </bpmn:extensionElements>
+    </bpmn:receiveTask>
+    <bpmn:endEvent id="Done"/>
+    <bpmn:sequenceFlow id="F1" sourceRef="Start" targetRef="Keep"/>
+    <bpmn:sequenceFlow id="F2" sourceRef="Keep" targetRef="Notify"/>
+    <bpmn:sequenceFlow id="F4" sourceRef="Notify" targetRef="Wait"/>
+    <bpmn:sequenceFlow id="F3" sourceRef="Wait" targetRef="Done"/>
+  </bpmn:process>
+</bpmn:definitions>

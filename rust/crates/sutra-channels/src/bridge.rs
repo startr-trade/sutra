@@ -491,14 +491,20 @@ pub trait InstanceBridge {
     /// admission slot) when the replica dies mid-chain. The durable implementation deletes it
     /// inside every final step of the instance; [`Self::end_inline_chain`] covers the endings
     /// that commit nothing. Default: a no-op (bridges with nothing to recover).
+    ///
+    /// A store that holds keys back writes them here, in the marker's own transaction, so a key
+    /// another delivery already recorded fails this call
+    /// ([`crate::codes::INBOUND_DUPLICATE_CONCURRENT`]) before the chain makes a call. Answers the
+    /// keys this chain now OWNS: only those may be released if it fails, so it can never delete a
+    /// record an earlier delivery wrote.
     async fn begin_inline_chain(
         &self,
         deployment: &DeploymentId,
         instance_id: &str,
         dedup_keys: &[(String, String)],
-    ) -> Result<(), Diagnostic> {
-        let _ = (deployment, instance_id, dedup_keys);
-        Ok(())
+    ) -> Result<Vec<(String, String)>, Diagnostic> {
+        let _ = (deployment, instance_id);
+        Ok(dedup_keys.to_vec())
     }
 
     /// Delete the in-flight marker of [`Self::begin_inline_chain`]. Idempotent and

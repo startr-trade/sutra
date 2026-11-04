@@ -391,3 +391,65 @@ fn collect_files(root: &Path, dir: &Path, out: &mut Vec<String>) {
         }
     }
 }
+
+// ---- diagram parity ------------------------------------------------------------------------
+
+// The diagram crate's own parser and docgen's mapping of the engine's model must draw the same
+// diagram from the same file.
+//
+// The fixtures belong to the crate, which knows no engine, so `messages.bpmn` carries no `q:`
+// binding. The engine's loader requires one on a send and on a receive, so this test adds them to
+// the copy the loader reads; the crate's parser ignoring extensions is what makes the two agree.
+
+use bpmn_svg::Options;
+use sutra_bpmn::BpmnModelLoader;
+use sutra_docgen::render::diagram_model::to_diagram_model;
+
+const FIXTURES: [&str; 7] = [
+    "tasks",
+    "events",
+    "gateways",
+    "sub-processes",
+    "boundary-events",
+    "several-processes",
+    "messages",
+];
+
+const SEND: &str = "<extensionElements><q:send channel=\"out\"/></extensionElements>";
+const SOURCE: &str = "<extensionElements><q:source channel=\"in\"/></extensionElements>";
+
+/// The fixture with the bindings only the engine's loader asks for.
+fn engine_form(xml: &str) -> String {
+    xml.replace("<definitions ", "<definitions xmlns:q=\"urn:sutra:q:1.0\" ")
+        .replace(
+            "<sendTask id=\"send\" name=\"Send\"/>",
+            &format!("<sendTask id=\"send\" name=\"Send\">{SEND}</sendTask>"),
+        )
+        .replace(
+            "<messageEventDefinition/></intermediateThrowEvent>",
+            &format!("{SEND}<messageEventDefinition/></intermediateThrowEvent>"),
+        )
+        .replace(
+            "<receiveTask id=\"receive\" name=\"Receive\"/>",
+            &format!("<receiveTask id=\"receive\" name=\"Receive\">{SOURCE}</receiveTask>"),
+        )
+}
+
+#[test]
+fn the_crates_parser_and_docgens_mapping_give_the_same_svg() {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../bpmn-svg/tests/fixtures");
+    for name in FIXTURES {
+        let xml = std::fs::read_to_string(dir.join(format!("{name}.bpmn"))).unwrap();
+
+        let parsed = bpmn_svg::parse(&xml).unwrap();
+        let from_parser = bpmn_svg::render(&parsed, &Options::default()).unwrap();
+
+        let module = BpmnModelLoader::new()
+            .load(engine_form(&xml).as_bytes())
+            .unwrap_or_else(|e| panic!("{name}: the engine's loader refused it: {e}"));
+        let mapped = to_diagram_model(module.processes());
+        let from_mapping = bpmn_svg::render(&mapped, &Options::default()).unwrap();
+
+        assert!(from_parser == from_mapping, "{name}: the diagrams differ");
+    }
+}

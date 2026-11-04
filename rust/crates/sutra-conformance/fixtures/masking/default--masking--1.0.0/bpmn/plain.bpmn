@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- No masking declared, audited with its payload, parked at a wait: the control. -->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0"
+                  id="Definitions_plain"
+                  targetNamespace="urn:sutra:module:masking:1.0.0">
+  <bpmn:process id="plain" name="Plain" isExecutable="true">
+    <bpmn:extensionElements>
+      <q:audit sink="jsonl" capture="payload"/>
+    </bpmn:extensionElements>
+    <bpmn:startEvent id="Start">
+      <bpmn:extensionElements>
+        <q:source channel="plain-in"/>
+        <q:alias name="caseRef" expression="payload.ref" unique="true"/>
+      </bpmn:extensionElements>
+    </bpmn:startEvent>
+    <bpmn:receiveTask id="Wait" name="Wait for a status">
+      <bpmn:extensionElements>
+        <q:source channel="status-in" name="status"/>
+        <q:alias name="caseRef" expression="status.ref"/>
+      </bpmn:extensionElements>
+    </bpmn:receiveTask>
+    <bpmn:endEvent id="Done"/>
+    <bpmn:sequenceFlow id="F1" sourceRef="Start" targetRef="Wait"/>
+    <bpmn:sequenceFlow id="F2" sourceRef="Wait" targetRef="Done"/>
+  </bpmn:process>
+</bpmn:definitions>

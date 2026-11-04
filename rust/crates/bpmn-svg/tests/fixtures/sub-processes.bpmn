@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL" targetNamespace="urn:example:diagrams">
+  <process id="containers" isExecutable="true">
+    <startEvent id="s"/>
+    <subProcess id="embedded" name="Embedded">
+      <startEvent id="e-s"/>
+      <subProcess id="nested" name="Nested">
+        <startEvent id="n-s"/>
+        <manualTask id="n-t" name="Deep"/>
+        <endEvent id="n-e"/>
+        <sequenceFlow id="n1" sourceRef="n-s" targetRef="n-t"/>
+        <sequenceFlow id="n2" sourceRef="n-t" targetRef="n-e"/>
+      </subProcess>
+      <endEvent id="e-e"/>
+      <sequenceFlow id="e1" sourceRef="e-s" targetRef="nested"/>
+      <sequenceFlow id="e2" sourceRef="nested" targetRef="e-e"/>
+    </subProcess>
+    <transaction id="tx" name="Transaction">
+      <startEvent id="t-s"/>
+      <manualTask id="t-t" name="Inside"/>
+      <endEvent id="t-c"><cancelEventDefinition/></endEvent>
+      <sequenceFlow id="t1" sourceRef="t-s" targetRef="t-t"/>
+      <sequenceFlow id="t2" sourceRef="t-t" targetRef="t-c"/>
+    </transaction>
+    <adHocSubProcess id="adhoc" name="Ad hoc">
+      <manualTask id="h-a" name="Any order"/>
+      <manualTask id="h-b" name="Or this"/>
+    </adHocSubProcess>
+    <subProcess id="looped-sub" name="Looped">
+      <multiInstanceLoopCharacteristics isSequential="true"><loopCardinality>2</loopCardinality></multiInstanceLoopCharacteristics>
+      <startEvent id="l-s"/>
+      <endEvent id="l-e"/>
+      <sequenceFlow id="l1" sourceRef="l-s" targetRef="l-e"/>
+    </subProcess>
+    <subProcess id="on-error" name="On error" triggeredByEvent="true">
+      <startEvent id="o-s" isInterrupting="true"><errorEventDefinition/></startEvent>
+      <endEvent id="o-e"/>
+      <sequenceFlow id="o1" sourceRef="o-s" targetRef="o-e"/>
+    </subProcess>
+    <endEvent id="end"/>
+    <sequenceFlow id="f1" sourceRef="s" targetRef="embedded"/>
+    <sequenceFlow id="f2" sourceRef="embedded" targetRef="tx"/>
+    <sequenceFlow id="f3" sourceRef="tx" targetRef="adhoc"/>
+    <sequenceFlow id="f4" sourceRef="adhoc" targetRef="looped-sub"/>
+    <sequenceFlow id="f5" sourceRef="looped-sub" targetRef="end"/>
+  </process>
+</definitions>
