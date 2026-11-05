@@ -215,6 +215,7 @@ impl BpmnModelLoader {
         apply_process_level_contracts(root, &mut bindings_by_node_id)?;
 
         let store_bindings_by_ref_id = collect_store_bindings(root);
+        refuse_misplaced_decodes(root, None)?;
 
         let mut params_by_service_task_id = HashMap::new();
         for task in root.collect_descendants_ns(BPMN_NS, "serviceTask") {
@@ -1961,10 +1962,13 @@ fn build_data_mapping(
 ) -> Result<DataMapping, SutraError> {
     let ins: Vec<&XmlElement> = st.children_ns(BPMN_NS, "dataInputAssociation").collect();
     let outs: Vec<&XmlElement> = st.children_ns(BPMN_NS, "dataOutputAssociation").collect();
+    let mut mapping = DataMapping {
+        message_decodes: parse_message_decodes(st, id)?,
+        ..DataMapping::default()
+    };
     if ins.is_empty() && outs.is_empty() {
-        return Ok(DataMapping::default());
+        return Ok(mapping);
     }
-    let mut mapping = DataMapping::default();
 
     for a in ins {
         if a.child_ns(BPMN_NS, "transformation").is_some() {
@@ -2079,6 +2083,70 @@ fn build_data_mapping(
         }
     }
     Ok(mapping)
+}
+
+/// The `<q:decode>` children of a serviceTask's extension elements, in document order.
+fn parse_message_decodes(
+    st: &XmlElement,
+    id: &str,
+) -> Result<Vec<crate::qbindings::MessageDecodeBinding>, SutraError> {
+    let mut out = Vec::new();
+    for ext in st.children_ns(BPMN_NS, "extensionElements") {
+        for d in ext.children_ns(Q_NS, "decode") {
+            let name = opt_attr(d, "name");
+            let expression = opt_attr(d, "expression");
+            let codec = opt_attr(d, "codec");
+            let (Some(name), Some(expression), Some(codec)) = (name, expression, codec) else {
+                return Err(err(
+                    codes::PARSE_Q_DECODE_INCOMPLETE,
+                    format!(
+                        "<q:decode> on serviceTask '{id}' needs a name, an expression and a codec."
+                    ),
+                ));
+            };
+            let mut redactors = Vec::new();
+            for container in d.children_ns(Q_NS, "redactors") {
+                parse_redactors(container, &mut redactors);
+            }
+            out.push(crate::qbindings::MessageDecodeBinding {
+                name: name.trim().to_string(),
+                expression,
+                codec: codec.trim().to_string(),
+                content_type_expression: opt_attr(d, "contentType"),
+                redactors,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// `<q:decode>` is a data-task step. Anywhere else (a serviceTask with an `@implementation`, or any
+/// other element) it would silently do nothing, so it is refused.
+fn refuse_misplaced_decodes(
+    element: &XmlElement,
+    parent: Option<&XmlElement>,
+) -> Result<(), SutraError> {
+    for child in &element.children {
+        if child.is(Q_NS, "decode") {
+            let on_data_task = element.is(BPMN_NS, "extensionElements")
+                && parent.is_some_and(|task| {
+                    task.is(BPMN_NS, "serviceTask")
+                        && task.attr_or_empty("implementation").trim().is_empty()
+                });
+            if !on_data_task {
+                return Err(err(
+                    codes::PARSE_Q_DECODE_NOT_ON_DATA_TASK,
+                    format!(
+                        "<q:decode name='{}'> belongs on a data task: a serviceTask with no \
+                         @implementation.",
+                        child.attr_or_empty("name")
+                    ),
+                ));
+            }
+        }
+        refuse_misplaced_decodes(child, Some(element))?;
+    }
+    Ok(())
 }
 
 fn collect_assignments(

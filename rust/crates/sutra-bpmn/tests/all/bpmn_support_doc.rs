@@ -283,10 +283,10 @@ fn row(kind: NodeKind) -> Row {
                     template, and runs inline.",
         },
         DataTask => Row {
-            xml: "`<serviceTask>` with data associations, no `@implementation`",
+            xml: "`<serviceTask>` with data associations or `<q:decode>`, no `@implementation`",
             variant: "DataTask",
             wait: Wait::No,
-            notes: "Declarative: its store reads, FEEL assignments and store writes ARE its \
+            notes: "Declarative: its store reads, `<q:decode>` steps, FEEL assignments and store writes ARE its \
                     behaviour. No registered task is resolved.",
         },
         ScriptTask => Row {

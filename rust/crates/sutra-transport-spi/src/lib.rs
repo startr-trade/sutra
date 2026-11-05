@@ -37,8 +37,10 @@ pub type EnvRefResolver = fn(&str) -> Result<String, String>;
 /// `definition` with the named properties resolved through the engine's `resolver`, so a
 /// transport reads `region: "${AWS_REGION}"` the way it reads a credential reference. A property
 /// the channel does not set stays unset, and text with no reference passes through unchanged. A
-/// reference that cannot be resolved fails with `code`, naming the channel and the property but
-/// not the value, so the channel fails closed at wiring instead of connecting to a literal `${…}`.
+/// reference that cannot be resolved fails with `code`, naming the channel and the property and
+/// never a resolved value, so the channel fails closed at wiring instead of connecting to a literal
+/// `${…}`. A reference that resolves to blank leaves the property blank, which every reader treats
+/// as unset, so `${NAME:}` is how an author writes an optional setting.
 pub fn resolve_channel_properties(
     definition: &ChannelDefinition,
     keys: &[&str],
@@ -63,31 +65,30 @@ pub fn resolve_channel_properties(
     Ok(resolved)
 }
 
-/// Refuses a `${` in any of the named properties, for a transport that reads those properties as
-/// written. Left alone, such a channel would connect to or consume under the literal name, and on
-/// some brokers receive nothing with no error at all. The error names the channel and the property
-/// and never the value, which may carry anything an author put there.
-pub fn refuse_unexpanded_references(
+/// Refuses a port that came from a reference and is not a port. A transport's own parser quotes
+/// what it could not read, which is fine for a value written in the file and not for one that came
+/// out of a secret store, so this runs first and names the channel and the property only. A port
+/// written literally is left to the parser, and a blank one means the transport's default.
+pub fn require_resolved_port(
     definition: &ChannelDefinition,
-    keys: &[&str],
+    resolved: &ChannelDefinition,
+    key: &str,
     code: &str,
 ) -> Result<(), Diagnostic> {
-    for key in keys {
-        if definition
-            .properties
-            .get(*key)
-            .is_some_and(|raw| raw.contains("${"))
-        {
-            return Err(Diagnostic::error(
-                code,
-                format!(
-                    "channel '{}' property '{key}' contains a '${{' reference, which this \
-                     transport reads as written; references in this property arrive in a later \
-                     release, so set a literal value",
-                    definition.binding.channel_name
-                ),
-            ));
-        }
+    let Some(port) = resolved.properties.get(key) else {
+        return Ok(());
+    };
+    let port = port.trim();
+    let from_reference = definition.properties.get(key).map(|raw| raw.trim()) != Some(port);
+    if from_reference && !port.is_empty() && !port.parse::<u16>().is_ok_and(|n| n != 0) {
+        return Err(Diagnostic::error(
+            code,
+            format!(
+                "channel '{}' property '{key}' has a reference that does not resolve to an \
+                 integer in 1..=65535",
+                definition.binding.channel_name
+            ),
+        ));
     }
     Ok(())
 }
@@ -372,12 +373,12 @@ pub fn inline_caller_factories() -> Vec<&'static InlineCallerFactory> {
 }
 
 #[cfg(test)]
-mod unexpanded_reference_tests {
-    use super::refuse_unexpanded_references;
+mod resolved_port_tests {
+    use super::require_resolved_port;
     use sutra_channels::config::{ChannelBinding, Namespace};
     use sutra_channels::{ChannelDefinition, DeploymentId};
 
-    fn definition(key: &str, value: &str) -> ChannelDefinition {
+    fn definition(port: &str) -> ChannelDefinition {
         ChannelDefinition {
             binding: ChannelBinding::new(
                 "orders-in",
@@ -392,30 +393,32 @@ mod unexpanded_reference_tests {
             auth_scheme: None,
             idempotency_key_header: None,
             payload_cap_bytes: None,
-            properties: [(key.to_string(), value.to_string())].into_iter().collect(),
+            properties: [("port".to_string(), port.to_string())]
+                .into_iter()
+                .collect(),
         }
     }
 
     #[test]
-    fn a_reference_is_refused_naming_channel_and_property_but_not_the_value() {
-        for value in ["${NAME}", "prefix-${NAME:other}-suffix"] {
-            let err = refuse_unexpanded_references(&definition("host", value), &["host"], "T.CODE")
-                .unwrap_err();
+    fn a_reference_that_is_not_a_port_is_refused_without_quoting_it() {
+        for value in ["s3cret-value", "0", "70000"] {
+            let err =
+                require_resolved_port(&definition("${P}"), &definition(value), "port", "T.CODE")
+                    .unwrap_err();
             assert_eq!(err.code, "T.CODE");
             assert!(err.message.contains("orders-in"), "{}", err.message);
-            assert!(err.message.contains("'host'"), "{}", err.message);
-            assert!(err.message.contains("later release"), "{}", err.message);
-            assert!(!err.message.contains("NAME"), "{}", err.message);
+            assert!(err.message.contains("'port'"), "{}", err.message);
+            assert!(!err.message.contains(value), "{}", err.message);
         }
     }
 
     #[test]
-    fn a_literal_an_unlisted_property_and_an_unset_one_all_pass() {
-        let keys = ["host"];
-        assert!(
-            refuse_unexpanded_references(&definition("host", "broker$1{a}"), &keys, "C").is_ok()
-        );
-        assert!(refuse_unexpanded_references(&definition("other", "${A}"), &keys, "C").is_ok());
+    fn a_good_port_a_blank_one_and_a_literal_one_are_left_alone() {
+        let raw = definition("${P}");
+        assert!(require_resolved_port(&raw, &definition("5672"), "port", "C").is_ok());
+        assert!(require_resolved_port(&raw, &definition(" "), "port", "C").is_ok());
+        let literal = definition("not-a-port");
+        assert!(require_resolved_port(&literal, &literal, "port", "C").is_ok());
     }
 }
 

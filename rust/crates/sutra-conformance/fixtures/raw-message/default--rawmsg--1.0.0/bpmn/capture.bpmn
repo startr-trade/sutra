@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Keep the message exactly as it arrived, unless its bytes could not be kept as text. -->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0"
+                  id="Definitions_capture"
+                  targetNamespace="urn:sutra:module:rawmsg:1.0.0">
+  <bpmn:dataStore id="messagesStore" name="messages"/>
+  <bpmn:process id="capture" isExecutable="true">
+    <bpmn:extensionElements>
+      <q:variables><q:variable name="row" type="object"/></q:variables>
+    </bpmn:extensionElements>
+    <bpmn:dataStoreReference id="refRow" dataStoreRef="messagesStore">
+      <bpmn:extensionElements><q:store key="event.dedupKey"/></bpmn:extensionElements>
+    </bpmn:dataStoreReference>
+    <bpmn:startEvent id="Start">
+      <bpmn:extensionElements><q:source channel="message-in"/></bpmn:extensionElements>
+    </bpmn:startEvent>
+    <bpmn:exclusiveGateway id="Keepable" default="ToKeep"/>
+    <bpmn:serviceTask id="Keep" name="Keep the text">
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment>
+          <bpmn:from>{messageId: event.dedupKey, contentType: event.contentType, body: event.body}</bpmn:from>
+          <bpmn:to>row</bpmn:to>
+        </bpmn:assignment>
+      </bpmn:dataInputAssociation>
+      <bpmn:dataOutputAssociation>
+        <bpmn:sourceRef>row</bpmn:sourceRef><bpmn:targetRef>refRow</bpmn:targetRef>
+      </bpmn:dataOutputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="Kept"/>
+    <bpmn:endEvent id="NotText"/>
+    <bpmn:sequenceFlow id="F1" sourceRef="Start" targetRef="Keepable"/>
+    <bpmn:sequenceFlow id="ToKeep" sourceRef="Keepable" targetRef="Keep"/>
+    <bpmn:sequenceFlow id="ToRefuse" sourceRef="Keepable" targetRef="NotText">
+      <bpmn:conditionExpression>event.bodyLossy = true</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="F2" sourceRef="Keep" targetRef="Kept"/>
+  </bpmn:process>
+</bpmn:definitions>

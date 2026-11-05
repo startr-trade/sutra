@@ -183,6 +183,19 @@ pub struct ReceiptAttribute {
     pub expression: String,
 }
 
+/// Parsed `<q:decode>` on a data task: parse text the flow already holds with a registered codec
+/// and bind the result to [`Self::name`]. `expression` and `content_type_expression` are FEEL, held
+/// as source text; `codec` is a built-in format name or a package schema codec URN, the same form
+/// `<q:send>` and `<q:reply>` take. `redactors` lists `<q:redactor ref>` values, in order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageDecodeBinding {
+    pub name: String,
+    pub expression: String,
+    pub codec: String,
+    pub content_type_expression: Option<String>,
+    pub redactors: Vec<String>,
+}
+
 /// Parsed `<q:reply>` — an outbound reply on a Service Task or End Event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplyBinding {

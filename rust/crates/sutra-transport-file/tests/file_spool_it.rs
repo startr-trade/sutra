@@ -491,3 +491,207 @@ fn a_late_settle_with_no_staged_file_left_is_a_tolerated_no_op() {
     );
     assert!(!fixture.failed("evt-vanished.dat").exists());
 }
+
+// ---- references in connection properties -----------------------------------------------------
+
+/// The engine's resolver, as the assembly hands it to every transport.
+fn engine_resolver(reference: &str) -> Result<String, String> {
+    sutra_envref_spi::resolve_value(reference).map_err(|e| e.to_string())
+}
+
+/// Every reference form the engine's resolver has, through the real resolver, on the one transport
+/// that needs no broker. The other transports call the same helper.
+#[test]
+fn every_reference_form_reaches_the_spool_directory() {
+    let spool = unique_spool();
+    let spool_text = spool.to_string_lossy().to_string();
+    let secrets = unique_spool();
+    std::fs::create_dir_all(&secrets).expect("secrets dir");
+    std::fs::write(secrets.join("spool-path"), format!("{spool_text}\n")).expect("secret file");
+    std::env::set_var(sutra_envref_spi::SECRETS_DIR_ENV, &secrets);
+    std::env::set_var("SUTRA_FILE_IT_SPOOL", &spool_text);
+
+    for form in [
+        "${SUTRA_FILE_IT_SPOOL}".to_string(),
+        "env:SUTRA_FILE_IT_SPOOL".to_string(),
+        "secret:spool-path".to_string(),
+        "${secret:spool-path}".to_string(),
+        format!("${{SUTRA_FILE_IT_NOT_SET:{spool_text}}}"),
+    ] {
+        let props = sutra_transport_file::file::FileChannelProperties::resolved(
+            &file_def("spool-in", &form),
+            engine_resolver,
+        )
+        .unwrap_or_else(|d| panic!("{form}: {}", d.message));
+        assert_eq!(props.spool_dir, spool, "for {form}");
+    }
+
+    // One of them all the way through: the file is delivered from the resolved directory.
+    std::fs::create_dir_all(&spool).expect("create spool dir");
+    std::fs::write(spool.join("evt-1.dat"), b"through-a-reference").expect("drop spool file");
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let intake = Arc::new(CapturingIntake::default());
+    let dyn_intake: Arc<dyn InboundIntake> = intake.clone();
+    let channels = spawn_file_channels_with_intake(
+        &[file_def("spool-in", "secret:spool-path")],
+        dyn_intake,
+        None,
+        engine_resolver,
+        rt.handle().clone(),
+    )
+    .expect("wire file channel");
+    assert!(
+        wait_until(|| intake.count() >= 1, Duration::from_secs(5)),
+        "the file in the resolved directory must be delivered"
+    );
+    rt.block_on(channels.drain());
+    let _ = std::fs::remove_dir_all(&spool);
+    let _ = std::fs::remove_dir_all(&secrets);
+}
+
+/// `${SET}` has resolved by the time `${UNSET}` fails, and the failure must not carry it.
+#[test]
+fn an_unresolved_reference_never_quotes_one_that_resolved() {
+    std::env::set_var("SUTRA_FILE_IT_RESOLVED", "resolved-sentinel-value");
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime");
+    for raw in [
+        "${SUTRA_FILE_IT_RESOLVED}/${SUTRA_FILE_IT_UNSET}",
+        "env:SUTRA_FILE_IT_UNSET",
+        "secret:sutra-file-it-unset",
+    ] {
+        let Err(err) = spawn_file_channels_with_intake(
+            &[file_def("spool-in", raw)],
+            Arc::new(CapturingIntake::default()),
+            None,
+            engine_resolver,
+            rt.handle().clone(),
+        ) else {
+            panic!("{raw} must not wire");
+        };
+        assert_eq!(err.code, "SUTRA.INBOUND.FILE.CONFIG_INVALID", "for {raw}");
+        assert!(err.message.contains("spool-in"), "{}", err.message);
+        assert!(err.message.contains("'spool.dir'"), "{}", err.message);
+        assert!(
+            !err.message.contains("resolved-sentinel-value"),
+            "{}",
+            err.message
+        );
+    }
+}
+
+/// `${NAME:}` means optional: a blank result is the property unset, not an error and not a blank
+/// directory. For a spool directory, which has no default, that is the transport's own refusal.
+#[test]
+fn a_reference_that_resolves_to_blank_is_the_property_unset() {
+    let err = sutra_transport_file::file::FileChannelProperties::resolved(
+        &file_def("spool-in", "${SUTRA_FILE_IT_NOT_SET:}"),
+        engine_resolver,
+    )
+    .unwrap_err();
+    assert_eq!(err.code, "SUTRA.INBOUND.FILE.CONFIG_INVALID");
+}
+
+static ACTIVATION_SPOOL: Mutex<Option<String>> = Mutex::new(None);
+
+/// A reference whose value the test can take away, as an unset variable would on the next flip.
+fn activation_resolver(reference: &str) -> Result<String, String> {
+    if reference != "${ACTIVATION_SPOOL}" {
+        return Ok(reference.to_string());
+    }
+    ACTIVATION_SPOOL
+        .lock()
+        .expect("spool")
+        .clone()
+        .ok_or_else(|| "${ACTIVATION_SPOOL} is not set".to_string())
+}
+
+#[derive(Clone, Default)]
+struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for CapturedLog {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().expect("log").extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// What activation does in a running engine when a reference does not resolve: the flip is not
+/// refused, the running consumer stops, nothing starts on the literal text, and a coded WARN says
+/// why. Once the value is back, the next flip starts the consumer again.
+#[test]
+fn activation_with_an_unresolved_reference_stops_the_consumer_and_warns() {
+    let spool = unique_spool();
+    std::fs::create_dir_all(&spool).expect("create spool dir");
+    *ACTIVATION_SPOOL.lock().expect("spool") = Some(spool.to_string_lossy().to_string());
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let intake = Arc::new(CapturingIntake::default());
+    let dyn_intake: Arc<dyn InboundIntake> = intake.clone();
+    let def = file_def("spool-in", "${ACTIVATION_SPOOL}");
+    let channels = spawn_file_channels_with_intake(
+        std::slice::from_ref(&def),
+        dyn_intake,
+        None,
+        activation_resolver,
+        rt.handle().clone(),
+    )
+    .expect("wire file channel");
+    std::fs::write(spool.join("evt-1.dat"), b"before").expect("drop file");
+    assert!(wait_until(|| intake.count() == 1, Duration::from_secs(5)));
+
+    // The value goes away and an activation arrives. Only the rewire's own warning is on this
+    // thread, which is the one the subscriber covers.
+    *ACTIVATION_SPOOL.lock().expect("spool") = None;
+    let log = CapturedLog::default();
+    let writer = log.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_writer(move || writer.clone())
+        .finish();
+    tracing::subscriber::with_default(subscriber, || {
+        rt.block_on(channels.rewire(std::slice::from_ref(&def)));
+    });
+    assert_eq!(
+        channels.consumer_count(),
+        0,
+        "no consumer on an unresolved value"
+    );
+    let warned = String::from_utf8(log.0.lock().expect("log").clone()).expect("utf-8");
+    assert!(warned.contains("WARN"), "{warned}");
+    assert!(
+        warned.contains("SUTRA.INBOUND.FILE.CONFIG_INVALID"),
+        "{warned}"
+    );
+    assert!(warned.contains("spool-in"), "{warned}");
+    assert!(warned.contains("'spool.dir'"), "{warned}");
+    assert!(!warned.contains(&*spool.to_string_lossy()), "{warned}");
+
+    std::fs::write(spool.join("evt-2.dat"), b"during").expect("drop file");
+    std::thread::sleep(Duration::from_millis(400));
+    assert_eq!(intake.count(), 1, "nothing is consumed while it is stopped");
+    assert!(spool.join("evt-2.dat").exists());
+    assert!(
+        !Path::new("${ACTIVATION_SPOOL}").exists(),
+        "nothing was created under the literal text"
+    );
+
+    // The value comes back: the next flip starts it, and the waiting file is delivered.
+    *ACTIVATION_SPOOL.lock().expect("spool") = Some(spool.to_string_lossy().to_string());
+    rt.block_on(channels.rewire(std::slice::from_ref(&def)));
+    assert_eq!(channels.consumer_count(), 1);
+    assert!(wait_until(|| intake.count() == 2, Duration::from_secs(5)));
+
+    rt.block_on(channels.drain());
+    let _ = std::fs::remove_dir_all(&spool);
+}

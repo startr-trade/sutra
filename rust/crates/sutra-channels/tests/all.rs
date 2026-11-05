@@ -27,6 +27,8 @@ mod http_it_test;
 mod inline_call_test;
 #[path = "all/intake_test.rs"]
 mod intake_test;
+#[path = "all/message_decode_test.rs"]
+mod message_decode_test;
 #[path = "all/outbound_validation_test.rs"]
 mod outbound_validation_test;
 #[path = "all/outbox_pool_test.rs"]

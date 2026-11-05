@@ -9,6 +9,12 @@ pub const RUNTIME_MULTI_INSTANCE_COMPLETION_FAILED: &str =
     "SUTRA.RUNTIME.MULTI_INSTANCE.COMPLETION_FAILED";
 pub const RUNTIME_ADHOC_COMPLETION_FAILED: &str = "SUTRA.RUNTIME.ADHOC.COMPLETION_FAILED";
 pub const RUNTIME_DATASTORE_CONFLICT: &str = "SUTRA.RUNTIME.DATASTORE.CONFLICT";
+/// A `<q:decode>` expression gave null or a non-string. Catchable.
+pub const RUNTIME_DECODE_NOT_TEXT: &str = "SUTRA.RUNTIME.DECODE.NOT_TEXT";
+/// A `<q:decode>` codec reported a fatal parse, or cannot be used at run time. Catchable.
+pub const RUNTIME_DECODE_FAILED: &str = "SUTRA.RUNTIME.DECODE.FAILED";
+/// A `<q:decode>` input is over the engine's payload cap, so nothing was decoded. Catchable.
+pub const RUNTIME_DECODE_TOO_LARGE: &str = "SUTRA.RUNTIME.DECODE.TOO_LARGE";
 /// A key query summed a field that holds a value that is not a number (text, a boolean, an
 /// object) in at least one matching row. A missing field or a JSON null is skipped instead.
 pub const RUNTIME_DATASTORE_QUERY_NOT_NUMERIC: &str = "SUTRA.RUNTIME.DATASTORE.QUERY_NOT_NUMERIC";

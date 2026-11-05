@@ -157,7 +157,7 @@ impl GcpPubSubChannels {
             .iter()
             .filter(|d| d.transport.as_deref() == Some(TRANSPORT) && !d.is_outbound())
         {
-            let props = match GcpPubSubChannelProperties::for_wiring(def) {
+            let props = match GcpPubSubChannelProperties::resolved(def, state.ctx.resolver) {
                 Ok(props) => props,
                 Err(d) => {
                     warn!(
@@ -274,7 +274,7 @@ fn build_and_start_consumer(
 ) -> Result<Option<(ConsumerKey, RunningConsumer)>, Diagnostic> {
     let channel = definition.binding.channel_name.clone();
     let tenant = definition.binding.tenant().to_string();
-    let properties = GcpPubSubChannelProperties::for_wiring(definition)?;
+    let properties = GcpPubSubChannelProperties::resolved(definition, ctx.resolver)?;
     let fingerprint = properties.clone();
 
     let singleton = properties.singleton;
@@ -505,7 +505,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod connection_reference_guard {
+mod connection_references {
     use super::spawn_gcp_pubsub_channels_with_intake;
     use crate::gcp_pubsub::GcpPubSubChannelProperties;
     use std::sync::Arc;
@@ -521,13 +521,23 @@ mod connection_reference_guard {
         }
     }
 
-    fn resolver(_reference: &str) -> Result<String, String> {
-        panic!("the guard runs before anything is resolved");
+    /// Stands in for the engine's registry: the listed references resolve and any other does not.
+    fn resolver(reference: &str) -> Result<String, String> {
+        match reference {
+            "${PROJECT}" => Ok("resolved-project".to_string()),
+            "env:SUBSCRIPTION" => Ok("resolved-sub".to_string()),
+            "secret:topic" => Ok("resolved-topic".to_string()),
+            "${ENDPOINT}" => Ok("emulator.test:8085".to_string()),
+            r if r.contains("${") || r.starts_with("env:") || r.starts_with("secret:") => {
+                Err(format!("{r} is not set"))
+            }
+            literal => Ok(literal.to_string()),
+        }
     }
 
-    /// A valid inbound definition, with `extra` on top and `reference` set to a `${…}` value.
-    fn definition(extra: &[(&str, &str)], reference: Option<&str>) -> ChannelDefinition {
-        let mut properties: std::collections::BTreeMap<String, String> = [
+    /// A valid inbound definition with `extra` on top.
+    fn definition(extra: &[(&str, &str)]) -> ChannelDefinition {
+        let properties: std::collections::BTreeMap<String, String> = [
             ("project-id", "p1"),
             ("subscription", "s1"),
             ("topic", "t1"),
@@ -537,9 +547,6 @@ mod connection_reference_guard {
         .chain(extra.iter().copied())
         .map(|(key, value)| (key.to_string(), value.to_string()))
         .collect();
-        if let Some(key) = reference {
-            properties.insert(key.to_string(), "${CHANNEL_SETTING}".to_string());
-        }
         ChannelDefinition {
             binding: ChannelBinding::new(
                 "orders-in",
@@ -559,38 +566,83 @@ mod connection_reference_guard {
     }
 
     #[test]
-    fn wiring_refuses_a_reference_in_each_connection_property() {
+    fn references_reach_the_client_configuration() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let channels = spawn_gcp_pubsub_channels_with_intake(
+            &[definition(&[
+                ("project-id", "${PROJECT}"),
+                ("subscription", "env:SUBSCRIPTION"),
+                ("topic", "secret:topic"),
+                ("endpoint-override", "${ENDPOINT}"),
+            ])],
+            Arc::new(NoIntake),
+            None,
+            resolver,
+            runtime.handle().clone(),
+        )
+        .unwrap_or_else(|d| panic!("{}", d.message));
+        assert_eq!(channels.consumer_count(), 1);
+        let state = channels.inner.as_ref().expect("wired");
+        let running = state.running.lock().expect("registry");
+        let props = &running.values().next().expect("one consumer").fingerprint;
+        assert_eq!(
+            props.subscription_path(),
+            "projects/resolved-project/subscriptions/resolved-sub"
+        );
+        assert_eq!(props.topic, "resolved-topic");
+        let client = crate::gcp_pubsub::build_client_config(
+            &props.project_id,
+            props.endpoint_override.as_deref(),
+        );
+        assert_eq!(client.project_id.as_deref(), Some("resolved-project"));
+        assert!(
+            matches!(
+                &client.environment,
+                google_cloud_gax::conn::Environment::Emulator(host) if host == "emulator.test:8085"
+            ),
+            "the override selects the emulator"
+        );
+    }
+
+    #[test]
+    fn an_unresolved_reference_fails_wiring_with_the_code() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .build()
             .expect("runtime");
         for key in ["project-id", "subscription", "topic", "endpoint-override"] {
-            let def = definition(&[], Some(key));
-            let Err(err) = spawn_gcp_pubsub_channels_with_intake(
-                &[def],
-                Arc::new(NoIntake),
-                None,
-                resolver,
-                runtime.handle().clone(),
-            ) else {
-                panic!("a reference in '{key}' must not wire");
-            };
-            assert_eq!(
-                err.code, "SUTRA.INBOUND.GCP_PUBSUB.CONFIG_INVALID",
-                "for {key}"
-            );
-            assert!(err.message.contains("orders-in"), "{}", err.message);
-            assert!(err.message.contains(&format!("'{key}'")), "{}", err.message);
-            assert!(err.message.contains("later release"), "{}", err.message);
-            assert!(!err.message.contains("CHANNEL_SETTING"), "{}", err.message);
+            for unresolved in [
+                "${UNSET_SETTING}",
+                "env:UNSET_SETTING",
+                "secret:unset-setting",
+            ] {
+                let def = definition(&[(key, unresolved)]);
+                let Err(err) = spawn_gcp_pubsub_channels_with_intake(
+                    &[def],
+                    Arc::new(NoIntake),
+                    None,
+                    resolver,
+                    runtime.handle().clone(),
+                ) else {
+                    panic!("an unresolved reference in '{key}' must not wire");
+                };
+                assert_eq!(
+                    err.code, "SUTRA.INBOUND.GCP_PUBSUB.CONFIG_INVALID",
+                    "for {key}"
+                );
+                assert!(err.message.contains("orders-in"), "{}", err.message);
+                assert!(err.message.contains(&format!("'{key}'")), "{}", err.message);
+            }
         }
     }
 
     #[test]
     fn a_literal_connection_property_is_unaffected() {
-        let literal = GcpPubSubChannelProperties::for_wiring(&definition(&[], None))
+        let literal = GcpPubSubChannelProperties::resolved(&definition(&[]), resolver)
             .expect("literal values wire");
-        let plain = GcpPubSubChannelProperties::from_definition(&definition(&[], None))
-            .expect("plain parse");
+        let plain =
+            GcpPubSubChannelProperties::from_definition(&definition(&[])).expect("plain parse");
         assert_eq!(literal, plain);
     }
 }

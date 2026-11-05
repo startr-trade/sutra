@@ -55,44 +55,4 @@ earlier versions wrote nothing.
 
 ## References in connection properties
 
-An inbound `aws-sqs` channel now resolves `${NAME}`, `${NAME:default}`, `env:NAME` and `secret:` references in
-`region`, `queue.url`, `endpoint-override`, `wait-time-seconds`, `max-messages` and `visibility-timeout-seconds`.
-Earlier versions read them as written and polled a queue literally named `${...}`, retrying forever. An
-unresolved reference now stops the channel at wiring with `SUTRA.INBOUND.AWS_SQS.CONFIG_INVALID`, naming the
-property.
-
-An illustrative channel (the keys match the SQS transport's properties; adjust the names and add your codec):
-
-```yaml
-channels:
-  - name: notes-in
-    transport: aws-sqs
-    region: "${AWS_REGION:eu-west-1}"
-    queue.url: "${NOTES_QUEUE_URL}"
-    ack-mode: on-persist
-```
-
-**Only `aws-sqs` expands references in connection properties.** The other transports do not yet, so in 0.6.18 a
-value containing `${` in one of the properties below is refused when the channel is wired, with that transport's
-`CONFIG_INVALID` code (`SUTRA.INBOUND.KAFKA.CONFIG_INVALID`, for example). The message names the channel and the
-property and says references there arrive in a later release; it does not repeat the value. Use literal values.
-
-| Transport | Properties that refuse `${` | Code |
-|---|---|---|
-| `kafka` | `bootstrap.servers`, `topic`, `group.id` | `SUTRA.INBOUND.KAFKA.CONFIG_INVALID` |
-| `rabbitmq` | `host`, `port`, `virtual-host`, `queue`, `exchange` | `SUTRA.INBOUND.RABBITMQ.CONFIG_INVALID` |
-| `amqp` | `host`, `port`, `queue`, `topic` | `SUTRA.INBOUND.AMQP.CONFIG_INVALID` |
-| `gcp-pubsub` | `project-id`, `subscription`, `topic`, `endpoint-override` | `SUTRA.INBOUND.GCP_PUBSUB.CONFIG_INVALID` |
-| `file` | `spool.dir`, `directory` | `SUTRA.INBOUND.FILE.CONFIG_INVALID` |
-
-What happens on refusal:
-
-- At boot the engine does not start.
-- On an activation in a running engine, the activation succeeds, that channel's consumer does not run, and the
-  code is logged as a WARN. `aws-sqs` behaves the same way for an unresolved reference.
-- This can stop a channel that ran before. Earlier versions used the text as a literal name. A Kafka `group.id`
-  of `${NAME}` consumed under a group literally named that; a file `spool.dir` polled a directory with that name;
-  an AMQP `queue` attached to that name. A new literal `group.id` is a new consumer group, so it starts from
-  `auto.offset.reset` (default `earliest`), not from the old group's offsets.
-- Only `${` is detected. `env:NAME` and `secret:` forms in these properties are still read as written.
-- Credentials, `inbound-auth` and outbound `bind` resolve references as before.
+Since 0.6.19 every inbound transport expands them: see [References in connection properties](connection-references.md). Version 0.6.18 refused `${` on all but `aws-sqs`.

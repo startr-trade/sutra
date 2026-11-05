@@ -128,7 +128,7 @@ impl FileChannels {
             .iter()
             .filter(|d| d.transport.as_deref() == Some(TRANSPORT) && !d.is_outbound())
         {
-            let props = match FileChannelProperties::for_wiring(def) {
+            let props = match FileChannelProperties::resolved(def, state.ctx.resolver) {
                 Ok(props) => props,
                 Err(d) => {
                     warn!(
@@ -255,7 +255,7 @@ fn build_and_start_consumer(
 ) -> Result<Option<(ConsumerKey, RunningConsumer)>, Diagnostic> {
     let channel = definition.binding.channel_name.clone();
     let tenant = definition.binding.tenant().to_string();
-    let properties = FileChannelProperties::for_wiring(definition)?;
+    let properties = FileChannelProperties::resolved(definition, ctx.resolver)?;
     let fingerprint = properties.clone();
 
     let singleton = properties.singleton;
@@ -476,7 +476,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod connection_reference_guard {
+mod connection_references {
     use super::spawn_file_channels_with_intake;
     use crate::file::FileChannelProperties;
     use std::sync::Arc;
@@ -492,21 +492,25 @@ mod connection_reference_guard {
         }
     }
 
-    fn resolver(_reference: &str) -> Result<String, String> {
-        panic!("the guard runs before anything is resolved");
+    /// Stands in for the engine's registry: the listed references resolve and any other does not.
+    fn resolver(reference: &str) -> Result<String, String> {
+        match reference {
+            "${SPOOL}" => Ok("/data/resolved".to_string()),
+            "env:SPOOL" => Ok("/data/resolved-env".to_string()),
+            r if r.contains("${") || r.starts_with("env:") || r.starts_with("secret:") => {
+                Err(format!("{r} is not set"))
+            }
+            literal => Ok(literal.to_string()),
+        }
     }
 
-    /// A valid inbound definition, with `extra` on top and `reference` set to a `${…}` value.
-    fn definition(extra: &[(&str, &str)], reference: Option<&str>) -> ChannelDefinition {
-        let mut properties: std::collections::BTreeMap<String, String> =
-            [("spool.dir", "/data/in")]
-                .into_iter()
-                .chain(extra.iter().copied())
-                .map(|(key, value)| (key.to_string(), value.to_string()))
-                .collect();
-        if let Some(key) = reference {
-            properties.insert(key.to_string(), "${CHANNEL_SETTING}".to_string());
-        }
+    /// A valid inbound definition with `extra` on top.
+    fn definition(extra: &[(&str, &str)]) -> ChannelDefinition {
+        let properties: std::collections::BTreeMap<String, String> = [("spool.dir", "/data/in")]
+            .into_iter()
+            .chain(extra.iter().copied())
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect();
         ChannelDefinition {
             binding: ChannelBinding::new(
                 "orders-in",
@@ -526,35 +530,58 @@ mod connection_reference_guard {
     }
 
     #[test]
-    fn wiring_refuses_a_reference_in_each_connection_property() {
+    fn references_reach_the_client_configuration() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .build()
             .expect("runtime");
-        for key in ["spool.dir", "directory"] {
-            let def = definition(&[], Some(key));
-            let Err(err) = spawn_file_channels_with_intake(
-                &[def],
-                Arc::new(NoIntake),
-                None,
-                resolver,
-                runtime.handle().clone(),
-            ) else {
-                panic!("a reference in '{key}' must not wire");
-            };
-            assert_eq!(err.code, "SUTRA.INBOUND.FILE.CONFIG_INVALID", "for {key}");
-            assert!(err.message.contains("orders-in"), "{}", err.message);
-            assert!(err.message.contains(&format!("'{key}'")), "{}", err.message);
-            assert!(err.message.contains("later release"), "{}", err.message);
-            assert!(!err.message.contains("CHANNEL_SETTING"), "{}", err.message);
+        let channels = spawn_file_channels_with_intake(
+            &[definition(&[("spool.dir", "${SPOOL}")])],
+            Arc::new(NoIntake),
+            None,
+            resolver,
+            runtime.handle().clone(),
+        )
+        .unwrap_or_else(|d| panic!("{}", d.message));
+        assert_eq!(channels.consumer_count(), 1);
+        let state = channels.inner.as_ref().expect("wired");
+        let running = state.running.lock().expect("registry");
+        let props = &running.values().next().expect("one consumer").fingerprint;
+        assert_eq!(props.spool_dir, std::path::PathBuf::from("/data/resolved"));
+    }
+
+    #[test]
+    fn an_unresolved_reference_fails_wiring_with_the_code() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        for key in ["spool.dir"] {
+            for unresolved in [
+                "${UNSET_SETTING}",
+                "env:UNSET_SETTING",
+                "secret:unset-setting",
+            ] {
+                let def = definition(&[(key, unresolved)]);
+                let Err(err) = spawn_file_channels_with_intake(
+                    &[def],
+                    Arc::new(NoIntake),
+                    None,
+                    resolver,
+                    runtime.handle().clone(),
+                ) else {
+                    panic!("an unresolved reference in '{key}' must not wire");
+                };
+                assert_eq!(err.code, "SUTRA.INBOUND.FILE.CONFIG_INVALID", "for {key}");
+                assert!(err.message.contains("orders-in"), "{}", err.message);
+                assert!(err.message.contains(&format!("'{key}'")), "{}", err.message);
+            }
         }
     }
 
     #[test]
     fn a_literal_connection_property_is_unaffected() {
-        let literal =
-            FileChannelProperties::for_wiring(&definition(&[], None)).expect("literal values wire");
-        let plain =
-            FileChannelProperties::from_definition(&definition(&[], None)).expect("plain parse");
+        let literal = FileChannelProperties::resolved(&definition(&[]), resolver)
+            .expect("literal values wire");
+        let plain = FileChannelProperties::from_definition(&definition(&[])).expect("plain parse");
         assert_eq!(literal, plain);
     }
 }

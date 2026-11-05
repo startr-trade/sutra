@@ -993,3 +993,87 @@ fn q_receipt_attribute_needs_a_name_and_an_expression() {
     let e = receipt_attributes(r#"<q:receipt><q:attribute name="x"/></q:receipt>"#).unwrap_err();
     assert_eq!(e.code, "SUTRA.PARSE.Q_RECEIPT_ATTRIBUTE_MISSING_EXPRESSION");
 }
+
+// ===== <q:decode> =====
+
+fn decode_task(task: &str) -> Result<ProcessModule, SutraError> {
+    load(&format!(
+        r#"<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                             xmlns:q="urn:sutra:q:1.0" targetNamespace="urn:t">
+             <bpmn:process id="p1">
+               <bpmn:startEvent id="S"/>
+               {task}
+               <bpmn:endEvent id="E"/>
+               <bpmn:sequenceFlow id="f1" sourceRef="S" targetRef="T"/>
+               <bpmn:sequenceFlow id="f2" sourceRef="T" targetRef="E"/>
+             </bpmn:process>
+           </bpmn:definitions>"#
+    ))
+}
+
+#[test]
+fn q_decode_parses_attributes_and_is_a_data_task() {
+    let module = decode_task(
+        r#"<bpmn:serviceTask id="T">
+             <bpmn:extensionElements>
+               <q:decode name="message" expression="row.body" codec="json"
+                         contentType="row.contentType">
+                 <q:redactors><q:redactor ref="card"/></q:redactors>
+               </q:decode>
+               <q:decode name="second" expression="other" codec="urn:note"/>
+             </bpmn:extensionElements>
+           </bpmn:serviceTask>"#,
+    )
+    .unwrap();
+    let process = module.process("p1").unwrap();
+    let sutra_bpmn::Node::DataTask { data_mapping, .. } = process.node("T").unwrap() else {
+        panic!("a decode with no @implementation is a data task");
+    };
+    let first = &data_mapping.message_decodes[0];
+    assert_eq!(first.name, "message");
+    assert_eq!(first.expression, "row.body");
+    assert_eq!(first.codec, "json");
+    assert_eq!(
+        first.content_type_expression.as_deref(),
+        Some("row.contentType")
+    );
+    assert_eq!(first.redactors, vec!["card".to_string()]);
+    assert_eq!(
+        data_mapping.message_decodes[1].content_type_expression,
+        None
+    );
+    assert!(data_mapping.message_decodes[1].redactors.is_empty());
+    assert!(data_mapping.has_store_ops());
+}
+
+#[test]
+fn q_decode_needs_a_name_an_expression_and_a_codec() {
+    for decode in [
+        r#"<q:decode expression="x" codec="json"/>"#,
+        r#"<q:decode name="x" codec="json"/>"#,
+        r#"<q:decode name="x" expression="x"/>"#,
+    ] {
+        let e = decode_task(&format!(
+            r#"<bpmn:serviceTask id="T"><bpmn:extensionElements>{decode}</bpmn:extensionElements></bpmn:serviceTask>"#
+        ))
+        .unwrap_err();
+        assert_eq!(e.code, codes::PARSE_Q_DECODE_INCOMPLETE, "{decode}");
+    }
+}
+
+#[test]
+fn q_decode_on_implementation_task_is_refused() {
+    let decode = r#"<bpmn:extensionElements>
+        <q:decode name="m" expression="x" codec="json"/>
+      </bpmn:extensionElements>"#;
+    for task in [
+        format!(
+            r#"<bpmn:serviceTask id="T" implementation="render.hbs">{decode}</bpmn:serviceTask>"#
+        ),
+        format!(r#"<bpmn:scriptTask id="T">{decode}</bpmn:scriptTask>"#),
+        format!(r#"<bpmn:receiveTask id="T">{decode}</bpmn:receiveTask>"#),
+    ] {
+        let e = decode_task(&task).unwrap_err();
+        assert_eq!(e.code, codes::PARSE_Q_DECODE_NOT_ON_DATA_TASK, "{task}");
+    }
+}

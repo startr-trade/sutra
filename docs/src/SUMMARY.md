@@ -54,6 +54,7 @@
 - [Configuration reference](operating/configuration.md)
 - [Acknowledgement modes](operating/ack-modes.md)
 - [Refused deliveries and connection references](operating/inbound-refusals.md)
+- [References in connection properties](operating/connection-references.md)
 - [Tuning for throughput](operating/throughput-tuning.md)
 - [Limits and quotas](operating/limits.md)
 - [Capacity pools and sessions](operating/capacity-pools.md)
@@ -62,6 +63,7 @@
 - [Logging and audit](operating/logging.md)
 - [Troubleshooting BPMN solutions](operating/troubleshooting.md)
 - [Upgrading to 0.6.18](operating/upgrading-0-6-18.md)
+- [Upgrading to 0.6.19](operating/upgrading-0-6-19.md)
 
 # Reference
 

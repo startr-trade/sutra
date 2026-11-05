@@ -1,0 +1,8 @@
+# Deployment package for the raw-message conformance suite: keep a message as text in a typed store
+# column, and read it back decoded. Labels are opaque selectors.
+labels:
+  "tenant": "default"
+  "module": "rawmsg"
+  "version": "1.0.0"
+engine:
+  minContract: 1

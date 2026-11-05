@@ -238,6 +238,9 @@ pub struct DataMapping {
     pub inputs: Vec<String>,
     pub outputs: Vec<String>,
     pub store_reads: Vec<StoreRead>,
+    /// `<q:decode>` steps of a data task, in document order. They run after the store reads and
+    /// before the assignments.
+    pub message_decodes: Vec<crate::qbindings::MessageDecodeBinding>,
     pub assignments: Vec<Assignment>,
     pub store_writes: Vec<StoreWrite>,
 }
@@ -248,6 +251,7 @@ impl DataMapping {
         self.inputs.is_empty()
             && self.outputs.is_empty()
             && self.store_reads.is_empty()
+            && self.message_decodes.is_empty()
             && self.assignments.is_empty()
             && self.store_writes.is_empty()
     }
@@ -255,6 +259,7 @@ impl DataMapping {
     /// True when the mapping carries data-store work — i.e. it describes a declarative data task.
     pub fn has_store_ops(&self) -> bool {
         !self.store_reads.is_empty()
+            || !self.message_decodes.is_empty()
             || !self.assignments.is_empty()
             || !self.store_writes.is_empty()
     }

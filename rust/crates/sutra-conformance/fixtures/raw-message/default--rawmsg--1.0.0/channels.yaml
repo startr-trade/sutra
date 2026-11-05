@@ -1,0 +1,47 @@
+# Channels for the raw-message package.
+#
+#   message-in   Any format. Starts `capture`, keyed by the X-Message-Id header.
+#   message-read Starts `retrieve`: read the row, decode it, render a summary.
+#   held-in      JSON, with a redactor. Starts `held`, which captures, parks, then decodes.
+#   held-go      Answers the wait of `held`, correlated on the ref.
+channels:
+  - name: message-in
+    transport: http
+    bind: "POST /channels/message-in"
+    idempotency-key-header: X-Message-Id
+    cloudevents-mode: none
+    auth:
+      scheme: apikey
+      apikey:
+        value: env:RAW_MESSAGE_API_KEY
+        header: X-Api-Key
+  - name: message-read
+    transport: http
+    bind: "POST /channels/message-read"
+    codec: json
+    cloudevents-mode: none
+    auth:
+      scheme: apikey
+      apikey:
+        value: env:RAW_MESSAGE_API_KEY
+        header: X-Api-Key
+  - name: held-in
+    transport: http
+    bind: "POST /channels/held-in"
+    codec: json
+    cloudevents-mode: none
+    auth:
+      scheme: apikey
+      apikey:
+        value: env:RAW_MESSAGE_API_KEY
+        header: X-Api-Key
+  - name: held-go
+    transport: http
+    bind: "POST /channels/held-go"
+    codec: json
+    cloudevents-mode: none
+    auth:
+      scheme: apikey
+      apikey:
+        value: env:RAW_MESSAGE_API_KEY
+        header: X-Api-Key

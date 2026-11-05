@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Read the row, decode its text by its own content type, and answer from the decoded fields. -->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0"
+                  id="Definitions_retrieve"
+                  targetNamespace="urn:sutra:module:rawmsg:1.0.0">
+  <bpmn:error id="undecodable" errorCode="SUTRA.RUNTIME.DECODE.FAILED"/>
+  <bpmn:dataStore id="messagesStore" name="messages"/>
+  <bpmn:process id="retrieve" isExecutable="true">
+    <bpmn:extensionElements>
+      <q:variables>
+        <q:variable name="row" type="object"/>
+        <q:variable name="message" type="object"/>
+      </q:variables>
+    </bpmn:extensionElements>
+    <bpmn:dataStoreReference id="refRead" dataStoreRef="messagesStore">
+      <bpmn:extensionElements><q:store key="req.id"/></bpmn:extensionElements>
+    </bpmn:dataStoreReference>
+    <bpmn:startEvent id="Start">
+      <bpmn:extensionElements><q:source channel="message-read" name="req"/></bpmn:extensionElements>
+    </bpmn:startEvent>
+    <bpmn:serviceTask id="Load" name="Read and decode">
+      <bpmn:extensionElements>
+        <q:decode name="message" expression="row.body" codec="json" contentType="row.contentType"/>
+      </bpmn:extensionElements>
+      <bpmn:dataInputAssociation>
+        <bpmn:sourceRef>refRead</bpmn:sourceRef><bpmn:targetRef>row</bpmn:targetRef>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:boundaryEvent id="BadText" attachedToRef="Load">
+      <bpmn:errorEventDefinition errorRef="undecodable"/>
+    </bpmn:boundaryEvent>
+    <bpmn:serviceTask id="Answer" implementation="summary.hbs">
+      <bpmn:extensionElements><q:reply mode="native" contentType="application/json"/></bpmn:extensionElements>
+    </bpmn:serviceTask>
+    <bpmn:serviceTask id="AnswerBad" implementation="undecodable.hbs">
+      <bpmn:extensionElements><q:reply mode="native" contentType="application/json"/></bpmn:extensionElements>
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="Done"/>
+    <bpmn:endEvent id="DoneBad"/>
+    <bpmn:sequenceFlow id="F1" sourceRef="Start" targetRef="Load"/>
+    <bpmn:sequenceFlow id="F2" sourceRef="Load" targetRef="Answer"/>
+    <bpmn:sequenceFlow id="F3" sourceRef="Answer" targetRef="Done"/>
+    <bpmn:sequenceFlow id="F4" sourceRef="BadText" targetRef="AnswerBad"/>
+    <bpmn:sequenceFlow id="F5" sourceRef="AnswerBad" targetRef="DoneBad"/>
+  </bpmn:process>
+</bpmn:definitions>

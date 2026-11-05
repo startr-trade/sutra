@@ -331,6 +331,37 @@ fn assert_message_masked(views: &MessageViews) {
 }
 
 #[test]
+fn invalid_utf8_sets_body_lossy_valid_utf8_does_not() {
+    let bpmn = masking_flow("", "");
+    let event_of = |body: &[u8]| {
+        let h = build_harness(&bpmn, "raw-bytes", |_, _| {});
+        let message = inbound("orders-in", body, "application/octet-stream");
+        drive(h.engine.dispatch(&message)).expect("dispatch succeeds");
+        captured_var(&h, "event").expect("event")
+    };
+    let clean = event_of("caf\u{e9} \u{1f600}".as_bytes());
+    assert_eq!(
+        field(&clean, "body"),
+        FeelValue::String("caf\u{e9} \u{1f600}".to_string()),
+        "valid UTF-8 round-trips exactly"
+    );
+    let FeelValue::Map(clean) = clean else {
+        panic!("event is a map");
+    };
+    assert!(
+        !clean.contains_key("bodyLossy"),
+        "no key on a clean message"
+    );
+
+    let lossy = event_of(&[b'o', b'k', 0xFF]);
+    assert_eq!(
+        field(&lossy, "body"),
+        FeelValue::String("ok\u{fffd}".to_string())
+    );
+    assert_eq!(field(&lossy, "bodyLossy"), FeelValue::Boolean(true));
+}
+
+#[test]
 fn a_redactor_masks_the_body_and_every_header() {
     assert_message_masked(&message_views(&masking_flow(
         "",

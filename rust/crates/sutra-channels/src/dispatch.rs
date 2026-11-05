@@ -6666,7 +6666,8 @@ fn correlation_for(
 
 /// The initial-variable map — the projected `event` sub-map. `event.body`
 /// is a (lossy) UTF-8 string: `FeelValue` has no bytes variant, and every text-wire flow
-/// reads it verbatim.
+/// reads it verbatim. `event.bodyLossy` is present, and true, only when the conversion replaced
+/// bytes, so a flow can route such a message away; a clean message has no such key.
 fn project_variables(message: &InboundMessage) -> Variables {
     let mut event = BTreeMap::new();
     event.insert(
@@ -6677,10 +6678,11 @@ fn project_variables(message: &InboundMessage) -> Variables {
         "contentType".to_string(),
         FeelValue::String(message.content_type.clone().unwrap_or_default()),
     );
-    event.insert(
-        "body".to_string(),
-        FeelValue::String(String::from_utf8_lossy(&message.body).into_owned()),
-    );
+    let body = String::from_utf8_lossy(&message.body);
+    if matches!(body, std::borrow::Cow::Owned(_)) {
+        event.insert("bodyLossy".to_string(), FeelValue::Boolean(true));
+    }
+    event.insert("body".to_string(), FeelValue::String(body.into_owned()));
     event.insert(
         "headers".to_string(),
         FeelValue::Map(
@@ -7299,6 +7301,60 @@ mod event_gateway_race_tests {
             resolved.len(),
             arms.len(),
             "the retirement list is exactly the arm set"
+        );
+    }
+}
+
+#[cfg(test)]
+mod channel_call_reply_event_tests {
+    use super::*;
+
+    fn wait_flow(mapping: &str) -> ProcessDefinition {
+        let xml = format!(
+            r#"<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:q="urn:sutra:q:1.0">
+                 <bpmn:process id="p">
+                   <bpmn:startEvent id="S"/>
+                   <bpmn:serviceTask id="Call" implementation="channel:out"><bpmn:extensionElements><q:timeout duration="PT5S"/></bpmn:extensionElements>{mapping}</bpmn:serviceTask>
+                   <bpmn:endEvent id="E"/>
+                   <bpmn:sequenceFlow id="f1" sourceRef="S" targetRef="Call"/>
+                   <bpmn:sequenceFlow id="f2" sourceRef="Call" targetRef="E"/>
+                 </bpmn:process>
+               </bpmn:definitions>"#
+        );
+        let module = sutra_bpmn::BpmnModelLoader::new()
+            .load(xml.as_bytes())
+            .expect("loads");
+        module.process("p").expect("process").clone()
+    }
+
+    /// A synchronous channel-call reply replaces `event` unless the task declares an output
+    /// mapping, so a flow keeping the original message captures it on the step after the intake.
+    #[test]
+    fn channel_call_reply_event_visibility() {
+        let mut reply = Variables::new();
+        reply.insert("event", FeelValue::String("the reply".to_string()));
+        reply.insert("answer", FeelValue::String("yes".to_string()));
+
+        let unmapped = wait_flow("");
+        assert!(
+            channel_call_output_mapping(&unmapped, "Call", &reply)
+                .expect("no mapping")
+                .is_none(),
+            "no mapping merges the whole reply, event included"
+        );
+
+        let mapped = wait_flow(
+            r#"<bpmn:dataOutputAssociation>
+                 <bpmn:assignment><bpmn:from>answer</bpmn:from><bpmn:to>kept</bpmn:to></bpmn:assignment>
+               </bpmn:dataOutputAssociation>"#,
+        );
+        let kept = channel_call_output_mapping(&mapped, "Call", &reply)
+            .expect("maps")
+            .expect("a mapping");
+        assert!(kept.get("event").is_none(), "a mapping leaves event alone");
+        assert_eq!(
+            kept.get("kept"),
+            Some(&FeelValue::String("yes".to_string()))
         );
     }
 }

@@ -122,24 +122,26 @@ pub struct GcpPubSubChannelProperties {
     pub singleton: bool,
 }
 
-/// The connection properties this transport reads as written. A `${` in one is refused at wiring
-/// rather than taken as a literal name. Credentials and `inbound-auth` resolve separately.
-const UNEXPANDED_PROPERTIES: [&str; 4] =
+/// The connection properties that may be an environment or secret reference. Credentials and
+/// `inbound-auth` resolve separately, later in the wiring.
+const REFERENCE_PROPERTIES: [&str; 4] =
     ["project-id", "subscription", "topic", "endpoint-override"];
 
 impl GcpPubSubChannelProperties {
-    /// [`Self::from_definition`] behind the refusal of a reference in a connection property
-    /// ([`codes::INBOUND_CONFIG_INVALID`]). This is what the wiring runs on, checked first so a
-    /// reference is reported as such and not as a value of the wrong shape.
-    pub(crate) fn for_wiring(
+    /// [`Self::from_definition`] with `${NAME}`, `${NAME:default}`, `env:NAME` and `secret:` style
+    /// references in the connection properties resolved first. This is what the wiring runs on: an
+    /// unresolved reference is [`codes::INBOUND_CONFIG_INVALID`] and the channel does not start.
+    pub fn resolved(
         def: &ChannelDefinition,
+        resolver: sutra_transport_spi::EnvRefResolver,
     ) -> Result<GcpPubSubChannelProperties, Diagnostic> {
-        sutra_transport_spi::refuse_unexpanded_references(
+        let resolved = sutra_transport_spi::resolve_channel_properties(
             def,
-            &UNEXPANDED_PROPERTIES,
+            &REFERENCE_PROPERTIES,
             codes::INBOUND_CONFIG_INVALID,
+            resolver,
         )?;
-        GcpPubSubChannelProperties::from_definition(def)
+        GcpPubSubChannelProperties::from_definition(&resolved)
     }
 
     pub const DEFAULT_MAX_OUTSTANDING_MESSAGES: i64 = 1_000;

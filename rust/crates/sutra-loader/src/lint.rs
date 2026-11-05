@@ -538,6 +538,7 @@ pub fn validate_deployment_with_manifests(
     out.extend(timer_expression_name_faults(deployment, &dep_label));
     check_template_inputs(deployment, &definitions, &dep_label, out);
     check_transient_reads(deployment, &dep_label, out);
+    check_message_decodes(deployment, &dep_label, out);
     check_raw_body_masking(deployment, &dep_label, out);
     check_never_initialized(deployment, &dep_label, out);
     for found in unrecognised_dedup_keys(deployment) {
@@ -3972,6 +3973,18 @@ fn push_data_mapping_sites(
             write.key_expression.clone(),
         ));
     }
+    for decode in &mapping.message_decodes {
+        sites.push((
+            format!("<q:decode> '{}' expression", decode.name),
+            decode.expression.clone(),
+        ));
+        if let Some(content_type) = &decode.content_type_expression {
+            sites.push((
+                format!("<q:decode> '{}' contentType", decode.name),
+                content_type.clone(),
+            ));
+        }
+    }
 }
 
 /// Apply `f` to every sequence flow of `process` and, recursively, of its embedded /
@@ -4359,6 +4372,9 @@ fn own_roots(process: &ProcessDefinition) -> BTreeSet<String> {
             for read in &mapping.store_reads {
                 roots.insert(read.target_var.clone());
             }
+            for decode in &mapping.message_decodes {
+                roots.insert(decode.name.clone());
+            }
             for assignment in &mapping.assignments {
                 roots.insert(assignment.target_var.clone());
             }
@@ -4474,6 +4490,282 @@ fn nodes_after_wait(process: &ProcessDefinition) -> BTreeSet<String> {
     after
 }
 
+fn check_raw_body_masking(
+    deployment: &LoadedDeployment,
+    dep_label: &str,
+    out: &mut Vec<LintDiagnostic>,
+) {
+    let mut seen = BTreeSet::new();
+    let mut flows: Vec<RawBodyFlow<'_>> = Vec::new();
+    for module in deployment.processes.values() {
+        for process in module.processes() {
+            if seen.insert(process.id.clone()) {
+                flows.push(RawBodyFlow::of(process));
+            }
+        }
+    }
+    if !flows.iter().any(|flow| flow.declares_masking) {
+        return;
+    }
+
+    // Stored raw text follows the store's name, so a retrieval flow with no redactors of its own is
+    // still covered. Other packages reading the same database are not seen.
+    let mut tainted_stores: BTreeSet<String> = BTreeSet::new();
+    loop {
+        let before = tainted_stores.len();
+        for flow in &mut flows {
+            flow.spread(&tainted_stores);
+            for (_, write) in &flow.writes {
+                if flow.tainted.contains(&write.value_var) {
+                    tainted_stores.insert(write.store.clone());
+                }
+            }
+        }
+        if tainted_stores.len() == before {
+            break;
+        }
+    }
+    for flow in &flows {
+        flow.report(dep_label, out);
+    }
+}
+
+/// One process's view for the raw-body check. Taint starts at an assignment reading `event.body` or
+/// `event` whole in a process that declares masking, and spreads through assignments and through
+/// store writes and reads to a fixpoint. `<q:alias>` and `<q:param>` are not sources. A `<q:decode>`
+/// does not spread it: its target is a parsed message, masked by its own rule, and not raw text.
+struct RawBodyFlow<'p> {
+    process: &'p ProcessDefinition,
+    sensitive: BTreeSet<&'p str>,
+    declares_masking: bool,
+    assignments: Vec<(String, sutra_bpmn::model::Assignment)>,
+    reads: Vec<(String, sutra_bpmn::model::StoreRead)>,
+    writes: Vec<(String, sutra_bpmn::model::StoreWrite)>,
+    decodes: Vec<(String, sutra_bpmn::qbindings::MessageDecodeBinding)>,
+    tainted: BTreeSet<String>,
+}
+
+impl<'p> RawBodyFlow<'p> {
+    fn of(process: &'p ProcessDefinition) -> RawBodyFlow<'p> {
+        let sensitive: BTreeSet<&str> = process
+            .declared_variables
+            .iter()
+            .filter(|d| d.sensitive)
+            .map(|d| d.name.as_str())
+            .collect();
+        let mut flow = RawBodyFlow {
+            process,
+            sensitive,
+            declares_masking: false,
+            assignments: Vec::new(),
+            reads: Vec::new(),
+            writes: Vec::new(),
+            decodes: Vec::new(),
+            tainted: BTreeSet::new(),
+        };
+        visit_nodes(process, &mut |owner, node| {
+            flow.declares_masking |= owner
+                .bindings_for(node.id())
+                .sources
+                .iter()
+                .any(|s| !s.redactors.is_empty() || flow.sensitive.contains(s.name.as_str()));
+            let mapping = match node {
+                Node::ServiceTask { data_mapping, .. } | Node::DataTask { data_mapping, .. } => {
+                    data_mapping
+                }
+                _ => return,
+            };
+            let id = node.id().to_string();
+            flow.assignments
+                .extend(mapping.assignments.iter().map(|a| (id.clone(), a.clone())));
+            flow.reads
+                .extend(mapping.store_reads.iter().map(|r| (id.clone(), r.clone())));
+            flow.writes
+                .extend(mapping.store_writes.iter().map(|w| (id.clone(), w.clone())));
+            flow.decodes.extend(
+                mapping
+                    .message_decodes
+                    .iter()
+                    .map(|d| (id.clone(), d.clone())),
+            );
+        });
+        flow
+    }
+
+    /// True when `expression` reads the raw message or a tainted variable.
+    fn reads_raw(&self, expression: &str) -> bool {
+        let Ok(paths) = sutra_feel::expressions::paths(expression) else {
+            return false;
+        };
+        paths.iter().any(|path| {
+            let dotted = path.dotted();
+            (self.declares_masking && (dotted == "event" || dotted == "event.body"))
+                || self.tainted.contains(path.root())
+        })
+    }
+
+    fn spread(&mut self, tainted_stores: &BTreeSet<String>) {
+        for (_, read) in &self.reads {
+            if tainted_stores.contains(&read.store) {
+                self.tainted.insert(read.target_var.clone());
+            }
+        }
+        loop {
+            let before = self.tainted.len();
+            let raw: Vec<String> = self
+                .assignments
+                .iter()
+                .filter(|(_, a)| self.reads_raw(&a.expression))
+                .map(|(_, a)| a.target_var.clone())
+                .collect();
+            self.tainted.extend(raw);
+            if self.tainted.len() == before {
+                break;
+            }
+        }
+    }
+
+    fn report(&self, dep_label: &str, out: &mut Vec<LintDiagnostic>) {
+        let process_id = &self.process.id;
+        let why = if self.declares_masking {
+            format!("process '{process_id}' declares masking, but")
+        } else {
+            format!("process '{process_id}' reads text a masking process stored, and")
+        };
+        let mut warned = BTreeSet::new();
+        let assigned = self
+            .assignments
+            .iter()
+            .map(|(node, a)| (node, a.target_var.as_str()));
+        let read = self
+            .reads
+            .iter()
+            .map(|(node, r)| (node, r.target_var.as_str()));
+        for (node, name) in assigned.chain(read) {
+            if self.tainted.contains(name) && !self.sensitive.contains(name) && warned.insert(name)
+            {
+                out.push(
+                    LintDiagnostic::warning(
+                        codes::CONFIG_BPMN_RAW_BODY_UNMASKED,
+                        format!(
+                            "deployment {dep_label}: {why} variable '{name}' holds raw event.body \
+                             text and is not sensitive, so the raw message shows in audit and \
+                             inspect and is stored unencrypted. Declare it \
+                             <q:variable name=\"{name}\" sensitive=\"true\"/>. This becomes an \
+                             error in a later release."
+                        ),
+                    )
+                    .at_node(process_id, node),
+                );
+            }
+        }
+        for (node, write) in &self.writes {
+            if self.tainted.contains(&write.value_var) {
+                out.push(
+                    LintDiagnostic::warning(
+                        codes::CONFIG_BPMN_RAW_BODY_STORED,
+                        format!(
+                            "deployment {dep_label}: {why} writes raw event.body text to data \
+                             store '{}' through variable '{}'. A store column has no at-rest \
+                             encryption, and sensitive does not reach it.",
+                            write.store, write.value_var
+                        ),
+                    )
+                    .at_node(process_id, node),
+                );
+            }
+        }
+        for (node, decode) in &self.decodes {
+            if self.reads_raw(&decode.expression)
+                && decode.redactors.is_empty()
+                && !self.sensitive.contains(decode.name.as_str())
+            {
+                out.push(
+                    LintDiagnostic::error(
+                        sutra_bpmn::codes::CONFIG_DECODE_REDACTORS_MISSING,
+                        format!(
+                            "deployment {dep_label}: {why} <q:decode name=\"{}\"> parses raw \
+                             event.body text into a variable with no masking, so the message shows \
+                             in audit and inspect. Declare it <q:variable name=\"{}\" \
+                             sensitive=\"true\"/>, or give the step <q:redactors>.",
+                            decode.name, decode.name
+                        ),
+                    )
+                    .at_node(process_id, node),
+                );
+            }
+        }
+    }
+}
+
+/// Every `<q:decode>` names a codec and redactors that resolve: the same answers the runtime gets,
+/// caught at package time instead of on the first message.
+fn check_message_decodes(
+    deployment: &LoadedDeployment,
+    dep_label: &str,
+    out: &mut Vec<LintDiagnostic>,
+) {
+    let builtin_redactors = sutra_channels::RedactorRegistry::with_builtins().names();
+    let redactor_known = |reference: &str| {
+        let logical = sutra_executor::logical_of("redactor", reference);
+        builtin_redactors
+            .iter()
+            .any(|name| name == reference || name == &sutra_executor::builtin_key(&logical))
+            || deployment.redactors.keys().any(|path| {
+                let stem = path.strip_suffix(".hbs").unwrap_or(path).replace('/', ":");
+                sutra_executor::logical_urn("redactor", &stem) == logical
+            })
+    };
+    let mut seen = BTreeSet::new();
+    for module in deployment.processes.values() {
+        for process in module.processes() {
+            if !seen.insert(process.id.clone()) {
+                continue;
+            }
+            visit_nodes(process, &mut |_, node| {
+                let Node::DataTask { data_mapping, .. } = node else {
+                    return;
+                };
+                for decode in &data_mapping.message_decodes {
+                    if matches!(
+                        declared_types(deployment, &decode.codec),
+                        DeclaredTypes::Unknown
+                    ) {
+                        out.push(
+                            LintDiagnostic::error(
+                                sutra_bpmn::codes::CONFIG_DECODE_CODEC_UNKNOWN,
+                                format!(
+                                    "deployment {dep_label}: <q:decode name=\"{}\"> names codec \
+                                     '{}', which is neither built in nor in this package. A \
+                                     package codec is written urn:<folder under schemas/>.",
+                                    decode.name, decode.codec
+                                ),
+                            )
+                            .at_node(&process.id, node.id()),
+                        );
+                    }
+                    for reference in &decode.redactors {
+                        if !redactor_known(reference) {
+                            out.push(
+                                LintDiagnostic::error(
+                                    sutra_bpmn::codes::CONFIG_DECODE_REDACTOR_UNKNOWN,
+                                    format!(
+                                        "deployment {dep_label}: <q:decode name=\"{}\"> names \
+                                         redactor '{reference}', which is neither built in nor \
+                                         in this package.",
+                                        decode.name
+                                    ),
+                                )
+                                .at_node(&process.id, node.id()),
+                            );
+                        }
+                    }
+                }
+            });
+        }
+    }
+}
+
 /// Fail-closed authoring gate: a `<q:variable transient="true">` must not be READ by a
 /// node reachable *after* a wait state. A transient variable is held in memory only and dropped at
 /// the park, so a post-wait read silently yields null. The check walks the process flow graph
@@ -4481,119 +4773,6 @@ fn nodes_after_wait(process: &ProcessDefinition) -> BTreeSet<String> {
 /// template — the primary read surface. (A transient read in a downstream FEEL flow-condition or
 /// `<q:param>` expression is not caught here; it degrades safely to null at runtime rather than
 /// leaking or corrupting — the persistence layer never carries the value across the wait.)
-fn check_raw_body_masking(
-    deployment: &LoadedDeployment,
-    dep_label: &str,
-    out: &mut Vec<LintDiagnostic>,
-) {
-    let mut seen = BTreeSet::new();
-    for module in deployment.processes.values() {
-        for process in module.processes() {
-            if seen.insert(process.id.clone()) {
-                check_process_raw_body(process, dep_label, out);
-            }
-        }
-    }
-}
-
-/// Raw `event.body` text copied into a plain variable of a process that declares masking: the
-/// engine masks `event.body` itself, but cannot see through the copy. Taint starts at an assignment
-/// reading `event.body` or `event` whole, and spreads through assignments to a fixpoint.
-fn check_process_raw_body(
-    process: &ProcessDefinition,
-    dep_label: &str,
-    out: &mut Vec<LintDiagnostic>,
-) {
-    let sensitive: BTreeSet<&str> = process
-        .declared_variables
-        .iter()
-        .filter(|d| d.sensitive)
-        .map(|d| d.name.as_str())
-        .collect();
-    let mut declares_masking = false;
-    let mut assignments: Vec<(String, sutra_bpmn::model::Assignment)> = Vec::new();
-    let mut writes: Vec<(String, sutra_bpmn::model::StoreWrite)> = Vec::new();
-    visit_nodes(process, &mut |owner, node| {
-        declares_masking |= owner
-            .bindings_for(node.id())
-            .sources
-            .iter()
-            .any(|s| !s.redactors.is_empty() || sensitive.contains(s.name.as_str()));
-        let mapping = match node {
-            Node::ServiceTask { data_mapping, .. } | Node::DataTask { data_mapping, .. } => {
-                data_mapping
-            }
-            _ => return,
-        };
-        for assignment in &mapping.assignments {
-            assignments.push((node.id().to_string(), assignment.clone()));
-        }
-        for write in &mapping.store_writes {
-            writes.push((node.id().to_string(), write.clone()));
-        }
-    });
-    if !declares_masking {
-        return;
-    }
-
-    let mut tainted: BTreeSet<String> = BTreeSet::new();
-    loop {
-        let before = tainted.len();
-        for (_, assignment) in &assignments {
-            let Ok(paths) = sutra_feel::expressions::paths(&assignment.expression) else {
-                continue;
-            };
-            let raw = paths.iter().any(|path| {
-                let dotted = path.dotted();
-                dotted == "event" || dotted == "event.body" || tainted.contains(path.root())
-            });
-            if raw {
-                tainted.insert(assignment.target_var.clone());
-            }
-        }
-        if tainted.len() == before {
-            break;
-        }
-    }
-
-    let mut warned = BTreeSet::new();
-    for (node, assignment) in &assignments {
-        let name = assignment.target_var.as_str();
-        if tainted.contains(name) && !sensitive.contains(name) && warned.insert(name) {
-            out.push(
-                LintDiagnostic::warning(
-                    codes::CONFIG_BPMN_RAW_BODY_UNMASKED,
-                    format!(
-                        "deployment {dep_label}: process '{}' declares masking, but variable \
-                         '{name}' holds raw event.body text and is not sensitive, so the raw message \
-                         shows in audit and inspect and is stored unencrypted. Declare it \
-                         <q:variable name=\"{name}\" sensitive=\"true\"/>. This becomes an error in a \
-                         later release.",
-                        process.id
-                    ),
-                )
-                .at_node(&process.id, node),
-            );
-        }
-    }
-    for (node, write) in &writes {
-        if tainted.contains(&write.value_var) {
-            out.push(
-                LintDiagnostic::warning(
-                    codes::CONFIG_BPMN_RAW_BODY_STORED,
-                    format!(
-                        "deployment {dep_label}: process '{}' declares masking, but writes raw \
-                         event.body text to data store '{}' through variable '{}'. A store column \
-                         has no at-rest encryption, and sensitive does not reach it.",
-                        process.id, write.store, write.value_var
-                    ),
-                )
-                .at_node(&process.id, node),
-            );
-        }
-    }
-}
-
 fn check_transient_reads(
     deployment: &LoadedDeployment,
     dep_label: &str,
@@ -5025,6 +5204,9 @@ fn variable_writers(process: &ProcessDefinition) -> BTreeSet<String> {
             for read in &mapping.store_reads {
                 writers.insert(read.target_var.clone());
             }
+            for decode in &mapping.message_decodes {
+                writers.insert(decode.name.clone());
+            }
             for assignment in &mapping.assignments {
                 writers.insert(assignment.target_var.clone());
             }
@@ -5077,6 +5259,12 @@ fn variable_readers(
         if let Some(mapping) = mapping {
             for assignment in &mapping.assignments {
                 add_feel_roots(&assignment.expression, &mut readers);
+            }
+            for decode in &mapping.message_decodes {
+                add_feel_roots(&decode.expression, &mut readers);
+                if let Some(content_type) = &decode.content_type_expression {
+                    add_feel_roots(content_type, &mut readers);
+                }
             }
             for read in &mapping.store_reads {
                 add_feel_roots(&read.key_expression, &mut readers);

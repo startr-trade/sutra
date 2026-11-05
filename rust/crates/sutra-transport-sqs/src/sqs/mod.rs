@@ -151,14 +151,24 @@ impl SqsChannelProperties {
         let wait_time_seconds = clamp(
             channel,
             "wait-time-seconds",
-            parse_int(channel, props.get("wait-time-seconds"), DEFAULT_WAIT_TIME)?,
+            parse_int(
+                channel,
+                "wait-time-seconds",
+                props.get("wait-time-seconds"),
+                DEFAULT_WAIT_TIME,
+            )?,
             0,
             20,
         )?;
         let max_messages = clamp(
             channel,
             "max-messages",
-            parse_int(channel, props.get("max-messages"), DEFAULT_MAX_MESSAGES)?,
+            parse_int(
+                channel,
+                "max-messages",
+                props.get("max-messages"),
+                DEFAULT_MAX_MESSAGES,
+            )?,
             1,
             10,
         )?;
@@ -167,6 +177,7 @@ impl SqsChannelProperties {
             "visibility-timeout-seconds",
             parse_int(
                 channel,
+                "visibility-timeout-seconds",
                 props.get("visibility-timeout-seconds"),
                 DEFAULT_VISIBILITY_TIMEOUT,
             )?,
@@ -198,13 +209,19 @@ pub fn is_fifo_queue_url(queue_url: &str) -> bool {
     queue_url.ends_with(".fifo")
 }
 
-fn parse_int(channel: &str, raw: Option<&String>, fallback: i32) -> Result<i32, Diagnostic> {
+/// Neither this nor [`clamp`] quotes the value: it may have come from a secret reference.
+fn parse_int(
+    channel: &str,
+    key: &str,
+    raw: Option<&String>,
+    fallback: i32,
+) -> Result<i32, Diagnostic> {
     match non_blank(raw) {
         None => Ok(fallback),
         Some(v) => v.parse::<i32>().map_err(|_| {
             Diagnostic::error(
                 codes::INBOUND_CONFIG_INVALID,
-                format!("aws-sqs channel '{channel}' has invalid integer property value: {v}"),
+                format!("aws-sqs channel '{channel}' property '{key}' is not an integer"),
             )
         }),
     }
@@ -214,10 +231,7 @@ fn clamp(channel: &str, key: &str, value: i32, min: i32, max: i32) -> Result<i32
     if value < min || value > max {
         return Err(Diagnostic::error(
             codes::INBOUND_CONFIG_INVALID,
-            format!(
-                "aws-sqs channel '{channel}' property '{key}' value {value} out of range \
-                 [{min}..{max}]"
-            ),
+            format!("aws-sqs channel '{channel}' property '{key}' is out of range [{min}..{max}]"),
         ));
     }
     Ok(value)
@@ -342,7 +356,11 @@ mod tests {
             "${BASE}/orders" => Ok("http://sqs.test/000000000000/orders".to_string()),
             "${ENDPOINT}" => Ok("http://sqs.test".to_string()),
             "${WAIT:5}" => Ok("5".to_string()),
-            r if r.contains("${") || r.starts_with("env:") => Err(format!("{r} is not set")),
+            "${BAD_WAIT}" => Ok("s3cret-value".to_string()),
+            "secret:queue" => Ok("http://sqs.test/000000000000/from-secret".to_string()),
+            r if r.contains("${") || r.starts_with("env:") || r.starts_with("secret:") => {
+                Err(format!("{r} is not set"))
+            }
             literal => Ok(literal.to_string()),
         }
     }
@@ -360,6 +378,27 @@ mod tests {
         assert_eq!(props.queue_url, "http://sqs.test/000000000000/orders");
         assert_eq!(props.endpoint_override.as_deref(), Some("http://sqs.test"));
         assert_eq!(props.wait_time_seconds, 5);
+    }
+
+    #[test]
+    fn a_secret_form_resolves_and_a_bad_value_is_not_quoted() {
+        let def = definition(&[("region", "env:REGION"), ("queue.url", "secret:queue")]);
+        let props = SqsChannelProperties::resolved(&def, test_resolver).expect("resolved");
+        assert_eq!(props.queue_url, "http://sqs.test/000000000000/from-secret");
+
+        let def = definition(&[
+            ("region", "env:REGION"),
+            ("wait-time-seconds", "${BAD_WAIT}"),
+        ]);
+        let err = SqsChannelProperties::resolved(&def, test_resolver).unwrap_err();
+        assert_eq!(err.code, codes::INBOUND_CONFIG_INVALID);
+        assert!(err.message.contains("transfer-queue"), "{}", err.message);
+        assert!(
+            err.message.contains("'wait-time-seconds'"),
+            "{}",
+            err.message
+        );
+        assert!(!err.message.contains("s3cret-value"), "{}", err.message);
     }
 
     #[test]

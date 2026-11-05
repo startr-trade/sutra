@@ -46,6 +46,8 @@ mod tc_money_transfer;
 mod tc_multi_replica;
 #[path = "all/tc_outbox_relay.rs"]
 mod tc_outbox_relay;
+#[path = "all/tc_raw_message.rs"]
+mod tc_raw_message;
 #[path = "all/tc_shard_lanes.rs"]
 mod tc_shard_lanes;
 #[path = "all/tc_snapshot_upgrade.rs"]

@@ -28,6 +28,17 @@ pub const PARSE_Q_RECEIPT_ATTRIBUTE_MISSING_EXPRESSION: &str =
 pub const CONFIG_RECEIPT_ATTRIBUTE_DUPLICATE: &str = "SUTRA.CONFIG.RECEIPT.ATTRIBUTE_DUPLICATE";
 /// A `<q:attribute>` reads a `sensitive` variable, so the caller only ever sees the mask.
 pub const CONFIG_RECEIPT_ATTRIBUTE_SENSITIVE: &str = "SUTRA.CONFIG.RECEIPT.ATTRIBUTE_SENSITIVE";
+/// A `<q:decode>` is missing its `name`, `expression` or `codec`.
+pub const PARSE_Q_DECODE_INCOMPLETE: &str = "SUTRA.PARSE.Q_DECODE.INCOMPLETE";
+/// A `<q:decode>` sits anywhere but a data task (a serviceTask with no `@implementation`).
+pub const PARSE_Q_DECODE_NOT_ON_DATA_TASK: &str = "SUTRA.PARSE.Q_DECODE.NOT_ON_DATA_TASK";
+/// A `<q:decode codec>` names neither a built-in codec or format nor one in the package.
+pub const CONFIG_DECODE_CODEC_UNKNOWN: &str = "SUTRA.CONFIG.DECODE.CODEC_UNKNOWN";
+/// A `<q:decode>`'s `<q:redactor ref>` names a redactor neither built in nor in the package.
+pub const CONFIG_DECODE_REDACTOR_UNKNOWN: &str = "SUTRA.CONFIG.DECODE.REDACTOR_UNKNOWN";
+/// A `<q:decode>` reads raw message text in a package that masks it, and its target is neither
+/// `@sensitive` nor masked by `<q:redactors>`, so the decoded message would show on every surface.
+pub const CONFIG_DECODE_REDACTORS_MISSING: &str = "SUTRA.CONFIG.DECODE.REDACTORS_MISSING";
 pub const PARSE_Q_REPLY_INVALID_MODE: &str = "SUTRA.PARSE.Q_REPLY_INVALID_MODE";
 pub const PARSE_Q_SEND_CHANNEL_OR_DESTINATION: &str = "SUTRA.PARSE.Q_SEND.CHANNEL_OR_DESTINATION";
 pub const PARSE_Q_HEADER_INCOMPLETE: &str = "SUTRA.PARSE.Q_HEADER.INCOMPLETE";

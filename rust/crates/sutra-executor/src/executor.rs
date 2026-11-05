@@ -202,6 +202,8 @@ pub struct TokenExecutor {
     /// Per-deployment configuration for timer expressions (`config.<key>`). `None` = every
     /// deployment has an empty configuration.
     deployment_config: Option<Box<DeploymentConfigResolver>>,
+    /// The codec seam `<q:decode>` runs through. `None` fails a decode step closed.
+    message_decode_seam: Option<Rc<dyn MessageDecodeSeam>>,
     emissions: Option<Rc<dyn EmissionSink>>,
     auth_resolvers: Option<Box<AuthRefResolverRegistry>>,
     template_engines: TemplateEngineRegistry,
@@ -226,6 +228,46 @@ pub struct TokenExecutor {
 /// `TokenExecutor` builder — the executor's wiring surface.
 pub struct Builder {
     executor: TokenExecutor,
+}
+
+/// What a `<q:decode>` produced: the value bound to the target, and the masked projection stored
+/// as its `.redacted` companion when the step declares `<q:redactors>`.
+#[derive(Debug, Clone)]
+pub struct MessageDecodeOutcome {
+    pub value: FeelValue,
+    pub masked: Option<FeelValue>,
+}
+
+/// Why a `<q:decode>` produced nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageDecodeFailureKind {
+    /// The codec or a redactor cannot be resolved in this deployment.
+    NotFound,
+    /// The text is over the engine's payload cap.
+    TooLarge,
+    /// The codec refused the text.
+    Fatal,
+}
+
+/// A failed `<q:decode>`. `detail` holds issue codes and paths only: a parser's message or value
+/// can quote the input, and the input may be what the flow masks.
+#[derive(Debug, Clone)]
+pub struct MessageDecodeFailure {
+    pub kind: MessageDecodeFailureKind,
+    pub detail: String,
+}
+
+/// The codec side of `<q:decode>`. The executor has no codec dependency, so the channel layer
+/// implements this over its registries, scoped to the instance's pinned deployment.
+pub trait MessageDecodeSeam {
+    fn decode_message(
+        &self,
+        deployment: &DeploymentId,
+        binding: &sutra_bpmn::qbindings::MessageDecodeBinding,
+        text: &str,
+        content_type: Option<&str>,
+        vars: &Variables,
+    ) -> Result<MessageDecodeOutcome, MessageDecodeFailure>;
 }
 
 impl TokenExecutor {
@@ -264,6 +306,7 @@ impl TokenExecutor {
                 decision_engines: DecisionEngineRegistry::new(),
                 decisions: Arc::new(DecisionRegistry::new()),
                 outbound_channels: Arc::new(crate::registry::OutboundChannelRegistry::new()),
+                message_decode_seam: None,
                 uuid_supplier: Box::new(new_uuid),
                 now_supplier: Box::new(now_utc),
             },
@@ -2903,6 +2946,9 @@ impl TokenExecutor {
                 .variables
                 .insert(read.target_var.clone(), value.unwrap_or(FeelValue::Null));
         }
+        for decode in &dm.message_decodes {
+            self.run_message_decode(id, decode, state)?;
+        }
         for assign in &dm.assignments {
             let vars = state.ctx.borrow().variables.clone();
             let value = (self.value_evaluator)(&assign.expression, &vars).map_err(Signal::Fatal)?;
@@ -2971,6 +3017,72 @@ impl TokenExecutor {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// One `<q:decode>` step: evaluate the text, hand it to the codec seam, and bind the value plus
+    /// any masked projection. It reads variables only, never a delivery, so a resume or a retry
+    /// decodes the same text. Diagnostics carry issue codes and paths, never the input.
+    fn run_message_decode(
+        &self,
+        id: &str,
+        decode: &sutra_bpmn::qbindings::MessageDecodeBinding,
+        state: &mut ExecutionState<'_>,
+    ) -> Result<(), Signal> {
+        let vars = state.ctx.borrow().variables.clone();
+        let input = (self.value_evaluator)(&decode.expression, &vars).map_err(Signal::Fatal)?;
+        let FeelValue::String(text) = input else {
+            return Err(decode_failure(
+                codes::RUNTIME_DECODE_NOT_TEXT,
+                id,
+                decode,
+                &format!("expression '{}' did not give a string", decode.expression),
+                state.process,
+            ));
+        };
+        let content_type = match &decode.content_type_expression {
+            Some(expression) => {
+                match (self.value_evaluator)(expression, &vars).map_err(Signal::Fatal)? {
+                    FeelValue::String(s) if !s.trim().is_empty() => Some(s),
+                    _ => None,
+                }
+            }
+            None => None,
+        };
+        let Some(seam) = &self.message_decode_seam else {
+            return Err(decode_failure(
+                codes::RUNTIME_DECODE_FAILED,
+                id,
+                decode,
+                "this engine has no codec registry wired",
+                state.process,
+            ));
+        };
+        let outcome = seam
+            .decode_message(
+                &state.deployment,
+                decode,
+                &text,
+                content_type.as_deref(),
+                &vars,
+            )
+            .map_err(|failure| {
+                let code = match failure.kind {
+                    MessageDecodeFailureKind::TooLarge => codes::RUNTIME_DECODE_TOO_LARGE,
+                    MessageDecodeFailureKind::NotFound | MessageDecodeFailureKind::Fatal => {
+                        codes::RUNTIME_DECODE_FAILED
+                    }
+                };
+                decode_failure(code, id, decode, &failure.detail, state.process)
+            })?;
+        let mut ctx = state.ctx.borrow_mut();
+        if let Some(masked) = outcome.masked {
+            ctx.variables.insert(
+                format!("{}{}", decode.name, sutra_bpmn::REDACTION_COMPANION_SUFFIX),
+                masked,
+            );
+        }
+        ctx.variables.insert(decode.name.clone(), outcome.value);
         Ok(())
     }
 
@@ -4842,6 +4954,13 @@ impl TokenExecutor {
 }
 
 impl Builder {
+    /// Wire the codec seam `<q:decode>` runs through. Without one a decode step fails with
+    /// `SUTRA.RUNTIME.DECODE.FAILED`.
+    pub fn with_message_decode_seam(mut self, seam: Rc<dyn MessageDecodeSeam>) -> Builder {
+        self.executor.message_decode_seam = Some(seam);
+        self
+    }
+
     pub fn with_condition_evaluator(
         mut self,
         evaluator: impl Fn(&str, &Variables) -> Result<bool, ExecError> + 'static,
@@ -5547,6 +5666,33 @@ fn expected_revision(write: &StoreWrite, key: &str, state: &ExecutionState<'_>) 
         .store_revs
         .get(&format!("{}#{key}", write.store))
         .unwrap_or(&0)
+}
+
+/// A `<q:decode>` that could not produce a value: a BPMN error when an error boundary on the data
+/// task or an event sub-process catches `code`, otherwise the instance fails with it.
+fn decode_failure(
+    code: &str,
+    node_id: &str,
+    decode: &sutra_bpmn::qbindings::MessageDecodeBinding,
+    detail: &str,
+    process: &ProcessDefinition,
+) -> Signal {
+    if find_error_boundary(process, node_id, code).is_some()
+        || find_error_event_sub_process(process, code).is_some()
+    {
+        return Signal::BpmnError {
+            source: node_id.to_string(),
+            code: code.to_string(),
+        };
+    }
+    fatal_diag(
+        code,
+        format!(
+            "<q:decode name='{}'> at data task '{node_id}' with codec '{}': {detail}. Catch {code} \
+             with an error boundary to route around it.",
+            decode.name, decode.codec
+        ),
+    )
 }
 
 /// A compare-and-set write that did not apply. When an error boundary on the data task or an

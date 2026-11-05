@@ -339,3 +339,71 @@ pub async fn ledger_count(db: &str, store: &str) -> i32 {
         .expect("one row");
     row.get::<i32, _>(0).expect("count")
 }
+
+/// A store keeping a whole message as text, in a NVARCHAR(MAX) column.
+pub const MESSAGE_XSD: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           targetNamespace="urn:sutra:messages"
+           xmlns="urn:sutra:messages"
+           elementFormDefault="qualified">
+  <xs:element name="MessageRow">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element name="messageId" type="MessageId"/>
+        <xs:element name="body" type="xs:string"/>
+      </xs:sequence>
+    </xs:complexType>
+  </xs:element>
+  <xs:simpleType name="MessageId">
+    <xs:restriction base="xs:string"><xs:maxLength value="64"/></xs:restriction>
+  </xs:simpleType>
+</xs:schema>
+"#;
+
+pub const MESSAGE_DDL: &str = "IF OBJECT_ID('messages', 'U') IS NULL \
+  CREATE TABLE messages ( \
+    store_key  VARCHAR(512)  NOT NULL, \
+    message_id VARCHAR(64)   NOT NULL, \
+    body       NVARCHAR(MAX) NOT NULL, \
+    rev        BIGINT        NOT NULL DEFAULT 1, \
+    updated_at DATETIME2     NOT NULL DEFAULT SYSUTCDATETIME(), \
+    CONSTRAINT pk_messages PRIMARY KEY NONCLUSTERED (store_key) \
+  );";
+
+/// The projected message store on database `db`.
+pub fn message_store(db: &str) -> MssqlDataStore {
+    let schema = sutra_xsd::Schema::compile(MESSAGE_XSD.as_bytes()).expect("schema compiles");
+    let fields = schema.fields_of("MessageRow").expect("declared type");
+    let structure = StructureRef {
+        schema: "urn:messages".to_string(),
+        type_name: "MessageRow".to_string(),
+        columns: BTreeMap::new(),
+    };
+    let projection = structure.project(&fields).expect("the type is flat");
+    let mut properties = BTreeMap::new();
+    properties.insert(
+        "sql.url".to_string(),
+        format!(
+            "sqlserver://127.0.0.1:{};databaseName={db};trustServerCertificate=true",
+            container_port()
+        ),
+    );
+    properties.insert("sql.username".to_string(), "sa".to_string());
+    properties.insert(
+        "sql.password".to_string(),
+        MssqlServer::DEFAULT_SA_PASSWORD.to_string(),
+    );
+    let def = StoreDefinition {
+        name: "messages".to_string(),
+        store_type: "sql".to_string(),
+        properties,
+        structure: None,
+    };
+    MssqlDataStore::from_definition_projected(
+        &def,
+        vec![MESSAGE_DDL.to_string()],
+        None,
+        Some(ProjectedStore::new("messages", "messages", projection).expect("projectable")),
+    )
+    .expect("store builds")
+}

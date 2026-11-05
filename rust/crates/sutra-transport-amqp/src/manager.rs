@@ -154,7 +154,7 @@ impl AmqpChannels {
             .iter()
             .filter(|d| d.transport.as_deref() == Some(TRANSPORT) && !d.is_outbound())
         {
-            let props = match AmqpChannelProperties::for_wiring(def) {
+            let props = match AmqpChannelProperties::resolved(def, state.ctx.resolver) {
                 Ok(props) => props,
                 Err(d) => {
                     warn!(
@@ -272,7 +272,7 @@ fn build_and_start_consumer(
 ) -> Result<Option<(ConsumerKey, RunningConsumer)>, Diagnostic> {
     let channel = definition.binding.channel_name.clone();
     let tenant = definition.binding.tenant().to_string();
-    let properties = AmqpChannelProperties::for_wiring(definition)?;
+    let properties = AmqpChannelProperties::resolved(definition, ctx.resolver)?;
     let fingerprint = properties.clone();
 
     let (username, password) = match (
@@ -568,7 +568,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod connection_reference_guard {
+mod connection_references {
     use super::spawn_amqp_channels_with_intake;
     use crate::amqp::AmqpChannelProperties;
     use std::sync::Arc;
@@ -584,13 +584,24 @@ mod connection_reference_guard {
         }
     }
 
-    fn resolver(_reference: &str) -> Result<String, String> {
-        panic!("the guard runs before anything is resolved");
+    /// Stands in for the engine's registry: the listed references resolve and any other does not.
+    fn resolver(reference: &str) -> Result<String, String> {
+        match reference {
+            "${HOST}" => Ok("broker.test".to_string()),
+            "${PORT}" => Ok("5673".to_string()),
+            "${BAD_PORT}" => Ok("s3cret-value".to_string()),
+            "env:QUEUE" => Ok("resolved-queue".to_string()),
+            "secret:topic" => Ok("resolved-topic".to_string()),
+            r if r.contains("${") || r.starts_with("env:") || r.starts_with("secret:") => {
+                Err(format!("{r} is not set"))
+            }
+            literal => Ok(literal.to_string()),
+        }
     }
 
-    /// A valid inbound definition, with `extra` on top and `reference` set to a `${…}` value.
-    fn definition(extra: &[(&str, &str)], reference: Option<&str>) -> ChannelDefinition {
-        let mut properties: std::collections::BTreeMap<String, String> = [
+    /// A valid inbound definition with `extra` on top.
+    fn definition(extra: &[(&str, &str)]) -> ChannelDefinition {
+        let properties: std::collections::BTreeMap<String, String> = [
             ("host", "broker"),
             ("port", "5672"),
             ("queue", "orders"),
@@ -600,9 +611,6 @@ mod connection_reference_guard {
         .chain(extra.iter().copied())
         .map(|(key, value)| (key.to_string(), value.to_string()))
         .collect();
-        if let Some(key) = reference {
-            properties.insert(key.to_string(), "${CHANNEL_SETTING}".to_string());
-        }
         ChannelDefinition {
             binding: ChannelBinding::new(
                 "orders-in",
@@ -622,40 +630,81 @@ mod connection_reference_guard {
     }
 
     #[test]
-    fn wiring_refuses_a_reference_in_each_connection_property() {
+    fn references_reach_the_client_configuration() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let channels = spawn_amqp_channels_with_intake(
+            &[definition(&[
+                ("host", "${HOST}"),
+                ("port", "${PORT}"),
+                ("queue", "env:QUEUE"),
+                ("topic", "secret:topic"),
+            ])],
+            Arc::new(NoIntake),
+            None,
+            resolver,
+            runtime.handle().clone(),
+        )
+        .unwrap_or_else(|d| panic!("{}", d.message));
+        assert_eq!(channels.consumer_count(), 1);
+        let state = channels.inner.as_ref().expect("wired");
+        let running = state.running.lock().expect("registry");
+        let props = &running.values().next().expect("one consumer").fingerprint;
+        assert!(
+            props.connection_uri().ends_with("broker.test:5673"),
+            "{}",
+            props.connection_uri()
+        );
+        assert_eq!(props.queue.as_deref(), Some("resolved-queue"));
+        assert_eq!(props.topic.as_deref(), Some("resolved-topic"));
+    }
+
+    #[test]
+    fn an_unresolved_reference_fails_wiring_with_the_code() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .build()
             .expect("runtime");
         for key in ["host", "port", "queue", "topic"] {
-            let def = definition(&[], Some(key));
-            let Err(err) = spawn_amqp_channels_with_intake(
-                &[def],
-                Arc::new(NoIntake),
-                None,
-                resolver,
-                runtime.handle().clone(),
-            ) else {
-                panic!("a reference in '{key}' must not wire");
-            };
-            assert_eq!(err.code, "SUTRA.INBOUND.AMQP.CONFIG_INVALID", "for {key}");
-            assert!(err.message.contains("orders-in"), "{}", err.message);
-            assert!(err.message.contains(&format!("'{key}'")), "{}", err.message);
-            assert!(err.message.contains("later release"), "{}", err.message);
-            assert!(!err.message.contains("CHANNEL_SETTING"), "{}", err.message);
+            for unresolved in [
+                "${UNSET_SETTING}",
+                "env:UNSET_SETTING",
+                "secret:unset-setting",
+            ] {
+                let def = definition(&[(key, unresolved)]);
+                let Err(err) = spawn_amqp_channels_with_intake(
+                    &[def],
+                    Arc::new(NoIntake),
+                    None,
+                    resolver,
+                    runtime.handle().clone(),
+                ) else {
+                    panic!("an unresolved reference in '{key}' must not wire");
+                };
+                assert_eq!(err.code, "SUTRA.INBOUND.AMQP.CONFIG_INVALID", "for {key}");
+                assert!(err.message.contains("orders-in"), "{}", err.message);
+                assert!(err.message.contains(&format!("'{key}'")), "{}", err.message);
+            }
         }
     }
 
     #[test]
     fn a_literal_connection_property_is_unaffected() {
-        let literal =
-            AmqpChannelProperties::for_wiring(&definition(&[], None)).expect("literal values wire");
-        let plain =
-            AmqpChannelProperties::from_definition(&definition(&[], None)).expect("plain parse");
+        let literal = AmqpChannelProperties::resolved(&definition(&[]), resolver)
+            .expect("literal values wire");
+        let plain = AmqpChannelProperties::from_definition(&definition(&[])).expect("plain parse");
         assert_eq!(literal, plain);
-        // A credential reference is resolved later, not refused here.
-        let with_credentials = definition(&[("username", "${BROKER_USER}")], None);
-        AmqpChannelProperties::for_wiring(&with_credentials)
-            .expect("a credential reference passes");
+    }
+
+    #[test]
+    fn a_port_reference_that_is_no_port_fails_without_quoting_it() {
+        let err =
+            AmqpChannelProperties::resolved(&definition(&[("port", "${BAD_PORT}")]), resolver)
+                .expect_err("not a port");
+        assert_eq!(err.code, "SUTRA.INBOUND.AMQP.CONFIG_INVALID");
+        assert!(err.message.contains("orders-in"), "{}", err.message);
+        assert!(err.message.contains("'port'"), "{}", err.message);
+        assert!(!err.message.contains("s3cret-value"), "{}", err.message);
     }
 }
 

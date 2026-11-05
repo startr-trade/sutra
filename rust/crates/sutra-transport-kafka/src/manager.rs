@@ -142,7 +142,7 @@ impl KafkaChannels {
             .iter()
             .filter(|d| d.transport.as_deref() == Some(TRANSPORT) && !d.is_outbound())
         {
-            let props = match KafkaChannelProperties::for_wiring(def) {
+            let props = match KafkaChannelProperties::resolved(def, state.ctx.resolver) {
                 Ok(props) => props,
                 Err(d) => {
                     warn!(
@@ -260,7 +260,7 @@ fn build_and_start_consumer(
 ) -> Result<Option<(ConsumerKey, RunningConsumer)>, Diagnostic> {
     let channel = definition.binding.channel_name.clone();
     let tenant = definition.binding.tenant().to_string();
-    let properties = KafkaChannelProperties::for_wiring(definition)?;
+    let properties = KafkaChannelProperties::resolved(definition, ctx.resolver)?;
     let fingerprint = properties.clone();
 
     let singleton = properties.singleton;
@@ -507,7 +507,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod connection_reference_guard {
+mod connection_references {
     use super::spawn_kafka_channels_with_intake;
     use crate::kafka::KafkaChannelProperties;
     use std::sync::Arc;
@@ -523,13 +523,22 @@ mod connection_reference_guard {
         }
     }
 
-    fn resolver(_reference: &str) -> Result<String, String> {
-        panic!("the guard runs before anything is resolved");
+    /// Stands in for the engine's registry: the listed references resolve and any other does not.
+    fn resolver(reference: &str) -> Result<String, String> {
+        match reference {
+            "${BOOTSTRAP}" => Ok("broker.test:9093".to_string()),
+            "env:TOPIC" => Ok("resolved-topic".to_string()),
+            "secret:group" => Ok("resolved-group".to_string()),
+            r if r.contains("${") || r.starts_with("env:") || r.starts_with("secret:") => {
+                Err(format!("{r} is not set"))
+            }
+            literal => Ok(literal.to_string()),
+        }
     }
 
-    /// A valid inbound definition, with `extra` on top and `reference` set to a `${…}` value.
-    fn definition(extra: &[(&str, &str)], reference: Option<&str>) -> ChannelDefinition {
-        let mut properties: std::collections::BTreeMap<String, String> = [
+    /// A valid inbound definition with `extra` on top.
+    fn definition(extra: &[(&str, &str)]) -> ChannelDefinition {
+        let properties: std::collections::BTreeMap<String, String> = [
             ("bootstrap.servers", "broker:9092"),
             ("topic", "orders"),
             ("group.id", "g1"),
@@ -538,9 +547,6 @@ mod connection_reference_guard {
         .chain(extra.iter().copied())
         .map(|(key, value)| (key.to_string(), value.to_string()))
         .collect();
-        if let Some(key) = reference {
-            properties.insert(key.to_string(), "${CHANNEL_SETTING}".to_string());
-        }
         ChannelDefinition {
             binding: ChannelBinding::new(
                 "orders-in",
@@ -560,35 +566,65 @@ mod connection_reference_guard {
     }
 
     #[test]
-    fn wiring_refuses_a_reference_in_each_connection_property() {
+    fn references_reach_the_client_configuration() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let channels = spawn_kafka_channels_with_intake(
+            &[definition(&[
+                ("bootstrap.servers", "${BOOTSTRAP}"),
+                ("topic", "env:TOPIC"),
+                ("group.id", "secret:group"),
+            ])],
+            Arc::new(NoIntake),
+            None,
+            resolver,
+            runtime.handle().clone(),
+        )
+        .unwrap_or_else(|d| panic!("{}", d.message));
+        assert_eq!(channels.consumer_count(), 1);
+        let state = channels.inner.as_ref().expect("wired");
+        let running = state.running.lock().expect("registry");
+        let props = &running.values().next().expect("one consumer").fingerprint;
+        let client = crate::kafka::source::consumer_client_config(props);
+        assert_eq!(client.get("bootstrap.servers"), Some("broker.test:9093"));
+        assert_eq!(client.get("group.id"), Some("resolved-group"));
+        assert_eq!(props.topic, "resolved-topic");
+    }
+
+    #[test]
+    fn an_unresolved_reference_fails_wiring_with_the_code() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .build()
             .expect("runtime");
         for key in ["bootstrap.servers", "topic", "group.id"] {
-            let def = definition(&[], Some(key));
-            let Err(err) = spawn_kafka_channels_with_intake(
-                &[def],
-                Arc::new(NoIntake),
-                None,
-                resolver,
-                runtime.handle().clone(),
-            ) else {
-                panic!("a reference in '{key}' must not wire");
-            };
-            assert_eq!(err.code, "SUTRA.INBOUND.KAFKA.CONFIG_INVALID", "for {key}");
-            assert!(err.message.contains("orders-in"), "{}", err.message);
-            assert!(err.message.contains(&format!("'{key}'")), "{}", err.message);
-            assert!(err.message.contains("later release"), "{}", err.message);
-            assert!(!err.message.contains("CHANNEL_SETTING"), "{}", err.message);
+            for unresolved in [
+                "${UNSET_SETTING}",
+                "env:UNSET_SETTING",
+                "secret:unset-setting",
+            ] {
+                let def = definition(&[(key, unresolved)]);
+                let Err(err) = spawn_kafka_channels_with_intake(
+                    &[def],
+                    Arc::new(NoIntake),
+                    None,
+                    resolver,
+                    runtime.handle().clone(),
+                ) else {
+                    panic!("an unresolved reference in '{key}' must not wire");
+                };
+                assert_eq!(err.code, "SUTRA.INBOUND.KAFKA.CONFIG_INVALID", "for {key}");
+                assert!(err.message.contains("orders-in"), "{}", err.message);
+                assert!(err.message.contains(&format!("'{key}'")), "{}", err.message);
+            }
         }
     }
 
     #[test]
     fn a_literal_connection_property_is_unaffected() {
-        let literal = KafkaChannelProperties::for_wiring(&definition(&[], None))
+        let literal = KafkaChannelProperties::resolved(&definition(&[]), resolver)
             .expect("literal values wire");
-        let plain =
-            KafkaChannelProperties::from_definition(&definition(&[], None)).expect("plain parse");
+        let plain = KafkaChannelProperties::from_definition(&definition(&[])).expect("plain parse");
         assert_eq!(literal, plain);
     }
 }
@@ -714,6 +750,74 @@ mod broker_rewire_conformance {
             "timed out waiting for {expected} deliveries (have {})",
             intake.count()
         );
+    }
+
+    static REFERENCED_BOOTSTRAP: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+    /// Answers for the broker address, which is only known once the container is up.
+    fn referenced_settings(reference: &str) -> Result<String, String> {
+        match reference {
+            "${T2_BOOTSTRAP}" => Ok(REFERENCED_BOOTSTRAP.get().expect("started").clone()),
+            "env:T2_TOPIC" => Ok(format!("reference-topic-{}", std::process::id())),
+            "secret:t2-group" => Ok(format!("reference-group-{}", std::process::id())),
+            other => Err(format!("{other} is not set")),
+        }
+    }
+
+    /// A consumer whose whole connection comes from references really connects to the broker and
+    /// consumes from the topic they name.
+    #[test]
+    #[ignore = "docker"]
+    fn a_consumer_connects_and_consumes_through_references() {
+        use testcontainers::runners::SyncRunner;
+        use testcontainers_modules::kafka::apache::{Kafka, KAFKA_PORT};
+
+        let (container, port): (testcontainers::Container<Kafka>, u16) = std::thread::spawn(|| {
+            let c = Kafka::default()
+                .start()
+                .expect("start apache/kafka-native (docker required)");
+            sutra_testkit::reap_on_exit(c.id());
+            let port = c.get_host_port_ipv4(KAFKA_PORT).expect("mapped kafka port");
+            (c, port)
+        })
+        .join()
+        .expect("broker bootstrap thread");
+        let bootstrap = format!("127.0.0.1:{port}");
+        REFERENCED_BOOTSTRAP.set(bootstrap.clone()).expect("once");
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let handle = rt.handle().clone();
+        let intake = Arc::new(CapturingIntake::default());
+        let dyn_intake: Arc<dyn InboundIntake> = intake.clone();
+
+        rt.block_on(async {
+            let topic = format!("reference-topic-{}", std::process::id());
+            create_topic(&bootstrap, &topic).await;
+            let def = broker_def(
+                "orders",
+                "${T2_BOOTSTRAP}",
+                "env:T2_TOPIC",
+                "secret:t2-group",
+                None,
+            );
+            let channels = spawn_kafka_channels_with_intake(
+                &[def],
+                dyn_intake.clone(),
+                None,
+                referenced_settings,
+                handle.clone(),
+            )
+            .expect("wire through references");
+            assert_eq!(channels.consumer_count(), 1);
+            produce(&bootstrap, &topic, b"through-a-reference").await;
+            wait_for_delivered(&intake, 1, Duration::from_secs(30)).await;
+            channels.drain().await;
+        });
+
+        drop(container);
     }
 
     #[test]

@@ -27,6 +27,8 @@ mod event_gateway_resume_test;
 mod gateways_test;
 #[path = "all/integration_examples_test.rs"]
 mod integration_examples_test;
+#[path = "all/message_decode_test.rs"]
+mod message_decode_test;
 #[path = "all/retry_policy_test.rs"]
 mod retry_policy_test;
 #[path = "all/task_kinds_test.rs"]

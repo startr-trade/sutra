@@ -938,3 +938,20 @@ async fn migration_ledger_runs_each_script_once_and_refuses_an_edited_one() {
     assert_eq!(fixed.get("k").await.unwrap(), None);
     assert_eq!(fixture::ledger_count(&db, "broken").await, 2);
 }
+
+/// A message kept as raw text comes back exactly: spacing, quotes, newlines and non-ASCII, and past
+/// the 64 KiB of a MySQL `TEXT`.
+#[ignore = "docker"]
+#[tokio::test(flavor = "multi_thread")]
+async fn raw_message_text_column_round_trips_exactly() {
+    let db = fixture::fresh_db().await;
+    let store = fixture::message_store(&db);
+    let text = "{ \"subject\" : \"caf\u{e9} \u{1f600}\",\n\t\"count\": 3.50 }";
+    let large = format!("{{\"fill\":\"{}\"}}", "x".repeat(70 * 1024));
+    for (key, body) in [("m1", text), ("m2", large.as_str())] {
+        let row = json!({"messageId": key, "body": body});
+        store.put(key, &row).await.unwrap();
+        let read = store.get(key).await.unwrap().expect("row");
+        assert_eq!(read["body"].as_str(), Some(body), "{key}");
+    }
+}

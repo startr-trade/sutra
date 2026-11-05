@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- A flow that masks: capture on the step after the intake, park, resume, then decode. -->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0"
+                  id="Definitions_held"
+                  targetNamespace="urn:sutra:module:rawmsg:1.0.0">
+  <bpmn:dataStore id="outcomesStore" name="outcomes"/>
+  <bpmn:process id="held" isExecutable="true">
+    <bpmn:extensionElements>
+      <q:audit sink="jsonl" capture="payload"/>
+      <q:variables>
+        <q:variable name="rawText" type="string" sensitive="true"/>
+        <q:variable name="ref" type="string"/>
+      </q:variables>
+    </bpmn:extensionElements>
+    <bpmn:dataStoreReference id="refOutcome" dataStoreRef="outcomesStore">
+      <bpmn:extensionElements><q:store key="ref"/></bpmn:extensionElements>
+    </bpmn:dataStoreReference>
+    <bpmn:startEvent id="Start">
+      <bpmn:extensionElements>
+        <q:source channel="held-in"><q:redactors><q:redactor ref="card"/></q:redactors></q:source>
+        <q:alias name="caseRef" expression="payload.ref" unique="true"/>
+      </bpmn:extensionElements>
+    </bpmn:startEvent>
+    <bpmn:serviceTask id="Capture" name="Capture the text">
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>event.body</bpmn:from><bpmn:to>rawText</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:receiveTask id="Wait" name="Wait">
+      <bpmn:extensionElements>
+        <q:source channel="held-go" name="go"/>
+        <q:alias name="caseRef" expression="go.ref"/>
+      </bpmn:extensionElements>
+    </bpmn:receiveTask>
+    <bpmn:serviceTask id="Decode" name="Decode after the wait">
+      <bpmn:extensionElements>
+        <q:decode name="message" expression="rawText" codec="json">
+          <q:redactors><q:redactor ref="card"/></q:redactors>
+        </q:decode>
+      </bpmn:extensionElements>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>message.ref</bpmn:from><bpmn:to>ref</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+      <bpmn:dataOutputAssociation>
+        <bpmn:sourceRef>ref</bpmn:sourceRef><bpmn:targetRef>refOutcome</bpmn:targetRef>
+      </bpmn:dataOutputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="Done"/>
+    <bpmn:sequenceFlow id="F1" sourceRef="Start" targetRef="Capture"/>
+    <bpmn:sequenceFlow id="F2" sourceRef="Capture" targetRef="Wait"/>
+    <bpmn:sequenceFlow id="F3" sourceRef="Wait" targetRef="Decode"/>
+    <bpmn:sequenceFlow id="F4" sourceRef="Decode" targetRef="Done"/>
+  </bpmn:process>
+</bpmn:definitions>

@@ -2027,6 +2027,9 @@ pub(crate) fn build_engine(
     // user `redactors/*.hbs` fold in alongside below (Mirror 2 — the redactor-URN reference
     // implementation).
     let mut redactors = RedactorRegistry::with_builtins();
+    // The `<q:decode>` seam's own registry: a template redactor's compiled cache is per owner, and
+    // the executor is built before the dispatcher's chain.
+    let mut decode_redactors = RedactorRegistry::with_builtins();
     let mut store_map: HashMap<(String, String), Rc<dyn DataStore>> = HashMap::new();
 
     // The binding keys the ACTIVE set claims — a draining deployment's definition on the
@@ -2049,6 +2052,7 @@ pub(crate) fn build_engine(
 
     for plan in active.iter().chain(draining.iter()) {
         register_archive_redactors(&mut redactors, plan);
+        register_archive_redactors(&mut decode_redactors, plan);
         for (name, store) in &plan.stores {
             let bound: Rc<dyn DataStore> = match store {
                 // Bind the async dialect stores DIRECTLY (thin await-adapters — no
@@ -2211,6 +2215,15 @@ pub(crate) fn build_engine(
         })
         .with_deployment_config(move |deployment| config_map.get(deployment.value()).cloned())
         .with_outbound_channels(Arc::clone(&shared.outbound_channels))
+        .with_message_decode_seam(Rc::new(
+            InboundChain::new(
+                Arc::clone(&shared.codecs),
+                Arc::clone(&shared.formats),
+                Arc::clone(&shared.validators),
+            )
+            .with_redactors(decode_redactors)
+            .with_message_decode_cap(payload_cap_bytes),
+        ))
         .with_emission_sink(Rc::clone(&sink) as Rc<dyn sutra_executor::EmissionSink>);
     // TEST-ONLY (P1-7 time-skipping test runtime): `now_override` is `None` on every production
     // boot, in which case the executor keeps its own default (`OffsetDateTime::now_utc`) —

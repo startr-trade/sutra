@@ -133,7 +133,7 @@ impl RabbitMqChannels {
             .iter()
             .filter(|d| d.transport.as_deref() == Some(TRANSPORT) && !d.is_outbound())
         {
-            let props = match RabbitMqChannelProperties::for_wiring(def) {
+            let props = match RabbitMqChannelProperties::resolved(def, state.ctx.resolver) {
                 Ok(props) => props,
                 Err(d) => {
                     warn!(
@@ -250,7 +250,7 @@ fn build_and_start_consumer(
 ) -> Result<Option<(ConsumerKey, RunningConsumer)>, Diagnostic> {
     let channel = definition.binding.channel_name.clone();
     let tenant = definition.binding.tenant().to_string();
-    let properties = RabbitMqChannelProperties::for_wiring(definition)?;
+    let properties = RabbitMqChannelProperties::resolved(definition, ctx.resolver)?;
     let fingerprint = properties.clone();
 
     let (username, password) = match (
@@ -555,7 +555,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod connection_reference_guard {
+mod connection_references {
     use super::spawn_broker_channels_with_intake;
     use crate::rabbitmq::RabbitMqChannelProperties;
     use std::sync::Arc;
@@ -571,13 +571,25 @@ mod connection_reference_guard {
         }
     }
 
-    fn resolver(_reference: &str) -> Result<String, String> {
-        panic!("the guard runs before anything is resolved");
+    /// Stands in for the engine's registry: the listed references resolve and any other does not.
+    fn resolver(reference: &str) -> Result<String, String> {
+        match reference {
+            "${HOST}" => Ok("broker.test".to_string()),
+            "${PORT}" => Ok("5673".to_string()),
+            "${BAD_PORT}" => Ok("s3cret-value".to_string()),
+            "env:VHOST" => Ok("resolved-vhost".to_string()),
+            "secret:queue" => Ok("resolved-queue".to_string()),
+            "${EXCHANGE:fallback-exchange}" => Ok("fallback-exchange".to_string()),
+            r if r.contains("${") || r.starts_with("env:") || r.starts_with("secret:") => {
+                Err(format!("{r} is not set"))
+            }
+            literal => Ok(literal.to_string()),
+        }
     }
 
-    /// A valid inbound definition, with `extra` on top and `reference` set to a `${…}` value.
-    fn definition(extra: &[(&str, &str)], reference: Option<&str>) -> ChannelDefinition {
-        let mut properties: std::collections::BTreeMap<String, String> = [
+    /// A valid inbound definition with `extra` on top.
+    fn definition(extra: &[(&str, &str)]) -> ChannelDefinition {
+        let properties: std::collections::BTreeMap<String, String> = [
             ("host", "broker"),
             ("port", "5672"),
             ("virtual-host", "/"),
@@ -588,9 +600,6 @@ mod connection_reference_guard {
         .chain(extra.iter().copied())
         .map(|(key, value)| (key.to_string(), value.to_string()))
         .collect();
-        if let Some(key) = reference {
-            properties.insert(key.to_string(), "${CHANNEL_SETTING}".to_string());
-        }
         ChannelDefinition {
             binding: ChannelBinding::new(
                 "orders-in",
@@ -610,43 +619,88 @@ mod connection_reference_guard {
     }
 
     #[test]
-    fn wiring_refuses_a_reference_in_each_connection_property() {
+    fn references_reach_the_client_configuration() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let channels = spawn_broker_channels_with_intake(
+            &[definition(&[
+                ("host", "${HOST}"),
+                ("port", "${PORT}"),
+                ("virtual-host", "env:VHOST"),
+                ("queue", "secret:queue"),
+                ("exchange", "${EXCHANGE:fallback-exchange}"),
+            ])],
+            Arc::new(NoIntake),
+            None,
+            resolver,
+            runtime.handle().clone(),
+        )
+        .unwrap_or_else(|d| panic!("{}", d.message));
+        assert_eq!(channels.consumer_count(), 1);
+        let state = channels.inner.as_ref().expect("wired");
+        let running = state.running.lock().expect("registry");
+        let props = &running.values().next().expect("one consumer").fingerprint;
+        assert!(
+            props
+                .connection_uri()
+                .ends_with("broker.test:5673/resolved-vhost"),
+            "{}",
+            props.connection_uri()
+        );
+        assert_eq!(props.queue, "resolved-queue");
+        assert_eq!(props.exchange, "fallback-exchange");
+    }
+
+    #[test]
+    fn an_unresolved_reference_fails_wiring_with_the_code() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .build()
             .expect("runtime");
         for key in ["host", "port", "virtual-host", "queue", "exchange"] {
-            let def = definition(&[], Some(key));
-            let Err(err) = spawn_broker_channels_with_intake(
-                &[def],
-                Arc::new(NoIntake),
-                None,
-                resolver,
-                runtime.handle().clone(),
-            ) else {
-                panic!("a reference in '{key}' must not wire");
-            };
-            assert_eq!(
-                err.code, "SUTRA.INBOUND.RABBITMQ.CONFIG_INVALID",
-                "for {key}"
-            );
-            assert!(err.message.contains("orders-in"), "{}", err.message);
-            assert!(err.message.contains(&format!("'{key}'")), "{}", err.message);
-            assert!(err.message.contains("later release"), "{}", err.message);
-            assert!(!err.message.contains("CHANNEL_SETTING"), "{}", err.message);
+            for unresolved in [
+                "${UNSET_SETTING}",
+                "env:UNSET_SETTING",
+                "secret:unset-setting",
+            ] {
+                let def = definition(&[(key, unresolved)]);
+                let Err(err) = spawn_broker_channels_with_intake(
+                    &[def],
+                    Arc::new(NoIntake),
+                    None,
+                    resolver,
+                    runtime.handle().clone(),
+                ) else {
+                    panic!("an unresolved reference in '{key}' must not wire");
+                };
+                assert_eq!(
+                    err.code, "SUTRA.INBOUND.RABBITMQ.CONFIG_INVALID",
+                    "for {key}"
+                );
+                assert!(err.message.contains("orders-in"), "{}", err.message);
+                assert!(err.message.contains(&format!("'{key}'")), "{}", err.message);
+            }
         }
     }
 
     #[test]
     fn a_literal_connection_property_is_unaffected() {
-        let literal = RabbitMqChannelProperties::for_wiring(&definition(&[], None))
+        let literal = RabbitMqChannelProperties::resolved(&definition(&[]), resolver)
             .expect("literal values wire");
-        let plain = RabbitMqChannelProperties::from_definition(&definition(&[], None))
-            .expect("plain parse");
+        let plain =
+            RabbitMqChannelProperties::from_definition(&definition(&[])).expect("plain parse");
         assert_eq!(literal, plain);
-        // A credential reference is resolved later, not refused here.
-        let with_credentials = definition(&[("username", "${BROKER_USER}")], None);
-        RabbitMqChannelProperties::for_wiring(&with_credentials)
-            .expect("a credential reference passes");
+    }
+
+    #[test]
+    fn a_port_reference_that_is_no_port_fails_without_quoting_it() {
+        let err =
+            RabbitMqChannelProperties::resolved(&definition(&[("port", "${BAD_PORT}")]), resolver)
+                .expect_err("not a port");
+        assert_eq!(err.code, "SUTRA.INBOUND.RABBITMQ.CONFIG_INVALID");
+        assert!(err.message.contains("orders-in"), "{}", err.message);
+        assert!(err.message.contains("'port'"), "{}", err.message);
+        assert!(!err.message.contains("s3cret-value"), "{}", err.message);
     }
 }
 
@@ -802,6 +856,74 @@ mod broker_rewire_conformance {
             "timed out waiting for {expected} deliveries (have {})",
             intake.count()
         );
+    }
+
+    static REFERENCED_PORT: std::sync::OnceLock<u16> = std::sync::OnceLock::new();
+
+    /// Answers for the broker port, which is only known once the container is up.
+    fn referenced_settings(reference: &str) -> Result<String, String> {
+        match reference {
+            "${T2_HOST}" => Ok("127.0.0.1".to_string()),
+            "${T2_PORT}" => Ok(REFERENCED_PORT.get().expect("started").to_string()),
+            "env:T2_QUEUE" => Ok(format!("reference-queue-{}", std::process::id())),
+            other => Err(format!("{other} is not set")),
+        }
+    }
+
+    /// A consumer whose whole connection comes from references really connects to the broker and
+    /// consumes from the queue they name.
+    #[test]
+    #[ignore = "docker"]
+    fn a_consumer_connects_and_consumes_through_references() {
+        let (container, port): (testcontainers::Container<testcontainers::GenericImage>, u16) =
+            std::thread::spawn(|| {
+                use testcontainers::core::{IntoContainerPort, WaitFor};
+                use testcontainers::runners::SyncRunner;
+                use testcontainers::GenericImage;
+                let c = GenericImage::new("rabbitmq", "3.13-management-alpine")
+                    .with_exposed_port(5672.tcp())
+                    .with_wait_for(WaitFor::message_on_stdout("Server startup complete"))
+                    .start()
+                    .expect("start rabbitmq:3.13-management-alpine (docker required)");
+                sutra_testkit::reap_on_exit(c.id());
+                let port = c.get_host_port_ipv4(5672).expect("mapped 5672");
+                (c, port)
+            })
+            .join()
+            .expect("broker bootstrap thread");
+        REFERENCED_PORT.set(port).expect("once");
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let handle = rt.handle().clone();
+        let intake = Arc::new(CapturingIntake::default());
+        let dyn_intake: Arc<dyn InboundIntake> = intake.clone();
+
+        rt.block_on(async {
+            let queue = format!("reference-queue-{}", std::process::id());
+            declare_queue(port, &queue).await;
+            let mut def = broker_def("orders", port, "env:T2_QUEUE", 1);
+            def.properties
+                .insert("host".to_string(), "${T2_HOST}".to_string());
+            def.properties
+                .insert("port".to_string(), "${T2_PORT}".to_string());
+            let channels = spawn_broker_channels_with_intake(
+                &[def],
+                dyn_intake.clone(),
+                None,
+                referenced_settings,
+                handle.clone(),
+            )
+            .expect("wire through references");
+            wait_for_consumer_count(port, &queue, 1, Duration::from_secs(25)).await;
+            publish(port, &queue, b"through-a-reference").await;
+            wait_for_delivered(&intake, 1, Duration::from_secs(20)).await;
+            channels.drain().await;
+        });
+
+        drop(container);
     }
 
     #[test]

@@ -154,6 +154,12 @@ new versions replace old ones for you.
 **`sutra deploy` to a ConfigMap.** The CLI judges the archive against the ConfigMap's other entries and
 refuses before patching it. Add `--engine-url` to have the engine judge it too, which covers every transport.
 
+## References compare as written
+
+A claim is computed where no secrets are to hand, including in the CLI, and its text appears in refusal messages and in the
+`deployment_endpoint_holder` table. So it holds a reference as you wrote it, never its value. Two deployments on one queue
+through `${A}/q` and `${B}/q` with the same value are not caught, and neither are `${A}/q` and the literal.
+
 ## Upgrading
 
 - **Two deployments already on one queue.** The one activated first keeps it. The later one stops being active

@@ -912,6 +912,359 @@ Two separate guarantees, worth keeping distinct:
 The [worked example](worked-example.md) combines both: a `singleton` channel serializes writers,
 and the debit/credit pair runs inside a `<bpmn:transaction>` so a rejected transfer touches no row.
 
+## Keeping a message as text
+
+A flow can keep a message exactly as it arrived, as text in a typed store column, and work with it
+decoded again later. This walkthrough keeps notes in a `TEXT` column, reads one back through
+`<q:decode>`, and then masks them.
+
+You need the engine and PostgreSQL; this walkthrough was run on PostgreSQL 16. `xsd/q.xsd` is the
+reference for the element.
+
+### 1. A typed store with a text column
+
+`package.yaml` labels the module `notes`, version `1.0.0`. `datastores.yaml` gives the store its row
+type:
+
+```yaml
+datastores:
+  - name: notes
+    type: sql
+    structure:
+      schema: urn:note-row
+      type: NoteRow
+    sql:
+      url-ref: env:NOTES_DB_URL
+      username-ref: env:NOTES_DB_USER
+      password-ref: env:NOTES_DB_PASSWORD
+      migrations: migrations/notes
+```
+
+`schemas/note-row/codec-manifest.yaml` is `schemaKind: xsd` and `formats: [xml]`.
+`schemas/note-row/note-row.xsd` declares the row. `body` has no length limit:
+
+```xml
+<xs:element name="NoteRow">
+  <xs:complexType>
+    <xs:sequence>
+      <xs:element name="noteId"      type="NoteId"/>    <!-- maxLength 64 -->
+      <xs:element name="contentType" type="MediaType" minOccurs="0"/>  <!-- maxLength 128 -->
+      <xs:element name="body"        type="xs:string"/>
+    </xs:sequence>
+  </xs:complexType>
+</xs:element>
+```
+
+`migrations/notes/V001__notes.sql`:
+
+```sql
+CREATE TABLE IF NOT EXISTS notes (
+  store_key    VARCHAR(512) NOT NULL,
+  note_id      VARCHAR(64)  NOT NULL,
+  content_type VARCHAR(128),
+  body         TEXT         NOT NULL,
+  rev          BIGINT       NOT NULL DEFAULT 1,
+  updated_at   TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (store_key)
+);
+```
+
+On MySQL, `TEXT` stops at 64 KiB, so use `MEDIUMTEXT` or `LONGTEXT`. On SQL Server, use
+`NVARCHAR(MAX)`.
+
+### 2. Capture the text
+
+`channels.yaml` declares two HTTP channels with the usual API-key auth. `note-in` has no `codec`, so
+it takes any format, and its key comes from a header:
+
+```yaml
+channels:
+  - name: note-in
+    transport: http
+    bind: "POST /channels/note-in"
+    idempotency-key-header: X-Note-Id
+    cloudevents-mode: none
+    auth: { scheme: apikey, apikey: { value: env:NOTES_API_KEY, header: X-Api-Key } }
+  - name: note-read
+    transport: http
+    bind: "POST /channels/note-read"
+    codec: json
+    cloudevents-mode: none
+    auth: { scheme: apikey, apikey: { value: env:NOTES_API_KEY, header: X-Api-Key } }
+```
+
+`bpmn/note-keep.bpmn` builds the row from `event` on the step right after the start. A later message
+would replace `event`, so capture here. The gateway is step 6:
+
+```xml
+<bpmn:dataStore id="notesStore" name="notes"/>
+<bpmn:process id="note-keep" isExecutable="true">
+  <bpmn:extensionElements>
+    <q:variables><q:variable name="row" type="object"/></q:variables>
+  </bpmn:extensionElements>
+  <bpmn:dataStoreReference id="refRow" dataStoreRef="notesStore">
+    <bpmn:extensionElements><q:store key="event.dedupKey"/></bpmn:extensionElements>
+  </bpmn:dataStoreReference>
+  <bpmn:startEvent id="Start">
+    <bpmn:extensionElements><q:source channel="note-in"/></bpmn:extensionElements>
+  </bpmn:startEvent>
+  <bpmn:exclusiveGateway id="IsText" default="ToKeep"/>
+  <bpmn:serviceTask id="Keep" name="Keep the text">
+    <bpmn:dataInputAssociation>
+      <bpmn:assignment>
+        <bpmn:from>{noteId: event.dedupKey, contentType: event.contentType, body: event.body}</bpmn:from>
+        <bpmn:to>row</bpmn:to>
+      </bpmn:assignment>
+    </bpmn:dataInputAssociation>
+    <bpmn:dataOutputAssociation>
+      <bpmn:sourceRef>row</bpmn:sourceRef><bpmn:targetRef>refRow</bpmn:targetRef>
+    </bpmn:dataOutputAssociation>
+  </bpmn:serviceTask>
+  <bpmn:endEvent id="Kept"/>
+  <bpmn:endEvent id="NotText"/>
+  <bpmn:sequenceFlow id="F1" sourceRef="Start" targetRef="IsText"/>
+  <bpmn:sequenceFlow id="ToKeep" sourceRef="IsText" targetRef="Keep"/>
+  <bpmn:sequenceFlow id="ToRefuse" sourceRef="IsText" targetRef="NotText">
+    <bpmn:conditionExpression>event.bodyLossy = true</bpmn:conditionExpression>
+  </bpmn:sequenceFlow>
+  <bpmn:sequenceFlow id="F2" sourceRef="Keep" targetRef="Kept"/>
+</bpmn:process>
+```
+
+### 3. A retrieval flow
+
+`bpmn/note-read.bpmn` reads the row, decodes its text by the row's own content type, and answers from
+the decoded fields. The store read runs first, then `<q:decode>`, within one data task. Text that
+doesn't parse raises `SUTRA.RUNTIME.DECODE.FAILED`, which the boundary event catches:
+
+```xml
+<bpmn:error id="undecodable" errorCode="SUTRA.RUNTIME.DECODE.FAILED"/>
+<bpmn:dataStore id="notesStore" name="notes"/>
+<bpmn:process id="note-read" isExecutable="true">
+  <bpmn:extensionElements>
+    <q:variables>
+      <q:variable name="row" type="object"/>
+      <q:variable name="note" type="object"/>
+    </q:variables>
+  </bpmn:extensionElements>
+  <bpmn:dataStoreReference id="refRead" dataStoreRef="notesStore">
+    <bpmn:extensionElements><q:store key="req.id"/></bpmn:extensionElements>
+  </bpmn:dataStoreReference>
+  <bpmn:startEvent id="Start">
+    <bpmn:extensionElements><q:source channel="note-read" name="req"/></bpmn:extensionElements>
+  </bpmn:startEvent>
+  <bpmn:serviceTask id="Load" name="Read and decode">
+    <bpmn:extensionElements>
+      <q:decode name="note" expression="row.body" codec="json" contentType="row.contentType"/>
+    </bpmn:extensionElements>
+    <bpmn:dataInputAssociation>
+      <bpmn:sourceRef>refRead</bpmn:sourceRef><bpmn:targetRef>row</bpmn:targetRef>
+    </bpmn:dataInputAssociation>
+  </bpmn:serviceTask>
+  <bpmn:boundaryEvent id="BadText" attachedToRef="Load">
+    <bpmn:errorEventDefinition errorRef="undecodable"/>
+  </bpmn:boundaryEvent>
+  <bpmn:serviceTask id="Answer" implementation="summary.hbs">
+    <bpmn:extensionElements><q:reply mode="native" contentType="application/json"/></bpmn:extensionElements>
+  </bpmn:serviceTask>
+  <bpmn:serviceTask id="AnswerBad" implementation="undecodable.hbs">
+    <bpmn:extensionElements><q:reply mode="native" contentType="application/json"/></bpmn:extensionElements>
+  </bpmn:serviceTask>
+  <bpmn:endEvent id="Done"/>
+  <bpmn:endEvent id="DoneBad"/>
+  <bpmn:sequenceFlow id="F1" sourceRef="Start" targetRef="Load"/>
+  <bpmn:sequenceFlow id="F2" sourceRef="Load" targetRef="Answer"/>
+  <bpmn:sequenceFlow id="F3" sourceRef="Answer" targetRef="Done"/>
+  <bpmn:sequenceFlow id="F4" sourceRef="BadText" targetRef="AnswerBad"/>
+  <bpmn:sequenceFlow id="F5" sourceRef="AnswerBad" targetRef="DoneBad"/>
+</bpmn:process>
+```
+
+`templates/summary.hbs`:
+
+```text
+{"decoded":true,"title":"{{note.title}}","pages":{{note.pages}}}
+```
+
+`templates/undecodable.hbs`:
+
+```text
+{"decoded":false}
+```
+
+### 4. Package it and start the engine
+
+```bash
+sutra lint notes
+sutra package notes -o deployments
+```
+
+Give the engine a role that can't bypass row-level security, and a database that role owns:
+
+```sql
+CREATE ROLE sutra_app LOGIN NOSUPERUSER NOBYPASSRLS PASSWORD '<a password>';
+CREATE DATABASE sutra OWNER sutra_app;
+```
+
+Start the engine with `SUTRA_DATASOURCE_URL` pointing at that database as `sutra_app`,
+`SUTRA_DEPLOYMENTS_DIR` pointing at `deployments`, `NOTES_API_KEY`, and `NOTES_DB_URL`,
+`NOTES_DB_USER` and `NOTES_DB_PASSWORD` for the store. Turn admin auth on with
+`SUTRA_ADMIN_AUTH_SCHEME=apikey`, `SUTRA_ADMIN_AUTH_KEY_REF=env:SUTRA_ADMIN_API_KEY` and
+`SUTRA_ADMIN_API_KEY`, because step 7 reads an instance. Set `B` to the engine's address.
+
+### 5. Keep a note and read it back
+
+`note.json` has odd spacing, a non-ASCII title, and a number with a written scale:
+
+```json
+{ "title" : "café notes",
+  "pages": 3.50 }
+```
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' -X POST "$B/channels/note-in" \
+  -H 'X-Api-Key: <your key>' -H 'Content-Type: application/json' -H 'X-Note-Id: n-1' \
+  --data-binary @note.json
+```
+
+```text
+200
+```
+
+The column holds the exact text:
+
+```sql
+SELECT store_key, note_id, content_type, body FROM notes;
+```
+
+```text
+ store_key | note_id |   content_type   |           body
+-----------+---------+------------------+---------------------------
+ n-1       | n-1     | application/json | { "title" : "café notes",+
+           |         |                  |   "pages": 3.50 }        +
+           |         |                  |
+```
+
+Read it back:
+
+```bash
+curl -s -X POST "$B/channels/note-read" -H 'X-Api-Key: <your key>' \
+  -H 'Content-Type: application/json' -d '{"id":"n-1"}'
+```
+
+```json
+{"decoded":true,"title":"café notes","pages":3.50}
+```
+
+The row's content type picks the parser, so the same flow reads XML. Keep
+`<note><title>second</title><pages>2</pages></note>` as `application/xml` under `n-2`, and read it:
+
+```json
+{"decoded":true,"title":"second","pages":2}
+```
+
+Keep `{ this is not json` as `application/json` under `n-3`. It is stored as it came, and reading it
+takes the error boundary:
+
+```json
+{"decoded":false}
+```
+
+### 6. A message that isn't text
+
+Send bytes that aren't valid UTF-8:
+
+```bash
+printf 'ok\377\376' | curl -s -o /dev/null -w '%{http_code}\n' -X POST "$B/channels/note-in" \
+  -H 'X-Api-Key: <your key>' -H 'Content-Type: application/octet-stream' -H 'X-Note-Id: n-4' \
+  --data-binary @-
+```
+
+```text
+200
+```
+
+The invalid bytes became U+FFFD, so `event.bodyLossy` is `true`, and the gateway took `ToRefuse`.
+There is no `n-4` row. A clean message has no `bodyLossy` key at all, which is why `= true` is the
+test. `<q:decode>` handles text only; there is no binary form.
+
+### 7. Masking
+
+Now suppose the titles are private. Add `redactors/title.hbs`, which holds the path to mask:
+
+```text
+/title
+```
+
+Name it on the source. This walkthrough also adds a wait, so there is an instance to look at:
+
+```xml
+<bpmn:startEvent id="Start">
+  <bpmn:extensionElements>
+    <q:source channel="note-in"><q:redactors><q:redactor ref="title"/></q:redactors></q:source>
+    <q:alias name="noteId" expression="event.dedupKey" unique="true"/>
+  </bpmn:extensionElements>
+</bpmn:startEvent>
+<!-- after Keep -->
+<bpmn:receiveTask id="Review" name="Wait for a review">
+  <bpmn:extensionElements>
+    <q:source channel="note-reviewed" name="review"/>
+    <q:alias name="noteId" expression="review.id"/>
+  </bpmn:extensionElements>
+</bpmn:receiveTask>
+```
+
+`sutra lint notes` now finds the copies the engine can't see through, including in `note-read`, which
+masks nothing itself but reads what a masking flow stored:
+
+```text
+[WARN] SUTRA.CONFIG.BPMN.RAW_BODY_UNMASKED — ... process 'note-keep' declares masking, but variable 'row' holds raw event.body text and is not sensitive, so the raw message shows in audit and inspect and is stored unencrypted. Declare it <q:variable name="row" sensitive="true"/>. This becomes an error in a later release.
+[WARN] SUTRA.CONFIG.BPMN.RAW_BODY_STORED — ... process 'note-keep' declares masking, but writes raw event.body text to data store 'notes' through variable 'row'. A store column has no at-rest encryption, and sensitive does not reach it.
+[WARN] SUTRA.CONFIG.BPMN.RAW_BODY_UNMASKED — ... process 'note-read' reads text a masking process stored, and variable 'row' holds raw event.body text and is not sensitive, ...
+[ERROR] SUTRA.CONFIG.DECODE.REDACTORS_MISSING — ... process 'note-read' reads text a masking process stored, and <q:decode name="note"> parses raw event.body text into a variable with no masking, so the message shows in audit and inspect. Declare it <q:variable name="note" sensitive="true"/>, or give the step <q:redactors>.
+```
+
+Declare `row` `sensitive` in both flows and `note` `sensitive` in `note-read`. Only
+`RAW_BODY_STORED` remains. It stays because storing the text is the point of this flow, and it is true:
+the column is cleartext.
+
+Package it and restart the engine with `SUTRA_CRYPTO_MASTER_KEY` set, so that parked state is
+encrypted. Keep a note with a private title under `n-5`, and look at the parked instance. This route
+needs the admin key:
+
+```bash
+curl -s -H "X-API-Key: $SUTRA_ADMIN_API_KEY" "$B/sutra/instances?alias=noteId:n-5"
+curl -s -H "X-API-Key: $SUTRA_ADMIN_API_KEY" "$B/sutra/instances/<instanceId>"
+```
+
+```json
+{"instanceId":"cb729345-dde3-46ab-94c6-0beaa6cbf5d3","deploymentId":"dep-a149aa3f6fbb7bc0a118c185","status":"SUSPENDED","completedNodes":["Keep"],"waitingNodes":["Review"],"sensitive":["row"],"variables":{"attr":"{}","event":"{body=[REDACTED], channel=note-in, contentType=application/json, dedupKey=[REDACTED], headers={accept=[REDACTED], content-length=[REDACTED], content-type=[REDACTED], host=[REDACTED], user-agent=[REDACTED], x-api-key=[REDACTED], x-note-id=[REDACTED]}, idempotencyKey=[REDACTED], receivedAt=2026-11-04T19:21:26.23034207Z}","header":"{accept=[REDACTED], content-length=[REDACTED], content-type=[REDACTED], host=[REDACTED], user-agent=[REDACTED], x-api-key=[REDACTED], x-note-id=[REDACTED]}","noteId":"n-5","payload":"{pages=1, title=[REDACTED]}","payload.validation":"[]","row":"***REDACTED***","validation":"{firstIssue=, firstReasonCode=, issues=[], outcome=OK, tier=n/a}"}}
+```
+
+The title appears nowhere in that answer, and the parked row in `instance_state` doesn't contain it
+either. The `notes` column does, in the clear. To keep it out of the column, don't store it in text.
+
+The flow itself still reads the real values. Answer the wait on `note-reviewed` with `{"id":"n-5"}`,
+then read the note:
+
+```json
+{"decoded":true,"title":"PRIVATE-TITLE-5","pages":1}
+```
+
+Answering with the title is this flow's choice. A real one masking its titles would answer something
+else.
+
+### Limits
+
+- **Size.** `<q:decode>` refuses text over `sutra.codec.max-payload-bytes` with
+  `SUTRA.RUNTIME.DECODE.TOO_LARGE`. Column limits are the database's.
+- **Encoding.** A body whose prolog declares another encoding, such as ISO-8859-1 XML, can't be kept
+  faithfully. A NUL byte survives into `event.body`, but PostgreSQL `TEXT` refuses it, and that write
+  fails the instance.
+- **After a wait.** A resuming message replaces `event`. Capture before the wait, as here.
+- **Other packages.** Lint follows a store by name within one package. Another package reading the same
+  database isn't seen.
+
 ## Sensitivity
 
 A store's `dataClass` (`pii` / `pci` / `phi` / `financial`) marks its contents sensitive: values

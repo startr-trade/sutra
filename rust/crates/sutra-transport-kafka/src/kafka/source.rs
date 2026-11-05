@@ -349,10 +349,8 @@ async fn supervise(
     }
 }
 
-/// Build the consumer client and subscribe to the topic. Creating the consumer does not
-/// connect (librdkafka connects lazily on first poll); a bad config fails closed here.
-fn open_session(config: &KafkaSourceConfig) -> Result<StreamConsumer, Diagnostic> {
-    let props = &config.properties;
+/// The librdkafka configuration a channel's consumer is built from.
+pub(crate) fn consumer_client_config(props: &KafkaChannelProperties) -> ClientConfig {
     let mut client = ClientConfig::new();
     client
         .set("bootstrap.servers", &props.bootstrap_servers)
@@ -363,12 +361,19 @@ fn open_session(config: &KafkaSourceConfig) -> Result<StreamConsumer, Diagnostic
     for (key, value) in &props.client_config {
         client.set(key, value);
     }
-    let consumer: StreamConsumer = client.create().map_err(|e| {
+    client
+}
+
+/// Build the consumer client and subscribe to the topic. Creating the consumer does not
+/// connect (librdkafka connects lazily on first poll); a bad config fails closed here.
+fn open_session(config: &KafkaSourceConfig) -> Result<StreamConsumer, Diagnostic> {
+    let props = &config.properties;
+    let consumer: StreamConsumer = consumer_client_config(props).create().map_err(|e| {
         Diagnostic::error(
             codes::INBOUND_CONFIG_INVALID,
             format!(
-                "kafka channel '{}' could not build a consumer for '{}': {e}",
-                config.channel, props.bootstrap_servers
+                "kafka channel '{}' could not build a consumer: {e}",
+                config.channel
             ),
         )
     })?;

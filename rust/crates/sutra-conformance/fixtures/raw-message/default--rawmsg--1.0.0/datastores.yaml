@@ -1,0 +1,20 @@
+# `messages` is a projected store: one typed column per field of schemas/message-row, and the message
+# itself sits in a TEXT column. `outcomes` is the plain key/value shape, for what the held flow decoded.
+datastores:
+  - name: messages
+    type: sql
+    structure:
+      schema: urn:message-row
+      type: MessageRow
+    sql:
+      url-ref: env:STORE_DB_URL
+      username-ref: env:STORE_DB_USER
+      password-ref: env:STORE_DB_PASSWORD
+      migrations: migrations/messages
+  - name: outcomes
+    type: sql
+    sql:
+      url-ref: env:STORE_DB_URL
+      username-ref: env:STORE_DB_USER
+      password-ref: env:STORE_DB_PASSWORD
+      migrations: migrations/outcomes

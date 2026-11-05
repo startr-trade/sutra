@@ -7,15 +7,18 @@ use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use sutra_bpmn::qbindings::OnValidationMode;
+use sutra_bpmn::qbindings::{MessageDecodeBinding, OnValidationMode};
 use sutra_bpmn::ProcessDefinition;
 use sutra_codec_spi::{
     CodecValue, DecodeOutcome, DecodeResult, IssueSeverity, PayloadCodec, ShapeClass,
     ValidationIssue,
 };
 use sutra_executor::telemetry;
-use sutra_executor::DeploymentId;
 use sutra_executor::Variables;
+use sutra_executor::{
+    DeploymentId, MessageDecodeFailure, MessageDecodeFailureKind, MessageDecodeOutcome,
+    MessageDecodeSeam,
+};
 use sutra_feel::FeelValue;
 
 use crate::codes;
@@ -99,6 +102,8 @@ pub struct InboundChain {
     /// [`with_redactors`](InboundChain::with_redactors) at engine assembly; empty by default (the
     /// many lightweight test constructions).
     redactors: RedactorRegistry,
+    /// The largest text a `<q:decode>` step parses. Seeded from the engine's global payload cap.
+    message_decode_cap_bytes: u64,
 }
 
 impl InboundChain {
@@ -115,7 +120,19 @@ impl InboundChain {
             formats: formats.into(),
             validators: validators.into(),
             redactors: RedactorRegistry::new(),
+            message_decode_cap_bytes: crate::PayloadCapPolicy::DEFAULT_MAX_PAYLOAD_BYTES,
         }
+    }
+
+    /// The `<q:decode>` input cap: the engine's global payload cap. `0` there disables the intake
+    /// cap, but a decode step still keeps the shipped default ceiling.
+    pub fn with_message_decode_cap(mut self, global_cap_bytes: u64) -> InboundChain {
+        self.message_decode_cap_bytes = if global_cap_bytes == 0 {
+            crate::PayloadCapPolicy::DEFAULT_MAX_PAYLOAD_BYTES
+        } else {
+            global_cap_bytes
+        };
+        self
     }
 
     /// Attach the redactor registry (built-ins + deployment-scoped user redactors). Builder-style so
@@ -163,27 +180,48 @@ impl InboundChain {
         if binding.codec.is_empty() {
             return Ok(Some(self.formats.open_decode(body, content_type)));
         }
+        let site = format!("Inbound on channel '{}'", binding.channel_name);
+        self.decode_with_codec(
+            &site,
+            &binding.channel_name,
+            &binding.codec,
+            &binding.deployment_id(),
+            body,
+            content_type,
+        )
+        .map(Some)
+    }
 
+    /// Decode `body` with a declared codec reference within `deployment`: a bare format is a shape
+    /// contract, anything else a schema-backed codec in full control. `site` opens the refusal's
+    /// message and `channel` is its attribute; the two callers are a channel and a `<q:decode>`.
+    fn decode_with_codec(
+        &self,
+        site: &str,
+        channel: &str,
+        codec_ref: &str,
+        deployment: &DeploymentId,
+        body: &[u8],
+        content_type: Option<&str>,
+    ) -> Result<DecodeResult, Diagnostic> {
         // A bare format reference — a shape contract; negotiate the parser by content-type.
-        if let Some(contract) = self.formats.contract(&binding.codec) {
+        if let Some(contract) = self.formats.contract(codec_ref) {
             let codec = self
                 .formats
-                .select(contract, content_type, &binding.codec)
+                .select(contract, content_type, codec_ref)
                 .ok_or_else(|| {
                     Diagnostic::error(
                         codes::INBOUND_CAPABILITY_MISMATCH,
                         format!(
-                            "Inbound on channel '{}' arrived as content-type '{}' but the '{}' \
-                             format contract accepts only {:?}; the flow cannot understand this \
-                             encoding.",
-                            binding.channel_name,
+                            "{site} arrived as content-type '{}' but the '{}' format contract \
+                             accepts only {:?}; the flow cannot understand this encoding.",
                             content_type.unwrap_or(""),
-                            binding.codec,
+                            codec_ref,
                             self.formats.admissible_content_types(contract)
                         ),
                     )
-                    .with_attribute("channel", &binding.channel_name)
-                    .with_attribute("codec", &binding.codec)
+                    .with_attribute("channel", channel)
+                    .with_attribute("codec", codec_ref)
                     .with_attribute("contentType", content_type.unwrap_or(""))
                 })?;
             let result = codec.decode(body, content_type);
@@ -196,49 +234,44 @@ impl InboundChain {
                         return Err(Diagnostic::error(
                             codes::INBOUND_CAPABILITY_MISMATCH,
                             format!(
-                                "Inbound on channel '{}' bound the flat '{}' format but the '{}' \
-                                 body is NESTED; a flat-map channel accepts only flat, row-shaped \
-                                 data (name→scalar).",
-                                binding.channel_name,
-                                binding.codec,
+                                "{site} bound the flat '{}' format but the '{}' body is NESTED; a \
+                                 flat-map channel accepts only flat, row-shaped data (name→scalar).",
+                                codec_ref,
                                 content_type.unwrap_or("")
                             ),
                         )
-                        .with_attribute("channel", &binding.channel_name)
-                        .with_attribute("codec", &binding.codec)
+                        .with_attribute("channel", channel)
+                        .with_attribute("codec", codec_ref)
                         .with_attribute("contentType", content_type.unwrap_or("")));
                     }
                 }
             }
-            return Ok(Some(result));
+            return Ok(result);
         }
 
-        // A schema-backed codec — the codec is in full control. Resolved within the binding's
+        // A schema-backed codec — the codec is in full control. Resolved within the
         // deployment, in the same tri-tier resolution order the codec registry documents:
         // archive codec → built-in `urn:sutra:codec:<name>:internal` → explicit URN.
         let codec = self
             .codecs
-            .resolve(&binding.codec, &binding.deployment_id())
-            .ok_or_else(|| {
-                codec_not_found(&binding.channel_name, &binding.codec, &self.codecs.names())
-            })?;
+            .resolve(codec_ref, deployment)
+            .ok_or_else(|| codec_not_found(channel, codec_ref, &self.codecs.names()))?;
         if !content_type::accepts(&codec.accepted_content_types(), content_type) {
             return Err(Diagnostic::error(
                 codes::INBOUND_CAPABILITY_MISMATCH,
                 format!(
-                    "Inbound on channel '{}' arrived as content-type '{}' but codec '{}' \
-                     accepts only {:?}; the flow cannot understand this encoding.",
-                    binding.channel_name,
+                    "{site} arrived as content-type '{}' but codec '{}' accepts only {:?}; the \
+                     flow cannot understand this encoding.",
                     content_type.unwrap_or(""),
-                    binding.codec,
+                    codec_ref,
                     codec.accepted_content_types()
                 ),
             )
-            .with_attribute("channel", &binding.channel_name)
-            .with_attribute("codec", &binding.codec)
+            .with_attribute("channel", channel)
+            .with_attribute("codec", codec_ref)
             .with_attribute("contentType", content_type.unwrap_or("")));
         }
-        Ok(Some(codec.decode(body, content_type)))
+        Ok(codec.decode(body, content_type))
     }
 
     /// Reply encode — the outbound counterpart of [`Self::decode`] ("native reply" continuity). For
@@ -674,6 +707,103 @@ impl InboundChain {
                 .with_attribute("redactor", reference)
             })
     }
+}
+
+impl MessageDecodeSeam for InboundChain {
+    /// The `<q:decode>` step: this chain's codec and redactor resolution, scoped to the instance's
+    /// pinned deployment, so a redeploy does not change an old instance's decode. Validators and
+    /// `<q:onValidation>` do not run: this is not intake. A failure names issue codes and paths
+    /// only, never `message` or `value`, because parser text can quote the input.
+    fn decode_message(
+        &self,
+        deployment: &DeploymentId,
+        binding: &MessageDecodeBinding,
+        text: &str,
+        content_type: Option<&str>,
+        vars: &Variables,
+    ) -> Result<MessageDecodeOutcome, MessageDecodeFailure> {
+        let _span = tracing::info_span!(telemetry::SPAN_DECODE, codec = %binding.codec).entered();
+        if text.len() as u64 > self.message_decode_cap_bytes {
+            return Err(MessageDecodeFailure {
+                kind: MessageDecodeFailureKind::TooLarge,
+                detail: format!(
+                    "the text is {} bytes, over the {}-byte cap",
+                    text.len(),
+                    self.message_decode_cap_bytes
+                ),
+            });
+        }
+        let site = format!("<q:decode name='{}'>", binding.name);
+        let decoded = self
+            .decode_with_codec(
+                &site,
+                &binding.name,
+                &binding.codec,
+                deployment,
+                text.as_bytes(),
+                content_type,
+            )
+            .map_err(|diagnostic| {
+                if diagnostic.code == codes::INBOUND_CODEC_NOT_FOUND {
+                    MessageDecodeFailure {
+                        kind: MessageDecodeFailureKind::NotFound,
+                        detail: "no such codec is registered in this deployment".to_string(),
+                    }
+                } else {
+                    MessageDecodeFailure {
+                        kind: MessageDecodeFailureKind::Fatal,
+                        detail: diagnostic.message,
+                    }
+                }
+            })?;
+        if decoded.outcome == DecodeOutcome::Fatal {
+            return Err(MessageDecodeFailure {
+                kind: MessageDecodeFailureKind::Fatal,
+                detail: format!(
+                    "the codec refused the text: {}",
+                    issue_codes(&decoded.issues)
+                ),
+            });
+        }
+        if !decoded.issues.is_empty() {
+            tracing::debug!(
+                codec = %binding.codec,
+                issues = decoded.issues.len(),
+                "<q:decode> proceeded past non-fatal codec issues"
+            );
+        }
+        let value = decoded
+            .payload
+            .as_ref()
+            .map(payload_view)
+            .unwrap_or(FeelValue::Null);
+        let masked = if binding.redactors.is_empty() {
+            None
+        } else {
+            let mut outcomes = Vec::with_capacity(binding.redactors.len());
+            for reference in &binding.redactors {
+                let redactor = self
+                    .redactors
+                    .resolve(reference, deployment)
+                    .ok_or_else(|| MessageDecodeFailure {
+                        kind: MessageDecodeFailureKind::NotFound,
+                        detail: format!("no redactor '{reference}' is registered"),
+                    })?;
+                outcomes.push(run_redactor(redactor.as_ref(), &value, vars));
+            }
+            Some(mask_projection(&value, &outcomes))
+        };
+        Ok(MessageDecodeOutcome { value, masked })
+    }
+}
+
+/// `code@path` for each issue, with neither its message nor its value.
+fn issue_codes(issues: &[ValidationIssue]) -> String {
+    let listed: Vec<String> = issues
+        .iter()
+        .map(|issue| format!("{}@{}", issue.code, issue.path))
+        .collect();
+    listed.join(", ")
 }
 
 /// The FEEL-walkable view of a decoded payload — ONE projection, used by aliases, gateway

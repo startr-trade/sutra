@@ -22,6 +22,7 @@ and the same XSD drives the `sutra-modeler-plugin` property panels.
 | `q:reply` | tasks | An outbound reply on the inbound's own channel; `continue="true"` is respond-and-continue. |
 | `q:send` | throw events, send tasks | An unsolicited outbound message to a channel destination. |
 | `q:header` | `q:send` / `q:reply` | An author-declared outbound header. |
+| `q:decode` | data task (`bpmn:serviceTask` with no `@implementation`) | Parses text the flow holds, such as a message kept in a typed store column, with a registered codec, and binds the result (0.6.19). |
 | `q:param` | `bpmn:serviceTask` | A scoped, per-invocation input to a registered task or template. |
 | `q:retry` | registered-task **and** channel-call `bpmn:serviceTask` | Per-task retry policy — attempts, backoff, non-retryable codes. |
 | `q:timeout` | channel-call `bpmn:serviceTask` | Synthesizes a timer boundary on the call. |
@@ -338,6 +339,81 @@ before 0.6.18.
 
 **A caller that lost its 202** can ask `GET /sutra/instances?alias=<name>:<value>`. See
 [Acceptance receipts](acceptance-receipts.md#6-find-the-instance-after-losing-the-202).
+
+## `q:decode` — read held text as a message
+
+`event.body` is the message as text, so a flow can keep it in a typed store column with an ordinary
+assignment. `<q:decode>` is the other half: it parses text the flow holds with a registered codec and
+binds the result. It hangs off a data task, and anywhere else is a parse error
+(`SUTRA.PARSE.Q_DECODE.NOT_ON_DATA_TASK`). The walkthrough is
+[Keeping a message as text](data-stores.md#keeping-a-message-as-text).
+
+```xml
+<bpmn:serviceTask id="Load">
+  <bpmn:extensionElements>
+    <q:decode name="message" expression="row.body" codec="json" contentType="row.contentType">
+      <q:redactors><q:redactor ref="card"/></q:redactors> <!-- optional -->
+    </q:decode>
+  </bpmn:extensionElements>
+  <bpmn:dataInputAssociation>
+    <bpmn:sourceRef>refRead</bpmn:sourceRef><bpmn:targetRef>row</bpmn:targetRef>
+  </bpmn:dataInputAssociation>
+</bpmn:serviceTask>
+```
+
+| Attribute | Required | What it is |
+|---|---|---|
+| `name` | yes | The variable the decoded value is bound to. |
+| `expression` | yes | FEEL giving a string. |
+| `codec` | yes | A built-in format name or a package schema codec URN, as on a channel. |
+| `contentType` | no | FEEL. Picks the parser within a format's contract (`json`, `xml` and `yaml` are one contract), and is passed to the codec. |
+
+**Order.** A data task runs its store reads, its decodes in document order, its assignments, then its
+store writes.
+
+**The instance's own codec.** It resolves in the instance's pinned deployment, so a redeploy does not
+change how an old instance decodes. Validators and `<q:onValidation>` do not run: this is not intake.
+A codec's non-fatal issues do not stop the step.
+
+**Failures** can be caught with an error boundary or an event sub-process. Uncaught, they fail the
+instance. Their text names issue codes and paths only, never the input.
+
+| Code | When |
+|---|---|
+| `SUTRA.RUNTIME.DECODE.NOT_TEXT` | The expression gave null or something other than a string. A timer start has no `event`, so `event.body` there gives this. |
+| `SUTRA.RUNTIME.DECODE.FAILED` | The codec refused the text or its content type, or the codec or a redactor isn't registered. |
+| `SUTRA.RUNTIME.DECODE.TOO_LARGE` | The text is over the engine's `sutra.codec.max-payload-bytes` (10 MiB by default; `0` there still leaves that default here). Nothing was decoded. |
+
+**Text only.** A valid UTF-8 body round-trips exactly. Otherwise invalid bytes become U+FFFD in
+`event.body`, and `event.bodyLossy` is `true`, so a flow can route the message away; a clean message
+has no such key. There is no binary form. A body whose prolog declares another encoding, such as
+ISO-8859-1 XML, cannot be kept faithfully. A NUL byte survives the conversion but PostgreSQL `TEXT`
+refuses it, and that store write fails the instance.
+
+**Masking.** A `<q:redactors>` child writes a masked projection to the `<name>.redacted` companion,
+and a crashed redactor masks the whole value. Otherwise declare the target `sensitive`. A store column
+has no at-rest encryption, and `sensitive` does not reach it. In a package where a process masks its
+source, `sutra lint`:
+
+| Code | Severity | When |
+|---|---|---|
+| `SUTRA.CONFIG.BPMN.RAW_BODY_UNMASKED` | warning, an error in a later release | A variable holds raw `event.body` text and isn't `sensitive`. This covers a copy, and a variable read from a store that a masking process wrote it to, even in a process with no masking of its own. |
+| `SUTRA.CONFIG.BPMN.RAW_BODY_STORED` | warning | Raw `event.body` text is written to a store. |
+| `SUTRA.CONFIG.DECODE.REDACTORS_MISSING` | error | A `<q:decode>` reads such text, and its target has neither `<q:redactors>` nor `sensitive`. |
+
+The check follows a store by name within one package; another package reading the same database isn't
+seen, and `<q:alias>` and `<q:param>` don't count as copies. It also refuses a codec or redactor that
+doesn't resolve (`SUTRA.CONFIG.DECODE.CODEC_UNKNOWN`, `SUTRA.CONFIG.DECODE.REDACTOR_UNKNOWN`), and a
+step missing an attribute fails at parse (`SUTRA.PARSE.Q_DECODE.INCOMPLETE`).
+
+**After a wait.** A decode reads variables and store rows, never a delivery, so a resume or a retry
+decodes the same text. But a resuming message replaces `event`, and so does a synchronous channel-call
+reply unless the task declares an output mapping. So capture on the step right after the intake you
+mean. A call activity sees its caller's `event`.
+
+**Cost.** The decoded target and any capture variable are persisted at a park like any other, so a
+large message costs two or three times its size per park unless declared `transient`. A flow that
+doesn't use `<q:decode>` pays nothing.
 
 ## `q:retry` — per-task retry policies {#qretry--per-task-retry-policies}
 

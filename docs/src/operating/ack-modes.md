@@ -125,7 +125,8 @@ runs `on-persist`.
 - A refused message is deleted. It leaves a WARN `SUTRA.INBOUND.DELIVERY_DROPPED` and, if an audit sink is on,
   an `inbound.DELIVERY_DROPPED` audit record. See [Refused deliveries and connection
   references](inbound-refusals.md).
-- `region` and `queue.url` are required, and accept references.
+- `region` and `queue.url` are required, and accept references. See [References in connection
+  properties](connection-references.md), which covers the other transports too.
 
 ## The deferred-ack registry
 

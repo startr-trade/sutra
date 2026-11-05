@@ -735,6 +735,37 @@
     <xsd:attribute name="expression" type="xsd:string" use="required"/>
   </xsd:complexType>
 
+  <!-- ===================== Decoding held text on a data task ===================== -->
+
+  <xsd:element name="decode" type="q:DecodeType">
+    <xsd:annotation>
+      <xsd:documentation>
+        A decode step (0.6.19, additive): hung off a data task's &lt;bpmn:extensionElements&gt;, a
+        &lt;bpmn:serviceTask&gt; with no @implementation; anywhere else it is a parse error. It parses
+        text the flow already holds, such as a message kept in a typed store column, with a registered
+        codec, and binds the result to @name. A data task runs its store reads, then its decodes in
+        document order, then its assignments, then its store writes. @expression is FEEL giving a
+        string. @codec is a built-in format name or a package schema codec URN, resolved in the
+        instance's pinned deployment. @contentType is FEEL, picks the parser within a format's
+        contract, and is passed to the codec. Validators and q:onValidation do not run. A child
+        q:redactors writes a masked projection to the @name.redacted companion. A null or non-string
+        input, a codec refusal or a text over the engine's payload cap raises
+        SUTRA.RUNTIME.DECODE.NOT_TEXT, .FAILED or .TOO_LARGE, which an error boundary can catch. Text
+        only: there is no binary form.
+      </xsd:documentation>
+    </xsd:annotation>
+  </xsd:element>
+
+  <xsd:complexType name="DecodeType">
+    <xsd:sequence>
+      <xsd:element ref="q:redactors" minOccurs="0" maxOccurs="1"/>
+    </xsd:sequence>
+    <xsd:attribute name="name" type="xsd:string" use="required"/>
+    <xsd:attribute name="expression" type="xsd:string" use="required"/>
+    <xsd:attribute name="codec" type="xsd:string" use="required"/>
+    <xsd:attribute name="contentType" type="xsd:string"/>
+  </xsd:complexType>
+
   <!-- ===================== Audit configuration per process ===================== -->
 
   <xsd:element name="audit" type="q:AuditType"/>
