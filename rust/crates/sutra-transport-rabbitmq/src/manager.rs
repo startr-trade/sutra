@@ -133,8 +133,15 @@ impl RabbitMqChannels {
             .iter()
             .filter(|d| d.transport.as_deref() == Some(TRANSPORT) && !d.is_outbound())
         {
-            let Ok(props) = RabbitMqChannelProperties::from_definition(def) else {
-                continue;
+            let props = match RabbitMqChannelProperties::for_wiring(def) {
+                Ok(props) => props,
+                Err(d) => {
+                    warn!(
+                        code = %d.code,
+                        "rabbitmq consumer NOT started during flip: {}", d.message
+                    );
+                    continue;
+                }
             };
             desired.insert(consumer_key(def), (def.clone(), props));
         }
@@ -243,7 +250,7 @@ fn build_and_start_consumer(
 ) -> Result<Option<(ConsumerKey, RunningConsumer)>, Diagnostic> {
     let channel = definition.binding.channel_name.clone();
     let tenant = definition.binding.tenant().to_string();
-    let properties = RabbitMqChannelProperties::from_definition(definition)?;
+    let properties = RabbitMqChannelProperties::for_wiring(definition)?;
     let fingerprint = properties.clone();
 
     let (username, password) = match (
@@ -471,6 +478,40 @@ inventory::submit! {
     }
 }
 
+/// A queue hands each message to one consumer, so it belongs to one deployment. Read from the raw
+/// properties: the credentials `from_definition` validates are no part of a queue's identity, and
+/// this runs where they may not resolve.
+fn endpoint_claims(def: &ChannelDefinition) -> Vec<sutra_transport_spi::EndpointClaim> {
+    let prop = |key: &str| {
+        def.properties
+            .get(key)
+            .map(|v| v.trim())
+            .filter(|v| !v.is_empty())
+    };
+    let Some(queue) = prop("queue") else {
+        return Vec::new();
+    };
+    let host = sutra_transport_spi::normalized_endpoint_host(
+        prop("host").unwrap_or(RabbitMqChannelProperties::DEFAULT_HOST),
+    );
+    let port = prop("port")
+        .map(str::to_string)
+        .unwrap_or_else(|| RabbitMqChannelProperties::DEFAULT_PORT.to_string());
+    let vhost = prop("virtual-host").unwrap_or(RabbitMqChannelProperties::DEFAULT_VHOST);
+    vec![sutra_transport_spi::EndpointClaim::exclusive(format!(
+        "{host}:{port} vhost {vhost} queue {queue}"
+    ))]
+}
+
+inventory::submit! {
+    sutra_transport_spi::EndpointClaimFactory {
+        transport: TRANSPORT,
+        claims: endpoint_claims,
+        listener_prefix: None,
+        preflight: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -510,6 +551,102 @@ mod tests {
         );
         let err = resolve_credential(Some("${MISSING}"), "password", "ch", fails).unwrap_err();
         assert_eq!(err.code, crate::rabbitmq::codes::INBOUND_CONNECTION_FAILED);
+    }
+}
+
+#[cfg(test)]
+mod connection_reference_guard {
+    use super::spawn_broker_channels_with_intake;
+    use crate::rabbitmq::RabbitMqChannelProperties;
+    use std::sync::Arc;
+    use sutra_channels::config::{ChannelBinding, Namespace};
+    use sutra_channels::{
+        AckDecision, BoxFuture, ChannelDefinition, DeploymentId, InboundIntake, InboundMessage,
+    };
+
+    struct NoIntake;
+    impl InboundIntake for NoIntake {
+        fn deliver(&self, _message: InboundMessage) -> BoxFuture<'_, AckDecision> {
+            Box::pin(async { AckDecision::Ack })
+        }
+    }
+
+    fn resolver(_reference: &str) -> Result<String, String> {
+        panic!("the guard runs before anything is resolved");
+    }
+
+    /// A valid inbound definition, with `extra` on top and `reference` set to a `${…}` value.
+    fn definition(extra: &[(&str, &str)], reference: Option<&str>) -> ChannelDefinition {
+        let mut properties: std::collections::BTreeMap<String, String> = [
+            ("host", "broker"),
+            ("port", "5672"),
+            ("virtual-host", "/"),
+            ("queue", "orders"),
+            ("exchange", "ex"),
+        ]
+        .into_iter()
+        .chain(extra.iter().copied())
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect();
+        if let Some(key) = reference {
+            properties.insert(key.to_string(), "${CHANNEL_SETTING}".to_string());
+        }
+        ChannelDefinition {
+            binding: ChannelBinding::new(
+                "orders-in",
+                Namespace::new("acme", "orders", "v1"),
+                DeploymentId::unresolved(),
+                "opaque",
+            ),
+            transport: Some("rabbitmq".to_string()),
+            bind_spec: None,
+            codec: None,
+            cloud_events_mode: None,
+            auth_scheme: None,
+            idempotency_key_header: None,
+            payload_cap_bytes: None,
+            properties,
+        }
+    }
+
+    #[test]
+    fn wiring_refuses_a_reference_in_each_connection_property() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        for key in ["host", "port", "virtual-host", "queue", "exchange"] {
+            let def = definition(&[], Some(key));
+            let Err(err) = spawn_broker_channels_with_intake(
+                &[def],
+                Arc::new(NoIntake),
+                None,
+                resolver,
+                runtime.handle().clone(),
+            ) else {
+                panic!("a reference in '{key}' must not wire");
+            };
+            assert_eq!(
+                err.code, "SUTRA.INBOUND.RABBITMQ.CONFIG_INVALID",
+                "for {key}"
+            );
+            assert!(err.message.contains("orders-in"), "{}", err.message);
+            assert!(err.message.contains(&format!("'{key}'")), "{}", err.message);
+            assert!(err.message.contains("later release"), "{}", err.message);
+            assert!(!err.message.contains("CHANNEL_SETTING"), "{}", err.message);
+        }
+    }
+
+    #[test]
+    fn a_literal_connection_property_is_unaffected() {
+        let literal = RabbitMqChannelProperties::for_wiring(&definition(&[], None))
+            .expect("literal values wire");
+        let plain = RabbitMqChannelProperties::from_definition(&definition(&[], None))
+            .expect("plain parse");
+        assert_eq!(literal, plain);
+        // A credential reference is resolved later, not refused here.
+        let with_credentials = definition(&[("username", "${BROKER_USER}")], None);
+        RabbitMqChannelProperties::for_wiring(&with_credentials)
+            .expect("a credential reference passes");
     }
 }
 

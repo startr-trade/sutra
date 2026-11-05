@@ -61,6 +61,7 @@ fn fixture() -> &'static Fixture {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "docker"]
 async fn tc_early_reply_refused_send_fails_the_instance_once() {
+    let _suite = sutra_testkit::hold_suite!("notice");
     let client = reqwest::Client::new();
     let id = "ER-REFUSED-1";
 

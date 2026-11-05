@@ -150,6 +150,7 @@ impl MySqlDeploymentArchiveStore {
         rows.iter()
             .map(|r| {
                 Ok(ServedArchiveRow {
+                    activated_at: None,
                     archive: ActiveArchive {
                         deployment_id: str_col(r, "deployment_id")?,
                         slot: str_col(r, "slot")?,

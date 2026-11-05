@@ -502,6 +502,7 @@ async fn summarize_async(fixture: &Fixture, id: &str) {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "docker"]
 async fn tc_ai_summarize_openai_wire_sync() {
+    let _suite = sutra_testkit::hold_suite!(SUITE);
     let before = stub_count("chat").await;
     summarize_sync(summarize_openai(), "AI-OA-SYNC-1").await;
     assert!(
@@ -513,18 +514,21 @@ async fn tc_ai_summarize_openai_wire_sync() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "docker"]
 async fn tc_ai_summarize_openai_wire_streamed() {
+    let _suite = sutra_testkit::hold_suite!(SUITE);
     summarize_stream(summarize_openai(), "AI-OA-SSE-1").await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "docker"]
 async fn tc_ai_summarize_openai_wire_async() {
+    let _suite = sutra_testkit::hold_suite!(SUITE);
     summarize_async(summarize_openai(), "AI-OA-ASYNC-1").await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "docker"]
 async fn tc_ai_summarize_anthropic_wire_sync() {
+    let _suite = sutra_testkit::hold_suite!(SUITE);
     let before = stub_count("messages").await;
     summarize_sync(summarize_anthropic(), "AI-AN-SYNC-1").await;
     assert!(
@@ -536,12 +540,14 @@ async fn tc_ai_summarize_anthropic_wire_sync() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "docker"]
 async fn tc_ai_summarize_anthropic_wire_streamed() {
+    let _suite = sutra_testkit::hold_suite!(SUITE);
     summarize_stream(summarize_anthropic(), "AI-AN-SSE-1").await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "docker"]
 async fn tc_ai_summarize_anthropic_wire_async() {
+    let _suite = sutra_testkit::hold_suite!(SUITE);
     summarize_async(summarize_anthropic(), "AI-AN-ASYNC-1").await;
 }
 
@@ -558,6 +564,7 @@ async fn advanced_sync(channel: &str, body: Value) -> Value {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "docker"]
 async fn tc_ai_advanced_cross_provider_fallback() {
+    let _suite = sutra_testkit::hold_suite!(SUITE);
     advanced();
     set_outage(true).await;
     let gated = stub_count("flaky").await;
@@ -579,6 +586,7 @@ async fn tc_ai_advanced_cross_provider_fallback() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "docker"]
 async fn tc_ai_advanced_json_mode() {
+    let _suite = sutra_testkit::hold_suite!(SUITE);
     let reply = advanced_sync(
         "classify",
         json!({ "ticketId": "AI-JSON-1", "description": "Checkout crashes for everyone." }),
@@ -604,6 +612,7 @@ fn refused_ticket(id: &str) -> Value {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "docker"]
 async fn tc_ai_refused_model_is_caught_and_the_caller_gets_the_recovery_reply() {
+    let _suite = sutra_testkit::hold_suite!(SUITE);
     let refused = stub_count("chat-model-refused").await;
     let (status, _, text) = post(
         advanced(),
@@ -635,6 +644,7 @@ async fn tc_ai_refused_model_is_caught_and_the_caller_gets_the_recovery_reply() 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "docker"]
 async fn tc_ai_refused_model_uncaught_fails_the_call_as_before() {
+    let _suite = sutra_testkit::hold_suite!(SUITE);
     let (status, _, text) = post(
         advanced(),
         ADVANCED_KEY,
@@ -687,6 +697,7 @@ async fn instance_reaching(fixture: &Fixture, ticket_id: &str, status: &str) -> 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "docker"]
 async fn tc_ai_refused_model_on_a_stored_instance_is_caught_and_it_completes() {
+    let _suite = sutra_testkit::hold_suite!(SUITE);
     let fixture = advanced();
     let (status, _, text) = post(
         fixture,
@@ -709,6 +720,7 @@ async fn tc_ai_refused_model_on_a_stored_instance_is_caught_and_it_completes() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "docker"]
 async fn tc_ai_refused_model_on_a_stored_instance_uncaught_is_failed_durably() {
+    let _suite = sutra_testkit::hold_suite!(SUITE);
     let fixture = advanced();
     let (status, _, text) = post(
         fixture,
@@ -725,6 +737,7 @@ async fn tc_ai_refused_model_on_a_stored_instance_uncaught_is_failed_durably() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "docker"]
 async fn tc_ai_advanced_tool_call() {
+    let _suite = sutra_testkit::hold_suite!(SUITE);
     let reply = advanced_sync("weather", json!({})).await;
     assert_eq!(reply["finish"], "tool-calls", "{reply}");
     let calls = reply["toolCalls"].as_array().expect("toolCalls");
@@ -764,6 +777,7 @@ async fn advanced_job(channel: &str, model_channel: &str, id: &str, via: &str) {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "docker"]
 async fn tc_ai_advanced_openai_job_polled() {
+    let _suite = sutra_testkit::hold_suite!(SUITE);
     let polls = stub_count("responses-poll").await;
     // The submit and the first poll are seconds apart, so the job row is observable in between.
     let watcher = tokio::spawn(async {
@@ -792,6 +806,7 @@ async fn tc_ai_advanced_openai_job_polled() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "docker"]
 async fn tc_ai_advanced_openai_job_webhook() {
+    let _suite = sutra_testkit::hold_suite!(SUITE);
     advanced_job(
         "summarize-webhook",
         "webhook-model",
@@ -804,6 +819,7 @@ async fn tc_ai_advanced_openai_job_webhook() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "docker"]
 async fn tc_ai_advanced_anthropic_batch() {
+    let _suite = sutra_testkit::hold_suite!(SUITE);
     let results = stub_count("batches-results").await;
     advanced_job("summarize-batch", "batch-model", "AI-BATCH-1", "batch").await;
     assert!(
@@ -855,6 +871,7 @@ fn unb64(value: &Value) -> Vec<u8> {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "docker"]
 async fn tc_ai_advanced_voice_audio_in_audio_out() {
+    let _suite = sutra_testkit::hold_suite!(SUITE);
     advanced();
     let (heard, spoke) = (
         stub_count("chat-audio-in").await,
@@ -892,6 +909,7 @@ async fn tc_ai_advanced_voice_audio_in_audio_out() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "docker"]
 async fn tc_ai_advanced_audio_understanding_json_answer() {
+    let _suite = sutra_testkit::hold_suite!(SUITE);
     advanced();
     let (in_words, refused, heard) = (
         stub_count("chat-json-in-words").await,
@@ -933,6 +951,7 @@ async fn tc_ai_advanced_audio_understanding_json_answer() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "docker"]
 async fn tc_ai_advanced_voice_pipeline() {
+    let _suite = sutra_testkit::hold_suite!(SUITE);
     advanced();
     let (stt, tts, messages) = (
         stub_count("transcriptions").await,
@@ -1029,6 +1048,7 @@ async fn assert_no_video_candidate_skipped() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "docker"]
 async fn tc_ai_advanced_vision_inline_image() {
+    let _suite = sutra_testkit::hold_suite!(SUITE);
     advanced();
     let _one = VISION.lock().await;
     let png = sample("frame-1.png");
@@ -1058,6 +1078,7 @@ async fn tc_ai_advanced_vision_inline_image() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "docker"]
 async fn tc_ai_advanced_vision_video_frames() {
+    let _suite = sutra_testkit::hold_suite!(SUITE);
     advanced();
     let _one = VISION.lock().await;
     let (first, second) = (sample("frame-1.png"), sample("frame-2.png"));
@@ -1088,6 +1109,7 @@ async fn tc_ai_advanced_vision_video_frames() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "docker"]
 async fn tc_ai_advanced_vision_media_reference() {
+    let _suite = sutra_testkit::hold_suite!(SUITE);
     advanced();
     let _one = VISION.lock().await;
     let png = sample("frame-2.png");
@@ -1114,6 +1136,7 @@ async fn tc_ai_advanced_vision_media_reference() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "docker"]
 async fn tc_ai_advanced_vision_media_reference_wrong_digest() {
+    let _suite = sutra_testkit::hold_suite!(SUITE);
     advanced();
     let _one = VISION.lock().await;
     let png = sample("frame-1.png");
@@ -1147,6 +1170,7 @@ async fn tc_ai_advanced_vision_media_reference_wrong_digest() {
 /// <variant> --overlay <shared>` would report.
 #[test]
 fn ai_example_variants_compose_and_lint_clean() {
+    let _suite = sutra_testkit::hold_suite!(SUITE);
     for example in ["ai-summarize", "ai-advanced"] {
         let dir = util::examples_dir().join(example);
         let mut variants: Vec<_> = std::fs::read_dir(dir.join("variants"))

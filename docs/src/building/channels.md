@@ -157,6 +157,9 @@ deploy-time error unless the channel opts into broadcast.
 admission cap on simultaneously active instances from that channel (a suspended instance still
 holds its slot). Absent, the channel is unbounded.
 
+Each exclusive endpoint (route, queue, subscription, consumer group, spool directory) belongs to one
+deployment; see [One endpoint, one deployment](endpoint-claims.md).
+
 ## Codecs — format × schema
 
 A **codec** is a channel-facing named decoder: a parser (`json` / `xml` / `yaml` / `csv` / a
@@ -238,8 +241,8 @@ the `schemaKind` bundle mechanism that lets an archive map its own schema editio
 `ack-mode` decides **when** the engine acknowledges an inbound relative to processing:
 
 - **`on-persist`** — ack as soon as the message is durably captured, before the process runs.
-  Broker default. On HTTP this is what makes a channel asynchronous (`202 Accepted`, no business
-  body).
+  Broker default. On HTTP this is what makes a channel asynchronous (`202 Accepted` with an
+  [acceptance receipt](acceptance-receipts.md)).
 - **`on-complete`** — ack only once the instance reaches a terminal state. HTTP default (classic
   synchronous request/reply — hold the connection, return the reply body). On a broker, this
   defers the ack via the engine's `DeferredAckRegistry` until the instance completes or fails.

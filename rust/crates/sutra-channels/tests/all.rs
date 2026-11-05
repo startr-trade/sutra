@@ -13,6 +13,8 @@ mod capacity_pool_test;
 mod channel_call_retry_dispatch_test;
 #[path = "all/config_test.rs"]
 mod config_test;
+#[path = "all/declared_dedup_test.rs"]
+mod declared_dedup_test;
 #[path = "all/deferred_ack_test.rs"]
 mod deferred_ack_test;
 #[path = "all/dispatcher_policy_test.rs"]

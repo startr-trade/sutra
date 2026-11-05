@@ -97,7 +97,8 @@ async fn post(channel: &str, event_id: Option<&str>, reference: &str) -> (u16, S
         .body(format!(r#"{{"ref":"{reference}"}}"#))
         .timeout(Duration::from_secs(90));
     if let Some(id) = event_id {
-        request = request.header("X-Event-Id", id);
+        // The header a channel or a flow names, and the CloudEvents id a flow can declare instead.
+        request = request.header("X-Event-Id", id).header("ce-id", id);
     }
     let response = request.send().await.expect("post");
     let status = response.status().as_u16();
@@ -132,6 +133,7 @@ async fn retry_until_accepted(channel: &str, event_id: &str, reference: &str) {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "docker"]
 async fn tc_dedup_refusal_a_delivery_that_cannot_be_checked_is_retried_and_processed_once() {
+    let _suite = sutra_testkit::hold_suite!("dedupref");
     fixture();
     // The same id twice while healthy: the suppression this refusal protects.
     let (status, _) = post("event-in", Some("healthy-1"), "healthy").await;
@@ -142,10 +144,29 @@ async fn tc_dedup_refusal_a_delivery_that_cannot_be_checked_is_retried_and_proce
         "a duplicate answers 2xx: {status}"
     );
 
+    // The same, from a key only the flow declares.
+    for (channel, id, reference) in [
+        ("declared-header-in", "declared-h-1", "declared-header"),
+        ("declared-ce-in", "declared-c-1", "declared-ce"),
+    ] {
+        for _ in 0..2 {
+            let (status, _) = post(channel, Some(id), reference).await;
+            assert!((200..300).contains(&status), "{channel}: {status}");
+        }
+    }
+
     docker_pg("stop");
     let (send_status, send_body) = post("event-in", Some("outage-1"), "outage").await;
     let (quiet_status, quiet_body) = post("quiet-in", Some("outage-2"), "outage-quiet").await;
+    let (header_status, header_body) =
+        post("declared-header-in", Some("outage-3"), "outage-header").await;
+    let (ce_status, ce_body) = post("declared-ce-in", Some("outage-4"), "outage-ce").await;
     docker_pg("start");
+
+    for (status, body) in [(header_status, &header_body), (ce_status, &ce_body)] {
+        assert_eq!(status, 503, "a declared key is refused too: {body}");
+        assert!(body.contains(REFUSAL), "{body}");
+    }
 
     println!("refusal: {send_status} {send_body}");
     assert_eq!(send_status, 503, "{send_body}");
@@ -157,6 +178,8 @@ async fn tc_dedup_refusal_a_delivery_that_cannot_be_checked_is_retried_and_proce
     // The sender retries the same ids.
     retry_until_accepted("event-in", "outage-1", "outage").await;
     retry_until_accepted("quiet-in", "outage-2", "outage-quiet").await;
+    retry_until_accepted("declared-header-in", "outage-3", "outage-header").await;
+    retry_until_accepted("declared-ce-in", "outage-4", "outage-ce").await;
     // A further retry after success is a duplicate, not a second run.
     let (status, _) = post("event-in", Some("outage-1"), "outage").await;
     assert!((200..300).contains(&status), "{status}");
@@ -172,7 +195,21 @@ async fn tc_dedup_refusal_a_delivery_that_cannot_be_checked_is_retried_and_proce
         "the healthy duplicate was suppressed"
     );
     assert_eq!(callbacks("outage"), 1, "processed exactly once");
-    for id in ["outage-1", "outage-2", "healthy-1"] {
+    assert_eq!(
+        callbacks("declared-header"),
+        1,
+        "the declared header dedupes"
+    );
+    assert_eq!(callbacks("declared-ce"), 1, "the declared id dedupes");
+    for id in [
+        "outage-1",
+        "outage-2",
+        "healthy-1",
+        "declared-h-1",
+        "declared-c-1",
+        "outage-3",
+        "outage-4",
+    ] {
         assert_eq!(
             sql(&format!(
                 "SELECT count(*) FROM inbox_seen WHERE event_id = '{id}'"
@@ -186,6 +223,7 @@ async fn tc_dedup_refusal_a_delivery_that_cannot_be_checked_is_retried_and_proce
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "docker"]
 async fn tc_dedup_refusal_a_delivery_with_no_explicit_id_never_consults_the_check() {
+    let _suite = sutra_testkit::hold_suite!("dedupref");
     fixture();
     let (first, _) = post("quiet-in", None, "no-id").await;
     let (second, _) = post("quiet-in", None, "no-id").await;

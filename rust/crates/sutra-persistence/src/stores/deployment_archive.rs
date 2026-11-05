@@ -100,6 +100,9 @@ pub struct ServedArchiveRow {
     pub archive: ActiveArchive,
     /// `Active` (serving intake) or `Draining` (registered for pinned resume only).
     pub status: ArchiveStatus,
+    /// When the row last became active. What decides between rows an older engine let share an
+    /// endpoint: the earliest holds.
+    pub activated_at: Option<OffsetDateTime>,
 }
 
 /// One status row (the CRD-mirror / status-endpoint projection — no bytes).
@@ -126,18 +129,47 @@ impl PgDeploymentArchiveStore {
         Self { pool }
     }
 
+    /// The pool this store reads and writes through.
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
     /// Store `new` as the ACTIVE archive for its slot, replacing in place: the prior active row for
     /// the slot is demoted to `draining` and the new row is inserted (or re-activated, if the same
     /// content-hash id is re-deployed) with a bumped per-slot `revision`, all in one transaction.
     /// Returns the new revision. This is the durable half of both a first deploy and a hot-deploy.
     pub async fn upsert_active(&self, new: &NewArchive) -> Result<i64> {
-        let now = OffsetDateTime::now_utc();
+        self.upsert_active_superseding(new, &[]).await
+    }
+
+    /// [`Self::upsert_active`] that also demotes the active rows of `superseded` slots to
+    /// `draining`, in the same transaction. One commit is what keeps a crash from leaving both
+    /// the old and the new deployment active on one endpoint, or neither.
+    pub async fn upsert_active_superseding(
+        &self,
+        new: &NewArchive,
+        superseded: &[String],
+    ) -> Result<i64> {
         let mut tx = self
             .pool
             .begin()
             .await
             .map_err(PersistenceError::db("deployment_archive upsert begin"))?;
+        let revision = Self::upsert_active_superseding_in(&mut tx, new, superseded).await?;
+        tx.commit()
+            .await
+            .map_err(PersistenceError::db("deployment_archive upsert commit"))?;
+        Ok(revision)
+    }
 
+    /// [`Self::upsert_active_superseding`] on the caller's connection, so a caller holding a lock
+    /// on that connection needs no second one to finish.
+    pub async fn upsert_active_superseding_in(
+        tx: &mut sqlx::PgConnection,
+        new: &NewArchive,
+        superseded: &[String],
+    ) -> Result<i64> {
+        let now = OffsetDateTime::now_utc();
         // Next monotonic revision for this slot.
         let revision: i64 = sqlx::query(
             "SELECT COALESCE(MAX(revision), 0) + 1 FROM deployment_archive WHERE slot = $1",
@@ -159,6 +191,15 @@ impl PgDeploymentArchiveStore {
         .execute(&mut *tx)
         .await
         .map_err(PersistenceError::db("deployment_archive demote"))?;
+        for slot in superseded {
+            sqlx::query(
+                "UPDATE deployment_archive SET status = 'draining' WHERE slot = $1 AND status = 'active'",
+            )
+            .bind(slot)
+            .execute(&mut *tx)
+            .await
+            .map_err(PersistenceError::db("deployment_archive demote superseded"))?;
+        }
 
         // Insert the new active row — or re-activate an identical content-hash re-deploy.
         sqlx::query(
@@ -189,9 +230,6 @@ impl PgDeploymentArchiveStore {
             .execute(&mut *tx)
             .await
             .map_err(PersistenceError::db("deployment_archive notify"))?;
-        tx.commit()
-            .await
-            .map_err(PersistenceError::db("deployment_archive upsert commit"))?;
         Ok(revision)
     }
 
@@ -230,12 +268,24 @@ impl PgDeploymentArchiveStore {
     /// comes first — the order the relay's DRAINING scope walk (most-recently-drained first)
     /// wants, with no re-sorting in the engine.
     pub async fn list_active_and_draining(&self) -> Result<Vec<ServedArchiveRow>> {
+        let mut conn = self
+            .pool
+            .acquire()
+            .await
+            .map_err(PersistenceError::db("deployment_archive served acquire"))?;
+        Self::list_active_and_draining_in(&mut conn).await
+    }
+
+    /// [`Self::list_active_and_draining`] on the caller's connection.
+    pub async fn list_active_and_draining_in(
+        conn: &mut sqlx::PgConnection,
+    ) -> Result<Vec<ServedArchiveRow>> {
         let rows = sqlx::query(
-            "SELECT deployment_id, slot, tenant, module, version, revision, bytes, status \
-             FROM deployment_archive WHERE status IN ('active', 'draining') \
+            "SELECT deployment_id, slot, tenant, module, version, revision, bytes, status, \
+             activated_at FROM deployment_archive WHERE status IN ('active', 'draining') \
              ORDER BY slot, revision DESC",
         )
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *conn)
         .await
         .map_err(PersistenceError::db(
             "deployment_archive list_active_and_draining",
@@ -255,9 +305,25 @@ impl PgDeploymentArchiveStore {
                         bytes: r.try_get("bytes").map_err(map_row)?,
                     },
                     status: ArchiveStatus::parse(&status)?,
+                    activated_at: r.try_get("activated_at").map_err(map_row)?,
                 })
             })
             .collect()
+    }
+
+    /// Stop an ACTIVE row serving intake, leaving it to drain: a row that lost an endpoint to one
+    /// another row holds. Returns `true` when a row flipped. Safe for every replica to repeat.
+    pub async fn demote_active(&self, deployment_id: &str) -> Result<bool> {
+        let affected = sqlx::query(
+            "UPDATE deployment_archive SET status = 'draining' \
+             WHERE deployment_id = $1 AND status = 'active'",
+        )
+        .bind(deployment_id)
+        .execute(&self.pool)
+        .await
+        .map_err(PersistenceError::db("deployment_archive demote_active"))?
+        .rows_affected();
+        Ok(affected >= 1)
     }
 
     /// The status projection over ALL rows (no bytes) — the source the CRD mirror + the

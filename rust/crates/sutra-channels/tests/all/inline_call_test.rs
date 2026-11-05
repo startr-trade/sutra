@@ -713,7 +713,10 @@ async fn an_explicit_id_whose_check_fails_is_refused_and_never_processed() {
     assert_eq!(reply_json(&retried), serde_json::json!({"a": {"v": 1}}));
     assert_eq!(caller.calls(), 1);
     let again = rig.handle.dispatch(start("k-1")).await.expect("dedup");
-    assert!(matches!(again, DispatchOutcome::Duplicate), "{again:?}");
+    assert!(
+        matches!(again, DispatchOutcome::Duplicate { .. }),
+        "{again:?}"
+    );
     assert_eq!(caller.calls(), 1, "processed once");
 }
 
@@ -1293,7 +1296,7 @@ async fn a_permanent_failure_fails_the_flow_and_releases_the_dedup_row() {
         .await
         .expect("dedup answers");
     assert!(
-        matches!(duplicate, DispatchOutcome::Duplicate),
+        matches!(duplicate, DispatchOutcome::Duplicate { .. }),
         "{duplicate:?}"
     );
 }
@@ -2859,7 +2862,10 @@ async fn a_replayed_delivery_of_a_caught_failure_does_not_run_again() {
         .await
         .expect("the recovery path completes");
     let replay = rig.handle.dispatch(start("k-1")).await.expect("dedup");
-    assert!(matches!(replay, DispatchOutcome::Duplicate), "{replay:?}");
+    assert!(
+        matches!(replay, DispatchOutcome::Duplicate { .. }),
+        "{replay:?}"
+    );
     assert_eq!(caller.calls(), 1, "no second call, no second completion");
 }
 

@@ -153,8 +153,15 @@ impl SqsChannels {
             .iter()
             .filter(|d| d.transport.as_deref() == Some(TRANSPORT) && !d.is_outbound())
         {
-            let Ok(props) = SqsChannelProperties::from_definition(def) else {
-                continue;
+            let props = match SqsChannelProperties::resolved(def, state.ctx.resolver) {
+                Ok(props) => props,
+                Err(d) => {
+                    warn!(
+                        code = %d.code,
+                        "aws-sqs consumer NOT started during flip: {}", d.message
+                    );
+                    continue;
+                }
             };
             desired.insert(consumer_key(def), (def.clone(), props));
         }
@@ -261,7 +268,7 @@ fn build_and_start_consumer(
 ) -> Result<Option<(ConsumerKey, RunningConsumer)>, Diagnostic> {
     let channel = definition.binding.channel_name.clone();
     let tenant = definition.binding.tenant().to_string();
-    let properties = SqsChannelProperties::from_definition(definition)?;
+    let properties = SqsChannelProperties::resolved(definition, ctx.resolver)?;
     let fingerprint = properties.clone();
 
     let singleton = properties.singleton;
@@ -432,6 +439,50 @@ inventory::submit! {
         // queue's visibility timeout (see the `sqs::source` module docs for the sizing
         // rule: visibility timeout >= worst-case park >= sutra.ack.deferred.timeout).
         handles_on_complete: true,
+    }
+}
+
+/// A queue hands each message to one consumer, so it belongs to one deployment. The URL already
+/// carries the region and account, so `region` is no part of the identity; the endpoint override
+/// tells a local emulator from AWS. A URL's scheme and host compare without case, and any inline
+/// credentials and a trailing slash go. A claim is made while a deployment is checked, before any
+/// wiring, so references compare as written: only the two properties that name the queue are read,
+/// and a reference in a numeric setting cannot lose the channel its claim.
+fn endpoint_claims(def: &ChannelDefinition) -> Vec<sutra_transport_spi::EndpointClaim> {
+    let Some(queue_url) = crate::sqs::non_blank(def.properties.get("queue.url")) else {
+        return Vec::new();
+    };
+    let endpoint = crate::sqs::non_blank(def.properties.get("endpoint-override"))
+        .as_deref()
+        .map(normalized_url)
+        .unwrap_or_else(|| "default".to_string());
+    vec![sutra_transport_spi::EndpointClaim::exclusive(format!(
+        "endpoint {endpoint} queue {}",
+        normalized_url(&queue_url)
+    ))]
+}
+
+fn normalized_url(url: &str) -> String {
+    let url = url.trim().trim_end_matches('/');
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_string();
+    };
+    let (authority, path) = rest.split_once('/').map_or((rest, ""), |(a, p)| (a, p));
+    let authority = sutra_transport_spi::normalized_endpoint_host(authority);
+    let scheme = scheme.to_ascii_lowercase();
+    if path.is_empty() {
+        format!("{scheme}://{authority}")
+    } else {
+        format!("{scheme}://{authority}/{path}")
+    }
+}
+
+inventory::submit! {
+    sutra_transport_spi::EndpointClaimFactory {
+        transport: TRANSPORT,
+        claims: endpoint_claims,
+        listener_prefix: None,
+        preflight: None,
     }
 }
 

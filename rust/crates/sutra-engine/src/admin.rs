@@ -12,6 +12,7 @@
 //! |----------------------------------------------|--------------------------------------------|
 //! | `GET  /admin/deployments`                    | activation-status snapshot (all)           |
 //! | `GET  /admin/deployments/{id}`               | one deployment's activation status         |
+//! | `POST /admin/deployments/check`              | judge an archive against the active set    |
 //! | `GET  /admin/instances`                      | list instances (`?deployment=`, `?status=`)|
 //! | `GET  /admin/instances/{id}`                 | inspect one instance (`@sensitive` redacted)|
 //! | `GET  /admin/instances/by-alias/{key}/{value}`| resolve a live instance by business key    |
@@ -39,6 +40,10 @@
 //! removing the archive from that directory (any in-memory retire would be re-activated on the next
 //! watch tick). The admin surface therefore exposes the deployment *read* status plus the instance
 //! read/control operations; archive lifecycle stays a deploy-plane (filesystem / ConfigMap) concern.
+//!
+//! The two instance READS under `/sutra/*` (`GET /sutra/instances`, including its `?alias=`
+//! search, and `GET /sutra/instances/{id}`) sit behind this same gate once admin auth is on: see
+//! [`gate_instance_reads`].
 //!
 //! ## Gating ([`AdminGate`])
 //!
@@ -199,6 +204,17 @@ impl AdminGate {
                 Ok(AdminGate::Oidc(Arc::new(verifier)))
             }
             _ => Ok(AdminGate::Unconfigured),
+        }
+    }
+
+    /// The gate the `GET /sutra/instances` routes answer to. With admin auth on (`ApiKey`,
+    /// `Oidc`) it is this gate. With it off they stay open as they have always been: `DevOpen`
+    /// serves them, and so does `Unconfigured`, where closing them would be a `503` on every
+    /// engine that never configured admin auth at all.
+    fn for_instance_reads(&self) -> AdminGate {
+        match self {
+            AdminGate::Unconfigured => AdminGate::DevOpen,
+            configured => configured.clone(),
         }
     }
 
@@ -420,6 +436,7 @@ pub(crate) fn admin_router(state: AppState, gate: AdminGate) -> Router {
             "/admin/deployments/{id}",
             get(admin_deployment_by_id).delete(admin_undeploy),
         )
+        .route("/admin/deployments/check", post(admin_deployment_check))
         .route("/admin/instances", get(admin_instances))
         .route("/admin/instances/{id}", get(admin_instance_by_id))
         .route(
@@ -451,8 +468,18 @@ pub(crate) fn admin_router(state: AppState, gate: AdminGate) -> Router {
         .with_state(state)
 }
 
-/// The bearer-JWT gate middleware. Applied only to `/admin/*` so it never loosens the platform
-/// routes. Fail-closed on every branch.
+/// Put the instance read routes behind the admin gate: the same [`admin_gate`] middleware and the
+/// same refusals as `/admin/*`, so a client holding the admin key or token sends it here too.
+/// Knowing an alias value is otherwise enough to find an instance and read its projection.
+pub(crate) fn gate_instance_reads(routes: Router<AppState>, gate: &AdminGate) -> Router<AppState> {
+    routes.route_layer(axum::middleware::from_fn_with_state(
+        gate.for_instance_reads(),
+        admin_gate,
+    ))
+}
+
+/// The admin gate middleware, for `/admin/*` and the instance reads ([`gate_instance_reads`]). It
+/// never loosens the other platform routes. Fail-closed on every branch.
 async fn admin_gate(State(gate): State<AdminGate>, req: Request, next: Next) -> Response {
     match &gate {
         AdminGate::DevOpen => next.run(req).await,
@@ -556,6 +583,18 @@ async fn admin_deploy(
         }
         _ => crate::server::deploy_response(&state, body).await,
     }
+}
+
+/// `POST /admin/deployments/check` — judge the sealed `.sutra` archive in the request body against
+/// this engine's ACTIVE set, changing nothing: the client-side fast answer for `sutra deploy` and
+/// `sutra lint`, from the one place that links every transport. `?slot=` names the slot the
+/// archive would replace (its own `tenant--module--version` by default).
+async fn admin_deployment_check(
+    State(state): State<AppState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    crate::server::deployment_check_response(&state, params.get("slot").map(String::as_str), &body)
 }
 
 /// `DELETE /admin/deployments/{slot}` (db source) — retire the slot's active archive + re-flip.
@@ -875,6 +914,99 @@ mod tests {
             get_admin(router_with(gate), None).await,
             StatusCode::SERVICE_UNAVAILABLE
         );
+    }
+
+    // ---- the instance reads under /sutra/* --------------------------------------------------
+
+    /// One request for each read the gate covers: the list, the alias search, and one instance.
+    const INSTANCE_READS: [&str; 3] = [
+        "/sutra/instances",
+        "/sutra/instances?alias=orderId:O-1",
+        "/sutra/instances/5f0c3d3a-3f0e-4d1e-9f53-7b1a2c9d4e10",
+    ];
+
+    async fn read_instance(gate: &AdminGate, uri: &str, key: Option<&str>) -> StatusCode {
+        let mut builder = Request::builder().method("GET").uri(uri);
+        if let Some(key) = key {
+            builder = builder.header("X-API-Key", key);
+        }
+        let req = builder.body(Body::empty()).unwrap();
+        crate::server::instance_read_router_for_test(gate)
+            .oneshot(req)
+            .await
+            .unwrap()
+            .status()
+    }
+
+    /// What the handler answers on a persistence-less engine once the gate lets a request by.
+    fn answered(uri: &str) -> StatusCode {
+        if uri.contains("?") || uri == "/sutra/instances" {
+            StatusCode::OK
+        } else {
+            StatusCode::NOT_FOUND
+        }
+    }
+
+    #[tokio::test]
+    async fn instance_reads_refuse_a_missing_or_wrong_key_when_admin_auth_is_on() {
+        let gate = AdminGate::from_config(&apikey_config()).unwrap();
+        for uri in INSTANCE_READS {
+            assert_eq!(
+                read_instance(&gate, uri, None).await,
+                StatusCode::UNAUTHORIZED,
+                "{uri} with no key"
+            );
+            assert_eq!(
+                read_instance(&gate, uri, Some("not-the-key")).await,
+                StatusCode::UNAUTHORIZED,
+                "{uri} with the wrong key"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn instance_reads_answer_the_right_key_when_admin_auth_is_on() {
+        let gate = AdminGate::from_config(&apikey_config()).unwrap();
+        for uri in INSTANCE_READS {
+            assert_eq!(
+                read_instance(&gate, uri, Some(TEST_ADMIN_KEY)).await,
+                answered(uri),
+                "{uri} with the right key"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn instance_reads_refuse_a_missing_token_under_oidc() {
+        let gate = AdminGate::from_config(&oidc_config()).unwrap();
+        for uri in INSTANCE_READS {
+            assert_eq!(
+                read_instance(&gate, uri, None).await,
+                StatusCode::UNAUTHORIZED,
+                "{uri} with no token"
+            );
+        }
+    }
+
+    /// Off means both postures with no credential to check: the explicit dev flag, and an engine
+    /// that never configured admin auth. `/admin/*` is a 503 on the second, and that is unchanged
+    /// too (`unconfigured_surface_is_closed_with_503`).
+    #[tokio::test]
+    async fn instance_reads_answer_with_no_key_when_admin_auth_is_off() {
+        let dev = AdminAuthConfig {
+            dev_disabled: true,
+            ..AdminAuthConfig::default()
+        };
+        for cfg in [dev, AdminAuthConfig::default()] {
+            let gate = AdminGate::from_config(&cfg).unwrap();
+            for uri in INSTANCE_READS {
+                assert_eq!(
+                    read_instance(&gate, uri, None).await,
+                    answered(uri),
+                    "{uri}"
+                );
+            }
+        }
     }
 
     // ---- the auth-key + secret gate (channels' inbound-auth model) --------------------------

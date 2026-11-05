@@ -278,7 +278,7 @@ async fn dynamic_channel_role_registers_and_contends_durably() {
 
 static BROKER: OnceLock<(Container<GenericImage>, u16)> = OnceLock::new();
 
-fn rabbit_port() -> u16 {
+pub(crate) fn rabbit_port() -> u16 {
     let (_, port) = BROKER.get_or_init(|| {
         std::thread::spawn(|| {
             let container = GenericImage::new("rabbitmq", "3.13-management-alpine")
@@ -296,7 +296,7 @@ fn rabbit_port() -> u16 {
     *port
 }
 
-async fn raw_connection(port: u16) -> Connection {
+pub(crate) async fn raw_connection(port: u16) -> Connection {
     Connection::connect(
         &format!("amqp://127.0.0.1:{port}"),
         ConnectionProperties::default(),
@@ -305,7 +305,7 @@ async fn raw_connection(port: u16) -> Connection {
     .expect("raw AMQP connection")
 }
 
-async fn declare_queue(port: u16, name: &str) {
+pub(crate) async fn declare_queue(port: u16, name: &str) {
     let connection = raw_connection(port).await;
     let channel = connection.create_channel().await.expect("channel");
     channel
@@ -322,7 +322,7 @@ async fn declare_queue(port: u16, name: &str) {
     connection.close(200, "declared").await.ok();
 }
 
-async fn consumer_count(port: u16, queue: &str) -> u32 {
+pub(crate) async fn consumer_count(port: u16, queue: &str) -> u32 {
     let connection = raw_connection(port).await;
     let channel = connection.create_channel().await.expect("channel");
     let q = channel

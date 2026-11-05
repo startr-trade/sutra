@@ -107,7 +107,34 @@ pub struct SqsChannelProperties {
     pub singleton: bool,
 }
 
+/// Every inbound property that may be an environment or secret reference. `ack-mode` and
+/// `singleton` are read by the engine as well as by this transport, so they stay as written.
+const REFERENCE_PROPERTIES: [&str; 6] = [
+    "region",
+    "queue.url",
+    "endpoint-override",
+    "wait-time-seconds",
+    "max-messages",
+    "visibility-timeout-seconds",
+];
+
 impl SqsChannelProperties {
+    /// [`Self::from_definition`] with `${NAME}`, `${NAME:default}`, `env:NAME` and `secret:` style
+    /// references in the channel's properties resolved first. This is what the wiring runs on: an
+    /// unresolved reference is [`codes::INBOUND_CONFIG_INVALID`] and the channel does not start.
+    pub fn resolved(
+        def: &ChannelDefinition,
+        resolver: sutra_transport_spi::EnvRefResolver,
+    ) -> Result<SqsChannelProperties, Diagnostic> {
+        let resolved = sutra_transport_spi::resolve_channel_properties(
+            def,
+            &REFERENCE_PROPERTIES,
+            codes::INBOUND_CONFIG_INVALID,
+            resolver,
+        )?;
+        SqsChannelProperties::from_definition(&resolved)
+    }
+
     /// Read the typed properties off a channel definition: `region` is required
     /// ([`codes::INBOUND_CONFIG_INVALID`]), and the integer knobs are parsed and
     /// range-checked (out-of-range / non-integer ⇒ `INBOUND_CONFIG_INVALID`).
@@ -196,7 +223,7 @@ fn clamp(channel: &str, key: &str, value: i32, min: i32, max: i32) -> Result<i32
     Ok(value)
 }
 
-fn non_blank(value: Option<&String>) -> Option<String> {
+pub(crate) fn non_blank(value: Option<&String>) -> Option<String> {
     value
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
@@ -307,6 +334,57 @@ fn non_blank_str(value: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Stands in for the engine's registry: `${BASE}` and `env:REGION` resolve, others do not.
+    fn test_resolver(reference: &str) -> Result<String, String> {
+        match reference {
+            "env:REGION" => Ok("eu-west-1".to_string()),
+            "${BASE}/orders" => Ok("http://sqs.test/000000000000/orders".to_string()),
+            "${ENDPOINT}" => Ok("http://sqs.test".to_string()),
+            "${WAIT:5}" => Ok("5".to_string()),
+            r if r.contains("${") || r.starts_with("env:") => Err(format!("{r} is not set")),
+            literal => Ok(literal.to_string()),
+        }
+    }
+
+    #[test]
+    fn references_in_inbound_properties_resolve() {
+        let def = definition(&[
+            ("region", "env:REGION"),
+            ("queue.url", "${BASE}/orders"),
+            ("endpoint-override", "${ENDPOINT}"),
+            ("wait-time-seconds", "${WAIT:5}"),
+        ]);
+        let props = SqsChannelProperties::resolved(&def, test_resolver).expect("resolved");
+        assert_eq!(props.region, "eu-west-1");
+        assert_eq!(props.queue_url, "http://sqs.test/000000000000/orders");
+        assert_eq!(props.endpoint_override.as_deref(), Some("http://sqs.test"));
+        assert_eq!(props.wait_time_seconds, 5);
+    }
+
+    #[test]
+    fn literal_properties_pass_through_resolution() {
+        let def = definition(&[
+            ("region", "us-east-1"),
+            ("queue.url", "https://sqs.us-east-1.amazonaws.com/1/q"),
+        ]);
+        let props = SqsChannelProperties::resolved(&def, test_resolver).expect("resolved");
+        assert_eq!(props.region, "us-east-1");
+        assert_eq!(props.queue_url, "https://sqs.us-east-1.amazonaws.com/1/q");
+    }
+
+    #[test]
+    fn an_unresolved_reference_is_a_coded_wiring_error_naming_the_property() {
+        for (key, reference) in [("region", "${NOPE}"), ("queue.url", "${NOPE}/orders")] {
+            let mut pairs = vec![("region", "us-east-1"), ("queue.url", "http://q")];
+            pairs.retain(|(k, _)| *k != key);
+            pairs.push((key, reference));
+            let err =
+                SqsChannelProperties::resolved(&definition(&pairs), test_resolver).unwrap_err();
+            assert_eq!(err.code, codes::INBOUND_CONFIG_INVALID);
+            assert!(err.message.contains(key), "{}", err.message);
+        }
+    }
     use sutra_channels::config::{ChannelBinding, Namespace};
     use sutra_channels::DeploymentId;
 

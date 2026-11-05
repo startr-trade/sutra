@@ -119,12 +119,21 @@ pub struct SyncReply {
 pub enum DispatchOutcome {
     Completed {
         instance_id: String,
-        /// End-event variable snapshot as a JSON tree (the reply-rendering view).
+        /// End-event variable snapshot as a JSON tree (the reply-rendering view). Internal: it
+        /// holds the inbound event and its headers, and no transport answers a caller with it.
         outputs: serde_json::Value,
         reply: Option<SyncReply>,
+        /// What the acceptance receipt needs from this pass; `None` on a channel that answers
+        /// without one.
+        acceptance: Option<Box<crate::receipt::AcceptanceFacts>>,
     },
     /// Inbox dedup hit — the delivery was already observed (first-observer-wins).
-    Duplicate,
+    Duplicate {
+        /// The instance the first delivery started or resumed, when its record names one.
+        original_instance_id: Option<String>,
+        /// The key the delivery was recognised by.
+        dedup_key: String,
+    },
     /// A NON-idempotent process (`<q:process idempotent="false">`, the default) failed
     /// during execution. Blind redelivery-and-reprocess would duplicate side effects, so the
     /// delivery is CONSUMED (the transport acks — at-most-once, no requeue) and a durable incident
@@ -481,7 +490,7 @@ impl ChannelEngine {
         self.begin_dispatch(true);
         let result = self.dispatch_inner(message).await;
         let result = self.hand_over_dedup(result);
-        self.settle_dedup(result.is_ok()).await;
+        self.settle_dedup(&result).await;
         result
     }
 
@@ -507,10 +516,17 @@ impl ChannelEngine {
 
     /// Before a dispatch that recorded a dedup key returns: write what no step consumed when the
     /// dispatch completed, drop it when it failed (see [`InboxStore::settle`]).
-    async fn settle_dedup(&self, processed: bool) {
+    async fn settle_dedup(&self, result: &Result<DispatchOutcome, Diagnostic>) {
         if self.dedup_touched.replace(false) {
             if let Some(inbox) = &self.inbox {
-                inbox.settle(processed).await;
+                let instance = match result {
+                    Ok(DispatchOutcome::Completed { instance_id, .. }) => {
+                        Some(instance_id.clone()).filter(|id| !id.is_empty())
+                    }
+                    Ok(DispatchOutcome::InlineCalls(handoff)) => handoff.instance_id(),
+                    _ => None,
+                };
+                inbox.settle(result.is_ok(), instance.as_deref()).await;
             }
         }
     }
@@ -563,7 +579,7 @@ impl ChannelEngine {
         self.begin_dispatch(true);
         let result = self.dispatch_inner(message).await;
         let result = self.hand_over_dedup(result);
-        self.settle_dedup(result.is_ok()).await;
+        self.settle_dedup(&result).await;
         let leftover = self.pending_settle.borrow_mut().take();
         let outcome = result?;
         // A synchronous chain carries the callbacks itself (when it took them) and settles at
@@ -724,7 +740,16 @@ impl ChannelEngine {
                     .await;
                 self.dedup_touched.set(true);
                 if !proceed_after_dedup_check(check, message, &message.idempotency_key)? {
-                    return Ok(DispatchOutcome::Duplicate);
+                    return Ok(DispatchOutcome::Duplicate {
+                        original_instance_id: inbox
+                            .original_instance(
+                                &deployment,
+                                &message.channel,
+                                &message.idempotency_key,
+                            )
+                            .await,
+                        dedup_key: message.idempotency_key.clone(),
+                    });
                 }
                 self.dispatch_dedup
                     .borrow_mut()
@@ -916,24 +941,13 @@ impl ChannelEngine {
             }
         }
 
-        // A `<q:source dedupKey="body.<path>">` spec re-derives the dedup key from
-        // the DECODED payload (header/ce.id precedence otherwise untouched). Unlike the pre-decode
-        // transport-side dedup, this key is only knowable AFTER decode + handler resolution, so the
-        // dedup runs HERE — a body-path dedup key now actually suppresses a redelivery (previously
-        // it only re-projected `event.idempotencyKey`, never driving inbox dedup).
-        if let Some(body_key) = apply_body_path_dedup_key(process, start_id, &mut variables) {
-            if let Some(inbox) = &self.inbox {
-                let check = inbox
-                    .record_seen(deployment, &message.channel, &body_key)
-                    .await;
-                self.dedup_touched.set(true);
-                if !proceed_after_dedup_check(check, message, &body_key)? {
-                    return Ok(DispatchOutcome::Duplicate);
-                }
-                self.dispatch_dedup
-                    .borrow_mut()
-                    .push((message.channel.clone(), body_key.clone()));
-            }
+        // A key the flow declares is only knowable once the handler is resolved, and a body path
+        // only after decoding, so this dedup runs here rather than with the transport's.
+        if let Some(duplicate) = self
+            .check_declared_dedup_key(process, start_id, deployment, message, &mut variables)
+            .await?
+        {
+            return Ok(duplicate);
         }
 
         self.drive_resolved(
@@ -946,6 +960,43 @@ impl ChannelEngine {
             routed_start,
         )
         .await
+    }
+
+    /// The dedup key `node`'s `<q:source>` declares for this channel, read and checked.
+    /// `Ok(Some(_))` is a duplicate, naming the instance its original started or resumed;
+    /// `Ok(None)` runs the delivery; a check that fails refuses it like any other key's. A key this
+    /// dispatch has already checked is not checked again: its record is still pending, and it
+    /// would be its own duplicate.
+    async fn check_declared_dedup_key(
+        &self,
+        process: &ProcessDefinition,
+        node: &str,
+        deployment: &DeploymentId,
+        message: &InboundMessage,
+        variables: &mut Variables,
+    ) -> Result<Option<DispatchOutcome>, Diagnostic> {
+        let Some(key) = read_declared_dedup_key(process, node, message, variables) else {
+            return Ok(None);
+        };
+        let Some(inbox) = &self.inbox else {
+            return Ok(None);
+        };
+        let entry = (message.channel.clone(), key.clone());
+        if self.dispatch_dedup.borrow().contains(&entry) {
+            return Ok(None);
+        }
+        let check = inbox.record_seen(deployment, &message.channel, &key).await;
+        self.dedup_touched.set(true);
+        if !proceed_after_dedup_check(check, message, &key)? {
+            return Ok(Some(DispatchOutcome::Duplicate {
+                original_instance_id: inbox
+                    .original_instance(deployment, &message.channel, &key)
+                    .await,
+                dedup_key: key,
+            }));
+        }
+        self.dispatch_dedup.borrow_mut().push(entry);
+        Ok(None)
     }
 
     /// Drive a RESOLVED start: the process, its start node and its seed variables are already
@@ -1066,6 +1117,7 @@ impl ChannelEngine {
                     .await;
                 let reply = self.build_reply(binding, process, message, &exec)?;
                 Ok(DispatchOutcome::Completed {
+                    acceptance: acceptance_facts(binding, process, message, &exec.outputs, true),
                     instance_id: exec.instance_id,
                     outputs: exec.outputs.to_json(),
                     reply,
@@ -1994,6 +2046,7 @@ impl ChannelEngine {
                 };
                 let reply = self.build_reply(binding, process, message, &exec)?;
                 Ok(DispatchOutcome::Completed {
+                    acceptance: acceptance_facts(binding, process, message, &exec.outputs, true),
                     instance_id,
                     outputs: exec.outputs.to_json(),
                     reply,
@@ -2230,6 +2283,7 @@ impl ChannelEngine {
                 // accept; any reply flows later on resume+complete. A respond-and-continue park
                 // carries the flushed reply (`reply`, built above).
                 Ok(DispatchOutcome::Completed {
+                    acceptance: acceptance_facts(binding, process, message, &variables, true),
                     instance_id,
                     outputs: serde_json::json!({}),
                     reply,
@@ -2257,6 +2311,7 @@ impl ChannelEngine {
             instance_id: instance_id.unwrap_or_default(),
             outputs: serde_json::json!({}),
             reply: None,
+            acceptance: None,
         };
         match self
             .resolve_relay(binding, deployment, decoded, message)
@@ -2458,8 +2513,20 @@ impl ChannelEngine {
 
         // Two-tier intake validation of the relayed payload against the wait node's
         // <q:source> (uniform with a start event). FATAL ⇒ reject; nothing advances.
-        let relay_vars =
+        let mut relay_vars =
             self.relay_intake_variables(process, &target.wait_node_id, binding, decoded, message)?;
+        if let Some(duplicate) = self
+            .check_declared_dedup_key(
+                process,
+                &target.wait_node_id,
+                deployment,
+                message,
+                &mut relay_vars,
+            )
+            .await?
+        {
+            return Ok(RelayResolution::Resumed(duplicate));
+        }
 
         // The correlation the relay carries — the WAIT NODE's own declared <q:alias>
         // first (the channel-call park key), then the process-level
@@ -2922,7 +2989,7 @@ impl ChannelEngine {
                 resolved.reply_to.as_deref().cloned(),
             )
             .await;
-        self.settle_dedup(result.is_ok()).await;
+        self.settle_dedup(&result).await;
         result
     }
 
@@ -2987,6 +3054,7 @@ impl ChannelEngine {
                 // A relay answers with the `<q:reply>` THIS pass reached, rendered against its
                 // own delivery; outputs stay empty, never the resumed instance's raw variable
                 // map (the drive-relay contract).
+                let acceptance = relay_acceptance_facts(&reply_to, process, &outputs);
                 let reply = match &reply_to {
                     Some(to) => self
                         .relay_reply(
@@ -3008,6 +3076,7 @@ impl ChannelEngine {
                     instance_id,
                     outputs: serde_json::json!({}),
                     reply,
+                    acceptance,
                 })
             }
             StatefulExecResult::Suspended {
@@ -3179,6 +3248,7 @@ impl ChannelEngine {
                     instance_id,
                     outputs: serde_json::json!({}),
                     reply: early_reply,
+                    acceptance: relay_acceptance_facts(&reply_to, process, &variables),
                 })
             }
         }
@@ -3306,7 +3376,7 @@ impl ChannelEngine {
             // A schedule cannot be a duplicate delivery (no explicit event id was offered) and
             // cannot be dead-lettered as an inbound (nothing was consumed) — but both shapes are
             // reachable through the shared path, and neither is a reason to keep re-firing.
-            DispatchOutcome::Duplicate => ScheduledStartOutcome::Started {
+            DispatchOutcome::Duplicate { .. } => ScheduledStartOutcome::Started {
                 instance_id: String::new(),
                 completed: true,
             },
@@ -4692,6 +4762,7 @@ impl ChannelEngine {
             }
             self.release_chain(&chain, ChainEnd::Completed).await;
             chain.visited.extend(visited_nodes);
+            let acceptance = chain_acceptance_facts(&chain, &outputs);
             let reply = self.stored_chain_reply(&chain, outputs, chain.visited.clone(), false);
             let early = chain.early_reply.take();
             return InlineStep::Done {
@@ -4699,6 +4770,7 @@ impl ChannelEngine {
                     instance_id: chain.instance_id.clone(),
                     outputs: serde_json::json!({}),
                     reply: reply.or(early),
+                    acceptance,
                 }),
                 settle_consumed: false,
                 completed: true,
@@ -4727,6 +4799,7 @@ impl ChannelEngine {
             instance_id: exec.instance_id.clone(),
             outputs: exec.outputs.to_json(),
             reply: reply.or_else(|| chain.early_reply.take()),
+            acceptance: chain_acceptance_facts(&chain, &exec.outputs),
         });
         InlineStep::Done {
             outcome,
@@ -4846,6 +4919,7 @@ impl ChannelEngine {
                     instance_id: chain.instance_id.clone(),
                     outputs: serde_json::json!({}),
                     reply: park_reply,
+                    acceptance: chain_acceptance_facts(&chain, &chain.variables),
                 }),
                 settle_consumed: false,
                 completed: false,
@@ -4913,6 +4987,7 @@ impl ChannelEngine {
                 instance_id: chain.instance_id.clone(),
                 outputs: serde_json::json!({}),
                 reply: park_reply,
+                acceptance: chain_acceptance_facts(&chain, &chain.variables),
             }),
             settle_consumed: registered,
             completed: false,
@@ -6694,8 +6769,8 @@ fn dedup_refusal(code: &str, detail: String, message: &InboundMessage) -> Diagno
 /// What a dedup check means for this delivery: `Ok(true)` run it, `Ok(false)` it is a duplicate,
 /// `Err` refuse it.
 ///
-/// Only a delivery with a key to protect reaches a check: an explicit event id, or a declared
-/// `dedupKey="body.<path>"`. Neither is ever processed unchecked, because its effects can't all be
+/// Only a delivery with a key to protect reaches a check: an explicit event id, or a key its flow
+/// declares. Neither is ever processed unchecked, because its effects can't all be
 /// undone afterwards: a data task's store write commits before the step whose insert would catch
 /// the duplicate.
 fn proceed_after_dedup_check(
@@ -6728,50 +6803,178 @@ fn proceed_after_dedup_check(
     }
 }
 
-/// Apply a `<q:source dedupKey="body.<path>">` spec against the DECODED payload:
-/// the path binds the decoded body under `body`, and a non-blank result (a) overrides the
-/// `event.idempotencyKey` FEEL variable and (b) is RETURNED so the caller can drive inbox dedup on
-/// it (a body-path dedup key now actually deduplicates — previously it only re-projected the FEEL
-/// variable, after the transport-side dedup check, so it never suppressed a redelivery). A blank /
-/// non-`body.` spec returns `None` (header.* / ce.id forms are resolved transport-side, upstream).
-fn apply_body_path_dedup_key(
+/// Read the dedup key `node`'s `<q:source>` declares for this message's channel. It names where to
+/// look, so the channel's own settings decide nothing: `header.<name>` reads that header, `ce.id` the
+/// CloudEvents id however the channel treats CloudEvents, `body.<path>` the decoded payload, and
+/// `<scheme>.message-id` the broker's own id, which its transport hands over as a header. A
+/// key that is found becomes `event.dedupKey` for the flow. One that is absent from this message
+/// leaves it a delivery with no declared key, and the log says so.
+fn read_declared_dedup_key(
     process: &ProcessDefinition,
-    start_id: &str,
+    node: &str,
+    message: &InboundMessage,
     variables: &mut Variables,
 ) -> Option<String> {
-    let bindings = process.bindings_for(start_id);
-    let source = bindings.source()?;
-    let spec = source.dedup_key.as_deref()?;
-    let spec = spec.trim();
-    if !spec.starts_with("body.") {
-        return None; // header.* / ce.id specs are transport-side
+    let bindings = process.bindings_for(node);
+    let source = bindings
+        .sources
+        .iter()
+        .find(|source| source.channel == message.channel)
+        .or_else(|| bindings.source())?;
+    let spec = source.dedup_key.as_deref()?.trim();
+    // A form nothing reads, in a package an earlier engine accepted: no key at all, and the load
+    // already said so.
+    if !sutra_bpmn::qbindings::is_recognised_dedup_key(spec) {
+        return None;
     }
-    // The projected payload view — unwrap an envelope's `body` key so `body.GrpHdr.MsgId`
-    // navigates the structured message in both shapes.
-    let payload = variables.get(&source.name).cloned()?;
+    let found = if let Some(name) = spec.strip_prefix("header.") {
+        message
+            .headers
+            .iter()
+            .find(|(header, _)| header.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.trim().to_string())
+    } else if spec == "ce.id" {
+        crate::cloudevents::carried_event_id(
+            &message.headers,
+            message.cloud_event.as_deref(),
+            &message.body,
+        )
+    } else if spec.starts_with("body.") {
+        declared_body_path(spec, &source.name, variables)
+    } else {
+        message
+            .headers
+            .get(crate::NATIVE_MESSAGE_ID_HEADER)
+            .map(|value| value.trim().to_string())
+    };
+    let Some(key) = found.filter(|key| !key.is_empty()) else {
+        warn_declared_dedup_key_absent(&message.channel, spec);
+        return None;
+    };
+    if let Some(FeelValue::Map(event)) = variables.get("event") {
+        let mut event = event.clone();
+        event.insert("dedupKey".to_string(), FeelValue::String(key.clone()));
+        event.insert("idempotencyKey".to_string(), FeelValue::String(key.clone()));
+        variables.insert("event", FeelValue::Map(event));
+    }
+    Some(key)
+}
+
+fn warn_declared_dedup_key_absent(channel: &str, declared: &str) {
+    tracing::warn!(
+        channel,
+        dedup_key = declared,
+        "a delivery on channel '{channel}' has no value for its declared dedupKey '{declared}'; \
+         it runs as a delivery with no key, so a redelivery of it runs again"
+    );
+}
+
+/// A `body.<path>` against the decoded payload, under `body`. An envelope's own `body` key is unwrapped
+/// so `body.GrpHdr.MsgId` navigates the structured message in both shapes.
+fn declared_body_path(spec: &str, payload_name: &str, variables: &Variables) -> Option<String> {
+    let payload = variables.get(payload_name).cloned()?;
     let decoded_body = match &payload {
         FeelValue::Map(m) if m.contains_key("body") => m.get("body").cloned().expect("checked"),
         other => other.clone(),
     };
     let mut ctx = sutra_feel::FeelContext::new();
     ctx.insert("body".to_string(), decoded_body);
-    let resolved = match sutra_feel::expressions::eval(spec, &ctx) {
-        Ok(v) if !v.is_null() => sutra_feel::value::canonical_string_of(&v),
-        _ => return None,
-    };
-    if resolved.trim().is_empty() {
+    match sutra_feel::expressions::eval(spec, &ctx) {
+        Ok(v) if !v.is_null() => Some(
+            sutra_feel::value::canonical_string_of(&v)
+                .trim()
+                .to_string(),
+        ),
+        _ => None,
+    }
+}
+
+/// What the receipt of an accepted delivery needs from this pass, read at the moment of the
+/// answer: the variables a `<q:reply continue="true">` renders against, which hold everything the
+/// intake bound plus whatever the flow computed before replying or parking. `None` when the
+/// channel answers without a receipt, so no other channel pays for it. `fresh_start` says the
+/// variables' `event` map describes this delivery, not an earlier one.
+fn acceptance_facts(
+    binding: &ChannelBinding,
+    process: &ProcessDefinition,
+    message: &InboundMessage,
+    variables: &Variables,
+    fresh_start: bool,
+) -> Option<Box<crate::receipt::AcceptanceFacts>> {
+    if !binding.answers_with_receipt {
         return None;
     }
-    if let Some(FeelValue::Map(event)) = variables.get("event") {
-        let mut event = event.clone();
-        event.insert("dedupKey".to_string(), FeelValue::String(resolved.clone()));
-        event.insert(
-            "idempotencyKey".to_string(),
-            FeelValue::String(resolved.clone()),
-        );
-        variables.insert("event", FeelValue::Map(event));
-    }
-    Some(resolved)
+    let evaluate = |expression: &str, variables: &Variables| {
+        sutra_feel::expressions::eval(expression, &variables.to_feel_context()).ok()
+    };
+    let evaluate_reported = |expression: &str, variables: &Variables| {
+        let value = evaluate(expression, variables);
+        if value.is_none() {
+            // The expression alone: its operands are what redaction exists to keep out of logs.
+            tracing::warn!(
+                process = %process.id,
+                expression,
+                "a <q:receipt> attribute failed to evaluate and is left out of the receipt"
+            );
+        }
+        value
+    };
+    Some(Box::new(crate::receipt::AcceptanceFacts {
+        aliases: sutra_executor::audit_correlation::correlation_snapshot(
+            process, variables, &evaluate,
+        ),
+        attributes: sutra_executor::audit_correlation::receipt_attribute_snapshot(
+            process,
+            variables,
+            &evaluate_reported,
+        ),
+        idempotency_key: receipt_idempotency_key(message, variables, fresh_start),
+    }))
+}
+
+/// The key a receipt echoes: the one the caller supplied, or the one a `<q:source dedupKey>`
+/// derived from the body, which replaced the projected `event.idempotencyKey`. The transport's
+/// body hash is neither, so it is not echoed: it would claim a retry is recognised when it is not.
+fn receipt_idempotency_key(
+    message: &InboundMessage,
+    variables: &Variables,
+    fresh_start: bool,
+) -> Option<String> {
+    let derived = match variables.get("event") {
+        Some(FeelValue::Map(event)) if fresh_start => match event.get("idempotencyKey") {
+            Some(FeelValue::String(key)) if *key != message.idempotency_key => Some(key.clone()),
+            _ => None,
+        },
+        _ => None,
+    };
+    derived.or_else(|| {
+        (message.explicit_event_id && !message.idempotency_key.is_empty())
+            .then(|| message.idempotency_key.clone())
+    })
+}
+
+/// [`acceptance_facts`] for a resumed instance: only a delivery has anyone to answer.
+fn relay_acceptance_facts(
+    reply_to: &Option<RelayReplyContext>,
+    process: &ProcessDefinition,
+    variables: &Variables,
+) -> Option<Box<crate::receipt::AcceptanceFacts>> {
+    let to = reply_to.as_ref()?;
+    acceptance_facts(&to.binding, process, &to.message, variables, false)
+}
+
+/// [`acceptance_facts`] at the end of a synchronous-call chain, over `variables`.
+fn chain_acceptance_facts(
+    chain: &InlineChain,
+    variables: &Variables,
+) -> Option<Box<crate::receipt::AcceptanceFacts>> {
+    acceptance_facts(
+        &chain.binding,
+        &chain.process,
+        &chain.message,
+        variables,
+        chain.stored.is_none(),
+    )
 }
 
 /// The `contentType` declared on a VISITED `<q:reply>` node with no destination (the

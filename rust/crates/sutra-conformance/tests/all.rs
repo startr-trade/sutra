@@ -20,6 +20,10 @@ use sutra_formats as _;
 #[path = "all/support.rs"]
 mod support;
 
+#[path = "all/suite_guard_coverage.rs"]
+mod suite_guard_coverage;
+#[path = "all/tc_acceptance_receipt.rs"]
+mod tc_acceptance_receipt;
 #[path = "all/tc_ai_examples.rs"]
 mod tc_ai_examples;
 #[path = "all/tc_approval_hold.rs"]
@@ -48,6 +52,8 @@ mod tc_shard_lanes;
 mod tc_snapshot_upgrade;
 #[path = "all/tc_store_features.rs"]
 mod tc_store_features;
+#[path = "all/tc_suite_release.rs"]
+mod tc_suite_release;
 #[path = "all/tc_timer_expressions.rs"]
 mod tc_timer_expressions;
 #[path = "all/tc_wait_race.rs"]

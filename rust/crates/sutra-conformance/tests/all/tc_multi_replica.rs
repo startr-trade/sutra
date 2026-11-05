@@ -73,6 +73,7 @@ fn build_topology() -> Topology {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "docker"]
 async fn tc_multi_replica_singleton_serializes_channel() {
+    let _suite = sutra_testkit::hold_suite!("mr");
     let topo = topology();
     let broker_port = topo.broker.host_port;
     let engine_port = topo.replicas[0].http_port;

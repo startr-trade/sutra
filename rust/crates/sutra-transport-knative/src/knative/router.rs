@@ -2,7 +2,8 @@
 //! `sutra_channels::http`'s `(METHOD, path)` route table. A Knative Subscription/Trigger
 //! delivers to ONE catch-all route (`POST /knative/{subscription}`, mirroring
 //! `KnativeTriggerSource.handleKnativePost`); the subscription segment resolves the served
-//! channel.
+//! channels. Several channels, in any deployments, may bind one name: an event is broadcast, so
+//! each receives its own copy, and the push is answered once, with the worst of their answers.
 //!
 //! ## `ack-mode` — the response IS the ack
 //!
@@ -71,7 +72,7 @@ struct KnativeChannel {
     hold_timeout: Duration,
 }
 
-type RouteSnapshot = Arc<HashMap<String, KnativeChannel>>;
+type RouteSnapshot = Arc<HashMap<String, Vec<KnativeChannel>>>;
 
 /// The swappable subscription → channel table the mounted [`Router`] reads dynamically —
 /// the Knative half of the binding-flip route swap.
@@ -96,17 +97,17 @@ impl KnativeRouteTable {
 
 /// A validated, servable Knative route set (opaque — build via [`knative_routes_of`]).
 #[derive(Debug)]
-pub struct KnativeRouteSet(HashMap<String, KnativeChannel>);
+pub struct KnativeRouteSet(HashMap<String, Vec<KnativeChannel>>);
 
 /// Resolve every `transport: knative` inbound channel of `definitions` to its subscription
 /// binding. Fail-closed on a missing subscription
 /// ([`codes::INBOUND_SUBSCRIPTION_NOT_BOUND`], mirroring
-/// `KnativeTriggerSource.start`'s `hasSubscription()` guard) and on a subscription collision
-/// ([`shared_codes::CHANNEL_NAME_COLLISION`]). `direction: outbound` definitions are skipped
+/// `KnativeTriggerSource.start`'s `hasSubscription()` guard). Several channels may bind one
+/// subscription name. `direction: outbound` definitions are skipped
 /// (a `<q:send>` target, resolved by the outbox dispatcher via
 /// [`super::sink::KnativeMessageSink`] instead).
 pub fn knative_routes_of(definitions: &[ChannelDefinition]) -> Result<KnativeRouteSet, Diagnostic> {
-    let mut by_subscription: HashMap<String, KnativeChannel> = HashMap::new();
+    let mut by_subscription: HashMap<String, Vec<KnativeChannel>> = HashMap::new();
     for def in definitions {
         if def.transport.as_deref() != Some(TRANSPORT) {
             continue;
@@ -146,19 +147,10 @@ pub fn knative_routes_of(definitions: &[ChannelDefinition]) -> Result<KnativeRou
             hold_until_complete,
             hold_timeout: props.hold_timeout,
         };
-        if by_subscription
-            .insert(props.subscription.clone(), channel)
-            .is_some()
-        {
-            return Err(Diagnostic::error(
-                shared_codes::CHANNEL_NAME_COLLISION,
-                format!(
-                    "knative subscription '{}' is already bound; refusing to bind a second \
-                     channel ('{}') to it.",
-                    props.subscription, def.binding.channel_name
-                ),
-            ));
-        }
+        by_subscription
+            .entry(props.subscription.clone())
+            .or_default()
+            .push(channel);
     }
     Ok(KnativeRouteSet(by_subscription))
 }
@@ -187,7 +179,7 @@ async fn handle_post(
     body: Bytes,
 ) -> Response {
     let routes = state.routes.current();
-    let Some(channel) = routes.get(&subscription) else {
+    let Some(channels) = routes.get(&subscription) else {
         return StatusCode::NOT_FOUND.into_response();
     };
 
@@ -199,7 +191,7 @@ async fn handle_post(
     if has_any_ce_header(&copied_headers) && !has_all_required_ce_headers(&copied_headers) {
         tracing::warn!(
             code = %codes::INBOUND_MISSING_HEADERS,
-            channel = %channel.channel_name,
+            subscription = %subscription,
             "knative delivery presented a partial CloudEvent (missing one or more of \
              ce-id, ce-source, ce-type)"
         );
@@ -211,6 +203,64 @@ async fn handle_post(
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
 
+    if let [only] = channels.as_slice() {
+        return deliver(
+            state.handle.clone(),
+            only.clone(),
+            copied_headers,
+            content_type,
+            body,
+        )
+        .await;
+    }
+
+    // Broadcast: each subscriber gets its own copy, concurrently, so one holding its response
+    // does not delay the rest. A retryable answer brings the event back to every subscriber. What
+    // stops one that already accepted from running again is its inbox: the event id, or a declared
+    // key, dedupes per subscriber. With neither, a redelivery runs again, and the lint warns the
+    // author of such a flow.
+    let mut deliveries = tokio::task::JoinSet::new();
+    for channel in channels {
+        let delivery = deliver(
+            state.handle.clone(),
+            channel.clone(),
+            copied_headers.clone(),
+            content_type.clone(),
+            body.clone(),
+        );
+        deliveries.spawn(async move { delivery.await.status() });
+    }
+    let mut worst = StatusCode::ACCEPTED;
+    while let Some(result) = deliveries.join_next().await {
+        let status = result.unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        if delivery_severity(status) > delivery_severity(worst) {
+            worst = status;
+        }
+    }
+    worst.into_response()
+}
+
+/// How badly a subscriber's answer should weigh on the one answer the sender gets: a retryable
+/// failure outranks a permanent reject (the one brings a redelivery the failed subscriber still
+/// needs, the other would dead-letter it), and both outrank success.
+fn delivery_severity(status: StatusCode) -> u8 {
+    if status.is_success() {
+        0
+    } else if status.is_client_error() {
+        1
+    } else {
+        2
+    }
+}
+
+/// Deliver one event to one subscribing channel, under that channel's `ack-mode`.
+async fn deliver(
+    handle: EngineHandle,
+    channel: KnativeChannel,
+    copied_headers: BTreeMap<String, String>,
+    content_type: Option<String>,
+    body: Bytes,
+) -> Response {
     let extraction = match cloudevents::extract(
         channel.ce_mode,
         &channel.channel_name,
@@ -227,7 +277,7 @@ async fn handle_post(
     };
 
     let (idempotency_key, explicit) = resolve_idempotency_key(
-        channel,
+        &channel,
         &copied_headers,
         extraction.explicit_id.as_deref(),
         &body,
@@ -248,13 +298,13 @@ async fn handle_post(
 
     if !channel.hold_until_complete {
         // `ack-mode: on-persist` (the transport default) — settle at dispatch return.
-        return match state.handle.dispatch(message).await {
+        return match handle.dispatch(message).await {
             // Knative subscribers ack with a 2xx-empty; this handler answers 202 — non-2xx
             // triggers retry per the subscription's deliverySpec policy.
             // A dead-lettered (non-idempotent, failed) delivery is CONSUMED at-most-once: a
             // durable incident was recorded, so a 2xx suppresses the subscription's retry policy (a
             // retry would only re-fail and re-dead-letter).
-            Ok(DispatchOutcome::Duplicate)
+            Ok(DispatchOutcome::Duplicate { .. })
             | Ok(DispatchOutcome::Completed { .. })
             | Ok(DispatchOutcome::DeadLettered { .. }) => StatusCode::ACCEPTED.into_response(),
             // Unreachable: `EngineHandle::dispatch` consumes every shard handoff on the
@@ -271,7 +321,7 @@ async fn handle_post(
     // engine actor, the park arm registers them on the deferred-ack registry, and whichever
     // one the instance's terminal event fires releases the held response.
     let (decided, settle) = response_settle();
-    match state.handle.dispatch_deferred(message, settle).await {
+    match handle.dispatch_deferred(message, settle).await {
         // No park — the terminal events fired inside the dispatch, exactly like on-persist;
         // the settle callbacks dropped unfired and the outcome decides the status now.
         Ok(DeferredDispatch::Settled(outcome)) => settled_response(&outcome),
@@ -359,7 +409,7 @@ fn decision_response(decision: AckDecision) -> Response {
 /// permanent-reject status (the `NackDrop` posture the registry would have fired).
 fn settled_response(outcome: &DispatchOutcome) -> Response {
     match outcome {
-        DispatchOutcome::Duplicate | DispatchOutcome::Completed { .. } => {
+        DispatchOutcome::Duplicate { .. } | DispatchOutcome::Completed { .. } => {
             StatusCode::ACCEPTED.into_response()
         }
         DispatchOutcome::DeadLettered { .. } => decision_response(AckDecision::NackDrop),
@@ -505,13 +555,29 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_subscription_across_channels_collides() {
+    fn a_subscription_name_broadcasts_to_every_channel_bound_to_it() {
         let defs = vec![
             definition("orders-in-1", "knative", &[("subscription", "orders-sub")]),
             definition("orders-in-2", "knative", &[("subscription", "orders-sub")]),
         ];
-        let err = knative_routes_of(&defs).unwrap_err();
-        assert_eq!(err.code, shared_codes::CHANNEL_NAME_COLLISION);
+        let set = knative_routes_of(&defs).unwrap();
+        let bound: Vec<&str> = set.0["orders-sub"]
+            .iter()
+            .map(|c| c.channel_name.as_str())
+            .collect();
+        assert_eq!(bound, ["orders-in-1", "orders-in-2"]);
+    }
+
+    #[test]
+    fn the_worst_subscriber_answer_wins() {
+        assert!(
+            delivery_severity(StatusCode::INTERNAL_SERVER_ERROR)
+                > delivery_severity(StatusCode::UNPROCESSABLE_ENTITY)
+        );
+        assert!(
+            delivery_severity(StatusCode::UNPROCESSABLE_ENTITY)
+                > delivery_severity(StatusCode::ACCEPTED)
+        );
     }
 
     #[test]

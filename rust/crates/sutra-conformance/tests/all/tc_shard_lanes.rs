@@ -81,6 +81,7 @@ fn unpinned() -> &'static Fixture {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "docker"]
 async fn tc_shard_lanes_container_boots_the_requested_lane_count() {
+    let _suite = sutra_testkit::hold_suite!("shardlanes", "unpinnedlanes");
     let port = fixture().engine.http_port;
     let live = tokio::task::spawn_blocking(move || engine::ready_shards(port))
         .await
@@ -102,6 +103,7 @@ async fn tc_shard_lanes_container_boots_the_requested_lane_count() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "docker"]
 async fn tc_shard_lanes_unpinned_container_follows_the_run_wide_knob() {
+    let _suite = sutra_testkit::hold_suite!("shardlanes", "unpinnedlanes");
     let expected = u64::from(engine::conformance_shards().unwrap_or(1));
     let port = unpinned().engine.http_port;
     let live = tokio::task::spawn_blocking(move || engine::ready_shards(port))
@@ -126,6 +128,7 @@ async fn tc_shard_lanes_unpinned_container_follows_the_run_wide_knob() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "docker"]
 async fn tc_shard_lanes_park_and_relay_across_lanes() {
+    let _suite = sutra_testkit::hold_suite!("shardlanes", "unpinnedlanes");
     let client = reqwest::Client::new();
     let port = fixture().engine.http_port;
 

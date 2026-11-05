@@ -136,9 +136,10 @@ BASE_URL="$BASE_URL" API_KEY="$API_KEY" \
 # --- timer-storm: post-run drain poll -----------------------------------------------------
 #
 # k6 only measures the ARM phase (see timer-storm.js's header comment). Fire-to-complete
-# drain is measured here: poll GET /sutra/instances?status=WAITING (unauthenticated
-# internal-ops surface, rust/crates/sutra-engine/src/server.rs) from the moment k6's arm
-# phase exits until the count reaches zero (fully drained) or DRAIN_TIMEOUT elapses.
+# drain is measured here: poll GET /sutra/instances?status=WAITING from the moment k6's arm
+# phase exits until the count reaches zero (fully drained) or DRAIN_TIMEOUT elapses. An engine
+# with admin auth on needs the admin key: set SUTRA_ADMIN_API_KEY, sent as X-API-Key. A refusal
+# has no instance list, which counts as "unknown" (-1), never as drained.
 #
 # Caveat, stated plainly: this measures "time from arm-phase-END to fully drained", not
 # "time from due-at to fully drained" — arming k instances takes nonzero wall time, so the
@@ -159,8 +160,8 @@ if [ "$PROFILE" = "timer-storm" ]; then
     waiting=-1
     timed_out=false
     while :; do
-        body="$(curl -s --max-time 5 "${BASE_URL}/sutra/instances?status=WAITING" 2>/dev/null || echo '{}')"
-        waiting="$(printf '%s' "$body" | jq -r '(.instances | length) // -1' 2>/dev/null || echo -1)"
+        body="$(curl -s --max-time 5 ${SUTRA_ADMIN_API_KEY:+-H "X-API-Key: ${SUTRA_ADMIN_API_KEY}"} "${BASE_URL}/sutra/instances?status=WAITING" 2>/dev/null || echo '{}')"
+        waiting="$(printf '%s' "$body" | jq -r 'if (.instances | type) == "array" then (.instances | length) else -1 end' 2>/dev/null || echo -1)"
         elapsed=$(( $(date +%s) - poll_start_epoch ))
         if [ "$waiting" = "0" ]; then
             break

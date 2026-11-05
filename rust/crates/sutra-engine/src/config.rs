@@ -80,7 +80,8 @@
 //! retention delete the recordings `q:audit` media events reference from whichever declared
 //! store holds them.
 //!
-//! Admin auth: the `/admin/*` surface is gated. Two models, fail-closed:
+//! Admin auth: the `/admin/*` surface is gated, and so are the `GET /sutra/instances` reads once a
+//! model below is configured. Two models, fail-closed:
 //! * **Auth key + secret** (`sutra.admin.auth.*`) — the SAME static-secret model the channels use
 //!   (`inbound-auth`): `scheme = apikey|bearer`, an expected key/secret resolved from `key-ref`
 //!   (`secret:`/`env:`/`${…}`), checked in `header` (default `X-API-Key` / `authorization`). This is

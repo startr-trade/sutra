@@ -237,10 +237,10 @@ fn non_payload_roots_are_skipped() {
 
 #[test]
 fn idempotency_key_path_is_navigation_checked() {
-    // A payload-rooted dedupKey typo is caught at the source-binding navigation site.
+    // A body-path dedupKey typo is caught at the source-binding navigation site.
     let report = lint_module(&bpmn(
         "",
-        r#" messageTypeValue="Payment" dedupKey="payload.Nope""#,
+        r#" messageTypeValue="Payment" dedupKey="body.Nope""#,
         "",
     ));
     assert!(

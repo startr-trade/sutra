@@ -137,6 +137,7 @@ fn lint_validates_the_composed_tree() {
             LintArgs {
                 package_dir: variant.clone(),
                 overlay: vec![shared.clone()],
+                ..Default::default()
             },
             &GlobalArgs::default(),
             io,
@@ -151,6 +152,7 @@ fn lint_validates_the_composed_tree() {
             LintArgs {
                 package_dir: variant.clone(),
                 overlay: Vec::new(),
+                ..Default::default()
             },
             &GlobalArgs::default(),
             io,
@@ -184,6 +186,7 @@ fn a_missing_overlay_directory_is_a_usage_error_in_both_commands() {
             LintArgs {
                 package_dir: variant.clone(),
                 overlay: vec![absent.clone()],
+                ..Default::default()
             },
             &GlobalArgs::default(),
             io,

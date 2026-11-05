@@ -125,7 +125,13 @@ pub async fn commit_step(pool: &sqlx::PgPool, step: &StepWrite) -> Result<()> {
 /// can prove atomicity by dropping the transaction before commit; production callers use
 /// [`commit_step`].
 pub async fn write_step_in(conn: &mut sqlx::PgConnection, step: &StepWrite) -> Result<()> {
-    record_inbox_seen_in(conn, &step.deployment, &step.inbox_seen).await?;
+    record_inbox_seen_in(
+        conn,
+        &step.deployment,
+        &step.inbox_seen,
+        Some(step.instance_id),
+    )
+    .await?;
     for node_id in &step.resolved_waits {
         sqlx::query(
             "UPDATE waiting_event SET status = 'RESOLVED', resolved_at = CURRENT_TIMESTAMP \
@@ -230,16 +236,23 @@ pub async fn write_step_in(conn: &mut sqlx::PgConnection, step: &StepWrite) -> R
 /// Write inbox dedup records on an open transaction; the first that another delivery already
 /// committed fails the transaction with [`PersistenceError::InboxDuplicate`]. A concurrent
 /// insert of the same key blocks on the unique index until the other transaction ends, so the
-/// loser always sees the winner's row.
+/// loser always sees the winner's row. `instance_id` is the instance the step belongs to, kept with
+/// each record so a later duplicate can name it.
 pub async fn record_inbox_seen_in(
     conn: &mut sqlx::PgConnection,
     deployment: &DeploymentId,
     records: &[(String, String)],
+    instance_id: Option<uuid::Uuid>,
 ) -> Result<()> {
     for (channel, event_id) in records {
-        let first =
-            crate::stores::PgInboxStore::record_seen_in(conn, deployment, channel, event_id)
-                .await?;
+        let first = crate::stores::PgInboxStore::record_seen_for_in(
+            conn,
+            deployment,
+            channel,
+            event_id,
+            instance_id,
+        )
+        .await?;
         if !first {
             return Err(PersistenceError::InboxDuplicate {
                 deployment: deployment.clone(),

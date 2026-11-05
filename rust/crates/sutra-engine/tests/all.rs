@@ -13,10 +13,12 @@
 // the full bundle, HTTP included, or channel POSTs 404. Cargo-feature-gated to match the
 // binary (default features link all six).
 use sutra_transport_amqp as _;
+use sutra_transport_dapr as _;
 use sutra_transport_file as _;
 use sutra_transport_gcp_pubsub as _;
 use sutra_transport_http as _;
 use sutra_transport_kafka as _;
+use sutra_transport_knative as _;
 use sutra_transport_rabbitmq as _;
 use sutra_transport_sqs as _;
 
@@ -26,12 +28,14 @@ mod archive_activation_conformance;
 mod call_log_csv_e2e;
 #[path = "all/call_log_load_it.rs"]
 mod call_log_load_it;
-#[path = "all/capacity_pool_config_test.rs"]
-mod capacity_pool_config_test;
 #[path = "all/channel_call_retry_it.rs"]
 mod channel_call_retry_it;
 #[path = "all/concurrency_cluster_it.rs"]
 mod concurrency_cluster_it;
+#[path = "all/draining_version_it.rs"]
+mod draining_version_it;
+#[path = "all/endpoint_claims_it.rs"]
+mod endpoint_claims_it;
 #[path = "all/external_task_pull_e2e.rs"]
 mod external_task_pull_e2e;
 #[path = "all/incident_dead_letter_it.rs"]

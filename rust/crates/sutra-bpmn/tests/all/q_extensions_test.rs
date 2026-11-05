@@ -946,3 +946,50 @@ fn q_stream_non_boolean_is_rejected() {
     let e = stream_flag("channel:llm", r#"q:stream="maybe""#).unwrap_err();
     assert_eq!(e.code, "SUTRA.CONFIG.BPMN.STREAM.INVALID");
 }
+
+fn receipt_attributes(
+    receipt: &str,
+) -> Result<Vec<sutra_bpmn::qbindings::ReceiptAttribute>, sutra_bpmn::SutraError> {
+    let xml = format!(
+        r#"<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                             xmlns:q="urn:sutra:q:1.0" targetNamespace="urn:t">
+             <bpmn:process id="p1">
+               <bpmn:extensionElements>{receipt}</bpmn:extensionElements>
+               <bpmn:startEvent id="S"/>
+               <bpmn:endEvent id="E"/>
+               <bpmn:sequenceFlow id="f1" sourceRef="S" targetRef="E"/>
+             </bpmn:process>
+           </bpmn:definitions>"#
+    );
+    let module = sutra_bpmn::BpmnModelLoader::new().load(xml.as_bytes())?;
+    Ok(module.process("p1").unwrap().receipt_attributes.clone())
+}
+
+#[test]
+fn q_receipt_is_optional_and_exposes_nothing_by_default() {
+    assert!(receipt_attributes("").unwrap().is_empty());
+}
+
+#[test]
+fn q_receipt_attributes_parse_in_document_order() {
+    let attributes = receipt_attributes(
+        r#"<q:receipt>
+             <q:attribute name="caseId" expression="req.caseId"/>
+             <q:attribute name="ref" expression="req.ref"/>
+           </q:receipt>"#,
+    )
+    .unwrap();
+    assert_eq!(attributes.len(), 2);
+    assert_eq!(attributes[0].name, "caseId");
+    assert_eq!(attributes[0].expression, "req.caseId");
+    assert_eq!(attributes[1].name, "ref");
+}
+
+#[test]
+fn q_receipt_attribute_needs_a_name_and_an_expression() {
+    let e =
+        receipt_attributes(r#"<q:receipt><q:attribute expression="x"/></q:receipt>"#).unwrap_err();
+    assert_eq!(e.code, "SUTRA.PARSE.Q_RECEIPT_ATTRIBUTE_MISSING_NAME");
+    let e = receipt_attributes(r#"<q:receipt><q:attribute name="x"/></q:receipt>"#).unwrap_err();
+    assert_eq!(e.code, "SUTRA.PARSE.Q_RECEIPT_ATTRIBUTE_MISSING_EXPRESSION");
+}

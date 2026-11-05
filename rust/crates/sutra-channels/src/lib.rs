@@ -40,12 +40,18 @@ pub mod auth;
 pub mod bridge;
 pub mod capacity;
 pub mod cloudevents;
+
+/// The header a transport hands over its broker's own id for a message in. Reserved: a transport
+/// overwrites whatever a sender put there. What `<q:source dedupKey="<scheme>.message-id">` reads.
+pub const NATIVE_MESSAGE_ID_HEADER: &str = "sutra-native-message-id";
 pub mod codes;
 pub mod config;
 pub mod diag;
+pub mod endpoint_claims;
 pub mod inline;
 pub mod intake;
 pub mod policy;
+pub mod receipt;
 pub mod redaction;
 pub mod registry;
 pub mod shard_metrics;
@@ -110,6 +116,10 @@ pub use dispatch::{
     ScheduledStartFire, ScheduledStartOutcome, SyncReply, TimerFireOutcome, ACK_DISPOSITION_ATTR,
     ACK_DISPOSITION_REQUEUE, SCHEDULE_CHANNEL, TRANSIENT_ATTR, WAIT_PENDING_ATTR,
 };
+pub use endpoint_claims::{
+    deployment_owner, describe_endpoint_refusal, find_endpoint_collisions, DeclaredEndpoint,
+    EndpointClaim, EndpointCollision, EndpointSharing, UNLABELED_PACKAGE_LABEL,
+};
 #[cfg(feature = "transport")]
 pub use external_task::{
     parse_pull_destination, CompletedTask, ExternalTask, ExternalTaskLimits, ExternalTaskNotifier,
@@ -152,8 +162,8 @@ pub use sink::{
 };
 #[cfg(feature = "transport")]
 pub use source::{
-    AckDecision, AlwaysLeading, DeferredSettle, DeliveryDisposition, InboundIntake, LeaderGate,
-    TriggerSource,
+    AckDecision, AlwaysLeading, DeferredSettle, DeliveryDisposition, DeliveryDropRecord,
+    InboundIntake, LeaderGate, TriggerSource,
 };
 pub use stores::{
     AliasStore, CollectingOutbox, DedupCheckOutcome, InMemoryAliasStore, InMemoryInboxStore,

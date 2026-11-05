@@ -225,6 +225,10 @@ unconfigured returns `503`, a missing/invalid credential returns `401`, and a va
 the required role/claim returns `403` — never silently open. The auth-key scheme is the same
 static-secret model channels use for inbound HTTP auth, and it takes precedence when both are set.
 Gating is disabled only via the explicit `sutra.admin.oidc.dev-disabled=true` escape hatch.
+From 0.6.18 the gate also covers `GET /sutra/instances`, its `?alias=` search and `GET /sutra/instances/{id}`
+when admin auth is configured. An engine with no admin configuration at all still answers them without a key,
+so keep such an engine where only operators can reach it. See [Upgrading to
+0.6.18](upgrading-0-6-18.md#reading-instances-takes-the-admin-key).
 
 ## Audit sinks
 

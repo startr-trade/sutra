@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Sutra engine — platform / system API
-  version: 0.6.17
+  version: 0.6.18
   description: |
     The **platform (system) API** the Sutra engine serves on its own HTTP port — distinct from the
     per-deployment channel endpoints (those are generated per archive). This surface is the
@@ -19,7 +19,9 @@ info:
     without updating this file fails the build.
 
     **Auth posture:** the `/sutra/*` operate routes run with the unauthenticated internal-ops
-    posture (cluster-internal). The `/admin/*` surface is their OIDC-gated twin — every
+    posture (cluster-internal), except the two `GET /sutra/instances` reads, which answer to the
+    admin gate once admin auth is configured (`401` with no credential or a wrong one; open when
+    admin auth is off). The `/admin/*` surface is their OIDC-gated twin — every
     admin request requires a bearer JWT validated against a configured issuer + audience + JWKS,
     carrying the required admin scope (`sutra.admin.oidc.*`). Fail-closed: no/invalid token → `401`,
     a valid token without the admin scope → `403`, and an unconfigured admin surface → `503`
@@ -155,8 +157,20 @@ paths:
         `sutra.instance.retention`) are EXCLUDED by default — this list is unpaged, and a busy
         deployment holds a whole retention window of them. Set `includeTerminal=true`, or ask for a
         terminal `status`, to see them.
+        Needs the admin credential once admin auth is on (`sutra.admin.auth.*` or
+        `sutra.admin.oidc.*`); answers without one when admin auth is off.
       operationId: instancesList
+      security: [{ bearerAuth: [] }, {}]
       parameters:
+        - name: alias
+          in: query
+          required: false
+          description: >
+            `<name>:<value>`, split at the first colon. Narrow to the instances bound to that
+            correlation alias, for a caller that lost its 202. Live bindings only, unless
+            `includeTerminal=true`, which also finds finished instances by their retired bindings
+            and walks the deployment's alias rows to do it.
+          schema: { type: string }
         - name: deployment
           in: query
           required: false
@@ -174,7 +188,8 @@ paths:
           schema: { type: boolean, default: false }
       responses:
         "200": { description: The instance summaries., content: { application/json: { schema: { $ref: "#/components/schemas/InstanceList" } } } }
-        "400": { description: Malformed `deployment` id., content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "400": { description: Malformed `deployment` id or `alias`., content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "401": { $ref: "#/components/responses/AdminUnauthorized" }
   /sutra/instances/{id}:
     get:
       tags: [instances]
@@ -186,7 +201,10 @@ paths:
         the instance's last PARK, not the terminal step's final variable values — per-step fidelity
         lives in the admin instance-history route. `404` once the retention window has elapsed (or
         immediately, when retention is `PT0S`).
+        Needs the admin credential once admin auth is on (`sutra.admin.auth.*` or
+        `sutra.admin.oidc.*`); answers without one when admin auth is off.
       operationId: instanceById
+      security: [{ bearerAuth: [] }, {}]
       parameters:
         - name: id
           in: path
@@ -196,6 +214,7 @@ paths:
       responses:
         "200": { description: The instance projection., content: { application/json: { schema: { $ref: "#/components/schemas/InstanceDetail" } } } }
         "400": { description: The id is not a UUID., content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "401": { $ref: "#/components/responses/AdminUnauthorized" }
         "404": { description: No such instance., content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
   /sutra/instances/{id}/cancel:
     post:
@@ -365,6 +384,30 @@ paths:
         "200": { description: (sync) The deployment is ACTIVE., content: { application/json: { schema: { type: object } } } }
         "202": { description: (async) Accepted — stored and Pending; the activation flip runs in the background., content: { application/json: { schema: { type: object } } } }
         "400": { description: The archive was rejected (validation failed)., content: { application/json: { schema: { type: object } } } }
+        "401": { $ref: "#/components/responses/AdminUnauthorized" }
+        "403": { $ref: "#/components/responses/AdminForbidden" }
+        "409": { description: "Refused: another active deployment holds an exclusive endpoint this archive claims (`SUTRA.DEPLOY.ENDPOINT.COLLISION`). Nothing changed.", content: { application/json: { schema: { type: object } } } }
+        "503": { $ref: "#/components/responses/AdminUnconfigured" }
+  /admin/deployments/check:
+    post:
+      tags: [admin]
+      summary: (admin) Judge a sealed .sutra archive against the active set, changing nothing.
+      description: >
+        Runs the check a deploy runs and reports it: `collisions` (each would refuse the deploy) and
+        `warnings` (data stores that would share rows, channels whose transport declares no
+        endpoint claims). Available on every deployment source. `sutra deploy` and `sutra lint
+        --engine-url` call it for a fast answer.
+      operationId: adminDeploymentCheck
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: slot, in: query, required: false, description: "The slot this archive would replace: never judged against itself. Defaults to its `tenant--module--version`; a `dir`-source engine's slot is the archive file name.", schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/octet-stream: { schema: { type: string, format: binary } }
+      responses:
+        "200": { description: "The verdict: `ok`, `collisions`, `warnings`.", content: { application/json: { schema: { type: object } } } }
+        "400": { description: The archive does not verify., content: { application/json: { schema: { type: object } } } }
         "401": { $ref: "#/components/responses/AdminUnauthorized" }
         "403": { $ref: "#/components/responses/AdminForbidden" }
         "503": { $ref: "#/components/responses/AdminUnconfigured" }

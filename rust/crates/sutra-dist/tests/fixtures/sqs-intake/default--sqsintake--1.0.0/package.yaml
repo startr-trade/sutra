@@ -1,0 +1,8 @@
+# Deployment package for the SQS intake suite: queues read through environment references, and
+# synchronous HTTP channels with and without a declared reply.
+labels:
+  "module": "sqsintake"
+  "tenant": "default"
+  "version": "1.0.0"
+engine:
+  minContract: 1

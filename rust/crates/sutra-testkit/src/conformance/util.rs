@@ -118,9 +118,7 @@ pub fn suite_of(name: &str) -> &str {
 ///
 /// Keying the network by suite makes that impossible by construction instead of by convention.
 pub fn network_for(suite: &str) -> &'static str {
-    static NETS: OnceLock<std::sync::Mutex<HashMap<String, &'static str>>> = OnceLock::new();
-    let nets = NETS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
-    let mut nets = nets.lock().expect("network registry");
+    let mut nets = networks().lock().expect("network registry");
     if let Some(name) = nets.get(suite) {
         return name;
     }
@@ -131,6 +129,19 @@ pub fn network_for(suite: &str) -> &'static str {
     crate::reap_network_on_exit(name);
     nets.insert(suite.to_string(), name);
     name
+}
+
+fn networks() -> &'static std::sync::Mutex<HashMap<String, &'static str>> {
+    static NETS: OnceLock<std::sync::Mutex<HashMap<String, &'static str>>> = OnceLock::new();
+    NETS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// The network [`network_for`] gave `suite`, if it was ever asked for one in this process.
+pub(crate) fn known_network(suite: &str) -> Option<&'static str> {
+    match networks().lock() {
+        Ok(nets) => nets.get(suite).copied(),
+        Err(poisoned) => poisoned.into_inner().get(suite).copied(),
+    }
 }
 
 /// A fresh, world-readable temp directory. The engine container runs unprivileged (uid 10001)

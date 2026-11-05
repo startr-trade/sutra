@@ -38,7 +38,7 @@ fn bpmn(process_id: &str, channel: &str, typed: bool, coverage: bool) -> String 
     <bpmn:extensionElements>{coverage_el}</bpmn:extensionElements>
     <bpmn:startEvent id="Start">
       <bpmn:extensionElements>
-        <q:source channel="{channel}"{message_type} dedupKey="payload.id"/>
+        <q:source channel="{channel}"{message_type} dedupKey="body.id"/>
       </bpmn:extensionElements>
       <bpmn:outgoing>F1</bpmn:outgoing>
     </bpmn:startEvent>

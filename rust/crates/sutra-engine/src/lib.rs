@@ -15,6 +15,7 @@ pub mod capacity;
 pub mod concurrency;
 pub mod config;
 pub mod deploy;
+pub mod deployment_facts;
 pub mod envref;
 pub mod external_task;
 pub mod media;

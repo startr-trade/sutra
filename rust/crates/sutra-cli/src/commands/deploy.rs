@@ -21,6 +21,11 @@
 //! **Capacity posture:** the ~1 MiB ConfigMap ceiling is accepted for examples and
 //! documented as a posture note for real estates — a deploy that would exceed it fails with
 //! a friendly error naming that note instead of an opaque API rejection.
+//!
+//! **Endpoint exclusivity:** before anything changes, `deploy` judges the archive with the check
+//! the engine runs: against a running engine when `--engine-url` is given, and against the
+//! ConfigMap's other archives on the ConfigMap path. A refusal here is only the fast answer; the
+//! engine runs the same check at deploy.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -319,12 +324,23 @@ pub fn execute_deploy(mut args: DeployArgs, global: &GlobalArgs, io: &mut Io<'_>
             return exit::FINDINGS;
         }
     };
+    // An engine loads what it already has with such a form, so that nothing strands. A deploy is new.
+    if let Some(found) = sutra_loader::unrecognised_dedup_keys(&archive.deployment).first() {
+        let _ = writeln!(
+            io.err,
+            "deploy: archive rejected: [{}] {}",
+            sutra_bpmn::codes::PARSE_Q_SOURCE_DEDUP_KEY_UNRECOGNISED,
+            found.describe_refusal()
+        );
+        return exit::FINDINGS;
+    }
     let Some(file_name) = archive_path.file_name().and_then(|n| n.to_str()) else {
         let _ = writeln!(io.err, "deploy: archive path has no file name");
         return exit::USAGE;
     };
 
     // ---- --api: the engine deploy API (db source), sync by default or --async LRO --------
+    // The POST itself is the fast answer: the engine judges the archive before storing it.
     if args.api {
         let Some(engine_url) = args.engine_url.clone() else {
             let _ = writeln!(io.err, "deploy --api requires --engine-url <URL>");
@@ -380,6 +396,43 @@ pub fn execute_deploy(mut args: DeployArgs, global: &GlobalArgs, io: &mut Io<'_>
         }
     };
 
+    // ---- the fast answer: ask the target engine before anything changes -------------------
+    // Activation on this path happens later, in the engine's watcher, so its refusal would come
+    // too late to answer this command. Without --engine-url, or from an engine that gives no
+    // verdict, the same check still runs against the ConfigMap's other archives below.
+    let mut engine_judged = false;
+    if let Some(engine_url) = args.engine_url.as_deref() {
+        let admin_key = args
+            .api_key
+            .as_deref()
+            .map(|k| (args.api_key_header.as_str(), k));
+        match block_on(crate::commands::endpoint_check::ask_engine(
+            engine_url,
+            &bytes,
+            Some(file_name),
+            admin_key,
+        )) {
+            Ok(findings) => {
+                engine_judged = true;
+                for diagnostic in findings.errors.iter().chain(&findings.warnings) {
+                    let _ = writeln!(io.err, "{}", diagnostic.render_text());
+                }
+                if !findings.errors.is_empty() {
+                    return exit::FINDINGS;
+                }
+            }
+            // The check against the ConfigMap below still runs, but this binary judges fewer
+            // transports than the engine does, so the user must know the stronger answer is missing.
+            Err(reason) => {
+                let _ = writeln!(
+                    io.err,
+                    "engine at {engine_url} gave no verdict ({reason}); checking against the \
+                     ConfigMap's archives only"
+                );
+            }
+        }
+    }
+
     let archive_bytes = bytes;
     let outcome = block_on(async {
         let client = client_for(args.target.context.as_deref()).await?;
@@ -387,7 +440,12 @@ pub fn execute_deploy(mut args: DeployArgs, global: &GlobalArgs, io: &mut Io<'_>
     });
 
     match outcome {
-        Ok(()) => {
+        Ok(warnings) => {
+            if !engine_judged {
+                for diagnostic in &warnings {
+                    let _ = writeln!(io.err, "{}", diagnostic.render_text());
+                }
+            }
             match format {
                 ReportFormat::Text => {
                     let _ = writeln!(
@@ -730,7 +788,7 @@ pub(crate) async fn run_deploy_api(
     if !status.is_success() {
         // 4xx — a genuine rejection (bad archive, unauthorized). Fail fast, no poll.
         return Err(DeployError::findings(
-            codes::API_REJECTED,
+            rejection_code(&text),
             format!(
                 "engine rejected the deployment (HTTP {status}): {}",
                 text.trim()
@@ -739,6 +797,7 @@ pub(crate) async fn run_deploy_api(
     }
     let body: serde_json::Value =
         serde_json::from_str(text.trim()).unwrap_or_else(|_| serde_json::json!({}));
+    report_deploy_warnings(&body, format, io);
     match format {
         ReportFormat::Text => {
             let _ = writeln!(
@@ -755,6 +814,31 @@ pub(crate) async fn run_deploy_api(
         }
     }
     Ok(())
+}
+
+/// The code an engine's refusal carries, or the generic one when its body names none.
+fn rejection_code(body: &str) -> &'static str {
+    let parsed: serde_json::Value = serde_json::from_str(body.trim()).unwrap_or_default();
+    if parsed["code"].as_str() == Some(sutra_channels::codes::DEPLOY_ENDPOINT_COLLISION) {
+        sutra_channels::codes::DEPLOY_ENDPOINT_COLLISION
+    } else {
+        codes::API_REJECTED
+    }
+}
+
+/// Print the warnings a deploy response carries. A JSON caller reads them in the body it gets.
+fn report_deploy_warnings(body: &serde_json::Value, format: ReportFormat, io: &mut Io<'_>) {
+    if format != ReportFormat::Text {
+        return;
+    }
+    for warning in body["warnings"].as_array().into_iter().flatten() {
+        let _ = writeln!(
+            io.err,
+            "[WARN] {} — {}",
+            warning["code"].as_str().unwrap_or_default(),
+            warning["message"].as_str().unwrap_or_default()
+        );
+    }
 }
 
 /// Fall-back for the SYNC deploy when the POST does not return a clean 2xx/4xx — a cut connection or
@@ -840,7 +924,7 @@ pub(crate) async fn run_deploy_api_async(
     // 202 Accepted is the async happy path; a validation failure still fails synchronously (4xx).
     if status.as_u16() != 202 {
         return Err(DeployError::findings(
-            codes::API_REJECTED,
+            rejection_code(&text),
             format!(
                 "engine did not accept the async deployment (HTTP {status}): {}",
                 text.trim()
@@ -849,6 +933,7 @@ pub(crate) async fn run_deploy_api_async(
     }
     let body: serde_json::Value =
         serde_json::from_str(text.trim()).unwrap_or_else(|_| serde_json::json!({}));
+    report_deploy_warnings(&body, format, io);
     let dep_id = body["deploymentId"]
         .as_str()
         .unwrap_or_default()
@@ -1030,6 +1115,43 @@ fn package_and_deploy_once(
     .map_err(|e| e.diagnostic().message.clone())
 }
 
+/// Judge the archive against what the ConfigMap already holds, which IS the target's active set on
+/// this path, refusing before the patch rather than after the engine has picked it up. An entry
+/// that does not read as an archive is the engine's to reject; it claims nothing here. Returns
+/// the warnings.
+fn check_against_configmap(
+    existing: &ConfigMap,
+    archive_key: &str,
+    archive_bytes: &[u8],
+) -> Result<Vec<Diagnostic>, DeployError> {
+    use crate::commands::endpoint_check::{facts_of_archive, judge};
+    let Ok(candidate) = facts_of_archive(archive_bytes) else {
+        return Ok(Vec::new());
+    };
+    let others: Vec<_> = existing
+        .binary_data
+        .iter()
+        .flatten()
+        .filter(|(key, _)| key.as_str() != archive_key)
+        .filter_map(|(key, entry)| {
+            facts_of_archive(&entry.0)
+                .ok()
+                .map(|facts| facts.in_slot(key))
+        })
+        .collect();
+    let findings = judge(&candidate.in_slot(archive_key), &others);
+    if let Some(first) = findings.errors.first() {
+        let message = findings
+            .errors
+            .iter()
+            .map(|d| d.message.as_str())
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(DeployError::findings(&first.code, message));
+    }
+    Ok(findings.warnings)
+}
+
 /// The deploy sequence — Secret FIRST, ConfigMap second. Separated from
 /// argument/IO handling so the mocked-service tests drive it with an injected [`Client`].
 pub(crate) async fn run_deploy(
@@ -1038,7 +1160,7 @@ pub(crate) async fn run_deploy(
     archive_key: &str,
     archive_bytes: Vec<u8>,
     secret_entries: BTreeMap<String, String>,
-) -> Result<(), DeployError> {
+) -> Result<Vec<Diagnostic>, DeployError> {
     if !secret_entries.is_empty() {
         ensure_secret_keys(&client, target, secret_entries).await?;
     }
@@ -1094,7 +1216,7 @@ async fn upsert_configmap_entry(
     target: &TargetArgs,
     archive_key: &str,
     archive_bytes: Vec<u8>,
-) -> Result<(), DeployError> {
+) -> Result<Vec<Diagnostic>, DeployError> {
     let api = configmaps_api(client, target);
     let existing = match api.get(&target.configmap).await {
         Ok(cm) => cm,
@@ -1117,6 +1239,7 @@ async fn upsert_configmap_entry(
         archive_bytes.len(),
         &target.configmap,
     )?;
+    let warnings = check_against_configmap(&existing, archive_key, &archive_bytes)?;
 
     let patch_body = ConfigMap {
         binary_data: Some(BTreeMap::from([(
@@ -1132,7 +1255,7 @@ async fn upsert_configmap_entry(
     )
     .await
     .map_err(|e| api_error("deployments ConfigMap patch", e))?;
-    Ok(())
+    Ok(warnings)
 }
 
 /// Capacity posture: the deployments ConfigMap tops out around 1 MiB of payload
@@ -1378,7 +1501,7 @@ async fn wait_for_active(
     }
 }
 
-fn block_on<F: std::future::Future>(future: F) -> F::Output {
+pub(crate) fn block_on<F: std::future::Future>(future: F) -> F::Output {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -1934,6 +2057,106 @@ mod tests {
             run_deploy(client, &t, "a.sutra", archive, BTreeMap::new()).await
         })
         .expect("deploy without secrets succeeds");
+    }
+
+    /// A sealed archive with one HTTP channel on `path`.
+    fn sealed_http_archive(module: &str, path: &str) -> Vec<u8> {
+        let dir = crate::test_fixtures::scratch_dir("deploy-claims");
+        std::fs::create_dir_all(dir.join("bpmn")).unwrap();
+        std::fs::write(
+            dir.join("bpmn/solo.bpmn"),
+            format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0"
+                  targetNamespace="urn:sutra:module:{module}:1.0.0">
+  <bpmn:process id="solo" name="Solo" isExecutable="true">
+    <bpmn:startEvent id="Start">
+      <bpmn:extensionElements><q:source channel="in"/></bpmn:extensionElements>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="Start" targetRef="End"/>
+    <bpmn:endEvent id="End"/>
+  </bpmn:process>
+</bpmn:definitions>
+"#
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("channels.yaml"),
+            format!(
+                "channels:\n  - name: in\n    transport: http\n    bind: \"POST {path}\"\n    \
+                 auth:\n      scheme: apikey\n      apikey:\n        value: env:DEPLOY_KEY\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("package.yaml"),
+            format!("labels:\n  module: \"{module}\"\n  tenant: \"acme\"\n  version: \"1\"\n"),
+        )
+        .unwrap();
+        let out = dir.join("out");
+        let outcome = sutra_loader::assemble_dir(&dir, &out, &Default::default()).unwrap();
+        std::fs::read(&outcome.archives[0].file_path).unwrap()
+    }
+
+    #[test]
+    fn deploy_refuses_a_taken_endpoint_before_patching_the_configmap() {
+        // The only exchange is the read: a PATCH would find no script and fail the mock.
+        let holder = sealed_http_archive("holder", "/shared");
+        let claimant = sealed_http_archive("claimant", "/shared");
+        let exchanges = vec![Exchange {
+            method: "GET",
+            path_contains: "/configmaps/sutra-deployments",
+            body_contains: vec![],
+            status: 200,
+            response_body: configmap_json(serde_json::json!({ "holder.sutra": b64(&holder) })),
+        }];
+        let t = target();
+        let err = with_mock_api(exchanges, move |client| async move {
+            run_deploy(client, &t, "claimant.sutra", claimant, BTreeMap::new()).await
+        })
+        .expect_err("a taken endpoint is refused");
+        assert_eq!(err.diagnostic().code, "SUTRA.DEPLOY.ENDPOINT.COLLISION");
+        assert!(err.diagnostic().message.contains("POST /shared"));
+        assert_eq!(err.exit_code(), exit::FINDINGS);
+    }
+
+    #[test]
+    fn deploy_replacing_its_own_configmap_key_is_not_a_collision() {
+        // Another owner under this key, on this route: only the key says it is being replaced.
+        let previous = sealed_http_archive("previous-owner", "/shared");
+        let next = sealed_http_archive("app", "/shared");
+        let exchanges = vec![
+            Exchange {
+                method: "GET",
+                path_contains: "/configmaps/sutra-deployments",
+                body_contains: vec![],
+                status: 200,
+                response_body: configmap_json(serde_json::json!({ "app.sutra": b64(&previous) })),
+            },
+            Exchange {
+                method: "PATCH",
+                path_contains: "/configmaps/sutra-deployments",
+                body_contains: vec!["app.sutra".into()],
+                status: 200,
+                response_body: configmap_json(serde_json::json!({})),
+            },
+        ];
+        let t = target();
+        with_mock_api(exchanges, move |client| async move {
+            run_deploy(client, &t, "app.sutra", next, BTreeMap::new()).await
+        })
+        .expect("replacing its own key");
+    }
+
+    #[test]
+    fn a_rejection_carrying_the_collision_code_keeps_it() {
+        assert_eq!(
+            rejection_code(r#"{"code":"SUTRA.DEPLOY.ENDPOINT.COLLISION","error":"taken"}"#),
+            "SUTRA.DEPLOY.ENDPOINT.COLLISION"
+        );
+        assert_eq!(rejection_code(r#"{"error":"bad"}"#), codes::API_REJECTED);
     }
 
     #[test]

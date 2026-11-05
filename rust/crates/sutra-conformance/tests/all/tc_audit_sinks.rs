@@ -128,6 +128,7 @@ fn fixture() -> &'static Fixture {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "docker"]
 async fn tc_audit_otel_endpoint_boots_and_the_collector_receives_sutra_audit_records() {
+    let _suite = sutra_testkit::hold_suite!("auditsinks");
     let client = reqwest::Client::new();
     let reference = "AUD-OTEL-1";
     run_one(&client, "otel", reference).await;
@@ -201,6 +202,7 @@ async fn tc_audit_otel_endpoint_boots_and_the_collector_receives_sutra_audit_rec
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "docker"]
 async fn tc_audit_jsonl_events_carry_the_instance_correlation_keys() {
+    let _suite = sutra_testkit::hold_suite!("auditsinks");
     let client = reqwest::Client::new();
     let reference = "AUD-JSONL-1";
     run_one(&client, "jsonl", reference).await;

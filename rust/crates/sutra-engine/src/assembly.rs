@@ -131,6 +131,9 @@ pub(crate) struct DeploymentPlan {
     /// modules + declared stores at plan time. Served live at `GET /sutra/deployments/{id}/openapi`
     /// and refreshed on every flip; a spec build is infallible so it never fails a deploy.
     pub(crate) openapi_spec: Arc<serde_json::Value>,
+    /// What this deployment claims from the engine's shared namespaces (endpoints, data-store
+    /// connections), for the checks that run before a flip.
+    pub(crate) facts: crate::deployment_facts::DeploymentFacts,
 }
 
 impl DeploymentPlan {
@@ -1486,6 +1489,13 @@ pub(crate) fn plan_deployment(
         },
     ));
 
+    let facts = crate::deployment_facts::DeploymentFacts::of(
+        d,
+        &definitions,
+        &store_defs,
+        crate::deployment_facts::ConnectionView::Resolved,
+    );
+
     Ok(DeploymentPlan {
         dep,
         namespace: sutra_channels::Namespace::new(&d.tenant, &d.module, &d.version),
@@ -1507,6 +1517,7 @@ pub(crate) fn plan_deployment(
         coverage,
         coverage_fault,
         openapi_spec,
+        facts,
     })
 }
 

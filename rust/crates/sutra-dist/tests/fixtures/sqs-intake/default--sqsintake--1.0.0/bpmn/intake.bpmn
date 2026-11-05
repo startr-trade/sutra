@@ -1,0 +1,79 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0"
+                  id="Definitions_intake"
+                  targetNamespace="urn:sutra:module:sqsintake:1.0.0">
+  <bpmn:dataStore id="seenStore" name="seen"/>
+  <bpmn:process id="orders" isExecutable="true">
+    <bpmn:extensionElements><q:variables><q:variable name="entry" type="string"/></q:variables></bpmn:extensionElements>
+    <bpmn:dataStoreReference id="ref-orders" dataStoreRef="seenStore">
+      <bpmn:extensionElements><q:store key="'order|' + payload.Ref"/></bpmn:extensionElements>
+    </bpmn:dataStoreReference>
+    <bpmn:startEvent id="start-orders"><bpmn:extensionElements><q:source channel="orders-in"/></bpmn:extensionElements></bpmn:startEvent>
+    <bpmn:serviceTask id="record-orders" name="Record it">
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>"received"</bpmn:from><bpmn:to>entry</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+      <bpmn:dataOutputAssociation>
+        <bpmn:sourceRef>entry</bpmn:sourceRef><bpmn:targetRef>ref-orders</bpmn:targetRef>
+      </bpmn:dataOutputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="end-orders"/>
+    <bpmn:sequenceFlow id="a-orders" sourceRef="start-orders" targetRef="record-orders"/>
+    <bpmn:sequenceFlow id="b-orders" sourceRef="record-orders" targetRef="end-orders"/>
+  </bpmn:process>
+  <bpmn:process id="raw" isExecutable="true">
+    <bpmn:extensionElements><q:variables><q:variable name="entry" type="string"/></q:variables></bpmn:extensionElements>
+    <bpmn:dataStoreReference id="ref-raw" dataStoreRef="seenStore">
+      <bpmn:extensionElements><q:store key="'raw|' + event.channel"/></bpmn:extensionElements>
+    </bpmn:dataStoreReference>
+    <bpmn:startEvent id="start-raw"><bpmn:extensionElements><q:source channel="raw-in"/></bpmn:extensionElements></bpmn:startEvent>
+    <bpmn:serviceTask id="record-raw" name="Record it">
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>"received"</bpmn:from><bpmn:to>entry</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+      <bpmn:dataOutputAssociation>
+        <bpmn:sourceRef>entry</bpmn:sourceRef><bpmn:targetRef>ref-raw</bpmn:targetRef>
+      </bpmn:dataOutputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="end-raw"/>
+    <bpmn:sequenceFlow id="a-raw" sourceRef="start-raw" targetRef="record-raw"/>
+    <bpmn:sequenceFlow id="b-raw" sourceRef="record-raw" targetRef="end-raw"/>
+  </bpmn:process>
+  <bpmn:process id="quiet" isExecutable="true">
+    <bpmn:extensionElements><q:variables><q:variable name="entry" type="string"/></q:variables></bpmn:extensionElements>
+    <bpmn:dataStoreReference id="ref-quiet" dataStoreRef="seenStore">
+      <bpmn:extensionElements><q:store key="'quiet|' + payload.ref"/></bpmn:extensionElements>
+    </bpmn:dataStoreReference>
+    <bpmn:startEvent id="start-quiet"><bpmn:extensionElements><q:source channel="quiet"/></bpmn:extensionElements></bpmn:startEvent>
+    <bpmn:serviceTask id="record-quiet" name="Record it">
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>"received"</bpmn:from><bpmn:to>entry</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+      <bpmn:dataOutputAssociation>
+        <bpmn:sourceRef>entry</bpmn:sourceRef><bpmn:targetRef>ref-quiet</bpmn:targetRef>
+      </bpmn:dataOutputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="end-quiet"/>
+    <bpmn:sequenceFlow id="a-quiet" sourceRef="start-quiet" targetRef="record-quiet"/>
+    <bpmn:sequenceFlow id="b-quiet" sourceRef="record-quiet" targetRef="end-quiet"/>
+  </bpmn:process>
+  <bpmn:process id="parked" isExecutable="true">
+    <bpmn:startEvent id="start-parked"><bpmn:extensionElements><q:source channel="parked"/></bpmn:extensionElements></bpmn:startEvent>
+    <bpmn:intermediateCatchEvent id="hold">
+      <bpmn:timerEventDefinition><bpmn:timeDuration>payload.wait</bpmn:timeDuration></bpmn:timerEventDefinition>
+    </bpmn:intermediateCatchEvent>
+    <bpmn:endEvent id="end-parked"/>
+    <bpmn:sequenceFlow id="a-parked" sourceRef="start-parked" targetRef="hold"/>
+    <bpmn:sequenceFlow id="b-parked" sourceRef="hold" targetRef="end-parked"/>
+  </bpmn:process>
+  <bpmn:process id="answered" isExecutable="true">
+    <bpmn:startEvent id="start-answered"><bpmn:extensionElements><q:source channel="answered"/></bpmn:extensionElements></bpmn:startEvent>
+    <bpmn:serviceTask id="answer" implementation="answer.hbs">
+      <bpmn:extensionElements><q:reply mode="native" contentType="application/json"/></bpmn:extensionElements>
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="end-answered"/>
+    <bpmn:sequenceFlow id="a-answered" sourceRef="start-answered" targetRef="answer"/>
+    <bpmn:sequenceFlow id="b-answered" sourceRef="answer" targetRef="end-answered"/>
+  </bpmn:process>
+</bpmn:definitions>

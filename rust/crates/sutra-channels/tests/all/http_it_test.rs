@@ -666,12 +666,12 @@ async fn wait_state_approval_hold_fails_fast_without_persistence() {
     );
 }
 
-// ---- ack-mode: on-persist → 202 empty --------------------------------------------------------------
+// ---- ack-mode: on-persist → 202 with the engine's receipt -------------------------------------------
 
 #[tokio::test]
-async fn on_persist_channel_answers_202_with_an_empty_body() {
+async fn on_persist_channel_answers_202_with_the_receipt_when_the_flow_replied_nothing() {
     // A synthetic http channel declaring ack-mode: on-persist over a tiny echo flow —
-    // the flow still runs; the reply does NOT ride the inbound connection.
+    // the flow still runs and replies nothing, so the body is the engine's receipt.
     let yaml = b"channels:\n  - name: fire-and-forget\n    transport: http\n    bind: \"POST /channels/fire-and-forget\"\n    codec: raw-text\n    ack-mode: on-persist\n    auth:\n      scheme: apikey\n      apikey:\n        value: fnf-key\n";
     let mut defs =
         load_channel_definitions(yaml, "t", "echo-mod", "1.0.0", "test.yaml").expect("loads");
@@ -726,10 +726,15 @@ async fn on_persist_channel_answers_202_with_an_empty_body() {
     )
     .await;
     assert_eq!(r.status, StatusCode::ACCEPTED);
+    let receipt: serde_json::Value = serde_json::from_str(&r.body).expect("a JSON receipt");
+    assert_eq!(receipt["duplicate"], false, "{receipt}");
+    assert_eq!(receipt["deploymentId"], "dep-000000000000000000000013");
+    assert_eq!(receipt["labels"]["module"], "echo-mod");
+    assert!(receipt["instanceId"].is_string(), "{receipt}");
+    assert_eq!(receipt["attributes"], serde_json::json!({}), "opt-in only");
     assert!(
-        r.body.is_empty(),
-        "202 carries no business body: {}",
-        r.body
+        receipt.get("idempotencyKey").is_none(),
+        "the body-hash fallback is not a key a retry is recognised by: {receipt}"
     );
 }
 
@@ -761,4 +766,98 @@ async fn bound_listener_on_port_zero_serves_a_real_socket_round_trip() {
     assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
     assert!(response.contains("<TransferAccepted"), "{response}");
     assert!(response.contains(r#"newFromBalance="50""#), "{response}");
+}
+
+// ---- what answers the caller of a synchronous channel --------------------------------------
+
+const NO_REPLY_BPMN: &str = r#"<?xml version="1.0"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0">
+  <bpmn:process id="quiet">
+    <bpmn:startEvent id="S">
+      <bpmn:extensionElements><q:source channel="quiet-in"/></bpmn:extensionElements>
+    </bpmn:startEvent>
+    <bpmn:endEvent id="E"/>
+    <bpmn:sequenceFlow id="f" sourceRef="S" targetRef="E"/>
+  </bpmn:process>
+</bpmn:definitions>"#;
+
+const NO_REPLY_CHANNELS: &str = r#"channels:
+  - name: quiet-in
+    transport: http
+    bind: "POST /channels/quiet-in"
+    codec: json
+    cloudevents-mode: none
+    auth: { scheme: apikey, apikey: { value: quiet-key, header: X-Api-Key } }
+"#;
+
+fn no_reply_dep() -> DeploymentId {
+    DeploymentId::of("dep-000000000000000000000052").expect("valid deployment id")
+}
+
+fn no_reply_definitions() -> Vec<ChannelDefinition> {
+    let mut defs = load_channel_definitions(
+        NO_REPLY_CHANNELS.as_bytes(),
+        "default",
+        "quiet",
+        "1.0.0",
+        "channels.yaml",
+    )
+    .expect("loads");
+    stamp_bindings(&mut defs, &no_reply_dep());
+    defs
+}
+
+fn no_reply_engine() -> ChannelEngine {
+    let module = BpmnModelLoader::new()
+        .load(NO_REPLY_BPMN.as_bytes())
+        .expect("BPMN");
+    let sink = Rc::new(DrainingSink::new());
+    let executor = TokenExecutor::builder(TaskRegistry::new())
+        .with_feel()
+        .with_emission_sink(Rc::clone(&sink) as Rc<dyn sutra_executor::EmissionSink>)
+        .build();
+    ChannelEngine::builder(
+        executor,
+        sink,
+        InboundChain::new(
+            CodecRegistry::with_builtins(),
+            sutra_channels::FormatRegistry::with_builtins(),
+            ValidatorRegistry::new(),
+        ),
+    )
+    .with_channel_definitions(&no_reply_definitions())
+    .with_module(&no_reply_dep(), &module)
+    .build()
+}
+
+/// A flow with no `<q:reply>` answers an empty 200. Its variables hold the inbound event: the
+/// body, the headers, and the credential the caller sent. None of it comes back.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_flow_with_no_reply_returns_nothing_of_its_variables() {
+    let handle: EngineHandle = spawn_engine(tokio::runtime::Handle::current(), no_reply_engine);
+    let app = channel_router(&no_reply_definitions(), handle).expect("router builds");
+    let answer = post(
+        &app,
+        "/channels/quiet-in",
+        "quiet-key",
+        "application/json",
+        r#"{"note":"BODY-MARKER"}"#,
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::OK, "{}", answer.body);
+    assert_eq!(answer.body, "", "no <q:reply>, no body");
+}
+
+/// A flow that declares `<q:reply>` answers exactly what the reply renders, and no variable,
+/// header or `event.*` beside it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_declared_reply_returns_its_body_and_nothing_else() {
+    let app = app();
+    let reply = post_transfer(&app, "alice", "bob", "1").await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+    assert!(reply.body.contains("<TransferAccepted"), "{}", reply.body);
+    assert!(!reply.body.contains(TRANSFER_KEY), "{}", reply.body);
+    assert!(!reply.body.contains("x-api-key"), "{}", reply.body);
+    assert!(!reply.body.contains("\"event\""), "{}", reply.body);
 }

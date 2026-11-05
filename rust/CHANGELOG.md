@@ -13,6 +13,261 @@ This is the changelog for the **Rust-native** engine (`rust/` workspace). It beg
 
 Nothing yet.
 
+## [0.6.18] — 2026-11-05
+
+**2026-11-04.** **A second deployment claiming a taken endpoint is now refused at deploy, with the first still serving.** An HTTP `METHOD path`, a queue, a subscription or a Kafka consumer group belongs to one deployment; only topics are shared. **A new version that takes a route from an older one drains the older version whole: for now, every channel of the old version stops taking new work, including one the new version doesn't have.** **An `on-persist` HTTP channel now answers with an acceptance receipt that names the instance, so a `202` that used to be empty has a JSON body. A duplicate names its original.** **A declared `<q:source dedupKey>` now always dedupes, and a new package with an unrecognised form is refused.** **With admin auth on, reading `GET /sutra/instances` now takes the admin key; without it a client gets `401`.** Two deployments that would share a data store's rows now get a warning. The `<q:receipt>` element is an additive, optional part of `urn:sutra:q:1.0`. **A broker message with no content type on a channel with a codec is now decoded by that codec; earlier versions deleted it silently.** **A synchronous HTTP flow with no `<q:reply>` now answers an empty body; earlier versions returned its variables, including the caller's key.** Two additive migrations run at boot: V304 and V1002. There is no archive format, deploymentId or snapshot format change.
+
+## Before you upgrade
+
+**A superseded version drains whole in 0.6.18.** Versions of one tenant and module count as one owner, so a
+new version may take an endpoint from an older one. New requests reach the new version, and the old version
+finishes the instances it already has. It stops taking new work on every channel it has, not only the ones the
+new version took. Before you deploy a new version over an old one, check for a channel that only the old version
+has. `SUTRA.DEPLOY.ENDPOINT.SUPERSEDED` warns and names what stops being served.
+
+**Check these against what you run:**
+
+- **Two deployments on one queue.** On the `db` source, the one activated first keeps the queue. The later one
+  stops being active, and is listed under `failed` until the next deployment change. Its running instances keep
+  their definition.
+- **Two archives on one endpoint in a deployments folder.** With no record of a holder, both report `Failed` and
+  neither deploys; everything else boots. This used to refuse boot for HTTP. Remove one and the other lands.
+- **Two deployments sharing a Kafka consumer group,** including two that share one because an unset `group.id`
+  defaults from the channel name. They keep running, with `SUTRA.DEPLOY.ENDPOINT.ALREADY_SHARED` logged as an error.
+  Any new deploy claiming that group is refused, including new content for one of them, so give each channel its
+  own `group.id` the next time you change it. A new group starts from its own offsets.
+- **A flow that declared `dedupKey="header.<name>"` or `dedupKey="ce.id"`, or any key on a wait.** It dedupes now.
+  A repeat that used to run answers as a duplicate.
+- **A caller that relied on an empty `202`.** The body is now the receipt, when the flow replied nothing.
+- **A client reading instances with no key.** This is a behaviour change. `GET /sutra/instances`, its `?alias=` search
+  and `GET /sutra/instances/{id}` now sit behind the admin gate when admin auth is on (`sutra.admin.auth.*` or
+  `sutra.admin.oidc.*`). No credential or a wrong one gets `401`, and a valid OIDC token without the admin role gets
+  `403`. Send what `/admin/*` takes: the admin key in `X-API-Key` or your configured header, or the bearer token. With
+  admin auth off, including an engine that never configured it, these routes answer as before.
+  `POST /sutra/instances/{id}/cancel` is not part of this change.
+- **A package with no `tenant` or `module` label** on the `db` source gets a slot of its own, and no longer replaces
+  another unlabeled package. To change one on a route, undeploy the old one first, or label it.
+- **A caller that read the answer of a flow with no `<q:reply>`.** This is a behaviour change. On a synchronous HTTP
+  channel (`ack-mode: on-complete`, the default), a flow with no `<q:reply>` now answers `200` with an empty body. Every
+  earlier version, from 0.2.0-rc.1 through 0.6.17, returned the instance's whole variable map as JSON: `event.body`, the
+  request's headers including the caller's `X-Api-Key`, and every variable the flow set. A flow that returns data
+  declares `<q:reply>`, and a client stops reading anything else. If a log, a proxy or a client stored those answers,
+  they hold those credentials, so rotate the keys. A declared reply, and status codes, are unchanged.
+- **A sender that stated `application/octet-stream` to a channel with a codec.** It is refused as before, now loudly. A
+  message that states no type is the one that changed: see below.
+
+## A message with no content type, and what a refused delivery leaves behind
+
+**Earlier versions lost these messages silently.** From 0.2.0-rc.1 through 0.6.17, a broker message with no content type
+on a channel declaring a codec, or a format such as `json`, was deleted with nothing recorded: no instance, no log line,
+no audit record. The source filled in `application/octet-stream`, the codec's capability gate refused that, and the only
+trace of the refusal was a decision to drop. What the drop did depended on the transport:
+
+| Transport | What happened to it | Where a copy can still be |
+|---|---|---|
+| `aws-sqs` | deleted | nowhere, unless the sender keeps its own |
+| `kafka` | offset committed past it | in the topic, until retention removes it |
+| `gcp-pubsub` | acked | in a snapshot or a seek window, if you keep one |
+| `rabbitmq`, `amqp` | rejected without requeue | in the dead-letter route, if the broker has one |
+
+The same silence covered every other permanent refusal on these transports: a body the codec refused, a stated type it
+does not accept, a message no start event matched, a tenant quota. HTTP, dapr and knative answered the sender with a status.
+The file transport moved the file to `.failed/`.
+
+**To check for losses,** compare what your senders sent with the instances and rows the engine produced for that
+channel, over the time it ran an earlier version. On Kafka, compare the topic's offsets with the same counts, and replay
+what is missing with `content-type` set. There is no record in the engine to query, because none was written.
+
+**What it does now.** A message with no content type is decoded with the channel's codec. If the codec refuses it, it
+follows the normal reject path. A message stating a type the codec does not accept is still refused. A channel with no
+codec reads a message with no type as raw bytes, as before; the one visible difference is that `event.contentType` is
+now empty there rather than `application/octet-stream`, the same as on HTTP and file channels.
+
+**Every permanent refusal on a broker or file channel now leaves two things:**
+
+- a WARN with `code` `SUTRA.INBOUND.DELIVERY_DROPPED`, the refusal's own code as `cause_code`, the channel, and the
+  dedup key, never the body;
+- when an audit sink is on, a record `inbound.DELIVERY_DROPPED` in the deployment's journal, whose `diagnostic_code` is
+  the refusal's and whose `diagnostic_json` names the channel. No instance owns it, so its `instance_id` is empty. The
+  body is not kept: on SQS, a refused message is still deleted.
+
+**Two limits of this release.** A refused body is not captured: on SQS it is deleted, and nothing in the engine can
+redrive it. And `sutra.audit.sql` is off by default, so an engine with no audit sink writes no audit record, and the WARN
+is the only trace. Turn a sink on if you need the record.
+
+A rejected credential gets the same audit record, beside the WARN the transport already wrote. A message settled as a
+duplicate is not a drop, and now logs at INFO with `SUTRA.INBOUND.DUPLICATE_DELIVERY`. A deferred nack for a failed
+instance (`SUTRA.ACK.DEFERRED_NACKED`) is raised from INFO to WARN.
+
+## References in an SQS channel's properties
+
+An inbound `aws-sqs` channel now resolves `${NAME}`, `${NAME:default}`, `env:NAME` and `secret:` references in `region`,
+`queue.url`, `endpoint-override`, `wait-time-seconds`, `max-messages` and `visibility-timeout-seconds`. Earlier versions
+read them as written and polled a queue literally named `${...}`, retrying forever with "failed to construct request". An
+unresolved reference now stops the channel at wiring with `SUTRA.INBOUND.AWS_SQS.CONFIG_INVALID`, naming the property.
+
+**This covers `aws-sqs` only.** The inbound connection properties of the other transports do not expand references yet,
+so a value containing `${` in one of them is now refused when the channel is wired, with that transport's
+`CONFIG_INVALID` code (`SUTRA.INBOUND.KAFKA.CONFIG_INVALID`, for example). The message names the channel and the
+property and says references there arrive in a later release; it does not repeat the value. Use literal values.
+
+| Transport | Properties that refuse `${` |
+|---|---|
+| `kafka` | `bootstrap.servers`, `topic`, `group.id` |
+| `rabbitmq` | `host`, `port`, `virtual-host`, `queue`, `exchange` |
+| `amqp` | `host`, `port`, `queue`, `topic` |
+| `gcp-pubsub` | `project-id`, `subscription`, `topic`, `endpoint-override` |
+| `file` | `spool.dir`, `directory` |
+
+- **At boot** the engine does not start. **On an activation in a running engine** the activation succeeds, that channel's
+  consumer does not run, and the code is logged as a WARN. `aws-sqs` behaves the same way for an unresolved reference.
+- **This can stop a channel that ran before.** Earlier versions used the text as a literal name: some failed with a
+  repeating WARN, but kafka `group.id` consumed under a group literally named `${NAME}`, file `spool.dir` polled a
+  directory with that name, and amqp `queue` or `topic` attached to that name and received nothing on a broker that
+  creates addresses on demand. A new literal `group.id` is a new consumer group, so it starts from `auto.offset.reset`
+  (default `earliest`), not from the old group's offsets.
+- **Only `${` is detected.** `env:NAME` and `secret:` forms in these properties are still read as written.
+- **Unchanged:** credentials, `inbound-auth` and outbound `bind` resolve references as before.
+
+## Endpoint exclusivity
+
+| Endpoint | Who can hold it |
+|---|---|
+| HTTP `METHOD path` | one deployment |
+| Queue (RabbitMQ, SQS, AMQP 1.0) | one deployment |
+| Pub/Sub subscription | one deployment |
+| Kafka consumer group, on any topic | one deployment |
+| File spool directory | one deployment |
+| LLM callback route | one deployment |
+| A channel's name, under a package's tenant, module and version | one deployment |
+| Topic (Dapr, Knative subscription, AMQP 1.0) | any number; each receives its own copy |
+
+**On the `db` source,** the check runs before the deployment is stored. A refusal is HTTP `409` with
+`SUTRA.DEPLOY.ENDPOINT.COLLISION`. Nothing is stored, and the old state keeps serving.
+
+**On a folder source,** a refused archive is listed under `failed`, and the engine serves the rest. File names and
+arrival order decide nothing:
+
+- The deployment holding an endpoint keeps it across restarts and on new pods. The holder is recorded in the
+  engine's database (`deployment_endpoint_holder`, migration V1002), so every replica reads the same answer.
+- The highest version of one owner wins, comparing versions rather than text, so a restart never rolls a route
+  back. To roll back, remove the newer file. A superseded version's parked instances keep resuming after a restart.
+- A pod that can't verify the holder's file doesn't give the endpoint away. It passes on only when the file is gone.
+- A refused archive that used to serve keeps its parked instances after a restart.
+- One archive with a label or endpoint the record can't store fails alone, with
+  `SUTRA.DEPLOY.ENDPOINT.UNRECORDABLE`.
+
+**You can ask before you deploy.** `POST /admin/deployments/check` judges an archive against the active set and
+changes nothing. `sutra lint --active-set <PATH>...` and `sutra lint --engine-url <URL>` run the same check.
+`sutra deploy` runs it before touching a ConfigMap. The CLI links only the HTTP transport, so `--active-set` reports
+a channel on any other transport as `SUTRA.DEPLOY.ENDPOINT.UNCHECKED`; `--engine-url` covers them all.
+
+**Other warnings.** `SUTRA.DEPLOY.ENDPOINT.OUTRANKED`: a folder target wouldn't serve an older version.
+`SUTRA.DEPLOY.ENDPOINT.SHADOWED`: a channel binds under a path another transport serves.
+`SUTRA.DEPLOY.ENDPOINT.SAME_VERSION_ELSEWHERE`: `sutra lint --active-set` found this version under another file name.
+
+**Topics.** Dapr and Knative channels on one topic now all receive each event, where a second claim used to be
+refused. A push gets one answer, the worst of the subscribers'. A redelivery reaches every subscriber, and each
+one's inbox absorbs what it has seen by CloudEvents id or declared key. `SUTRA.CHANNEL.NO_IDEMPOTENCY_KEY` now warns
+on a broadcast subscriber that declares no key, because a redelivery can run it twice. On a Dapr topic an event goes
+only to its component's subscribers, and a raw one no component can be attributed to on a shared topic is answered
+`404`.
+
+**What wasn't run.** Claim identities for Kafka, SQS, Pub/Sub, AMQP and file have unit tests, with no broker behind
+them. RabbitMQ and an HTTP route were run end to end. Dapr fan-out was driven by a direct POST with no sidecar, and
+Knative fan-out has unit tests only. The ConfigMap path was run against a mocked Kubernetes API. The advisory lock
+has no concurrent-replica race test.
+
+## Shared data store connections
+
+`SUTRA.DEPLOY.DATASTORE.SHARED_CONNECTION` warns when two deployments would use one connection with the same store
+names, because rows are keyed by store name and key, so they would read and write each other's rows. Sharing can be
+a legitimate choice, so this never refuses a deploy. It names the other deployment and the stores, never the
+connection.
+
+`sutra lint` with no target also warns when a `sql` store's connection reference names neither the tenant nor the
+module, since any co-hosted copy of the package would share it. Lint still exits 0.
+
+## Acceptance receipts
+
+An HTTP channel with `ack-mode: on-persist` now answers `202` with `Sutra-Instance-Id` and `Sutra-Receipt` headers.
+When the flow replied nothing, the receipt is also the JSON body. A body the flow authored with
+`<q:reply continue="true">` is unchanged, and the receipt rides only in the headers.
+
+```json
+{"deploymentId":"dep-…","labels":{"module":"cases","tenant":"default","version":"1.0.0"},"duplicate":false,"instanceId":"…","aliases":{"orderId":"O-100"},"attributes":{"caseId":"C-7"},"idempotencyKey":"try-1"}
+```
+
+- **A duplicate names its original.** A duplicate on any HTTP channel, including `on-complete`, gets a `202` with a
+  JSON receipt carrying `duplicate: true` and `originalInstanceId`. It names none if the first delivery ended without
+  an instance, or was recorded before this release.
+- **Aliases are automatic.** A correlation alias's value reaches the caller without the author opting in, masked
+  when it is sensitive. An alias built from the payload shows that value to the caller.
+- **`<q:receipt>` declares the flow's own values.** `<q:attribute name expression>` children on the process's
+  `extensionElements` are evaluated at the answer, over the variables the reply would render against. Values are
+  strings. A null is left out. An expression that fails is logged and left out, because the work is already accepted.
+- **Masking applies.** A sensitive input masks the value, and lint warns with `SUTRA.CONFIG.RECEIPT.ATTRIBUTE_SENSITIVE`.
+  A duplicate attribute name is `SUTRA.CONFIG.RECEIPT.ATTRIBUTE_DUPLICATE`, a lint error. A missing name or expression
+  is a load error.
+- **Limits.** `Sutra-Receipt` is one line of ASCII JSON; over 4 KiB it keeps only the identifying fields and adds
+  `"truncated": true`. Queue transports have no synchronous answer, so they get no receipt. Two deliveries racing
+  before either commits still behave as before: the loser gets `SUTRA.INBOUND.DUPLICATE_CONCURRENT`.
+
+**Finding an instance after a lost `202`.** `GET /sutra/instances?alias=<name>:<value>` finds a live instance, split
+at the first colon. `includeTerminal=true` also finds a finished one, and walks the deployment's alias rows with no
+index, so don't poll it. With admin auth on, it takes the admin key like any admin route, because knowing an alias
+value would otherwise be enough to find an instance. See "Before you upgrade".
+
+## A declared `dedupKey` always dedupes
+
+The recognised forms are `header.<name>`, `ce.id`, `body.<path>` and `amqp.message-id`. Each is read at dispatch, on
+a start event and on a wait, whatever the channel's `cloudevents-mode` or `idempotency-key-header` say. A check that
+fails refuses the delivery. A message missing the declared key runs as one with no key, with a warning in the log. A
+key on a wait stops a repeat of an answer being taken for the next answer.
+
+**A new package with any other form is refused,** with `SUTRA.PARSE.Q_SOURCE.DEDUP_KEY_UNRECOGNISED` at lint, sealing
+and deploy. `dedupKey="payload.id"`, say, used to be accepted and ignored. A package already deployed with one keeps
+running: it dedupes nothing as before, its parked instances resume, and the engine logs the code as an error at boot
+and on reload. A folder can't tell whether a file was ever deployed, so any file in one loads this way.
+
+**Don't key on a secret header.** The value is stored in `inbox_seen`, and it can appear in refusal text and in the
+log when a check fails.
+
+## Fixed
+
+- A hot flip whose HTTP routes couldn't be built only warned: the new deployment reported Active while the old routes
+  kept serving. The flip is now refused whole, and LLM callbacks the same way. A failed folder flip reports what the
+  engine really serves.
+- A deploy that stored its row and then failed to flip answered as a refusal. It now answers `500` with
+  `SUTRA.DEPLOY.ACTIVATE.FLIP_FAILED`, because a restart serves what was stored.
+- `POST /admin/deployments` answers `400` for an archive that can't be planned, such as one with an unset env
+  reference. It used to store the archive and silently drop it from the flip.
+- Waiting deploys could exhaust the pool under the deploy they waited for. A deploy now uses one connection.
+- A folder rejects an archive whose routes couldn't be served when it reads it, so the archive can't displace what is
+  serving, and no longer stops the engine booting.
+- Two unlabeled packages with one channel name reached a registry collision that took the engine down. They are now
+  refused, because a channel's name is an endpoint.
+- `sutra lint` no longer passes a target check it couldn't run, and a file named after the package no longer hides
+  another owner's archive. `sutra deploy --engine-url` times out after 30 seconds and says why it got no verdict.
+
+## For extension authors
+
+- **`EndpointClaimFactory` in `sutra-transport-spi`** declares a transport's claims through `inventory`. It's additive:
+  a transport that submits nothing keeps working, and is reported as `SUTRA.DEPLOY.ENDPOINT.UNCHECKED`. Its `claims`
+  function must be pure, with no I/O or secrets, since it runs in the CLI too. An identity must tell two endpoints
+  apart and must never hold a credential, because it appears in refusal messages.
+- **`TransportChannels::prepare_rewire`** is a new default method. Override it if a rewire can fail as a whole.
+- **Source-breaking changes in `sutra-channels` and `sutra-persistence`:** `DispatchOutcome::Duplicate` now has
+  `{ original_instance_id, dedup_key }`, `DispatchOutcome::Completed` gains `acceptance`, `InboxStore::settle` gains
+  `instance_id`, and `record_inbox_seen_in` gains an instance parameter. `InboxStore::original_instance` is added with
+  a default.
+
+## Migrations
+
+- **V304** adds a nullable `inbox_seen.instance_id` on PostgreSQL, MySQL and SQL Server. There is no index. The MySQL
+  and SQL Server inbox stores have the column but don't fill it, because the engine runs on PostgreSQL.
+- **V1002** creates `deployment_endpoint_holder` on PostgreSQL.
+
 ## [0.6.17] — 2026-11-04
 
 **2026-11-04.** **Senders see a new retryable refusal during a database problem:** a delivery with an explicit event id or a declared body-path `dedupKey` that can't be checked for a duplicate is now refused instead of processed unchecked. **It also closes a masking leak: in a flow that declares masking, the raw message and every inbound header, including credentials such as an API key, showed in audit, inspect and snapshots.** **It also stops a message on one owner's channel resuming another owner's draining instance.** This release also adds `bpmn-svg`, a standalone library that draws BPMN diagrams as SVG, and renews the image scan's time-boxed entries. There is no `urn:sutra:q:1.0` change, no archive format, deploymentId or snapshot format change, and no migration.

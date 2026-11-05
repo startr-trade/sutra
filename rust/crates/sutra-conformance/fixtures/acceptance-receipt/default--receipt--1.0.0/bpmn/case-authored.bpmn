@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Replies with its own body at <q:reply continue="true">: the 202 keeps that body byte for byte,
+     and the engine's receipt rides only in the headers. -->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0"
+                  id="Definitions_case_authored"
+                  targetNamespace="urn:sutra:module:receipt:1.0.0">
+  <bpmn:process id="case-authored" isExecutable="true">
+    <bpmn:extensionElements>
+      <q:receipt>
+        <q:attribute name="caseId" expression="req.caseId"/>
+      </q:receipt>
+    </bpmn:extensionElements>
+    <bpmn:startEvent id="Start">
+      <bpmn:extensionElements><q:source channel="case-authored" name="req"/></bpmn:extensionElements>
+      <bpmn:outgoing>F1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="F1" sourceRef="Start" targetRef="Accept"/>
+    <bpmn:serviceTask id="Accept" implementation="authored.hbs">
+      <bpmn:extensionElements>
+        <q:reply mode="native" continue="true" contentType="application/json"/>
+      </bpmn:extensionElements>
+      <bpmn:incoming>F1</bpmn:incoming><bpmn:outgoing>F2</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F2" sourceRef="Accept" targetRef="Done"/>
+    <bpmn:endEvent id="Done"><bpmn:incoming>F2</bpmn:incoming></bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>

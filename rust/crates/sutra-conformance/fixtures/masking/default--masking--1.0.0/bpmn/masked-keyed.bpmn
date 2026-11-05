@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- As masked, with a key only the flow declares, read from a header. -->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0"
+                  id="Definitions_masked_keyed"
+                  targetNamespace="urn:sutra:module:masking:1.0.0">
+  <bpmn:process id="masked-keyed" name="Masked keyed" isExecutable="true">
+    <bpmn:extensionElements>
+      <q:audit sink="jsonl" capture="payload"/>
+      <q:variables>
+        <q:variable name="payload" type="object" sensitive="true"/>
+      </q:variables>
+    </bpmn:extensionElements>
+    <bpmn:startEvent id="Start">
+      <bpmn:extensionElements>
+        <q:source channel="masked-keyed-in" dedupKey="header.X-Dedup-Id"/>
+        <q:alias name="caseRef" expression="payload.ref" unique="true"/>
+      </bpmn:extensionElements>
+    </bpmn:startEvent>
+    <bpmn:receiveTask id="Wait" name="Wait for a status">
+      <bpmn:extensionElements>
+        <q:source channel="keyed-status-in" name="status"/>
+        <q:alias name="caseRef" expression="status.ref"/>
+      </bpmn:extensionElements>
+    </bpmn:receiveTask>
+    <bpmn:endEvent id="Done"/>
+    <bpmn:sequenceFlow id="F1" sourceRef="Start" targetRef="Wait"/>
+    <bpmn:sequenceFlow id="F2" sourceRef="Wait" targetRef="Done"/>
+  </bpmn:process>
+</bpmn:definitions>

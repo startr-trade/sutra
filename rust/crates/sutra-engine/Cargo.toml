@@ -104,11 +104,15 @@ sutra-transport-gcp-pubsub = { path = "../sutra-transport-gcp-pubsub" }
 sutra-transport-rabbitmq = { path = "../sutra-transport-rabbitmq" }
 sutra-transport-amqp = { path = "../sutra-transport-amqp" }
 sutra-transport-file = { path = "../sutra-transport-file" }
+sutra-transport-dapr = { path = "../sutra-transport-dapr" }
+sutra-transport-knative = { path = "../sutra-transport-knative" }
 # Raw RabbitMQ client for the leadership IT (queue declare + publish into the broker).
 # The per-broker conformance clients (rdkafka/aws/google/fe2o3) moved to their transport
 # crates with the conformance ITs (domain-neutrality refactor) — the engine bundles the
 # transports but no longer tests them directly, so it links no broker client but lapin here.
 lapin = { workspace = true }
+# A raw AMQP 1.0 producer, for the redelivery a flow dedupes on the message id.
+fe2o3-amqp = { workspace = true }
 testcontainers = { workspace = true }
 # `mysql` backs the datastore driver-dispatch lib test (assembly.rs); `postgres` + `kafka`
 # come from the workspace default. Dev-only — the binary is unaffected.

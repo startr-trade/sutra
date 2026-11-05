@@ -304,6 +304,7 @@ async fn assert_recovered(
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "docker"]
 async fn tc_outbox_relay_settles_every_order_exactly_once_under_concurrency() {
+    let _suite = sutra_testkit::hold_suite!("relay");
     let slot = &CONCURRENT;
     let engine = start_engine(slot, 4);
     let accepted = post_orders(vec![engine.http_port], "conc".to_string(), 300).await;
@@ -322,6 +323,7 @@ async fn tc_outbox_relay_settles_every_order_exactly_once_under_concurrency() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "docker"]
 async fn tc_outbox_relay_recovers_from_a_crash_mid_flight() {
+    let _suite = sutra_testkit::hold_suite!("relay");
     let slot = &CRASH;
     let first = start_engine(slot, 4);
     let accepted = load_and_kill(slot, vec![first.http_port], "crash", 1500, || {
@@ -346,6 +348,7 @@ async fn tc_outbox_relay_recovers_from_a_crash_mid_flight() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "docker"]
 async fn tc_outbox_relay_recovers_from_a_postgres_crash_mid_flight() {
+    let _suite = sutra_testkit::hold_suite!("relay");
     let slot = &PG_CRASH;
     let engine = start_engine(slot, 4);
     let pg = fixture(slot).pg.container.id().to_string();
@@ -373,6 +376,7 @@ async fn tc_outbox_relay_recovers_from_a_postgres_crash_mid_flight() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "docker"]
 async fn tc_outbox_relay_two_replicas_deliver_each_callback_once() {
+    let _suite = sutra_testkit::hold_suite!("relay");
     let slot = &REPLICAS;
     let first = start_engine(slot, 4);
     let second = start_engine(slot, 4);
@@ -407,6 +411,7 @@ async fn tc_outbox_relay_two_replicas_deliver_each_callback_once() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "docker"]
 async fn tc_outbox_relay_two_replicas_recover_from_a_crash_mid_flight() {
+    let _suite = sutra_testkit::hold_suite!("relay");
     let slot = &REPLICA_CRASH;
     let first = start_engine(slot, 4);
     let second = start_engine(slot, 4);

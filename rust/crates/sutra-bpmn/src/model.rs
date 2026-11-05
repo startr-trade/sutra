@@ -653,6 +653,9 @@ pub struct ProcessDefinition {
     /// duplicate-detection value): a dedup key never, on its own, asserts retry-safety. Gates the
     /// inbound ack decision on an execution failure (`SUTRA.INBOUND.NON_IDEMPOTENT_FAILURE`).
     pub idempotent: bool,
+    /// The values this process exposes on the acceptance receipt (`<q:receipt>`). Empty, the
+    /// default, exposes nothing: a receipt never carries flow data the author did not name.
+    pub receipt_attributes: Vec<crate::qbindings::ReceiptAttribute>,
 }
 
 /// Decides one start event's `<q:source filterExpression>` predicate for the message being
@@ -752,6 +755,7 @@ impl ProcessDefinition {
             coverage_paths: Vec::new(),
             audit: None,
             idempotent: false,
+            receipt_attributes: Vec::new(),
         })
     }
 
@@ -785,6 +789,16 @@ impl ProcessDefinition {
     /// the parser after assembly, like coverage/audit). Default is `false` (fail-closed).
     pub fn with_idempotent(mut self, idempotent: bool) -> ProcessDefinition {
         self.idempotent = idempotent;
+        self
+    }
+
+    /// A copy of this process with its `<q:receipt>` attributes set (applied by the parser after
+    /// assembly, like the idempotency assertion).
+    pub fn with_receipt_attributes(
+        mut self,
+        attributes: Vec<crate::qbindings::ReceiptAttribute>,
+    ) -> ProcessDefinition {
+        self.receipt_attributes = attributes;
         self
     }
 

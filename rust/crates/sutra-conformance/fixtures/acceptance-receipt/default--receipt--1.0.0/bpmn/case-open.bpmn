@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Parks at a wait having replied nothing, so the 202's body is the engine's receipt.
+
+  The receipt's attributes show each rule: a value from the payload; one the flow computes before
+  the wait, which an evaluation at intake could not see; a sensitive variable, which is masked; and
+  a field the payload lacks, which is left out.
+-->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0"
+                  id="Definitions_case_open"
+                  targetNamespace="urn:sutra:module:receipt:1.0.0">
+  <bpmn:process id="case-open" isExecutable="true">
+    <bpmn:extensionElements>
+      <q:variables>
+        <q:variable name="holderId" type="string" sensitive="true"/>
+        <q:variable name="computed" type="string"/>
+      </q:variables>
+      <q:receipt>
+        <q:attribute name="caseId" expression="req.caseId"/>
+        <q:attribute name="computed" expression="computed"/>
+        <q:attribute name="holder" expression="holderId"/>
+        <q:attribute name="absent" expression="req.noSuchField"/>
+      </q:receipt>
+    </bpmn:extensionElements>
+    <bpmn:startEvent id="Start">
+      <bpmn:extensionElements>
+        <q:source channel="case-open" name="req"/>
+        <q:alias name="orderId" expression="req.orderId" unique="true" onConflict="correlate"/>
+        <q:alias name="holderId" expression="req.holderId"/>
+      </bpmn:extensionElements>
+      <bpmn:outgoing>F1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="F1" sourceRef="Start" targetRef="Compute"/>
+    <bpmn:serviceTask id="Compute">
+      <bpmn:incoming>F1</bpmn:incoming><bpmn:outgoing>F2</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment>
+          <bpmn:from>"run-" + req.caseId</bpmn:from>
+          <bpmn:to>computed</bpmn:to>
+        </bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F2" sourceRef="Compute" targetRef="Release"/>
+    <bpmn:receiveTask id="Release">
+      <bpmn:extensionElements>
+        <q:source channel="case-release" name="release"/>
+      </bpmn:extensionElements>
+      <bpmn:incoming>F2</bpmn:incoming><bpmn:outgoing>F3</bpmn:outgoing>
+    </bpmn:receiveTask>
+    <bpmn:sequenceFlow id="F3" sourceRef="Release" targetRef="Done"/>
+    <bpmn:endEvent id="Done"><bpmn:incoming>F3</bpmn:incoming></bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>

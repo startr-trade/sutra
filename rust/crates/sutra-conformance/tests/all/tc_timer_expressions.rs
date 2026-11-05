@@ -59,6 +59,7 @@ fn fixture() -> &'static Fixture {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "docker"]
 async fn tc_timer_expressions_a_catch_waits_the_duration_a_flow_variable_names() {
+    let _suite = sutra_testkit::hold_suite!("timers");
     let client = reqwest::Client::new();
     let id = "TE-CATCH-1";
     let (status, body) = post(
@@ -84,6 +85,7 @@ async fn tc_timer_expressions_a_catch_waits_the_duration_a_flow_variable_names()
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "docker"]
 async fn tc_timer_expressions_a_receive_task_boundary_closes_the_window_a_flow_variable_names() {
+    let _suite = sutra_testkit::hold_suite!("timers");
     let client = reqwest::Client::new();
     let id = "TE-LISTEN-1";
     let (status, body) = post(
@@ -139,6 +141,7 @@ async fn tc_timer_expressions_a_receive_task_boundary_closes_the_window_a_flow_v
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "docker"]
 async fn tc_timer_expressions_a_retry_backoff_is_the_configured_delay() {
+    let _suite = sutra_testkit::hold_suite!("timers");
     let client = reqwest::Client::new();
     let id = "TE-RETRY-1";
     let began = Instant::now();
@@ -170,6 +173,7 @@ async fn tc_timer_expressions_a_retry_backoff_is_the_configured_delay() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "docker"]
 async fn tc_timer_expressions_a_start_timer_is_armed_from_the_configuration() {
+    let _suite = sutra_testkit::hold_suite!("timers");
     let _ = fixture();
     let row = sql("SELECT kind || ' ' || spec FROM timer_schedule WHERE node_id = 'Tick'");
     assert_eq!(row, "DURATION PT3S", "the resolved spec is what persists");
@@ -197,6 +201,7 @@ async fn tc_timer_expressions_a_start_timer_is_armed_from_the_configuration() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "docker"]
 async fn tc_timer_expressions_a_null_expression_fails_the_instance_once() {
+    let _suite = sutra_testkit::hold_suite!("timers");
     let client = reqwest::Client::new();
     let id = "TE-NULL-1";
     let (status, body) = post(&client, "/channels/te/null", &format!(r#"{{"id":"{id}"}}"#)).await;

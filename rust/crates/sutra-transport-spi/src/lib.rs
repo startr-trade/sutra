@@ -19,19 +19,78 @@ use std::sync::Arc;
 
 use sqlx::PgPool;
 use sutra_channels::http::EngineHandle;
-use sutra_channels::{ChannelDefinition, Diagnostic, SinkRegistry};
+use sutra_channels::{ChannelDefinition, DeclaredEndpoint, Diagnostic, SinkRegistry};
 use tokio::runtime::Handle;
 
 pub mod intake;
 pub mod leadership;
 
 pub use intake::EngineIntake;
+pub use sutra_channels::{EndpointClaim, EndpointSharing};
 
 /// A resolver for `env:` / `secret:` / `vault:` references + `${…}` placeholders — the
 /// engine's `envref` registry, passed into a transport's [`TransportFactory::spawn`] as a
 /// plain `fn` pointer so the transport crate resolves inbound-auth + broker credentials
 /// without depending on `sutra-engine` (where the registry lives).
 pub type EnvRefResolver = fn(&str) -> Result<String, String>;
+
+/// `definition` with the named properties resolved through the engine's `resolver`, so a
+/// transport reads `region: "${AWS_REGION}"` the way it reads a credential reference. A property
+/// the channel does not set stays unset, and text with no reference passes through unchanged. A
+/// reference that cannot be resolved fails with `code`, naming the channel and the property but
+/// not the value, so the channel fails closed at wiring instead of connecting to a literal `${…}`.
+pub fn resolve_channel_properties(
+    definition: &ChannelDefinition,
+    keys: &[&str],
+    code: &str,
+    resolver: EnvRefResolver,
+) -> Result<ChannelDefinition, Diagnostic> {
+    let mut resolved = definition.clone();
+    for key in keys {
+        if let Some(raw) = definition.properties.get(*key) {
+            let value = resolver(raw).map_err(|e| {
+                Diagnostic::error(
+                    code,
+                    format!(
+                        "channel '{}' property '{key}' has an unresolved reference: {e}",
+                        definition.binding.channel_name
+                    ),
+                )
+            })?;
+            resolved.properties.insert((*key).to_string(), value);
+        }
+    }
+    Ok(resolved)
+}
+
+/// Refuses a `${` in any of the named properties, for a transport that reads those properties as
+/// written. Left alone, such a channel would connect to or consume under the literal name, and on
+/// some brokers receive nothing with no error at all. The error names the channel and the property
+/// and never the value, which may carry anything an author put there.
+pub fn refuse_unexpanded_references(
+    definition: &ChannelDefinition,
+    keys: &[&str],
+    code: &str,
+) -> Result<(), Diagnostic> {
+    for key in keys {
+        if definition
+            .properties
+            .get(*key)
+            .is_some_and(|raw| raw.contains("${"))
+        {
+            return Err(Diagnostic::error(
+                code,
+                format!(
+                    "channel '{}' property '{key}' contains a '${{' reference, which this \
+                     transport reads as written; references in this property arrive in a later \
+                     release, so set a literal value",
+                    definition.binding.channel_name
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
 
 /// The uniform inbound-consumer spawner signature every vendor's [`TransportFactory`]
 /// exposes: `(defs, engine, pool, envref-resolver, runtime) -> the live manager`.
@@ -68,6 +127,168 @@ pub trait TransportChannels: Send + Sync {
     fn inbound_router(&self) -> Option<axum::Router> {
         None
     }
+    /// Would [`Self::rewire`] accept this ACTIVE definition set? Called on every transport before
+    /// an activation flip commits, so a set one transport cannot serve aborts the flip with the
+    /// old state intact, rather than failing part-way through it. Must not change anything. The
+    /// default accepts everything: a transport whose rewire isolates failures per consumer has
+    /// nothing to refuse up front.
+    fn prepare_rewire(&self, _active: &[ChannelDefinition]) -> Result<(), Diagnostic> {
+        Ok(())
+    }
+}
+
+/// What the running engine offers a channel, for a check that runs before any flip.
+#[derive(Debug, Clone, Copy)]
+pub struct PreflightHost {
+    /// The engine has a database. A channel that needs one cannot be served without it.
+    pub persistence: bool,
+}
+
+/// Can these definitions be served at all? See [`EndpointClaimFactory::preflight`].
+pub type EndpointPreflight =
+    fn(&[ChannelDefinition], EnvRefResolver, PreflightHost) -> Result<(), Diagnostic>;
+
+/// A transport's declaration of the inbound endpoints its channels claim. A transport
+/// `inventory::submit!`s one beside its [`TransportFactory`]; the engine, `sutra lint` and
+/// `sutra deploy` collect them through [`declared_endpoints`] and refuse a deployment that claims
+/// an exclusive endpoint another active deployment holds.
+///
+/// Separate from [`TransportFactory`], so a transport outside this repository keeps compiling
+/// unchanged: one that submits nothing simply is not checked, and is reported as unchecked.
+pub struct EndpointClaimFactory {
+    /// The `transport:` value these claims belong to.
+    pub transport: &'static str,
+    /// The endpoints one INBOUND channel of this transport claims. Pure: it runs off-line, in
+    /// the CLI as well as the engine, with no broker and no secrets to hand. A channel whose
+    /// properties are too broken to name an endpoint claims nothing, because the transport's own
+    /// validation refuses it.
+    pub claims: fn(&ChannelDefinition) -> Vec<EndpointClaim>,
+    /// The path prefix this transport serves on the engine's shared listener, if it serves one.
+    /// Another transport's channel bound under it would never receive anything.
+    pub listener_prefix: Option<&'static str>,
+    /// The off-line half of [`TransportChannels::prepare_rewire`]: can these definitions be served
+    /// at all? A folder source runs it on each archive, before the archive can displace anything.
+    pub preflight: Option<EndpointPreflight>,
+}
+
+inventory::collect!(EndpointClaimFactory);
+
+/// What one deployment's inbound channels claim, as far as this binary can tell.
+#[derive(Debug, Default, Clone)]
+pub struct DeploymentEndpoints {
+    pub endpoints: Vec<DeclaredEndpoint>,
+    /// `(channel, transport)` of each inbound channel whose transport declares no claims in this
+    /// binary. Nothing was checked for these.
+    pub unchecked: Vec<(String, String)>,
+    /// `(channel, path, transport)`: a channel bound under a path another transport serves on the
+    /// shared listener.
+    pub shadowed: Vec<(String, String, String)>,
+}
+
+/// Can this binary's transports serve `definitions`? The first refusal is returned.
+pub fn preflight_definitions(
+    definitions: &[ChannelDefinition],
+    resolver: EnvRefResolver,
+    host: PreflightHost,
+) -> Result<(), Diagnostic> {
+    for factory in inventory::iter::<EndpointClaimFactory> {
+        if let Some(preflight) = factory.preflight {
+            preflight(definitions, resolver, host)?;
+        }
+    }
+    Ok(())
+}
+
+/// A broker host as an endpoint identity: lower case, because host names are, and without any inline
+/// credentials, because identities appear in refusals and in the engine's holder record.
+///
+/// This runs on authored text, so a `${...}` reference may be in it. A reference keeps its exact
+/// spelling, because environment names are case-sensitive, and an `@` inside one is part of its name.
+pub fn normalized_endpoint_host(raw: &str) -> String {
+    let raw = raw.trim();
+    let mut host_starts = 0;
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    let mut at = 0;
+    while let Some(open) = raw[at..].find("${").map(|i| i + at) {
+        let Some(close) = raw[open..].find('}').map(|i| i + open + 1) else {
+            break;
+        };
+        spans.push((open, close));
+        at = close;
+    }
+    for (i, c) in raw.char_indices() {
+        if c == '@'
+            && !spans
+                .iter()
+                .any(|(open, close)| (*open..*close).contains(&i))
+        {
+            host_starts = i + 1;
+        }
+    }
+    let mut host = String::with_capacity(raw.len() - host_starts);
+    let mut at = host_starts;
+    for (open, close) in spans.iter().filter(|(open, _)| *open >= host_starts) {
+        host.push_str(&raw[at..*open].to_ascii_lowercase());
+        host.push_str(&raw[*open..*close]);
+        at = *close;
+    }
+    host.push_str(&raw[at..].to_ascii_lowercase());
+    host
+}
+
+/// Collect the endpoint claims of one deployment's `definitions`, skipping outbound channels
+/// (a send target receives nothing).
+pub fn declared_endpoints(
+    deployment_id: &str,
+    deployment_label: &str,
+    definitions: &[ChannelDefinition],
+) -> DeploymentEndpoints {
+    let mut out = DeploymentEndpoints::default();
+    for def in definitions.iter().filter(|d| !d.is_outbound()) {
+        let Some(transport) = def.transport.as_deref().filter(|t| !t.is_empty()) else {
+            continue;
+        };
+        if def.bind_spec.is_some() {
+            let (_, path) = def.bind_method_and_path();
+            let owner = inventory::iter::<EndpointClaimFactory>
+                .into_iter()
+                .find(|f| {
+                    f.transport != transport
+                        && f.listener_prefix
+                            .is_some_and(|prefix| path.starts_with(prefix))
+                });
+            if let Some(owner) = owner {
+                out.shadowed.push((
+                    def.binding.channel_name.clone(),
+                    path.to_string(),
+                    owner.transport.to_string(),
+                ));
+            }
+        }
+        let factory = inventory::iter::<EndpointClaimFactory>
+            .into_iter()
+            .find(|f| f.transport == transport);
+        let Some(factory) = factory else {
+            out.unchecked
+                .push((def.binding.channel_name.clone(), transport.to_string()));
+            continue;
+        };
+        for claim in (factory.claims)(def) {
+            out.endpoints.push(DeclaredEndpoint {
+                deployment_id: deployment_id.to_string(),
+                deployment_label: deployment_label.to_string(),
+                owner: sutra_channels::deployment_owner(
+                    &def.binding.namespace.tenant,
+                    &def.binding.namespace.module,
+                    deployment_id,
+                ),
+                channel: def.binding.channel_name.clone(),
+                transport: transport.to_string(),
+                claim,
+            });
+        }
+    }
+    out
 }
 
 /// A vendor transport's self-registration: its `transport:` discriminator + the inbound
@@ -148,4 +369,73 @@ pub fn inline_caller_factories() -> Vec<&'static InlineCallerFactory> {
         inventory::iter::<InlineCallerFactory>.into_iter().collect();
     factories.sort_by_key(|f| f.transport);
     factories
+}
+
+#[cfg(test)]
+mod unexpanded_reference_tests {
+    use super::refuse_unexpanded_references;
+    use sutra_channels::config::{ChannelBinding, Namespace};
+    use sutra_channels::{ChannelDefinition, DeploymentId};
+
+    fn definition(key: &str, value: &str) -> ChannelDefinition {
+        ChannelDefinition {
+            binding: ChannelBinding::new(
+                "orders-in",
+                Namespace::new("acme", "orders", "v1"),
+                DeploymentId::unresolved(),
+                "opaque",
+            ),
+            transport: Some("test".to_string()),
+            bind_spec: None,
+            codec: None,
+            cloud_events_mode: None,
+            auth_scheme: None,
+            idempotency_key_header: None,
+            payload_cap_bytes: None,
+            properties: [(key.to_string(), value.to_string())].into_iter().collect(),
+        }
+    }
+
+    #[test]
+    fn a_reference_is_refused_naming_channel_and_property_but_not_the_value() {
+        for value in ["${NAME}", "prefix-${NAME:other}-suffix"] {
+            let err = refuse_unexpanded_references(&definition("host", value), &["host"], "T.CODE")
+                .unwrap_err();
+            assert_eq!(err.code, "T.CODE");
+            assert!(err.message.contains("orders-in"), "{}", err.message);
+            assert!(err.message.contains("'host'"), "{}", err.message);
+            assert!(err.message.contains("later release"), "{}", err.message);
+            assert!(!err.message.contains("NAME"), "{}", err.message);
+        }
+    }
+
+    #[test]
+    fn a_literal_an_unlisted_property_and_an_unset_one_all_pass() {
+        let keys = ["host"];
+        assert!(
+            refuse_unexpanded_references(&definition("host", "broker$1{a}"), &keys, "C").is_ok()
+        );
+        assert!(refuse_unexpanded_references(&definition("other", "${A}"), &keys, "C").is_ok());
+    }
+}
+
+#[cfg(test)]
+mod endpoint_host_tests {
+    use super::normalized_endpoint_host as host;
+
+    #[test]
+    fn a_host_compares_in_lower_case_without_credentials() {
+        assert_eq!(host(" Broker.Example:9092 "), "broker.example:9092");
+        assert_eq!(host("user:pw@Broker:9092"), "broker:9092");
+    }
+
+    /// Environment names are case-sensitive, and an `@` inside a reference is part of its name.
+    #[test]
+    fn a_reference_keeps_its_exact_spelling() {
+        assert_ne!(host("${broker_a}"), host("${BROKER_A}"));
+        assert_eq!(host("${BROKER_A}"), "${BROKER_A}");
+        assert_eq!(host("Host-${BROKER_A}:9092"), "host-${BROKER_A}:9092");
+        assert_eq!(host("${vault:a@b}"), "${vault:a@b}");
+        assert_eq!(host("${USER}:${PASS}@Broker:9092"), "broker:9092");
+    }
 }

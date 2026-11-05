@@ -4,8 +4,9 @@
 
 use sutra_channels::http::EngineHandle;
 use sutra_channels::{
-    AckDecision, BoxFuture, DeferredDispatch, DeferredSettle, DeliveryDisposition, Diagnostic,
-    InboundIntake, InboundMessage, ACK_DISPOSITION_ATTR, ACK_DISPOSITION_REQUEUE,
+    AckDecision, BoxFuture, DeferredDispatch, DeferredSettle, DeliveryDisposition,
+    DeliveryDropRecord, Diagnostic, DispatchOutcome, InboundIntake, InboundMessage,
+    ACK_DISPOSITION_ATTR, ACK_DISPOSITION_REQUEUE,
 };
 
 /// Adapt the engine actor into the [`InboundIntake`] seam. Decision mapping (the
@@ -15,6 +16,11 @@ use sutra_channels::{
 /// (draining / shut down) OR a retry-safe execution failure of an idempotent process ⇒
 /// [`AckDecision::NackRequeue`] (the broker redelivers and inbox dedup absorbs it), every other
 /// reject diagnostic ⇒ [`AckDecision::NackDrop`] (the broker's DLX posture, `requeue=false`).
+///
+/// This is the one place a broker delivery's refusal stops being a diagnostic, because the source
+/// only sees the decision. So it is where the refusal is recorded: a WARN carrying a stable code
+/// and the deployment's audit record (see [`DeliveryDropRecord`]). A transport whose `NackDrop`
+/// deletes the message leaves nothing else behind.
 ///
 /// Ack-mode TIMING note: the engine actor dispatches run-to-completion, so
 /// the returned future resolving IS both `on-persist` (durable intake happened) and
@@ -33,10 +39,10 @@ impl EngineIntake {
 impl InboundIntake for EngineIntake {
     fn deliver(&self, message: InboundMessage) -> BoxFuture<'_, AckDecision> {
         Box::pin(async move {
+            let record = DeliveryDropRecord::of(&message);
             match self.handle.dispatch(message).await {
-                Ok(_) => AckDecision::Ack,
-                Err(diagnostic) if wants_requeue(&diagnostic) => AckDecision::NackRequeue,
-                Err(_) => AckDecision::NackDrop,
+                Ok(outcome) => settled(&record, &outcome),
+                Err(diagnostic) => refused(&record, &diagnostic),
             }
         })
     }
@@ -52,16 +58,35 @@ impl InboundIntake for EngineIntake {
         settle: DeferredSettle,
     ) -> BoxFuture<'_, DeliveryDisposition> {
         Box::pin(async move {
+            let record = DeliveryDropRecord::of(&message);
             match self.handle.dispatch_deferred(message, settle).await {
                 Ok(DeferredDispatch::Deferred { .. }) => DeliveryDisposition::Deferred,
-                Ok(DeferredDispatch::Settled(_)) => DeliveryDisposition::Settle(AckDecision::Ack),
-                Err(diagnostic) if wants_requeue(&diagnostic) => {
-                    DeliveryDisposition::Settle(AckDecision::NackRequeue)
+                Ok(DeferredDispatch::Settled(outcome)) => {
+                    DeliveryDisposition::Settle(settled(&record, &outcome))
                 }
-                Err(_) => DeliveryDisposition::Settle(AckDecision::NackDrop),
+                Err(diagnostic) => DeliveryDisposition::Settle(refused(&record, &diagnostic)),
             }
         })
     }
+}
+
+/// The decision for a dispatch that answered. All of them are the engine's to own. A dead letter
+/// has logged its own error and recorded its incident; a duplicate is recorded here.
+fn settled(record: &DeliveryDropRecord, outcome: &DispatchOutcome) -> AckDecision {
+    if matches!(outcome, DispatchOutcome::Duplicate { .. }) {
+        record.report_duplicate();
+    }
+    AckDecision::Ack
+}
+
+/// The decision for a dispatch that refused. A permanent refusal is recorded before the source
+/// settles it, since nothing downstream knows why the delivery went.
+fn refused(record: &DeliveryDropRecord, diagnostic: &Diagnostic) -> AckDecision {
+    if wants_requeue(diagnostic) {
+        return AckDecision::NackRequeue;
+    }
+    record.report(diagnostic);
+    AckDecision::NackDrop
 }
 
 /// A failure the broker should REDELIVER (`NackRequeue`): either the engine actor is transiently
@@ -87,6 +112,39 @@ fn is_engine_unavailable(diagnostic: &Diagnostic) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn record() -> DeliveryDropRecord {
+        DeliveryDropRecord::of(&InboundMessage {
+            tenant: "acme".to_string(),
+            module_key: "acme/orders/1.0.0".to_string(),
+            channel: "orders-in".to_string(),
+            headers: Default::default(),
+            body: b"{}".to_vec().into(),
+            content_type: None,
+            idempotency_key: "k-1".to_string(),
+            explicit_event_id: true,
+            received_at: "2026-11-05T00:00:00Z".to_string(),
+            cloud_event: None,
+        })
+    }
+
+    #[test]
+    fn a_permanent_refusal_drops_and_a_retry_safe_one_requeues() {
+        let reject = Diagnostic::error("SUTRA.INBOUND.VALIDATION_REJECT", "no");
+        assert_eq!(refused(&record(), &reject), AckDecision::NackDrop);
+        let retry = Diagnostic::error("SUTRA.RUNTIME.TASK.UNCAUGHT", "boom")
+            .with_attribute(ACK_DISPOSITION_ATTR, ACK_DISPOSITION_REQUEUE);
+        assert_eq!(refused(&record(), &retry), AckDecision::NackRequeue);
+    }
+
+    #[test]
+    fn a_duplicate_is_acked_the_first_delivery_owns_it() {
+        let duplicate = DispatchOutcome::Duplicate {
+            original_instance_id: None,
+            dedup_key: "k-1".to_string(),
+        };
+        assert_eq!(settled(&record(), &duplicate), AckDecision::Ack);
+    }
 
     #[test]
     fn engine_unavailable_maps_to_requeue_everything_else_to_drop() {

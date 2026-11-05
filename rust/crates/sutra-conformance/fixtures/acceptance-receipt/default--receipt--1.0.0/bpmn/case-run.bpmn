@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Runs to its end and persists nothing, so no step writes the delivery's dedup record: the end
+     of the dispatch does. The key comes from the body, so only the engine knows it. -->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0"
+                  id="Definitions_case_run"
+                  targetNamespace="urn:sutra:module:receipt:1.0.0">
+  <bpmn:process id="case-run" isExecutable="true">
+    <bpmn:startEvent id="Start">
+      <bpmn:extensionElements>
+        <q:source channel="case-run" name="req" dedupKey="body.ref"/>
+      </bpmn:extensionElements>
+      <bpmn:outgoing>F1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="F1" sourceRef="Start" targetRef="Done"/>
+    <bpmn:endEvent id="Done"><bpmn:incoming>F1</bpmn:incoming></bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>

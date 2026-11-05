@@ -61,6 +61,7 @@ fn fixture() -> &'static Fixture {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "docker"]
 async fn tc_listen_window_statuses_before_the_timer_resume_the_receive_task_each_round() {
+    let _suite = sutra_testkit::hold_suite!("listen");
     let client = reqwest::Client::new();
     let id = "LW-ROUNDS-1";
 
@@ -122,6 +123,7 @@ async fn tc_listen_window_statuses_before_the_timer_resume_the_receive_task_each
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "docker"]
 async fn tc_listen_window_no_status_fires_the_timer_and_takes_the_boundary_path() {
+    let _suite = sutra_testkit::hold_suite!("listen");
     let client = reqwest::Client::new();
     let id = "LW-TIMEOUT-1";
 
@@ -155,6 +157,7 @@ async fn tc_listen_window_no_status_fires_the_timer_and_takes_the_boundary_path(
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "docker"]
 async fn tc_listen_window_an_uncorrelated_status_is_refused_and_moves_nothing() {
+    let _suite = sutra_testkit::hold_suite!("listen");
     let client = reqwest::Client::new();
     let id = "LW-UNCORRELATED-1";
 

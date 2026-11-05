@@ -351,6 +351,62 @@ async fn outbound_sink_wire_carries_outbox_key_and_ce_dash_attributes() {
 
 // ---- disposition semantics -----------------------------------------------------------------
 
+/// What a flow's `dedupKey="amqp.message-id"` reads: the broker redelivers a released message with
+/// the id it was sent with.
+#[ignore = "docker"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_redelivery_carries_the_same_native_message_id() {
+    use fe2o3_amqp::types::messaging::{MessageId, Properties};
+    let port = broker_port();
+    let queue = fresh_queue();
+    let intake = ScriptedIntake::scripted(vec![AckDecision::NackRequeue], AckDecision::Ack);
+    let source = source_for(port, &queue, "payments-in");
+    source
+        .start(intake.clone(), Arc::new(sutra_channels::AlwaysLeading))
+        .await
+        .expect("start");
+
+    let mut connection = Connection::open(
+        "it-id-producer",
+        format!("amqp://127.0.0.1:{port}").as_str(),
+    )
+    .await
+    .expect("open");
+    let mut session = Session::begin(&mut connection).await.expect("session");
+    let mut sender = Sender::attach(&mut session, "it-id-producer", queue.as_str())
+        .await
+        .expect("sender");
+    let message = Message::builder()
+        .properties(
+            Properties::builder()
+                .message_id(MessageId::String("ID:native-1".to_string()))
+                .build(),
+        )
+        .data(b"retry-me".to_vec())
+        .build();
+    sender.send(message).await.expect("send");
+
+    wait_until("redelivery after release", Duration::from_secs(20), || {
+        intake.delivered_count() >= 2
+    })
+    .await;
+    for delivery in 0..2 {
+        assert_eq!(
+            intake
+                .delivered_at(delivery)
+                .headers
+                .get(sutra_channels::NATIVE_MESSAGE_ID_HEADER)
+                .map(String::as_str),
+            Some("native-1"),
+            "delivery {delivery}"
+        );
+    }
+    let _ = sender.close().await;
+    let _ = session.end().await;
+    let _ = connection.close().await;
+    source.stop().await.expect("stop");
+}
+
 #[ignore = "docker"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn release_redelivers_until_acked() {

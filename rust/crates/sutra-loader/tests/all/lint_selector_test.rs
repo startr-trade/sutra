@@ -37,7 +37,7 @@ fn bpmn(
   <bpmn:process id="{process_id}" name="Demo" isExecutable="true">
     <bpmn:startEvent id="Start">
       <bpmn:extensionElements>
-        <q:source channel="{channel}"{pin}{predicate} dedupKey="payload.id"/>
+        <q:source channel="{channel}"{pin}{predicate} dedupKey="body.id"/>
       </bpmn:extensionElements>
       <bpmn:outgoing>F1</bpmn:outgoing>
     </bpmn:startEvent>

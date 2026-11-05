@@ -101,6 +101,43 @@ impl TransportChannels for KnativeTransport {
     fn inbound_router(&self) -> Option<Router> {
         Some(self.router.clone())
     }
+
+    /// A channel with no subscription, or with broken properties, refuses the flip while the old
+    /// routes and registries are still whole.
+    fn prepare_rewire(&self, active_definitions: &[ChannelDefinition]) -> Result<(), Diagnostic> {
+        knative_routes_of(active_definitions).map(|_| ())
+    }
+}
+
+/// The engine serves one push route per subscription name, and every channel bound to that name
+/// receives its own copy of each event, so any number of deployments may bind it.
+fn endpoint_claims(def: &ChannelDefinition) -> Vec<sutra_transport_spi::EndpointClaim> {
+    match KnativeChannelProperties::from_definition(def) {
+        Ok(props) if props.has_subscription() => {
+            vec![sutra_transport_spi::EndpointClaim::broadcast(format!(
+                "subscription {}",
+                props.subscription
+            ))]
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn preflight(
+    definitions: &[ChannelDefinition],
+    _resolver: sutra_transport_spi::EnvRefResolver,
+    _host: sutra_transport_spi::PreflightHost,
+) -> Result<(), Diagnostic> {
+    knative_routes_of(definitions).map(|_| ())
+}
+
+inventory::submit! {
+    sutra_transport_spi::EndpointClaimFactory {
+        transport: TRANSPORT,
+        claims: endpoint_claims,
+        listener_prefix: Some("/knative/"),
+        preflight: Some(preflight),
+    }
 }
 
 /// Factory `spawn` adapter — binds the Knative channels + builds the transport (ignores

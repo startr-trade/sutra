@@ -110,7 +110,7 @@ resolve a different codec registry than the archive it had just sealed.
 ### `sutra lint`
 
 ```
-sutra lint <PACKAGE_DIR | MANIFEST.yaml> [--overlay <DIR>]...
+sutra lint <PACKAGE_DIR | MANIFEST.yaml> [--overlay <DIR>]... [--active-set <PATH>]... [--engine-url <URL>]
 ```
 
 Runs the full package-time validation suite (the same fail-closed checks `sutra package` runs)
@@ -119,6 +119,16 @@ and emits nothing on success. The fast pre-flight before every `package`.
 `--overlay` composes base layers underneath `<PACKAGE_DIR>` before validating — the same
 composition `package` performs, so you lint exactly what would be sealed. See
 [Composing a package from layers](../building/deployment-packages.md#composing-a-package-from-layers).
+
+Given a target, `lint` also runs the check a deploy runs. `--active-set` names sealed archives, or
+directories of them, standing in for what the target runs. `--engine-url` asks a running engine
+(`POST /admin/deployments/check`; `--api-key` / `--api-key-header` as for `deploy`), which links every
+transport it can serve and resolves connection references in its own environment. `--active-set` judges only
+the transports the CLI links (HTTP) and reports a channel on any other as
+`SUTRA.DEPLOY.ENDPOINT.UNCHECKED`. An exclusive endpoint another deployment holds is the error
+`SUTRA.DEPLOY.ENDPOINT.COLLISION`; a data store that would share rows is the warning
+`SUTRA.DEPLOY.DATASTORE.SHARED_CONNECTION`. See [One endpoint, one
+deployment](../building/endpoint-claims.md).
 
 Given a deployment manifest (a `.yaml` file) instead of a directory, `lint` first prints the
 resolved stack — each layer in order, each overridden file with the layer that won and the one it
@@ -266,6 +276,13 @@ line leaves out — the command line wins. See
 | `--engine-url <URL>` | Engine base URL for `--wait` / `--api` |
 | `--api-key <KEY>` / `--api-key-header <HEADER>` | Admin auth for `--api` (default header `X-API-Key`) |
 | `--secret <KEY=VALUE>` / `--secret-from <FILE>` | Estate-secret keys ensured/merged **before** the ConfigMap patch |
+
+A deployment claiming an exclusive endpoint another active deployment holds is refused with
+`SUTRA.DEPLOY.ENDPOINT.COLLISION` and the old state serving (exit 1). On the ConfigMap path `deploy` runs the
+check first, asking the engine when `--engine-url` is given. A new version of one tenant and module may take an
+endpoint from an older one; the older drains whole (`SUTRA.DEPLOY.ENDPOINT.SUPERSEDED` warns).
+`--engine-url` times out after 30 seconds and says why it got no verdict. See [One endpoint, one
+deployment](../building/endpoint-claims.md).
 
 ### `sutra undeploy`
 

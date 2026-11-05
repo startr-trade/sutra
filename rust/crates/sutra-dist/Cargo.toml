@@ -93,6 +93,12 @@ sutra-llm-spi = { path = "../sutra-llm-spi" }
 sutra-transport-spi = { path = "../sutra-transport-spi" }
 # The envref bundle test resolves the assembled scheme set via `ResolverRegistry::with_builtins()`.
 sutra-envref-spi = { path = "../sutra-envref-spi" }
+# The suites under tests/all drive the built binary against real brokers.
+sutra-loader = { path = "../sutra-loader" }
+sutra-testkit = { path = "../sutra-testkit", features = ["conformance"] }
+testcontainers = { workspace = true }
+testcontainers-modules = { workspace = true }
+aws-sdk-sqs = { workspace = true }
 
 # The deployed binary keeps the name `sutra-engine` so the image path + k8s/conformance entrypoints
 # are unchanged; only the built package (`-p sutra-dist`) differs.

@@ -81,26 +81,11 @@ fn alias_value(
             None => evaluate(&alias.expression, variables),
         })
         .filter(|v| !v.is_null())?;
-    if sensitive.contains(alias.name.as_str()) || roots.iter().any(|r| sensitive.contains(r)) {
+    if sensitive.contains(alias.name.as_str()) {
         return Some(sutra_bpmn::REDACTED_PLACEHOLDER.to_string());
     }
-    let masked_root = roots.iter().find(|r| {
-        variables
-            .get(&format!("{r}{}", sutra_bpmn::REDACTION_COMPANION_SUFFIX))
-            .is_some()
-    });
-    if let Some(root) = masked_root {
-        // Read the same path from the masked projection; a non-path expression over a redacted
-        // input cannot be re-run safely on the projection, so it is masked whole (fail closed).
-        let projected = path.as_ref().filter(|p| p[0] == *root).and_then(|p| {
-            let companion =
-                variables.get(&format!("{root}{}", sutra_bpmn::REDACTION_COMPANION_SUFFIX))?;
-            walk(companion, &p[1..]).cloned()
-        });
-        return Some(match projected {
-            Some(v) if !v.is_null() => render(&v),
-            _ => sutra_bpmn::REDACTED_PLACEHOLDER.to_string(),
-        });
+    if let Some(masked) = masked_by_input(&roots, path.as_deref(), variables, sensitive) {
+        return Some(masked);
     }
     if variables
         .get(&format!(
@@ -113,6 +98,98 @@ fn alias_value(
         return Some(sutra_bpmn::REDACTED_PLACEHOLDER.to_string());
     }
     Some(render(&value))
+}
+
+/// The masked rendering of an expression whose inputs are protected, or `None` when none is: a
+/// `sensitive` input masks the value outright, and a redactor-controlled input (one with a
+/// `<name>.redacted` projection) reads the same path from the projection. A non-path expression
+/// over a redacted input cannot be re-run safely on the projection, so it is masked whole (fail
+/// closed).
+fn masked_by_input(
+    roots: &[&str],
+    path: Option<&[&str]>,
+    variables: &Variables,
+    sensitive: &HashSet<&str>,
+) -> Option<String> {
+    if roots.iter().any(|r| sensitive.contains(r)) {
+        return Some(sutra_bpmn::REDACTED_PLACEHOLDER.to_string());
+    }
+    let root = roots.iter().find(|r| {
+        variables
+            .get(&format!("{r}{}", sutra_bpmn::REDACTION_COMPANION_SUFFIX))
+            .is_some()
+    })?;
+    let projected = path.filter(|p| p[0] == *root).and_then(|p| {
+        let companion =
+            variables.get(&format!("{root}{}", sutra_bpmn::REDACTION_COMPANION_SUFFIX))?;
+        walk(companion, &p[1..]).cloned()
+    });
+    Some(match projected {
+        Some(v) if !v.is_null() => render(&v),
+        _ => sutra_bpmn::REDACTED_PLACEHOLDER.to_string(),
+    })
+}
+
+/// The fields of the intake's `event` map that carry no payload content. Everything else under
+/// `event` (the raw body, the headers, a CloudEvent's data) repeats what a redactor exists to
+/// hide, under a name that has no `.redacted` projection of its own.
+const EVENT_METADATA_FIELDS: [&str; 5] = [
+    "channel",
+    "contentType",
+    "dedupKey",
+    "idempotencyKey",
+    "receivedAt",
+];
+
+/// The `<q:receipt>` attributes of `process` over `variables`, redacted as every observability
+/// surface redacts: this value leaves the engine. A null or a failed evaluation is left out; the
+/// evaluator is expected to report a failure, since the work the receipt describes is already
+/// accepted and must not fail over it.
+pub fn receipt_attribute_snapshot(
+    process: &ProcessDefinition,
+    variables: &Variables,
+    evaluate: AliasEvaluator<'_>,
+) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    if process.receipt_attributes.is_empty() {
+        return out;
+    }
+    let sensitive: HashSet<&str> = process
+        .declared_variables
+        .iter()
+        .filter(|d| d.sensitive)
+        .map(|d| d.name.as_str())
+        .collect();
+    let any_redactor = variables
+        .to_feel_context()
+        .keys()
+        .any(|k| k.ends_with(sutra_bpmn::REDACTION_COMPANION_SUFFIX));
+    for attribute in &process.receipt_attributes {
+        let expression = attribute.expression.as_str();
+        let Some(value) = evaluate(expression, variables).filter(|v| !v.is_null()) else {
+            continue;
+        };
+        let roots = expression_roots(expression);
+        let path = plain_path(expression);
+        let shown = masked_by_input(&roots, path.as_deref(), variables, &sensitive).or_else(|| {
+            let metadata = path
+                .as_ref()
+                .is_some_and(|p| p.len() == 2 && EVENT_METADATA_FIELDS.contains(&p[1]));
+            (any_redactor && roots.contains(&"event") && !metadata)
+                .then(|| sutra_bpmn::REDACTED_PLACEHOLDER.to_string())
+        });
+        out.insert(
+            attribute.name.clone(),
+            shown.unwrap_or_else(|| render(&value)),
+        );
+    }
+    out
+}
+
+/// Whether `expression` reads the variable `name`, by the rule redaction itself uses: over-
+/// inclusive, because a false positive only means a warning about a value that is not masked.
+pub fn expression_reads(expression: &str, name: &str) -> bool {
+    expression_roots(expression).contains(&name)
 }
 
 fn render(value: &FeelValue) -> String {
@@ -234,6 +311,111 @@ mod tests {
 
     fn no_eval(_: &str, _: &Variables) -> Option<FeelValue> {
         None
+    }
+
+    /// A process exposing `attributes` (`(name, expression)`) over `sensitive`-declared variables.
+    fn receipt_process(sensitive: &[&str], attributes: &[(&str, &str)]) -> ProcessDefinition {
+        let vars: String = sensitive
+            .iter()
+            .map(|n| format!(r#"<q:variable name="{n}" sensitive="true"/>"#))
+            .collect();
+        let mut p = process(&vars, "", "");
+        p.receipt_attributes = attributes
+            .iter()
+            .map(
+                |(name, expression)| sutra_bpmn::qbindings::ReceiptAttribute {
+                    name: name.to_string(),
+                    expression: expression.to_string(),
+                },
+            )
+            .collect();
+        p
+    }
+
+    /// The evaluator for plain variable names and `a.b` paths, as FEEL answers them.
+    fn path_eval(expression: &str, vars: &Variables) -> Option<FeelValue> {
+        let mut parts = expression.split('.');
+        let mut current = vars.get(parts.next()?)?.clone();
+        for part in parts {
+            match current {
+                FeelValue::Map(m) => current = m.get(part)?.clone(),
+                _ => return None,
+            }
+        }
+        Some(current)
+    }
+
+    #[test]
+    fn a_process_without_a_receipt_exposes_nothing() {
+        let p = receipt_process(&[], &[]);
+        let vars: Variables = [("x".to_string(), s("1"))].into_iter().collect();
+        assert!(receipt_attribute_snapshot(&p, &vars, &path_eval).is_empty());
+    }
+
+    #[test]
+    fn a_receipt_attribute_renders_or_is_left_out() {
+        let p = receipt_process(&[], &[("caseId", "req.id"), ("gone", "req.nope")]);
+        let vars: Variables = [("req".to_string(), map(&[("id", s("C-1"))]))]
+            .into_iter()
+            .collect();
+        let got = receipt_attribute_snapshot(&p, &vars, &path_eval);
+        assert_eq!(got.get("caseId").map(String::as_str), Some("C-1"));
+        assert!(!got.contains_key("gone"), "a null is left out");
+    }
+
+    #[test]
+    fn a_receipt_attribute_over_a_sensitive_variable_is_masked() {
+        let p = receipt_process(&["ssn"], &[("holder", "ssn")]);
+        let vars: Variables = [("ssn".to_string(), s("000"))].into_iter().collect();
+        let got = receipt_attribute_snapshot(&p, &vars, &path_eval);
+        assert_eq!(
+            got.get("holder").map(String::as_str),
+            Some(sutra_bpmn::REDACTED_PLACEHOLDER)
+        );
+    }
+
+    #[test]
+    fn a_receipt_attribute_over_a_redacted_input_reads_the_projection() {
+        let p = receipt_process(&[], &[("card", "req.card"), ("ref", "req.ref")]);
+        let vars: Variables = [
+            (
+                "req".to_string(),
+                map(&[("card", s("4111")), ("ref", s("R-1"))]),
+            ),
+            (
+                format!("req{}", sutra_bpmn::REDACTION_COMPANION_SUFFIX),
+                map(&[("card", s("****")), ("ref", s("R-1"))]),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let got = receipt_attribute_snapshot(&p, &vars, &path_eval);
+        assert_eq!(got.get("card").map(String::as_str), Some("****"));
+        assert_eq!(got.get("ref").map(String::as_str), Some("R-1"));
+    }
+
+    #[test]
+    fn a_receipt_attribute_cannot_read_a_redacted_payload_through_event() {
+        let p = receipt_process(&[], &[("raw", "event.body"), ("channel", "event.channel")]);
+        let vars: Variables = [
+            (
+                "event".to_string(),
+                map(&[("body", s("{\"card\":\"4111\"}")), ("channel", s("c"))]),
+            ),
+            ("req".to_string(), map(&[("card", s("4111"))])),
+            (
+                format!("req{}", sutra_bpmn::REDACTION_COMPANION_SUFFIX),
+                map(&[("card", s("****"))]),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let got = receipt_attribute_snapshot(&p, &vars, &path_eval);
+        assert_eq!(
+            got.get("raw").map(String::as_str),
+            Some(sutra_bpmn::REDACTED_PLACEHOLDER)
+        );
+        assert_eq!(got.get("channel").map(String::as_str), Some("c"));
     }
 
     #[test]

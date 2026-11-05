@@ -331,3 +331,59 @@ impl CapacityPoolStore for PersistedCapacityPools {
         }
     }
 }
+
+/// A unit test rather than an integration module: the declared pools are process-wide, and every
+/// engine boot installs its own. In the integration binary, a test booting an engine alongside this
+/// one emptied the pools mid-assertion.
+#[cfg(test)]
+mod tests {
+    use sutra_channels::load_channel_definitions;
+
+    use super::*;
+
+    fn channels(tenant: &str, pool: &str) -> Vec<ChannelDefinition> {
+        let yaml = format!(
+            "channels:\n- name: call-start\n  transport: http\n  pool: {pool}\n- name: plain\n  transport: http\n"
+        );
+        load_channel_definitions(yaml.as_bytes(), tenant, "calls", "1.0.0", "channels.yaml")
+            .expect("channels load")
+    }
+
+    /// One test, because the declared pools are process-wide engine configuration. Without a
+    /// datasource the pools are counted in memory, per process.
+    #[test]
+    fn a_channel_naming_an_undeclared_or_disallowed_pool_fails_to_load() {
+        let dep = DeploymentId::of("dep-0000000000000000000000e1").unwrap();
+        install_configured_pools(&[
+            CapacityPool::new("trunk-main", 30).with_tenants(vec!["default".to_string()]),
+            CapacityPool::new("seats", 5),
+        ]);
+        assert_eq!(configured_pools().len(), 2);
+
+        // Declared, tenant allowed (and a pool with no allow-list admits every tenant).
+        validate_pool_references(&channels("default", "trunk-main"), &dep).expect("loads");
+        validate_pool_references(&channels("acme", "seats"), &dep).expect("loads");
+
+        let undeclared = validate_pool_references(&channels("default", "nowhere"), &dep)
+            .expect_err("undeclared pool");
+        assert!(
+            undeclared.contains("SUTRA.CONFIG.CHANNEL.POOL_UNDECLARED"),
+            "{undeclared}"
+        );
+        let disallowed = validate_pool_references(&channels("acme", "trunk-main"), &dep)
+            .expect_err("tenant outside the allow-list");
+        assert!(
+            disallowed.contains("SUTRA.CONFIG.CHANNEL.POOL_TENANT_NOT_ALLOWED"),
+            "{disallowed}"
+        );
+
+        // No datasource: an in-memory store over the declared pools.
+        let store = build_capacity_store(None).expect("pools are declared");
+        assert_eq!(store.pool("seats").map(|p| p.slots), Some(5));
+
+        // No pools declared: no store, and any `pool:` reference fails to load.
+        install_configured_pools(&[]);
+        assert!(build_capacity_store(None).is_none());
+        assert!(validate_pool_references(&channels("acme", "seats"), &dep).is_err());
+    }
+}

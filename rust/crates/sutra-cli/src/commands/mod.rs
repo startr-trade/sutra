@@ -21,6 +21,7 @@ pub mod deployments;
 pub mod describe;
 pub mod dispatch_graph;
 pub mod docs;
+pub(crate) mod endpoint_check;
 pub mod explain;
 pub mod generate;
 pub mod lint;

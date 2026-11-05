@@ -1,0 +1,7 @@
+# Deployment package for the acceptance-receipt conformance suite.
+labels:
+  "module": "receipt"
+  "tenant": "default"
+  "version": "1.0.0"
+engine:
+  minContract: 1

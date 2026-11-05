@@ -160,6 +160,7 @@ fn lint_out(input: PathBuf, overlay: Vec<PathBuf>, format: Option<&str>) -> (i32
             LintArgs {
                 package_dir: input,
                 overlay,
+                ..Default::default()
             },
             &global,
             io,

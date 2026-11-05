@@ -156,6 +156,7 @@ async fn post_json(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "docker"]
 async fn tc_store_features_key_query_pages_and_sums_through_a_data_task() {
+    let _suite = sutra_testkit::hold_suite!("storefeat");
     let client = reqwest::Client::new();
     // 25 rows for one account-day, a row of another day and another account around them.
     let mut in_cents = 0i64;
@@ -259,6 +260,7 @@ async fn tc_store_features_key_query_pages_and_sums_through_a_data_task() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "docker"]
 async fn tc_store_features_a_claim_raced_by_two_replicas_has_exactly_one_winner() {
+    let _suite = sutra_testkit::hold_suite!("storefeat");
     let client = reqwest::Client::new();
     const DAYS: usize = 15;
     const CONTENDERS: usize = 4;
@@ -337,6 +339,7 @@ async fn tc_store_features_a_claim_raced_by_two_replicas_has_exactly_one_winner(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "docker"]
 async fn tc_store_features_two_waits_on_one_channel_each_take_only_their_message_type() {
+    let _suite = sutra_testkit::hold_suite!("storefeat");
     let client = reqwest::Client::new();
     for reference in ["tw-1", "tw-2"] {
         post_json(

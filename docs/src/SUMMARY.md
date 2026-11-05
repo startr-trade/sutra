@@ -21,6 +21,8 @@
 - [Data stores](building/data-stores.md)
 - [Recordings and media references](building/recordings-and-media.md)
 - [Wait states and human tasks](building/wait-states.md)
+- [One endpoint, one deployment](building/endpoint-claims.md)
+- [Acceptance receipts](building/acceptance-receipts.md)
 - [External tasks: the pull worker surface](building/external-tasks.md)
 - [Retries, history, and schedules](building/retries-history-schedules.md)
 - [Testing time: fast-forwarding durable timers](building/testing-time.md)
@@ -51,6 +53,7 @@
 
 - [Configuration reference](operating/configuration.md)
 - [Acknowledgement modes](operating/ack-modes.md)
+- [Refused deliveries and connection references](operating/inbound-refusals.md)
 - [Tuning for throughput](operating/throughput-tuning.md)
 - [Limits and quotas](operating/limits.md)
 - [Capacity pools and sessions](operating/capacity-pools.md)
@@ -58,6 +61,7 @@
 - [Instance migration](operating/instance-migration.md)
 - [Logging and audit](operating/logging.md)
 - [Troubleshooting BPMN solutions](operating/troubleshooting.md)
+- [Upgrading to 0.6.18](operating/upgrading-0-6-18.md)
 
 # Reference
 

@@ -137,7 +137,7 @@ impl DeferredAckRegistry {
     /// registration (orphan terminal event) is a no-op.
     pub fn on_instance_failed(&self, instance_id: &str) {
         if let Some(mut entry) = self.remove(instance_id) {
-            tracing::info!(
+            tracing::warn!(
                 code = codes::ACK_DEFERRED_NACKED,
                 channel = %entry.channel,
                 instance = %instance_id,

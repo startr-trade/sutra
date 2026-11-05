@@ -49,7 +49,8 @@ use sutra_channels::diag::Diagnostic;
 use sutra_channels::dispatch::InboundMessage;
 use sutra_channels::sink::BoxFuture;
 use sutra_channels::source::{
-    AckDecision, DeferredSettle, DeliveryDisposition, InboundIntake, LeaderGate, TriggerSource,
+    AckDecision, DeferredSettle, DeliveryDisposition, DeliveryDropRecord, InboundIntake,
+    LeaderGate, TriggerSource,
 };
 
 use super::{
@@ -510,6 +511,10 @@ async fn run_session(
                     code = codes::INBOUND_AUTH_REJECTED,
                     "amqp channel rejected a delivery — credential did not match expected"
                 );
+                DeliveryDropRecord::of(&inbound).audit(&Diagnostic::error(
+                    codes::INBOUND_AUTH_REJECTED,
+                    "the credential did not match the expected key",
+                ));
                 if let Err(end) =
                     settle(config, &broker.receiver, &delivery, AckDecision::Ack).await
                 {
@@ -691,14 +696,24 @@ fn to_inbound_message(config: &AmqpSourceConfig, delivery: &Delivery<WireBody>) 
 /// The pure application-property → [`InboundMessage`] projection (the broker-free core,
 /// unit-tested): the `sutra-outbox-key` property is the EXPLICIT idempotency key when set;
 /// otherwise the AMQP `message-id` (NON-explicit), else the synthetic `coordinate`;
-/// `content-type` property → content type (default `application/octet-stream`).
+/// `content-type` property → content type, absent when the sender stated none.
 fn project_inbound(
     config: &AmqpSourceConfig,
-    headers: BTreeMap<String, String>,
+    mut headers: BTreeMap<String, String>,
     message_id: Option<String>,
     coordinate: String,
     body: Vec<u8>,
 ) -> InboundMessage {
+    // The broker's id, for a flow that declares it as its dedup key. Set here whatever a sender put
+    // in its properties under this name.
+    let native_id = message_id
+        .as_deref()
+        .map(|id| id.strip_prefix("ID:").unwrap_or(id).trim().to_string())
+        .filter(|id| !id.is_empty());
+    headers.retain(|name, _| !name.eq_ignore_ascii_case(sutra_channels::NATIVE_MESSAGE_ID_HEADER));
+    if let Some(id) = native_id {
+        headers.insert(sutra_channels::NATIVE_MESSAGE_ID_HEADER.to_string(), id);
+    }
     let outbox_key = headers
         .iter()
         .find(|(k, _)| k.eq_ignore_ascii_case(PROPERTY_OUTBOX_KEY))
@@ -719,15 +734,14 @@ fn project_inbound(
         .iter()
         .find(|(k, _)| k.eq_ignore_ascii_case(PROPERTY_CONTENT_TYPE))
         .map(|(_, v)| v.clone())
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| "application/octet-stream".to_string());
+        .filter(|v| !v.is_empty());
     InboundMessage {
         tenant: config.tenant.clone(),
         module_key: config.module_key.clone(),
         channel: config.channel.clone(),
         headers,
         body: body.into(),
-        content_type: Some(content_type),
+        content_type,
         idempotency_key,
         explicit_event_id,
         received_at: now_rfc3339(),
@@ -828,6 +842,37 @@ mod tests {
     }
 
     #[test]
+    fn the_message_id_is_handed_over_as_the_native_id_with_its_prefix_gone() {
+        let m = project_inbound(
+            &config(),
+            headers(&[("sutra-outbox-key", "ob-in-1")]),
+            Some("ID:provider-msg-99".to_string()),
+            "in-q-3".to_string(),
+            b"x".to_vec(),
+        );
+        assert_eq!(
+            m.headers.get(sutra_channels::NATIVE_MESSAGE_ID_HEADER),
+            Some(&"provider-msg-99".to_string())
+        );
+    }
+
+    /// A sender can't supply it as a property and have it taken for the broker's.
+    #[test]
+    fn a_property_cannot_pose_as_the_native_id() {
+        let m = project_inbound(
+            &config(),
+            headers(&[(sutra_channels::NATIVE_MESSAGE_ID_HEADER, "forged")]),
+            None,
+            "in-q-3".to_string(),
+            b"x".to_vec(),
+        );
+        assert_eq!(
+            m.headers.get(sutra_channels::NATIVE_MESSAGE_ID_HEADER),
+            None
+        );
+    }
+
+    #[test]
     fn outbox_key_property_becomes_the_explicit_idempotency_key() {
         let m = project_inbound(
             &config(),
@@ -887,9 +932,9 @@ mod tests {
     }
 
     #[test]
-    fn content_type_defaults_to_octet_stream() {
+    fn an_unstated_content_type_stays_absent() {
         let m = project_inbound(&config(), headers(&[]), None, "c".to_string(), Vec::new());
-        assert_eq!(m.content_type.as_deref(), Some("application/octet-stream"));
+        assert_eq!(m.content_type, None);
     }
 
     #[test]

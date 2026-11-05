@@ -37,11 +37,15 @@ use std::time::SystemTime;
 
 use sqlx::PgPool;
 use sutra_channels::http::EngineHandle;
-use sutra_channels::{ChannelDefinition, LiveDeploymentSet};
+use sutra_channels::{
+    describe_endpoint_refusal, find_endpoint_collisions, ChannelDefinition, DeclaredEndpoint,
+    EndpointSharing, LiveDeploymentSet,
+};
 use sutra_executor::emission::CloudEventLite;
 use sutra_executor::DeploymentId;
 use sutra_persistence::stores::{
-    ActiveArchive, OutboxEntry, OutboxStore, PgOutboxStore, ReplyMode, TimerScheduleArming,
+    ActiveArchive, EndpointHolderRow, OutboxEntry, OutboxStore, PgEndpointHolderStore,
+    PgOutboxStore, ReplyMode, TimerScheduleArming,
 };
 use sutra_persistence::DeploymentId as PersistDeploymentId;
 use sutra_transport_spi::TransportChannels;
@@ -52,6 +56,11 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::assembly::{build_engine, plan_deployment, DeploymentPlan};
+use crate::deployment_facts::{
+    already_shared_endpoints, deployment_slot, evaluate_candidate, holder_record_refusal,
+    settle_claims, ConnectionView, DeployWarning, DeploymentFacts, EndpointHolding, EndpointKey,
+    SettledClaim,
+};
 
 // ---- Activation diagnostics (the SUTRA.DEPLOY.* runtime-activation slice; the
 // archive/package codes — SUTRA.DEPLOY.ARCHIVE.* etc. — live in sutra-loader) ---------
@@ -69,6 +78,9 @@ pub const DEPLOY_SOURCE_DUPLICATE_ID: &str = "SUTRA.DEPLOY.SOURCE.DUPLICATE_ID";
 pub const DEPLOY_ACTIVATE_BROKER_TOPOLOGY_STATIC: &str =
     "SUTRA.DEPLOY.ACTIVATE.BROKER_TOPOLOGY_STATIC";
 
+/// The advisory-lock key serialising deploy admission across replicas: the ASCII of `sutradep`.
+const DEPLOY_ADMISSION_LOCK: i64 = 0x7375_7472_6164_6570;
+
 /// `(len, mtime)` change stamp of one archive file — the poll comparator.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct FileStamp {
@@ -83,9 +95,137 @@ struct ArchiveFile {
     /// verification keeps the previous contribution (the old deployment stays live).
     current: Option<DeploymentId>,
     /// The last verification/preparation error for this path's current bytes, if the most
-    /// recent (len,mtime) change was REJECTED — surfaced as a `Failed` slot in the
-    /// deployment-status endpoint. Cleared when the path next prepares cleanly.
+    /// recent (len,mtime) change was REJECTED, or why its archive was refused an endpoint —
+    /// surfaced as a `Failed` slot in the deployment-status endpoint. Cleared when the path next
+    /// prepares cleanly and is judged.
     last_error: Option<String>,
+    /// The higher versions serving in this archive's place, when it is superseded.
+    superseded_by: Vec<String>,
+    /// What this file may claim though this replica cannot serve it. `None` once it verifies.
+    unjudged: Option<UnjudgedClaim>,
+}
+
+/// A file this replica could not verify. Another replica may be able to, so it still stands in the
+/// way of anything that would take what it holds.
+#[derive(Clone)]
+enum UnjudgedClaim {
+    /// It reads, and something this replica lacks stops it serving, a secret say. Its claims are known.
+    Known(Box<DeploymentFacts>),
+    /// It does not read. Nothing can be said about what it claims.
+    Unreadable,
+}
+
+/// Why an archive failed preparation, and what that leaves of its claims.
+struct ArchiveRejection {
+    reason: String,
+    unjudged: Option<UnjudgedClaim>,
+}
+
+/// Who holds which exclusive endpoint, as far as this replica can know. With a database that is
+/// the shared record, so restarts and peers read one answer. Without one, what this process has seen
+/// is all there is, and it is gone at a restart.
+struct HolderLedger {
+    held: BTreeMap<EndpointKey, EndpointHolding>,
+    /// What this replica itself claimed last. Only a hold this replica watched end may be released:
+    /// a replica whose folder is behind must not delete a peer's newer record.
+    claimed: BTreeMap<EndpointKey, String>,
+    store: Option<(PgEndpointHolderStore, Handle)>,
+}
+
+impl HolderLedger {
+    /// Read the shared record, if there is one.
+    fn refresh(&mut self) -> Result<(), String> {
+        let Some((store, runtime)) = &self.store else {
+            return Ok(());
+        };
+        let rows = runtime.block_on(store.load()).map_err(|e| e.to_string())?;
+        self.held = rows
+            .into_iter()
+            .map(|row| {
+                (
+                    (row.transport, row.identity),
+                    EndpointHolding {
+                        owner: row.owner,
+                        deployment_id: row.holder_deployment_id,
+                        label: row.holder_label,
+                        also_held_by: row.also_held_by.into_iter().collect(),
+                    },
+                )
+            })
+            .collect();
+        Ok(())
+    }
+
+    /// Record `claims` as held, replacing any record of an owner that no longer claims the
+    /// endpoint, and let go of what this replica held and no longer claims. `Ok(false)` when a peer
+    /// got an endpoint first: nothing changed, and the caller judges again.
+    fn record(&mut self, claims: BTreeMap<EndpointKey, EndpointHolding>) -> Result<bool, String> {
+        let changed: Vec<(EndpointHolderRow, Option<String>)> = claims
+            .iter()
+            .filter(|(key, holding)| self.held.get(*key) != Some(*holding))
+            .map(|(key, holding)| {
+                let row = EndpointHolderRow {
+                    transport: key.0.clone(),
+                    identity: key.1.clone(),
+                    owner: holding.owner.clone(),
+                    holder_deployment_id: holding.deployment_id.clone(),
+                    holder_label: holding.label.clone(),
+                    also_held_by: holding.also_held_by.iter().cloned().collect(),
+                };
+                let stale_owner = self.held.get(key).map(|held| held.owner.clone());
+                (row, stale_owner)
+            })
+            .collect();
+        let released: Vec<(EndpointKey, String)> = self
+            .claimed
+            .iter()
+            .filter(|(key, owner)| {
+                claims
+                    .get(*key)
+                    .is_none_or(|holding| holding.owner != **owner)
+            })
+            .map(|(key, owner)| (key.clone(), owner.clone()))
+            .collect();
+        if let Some((store, runtime)) = &self.store {
+            if !runtime
+                .block_on(store.claim(&changed))
+                .map_err(|e| e.to_string())?
+            {
+                return Ok(false);
+            }
+            for ((transport, identity), owner) in &released {
+                if claims.contains_key(&(transport.clone(), identity.clone())) {
+                    continue;
+                }
+                runtime
+                    .block_on(store.release(transport, identity, owner))
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+        for ((key, owner), _) in released.iter().map(|r| (r, ())) {
+            if self
+                .held
+                .get(&key.clone())
+                .is_some_and(|h| h.owner == *owner)
+            {
+                self.held.remove(key);
+            }
+        }
+        self.claimed = claims
+            .iter()
+            .map(|(key, holding)| (key.clone(), holding.owner.clone()))
+            .collect();
+        self.held.extend(claims);
+        Ok(true)
+    }
+}
+
+/// One archive as the settling sees it.
+struct JudgedArchive {
+    path: PathBuf,
+    plan: DeploymentPlan,
+    /// This plan is the path's latest bytes, not the earlier content the path falls back on.
+    latest: bool,
 }
 
 /// A point-in-time view of the deployment state machine, published by the watcher after
@@ -107,6 +247,9 @@ pub(crate) struct DeploymentStatusSnapshot {
     /// Slots whose most recent bytes were REJECTED — `(slot, error)`. The slot keeps
     /// serving its previous deployment (or none); this is what lets a caller fail fast.
     pub(crate) failed: Vec<(String, String)>,
+    /// What each ACTIVE deployment claims — what `POST /admin/deployments/check` judges a
+    /// candidate against. Never serialized.
+    pub(crate) facts: Vec<DeploymentFacts>,
 }
 
 /// Shared, watcher-published deployment status read by the HTTP endpoints.
@@ -121,6 +264,20 @@ pub(crate) type SharedApiSpecs = std::sync::Arc<
 >;
 
 impl DeploymentStatusSnapshot {
+    /// A flip failed, so the engine still serves the set of the last flip that landed, and what
+    /// the directory wants instead is not served. Report that truth: a caller waiting on an
+    /// unserved deployment must get a failed verdict, not Active.
+    fn report_unapplied(&mut self, last_applied: &DeploymentStatusSnapshot, error: &str) {
+        for (id, slot) in &self.active {
+            if !last_applied.active.iter().any(|(served, _)| served == id) {
+                self.failed.push((slot.clone(), error.to_string()));
+            }
+        }
+        self.active = last_applied.active.clone();
+        self.draining = last_applied.draining.clone();
+        self.facts = last_applied.facts.clone();
+    }
+
     /// The whole snapshot as the `/sutra/deployments` JSON body.
     pub(crate) fn to_json(&self) -> serde_json::Value {
         serde_json::json!({
@@ -170,13 +327,39 @@ pub(crate) struct DeploymentDirectory {
     active: Vec<DeploymentId>,
     /// Flipped-away deployments, most recently drained first (DRAINING).
     draining: Vec<DeploymentId>,
+    /// Each path's latest verified bytes, whatever became of them: a superseded or refused
+    /// archive's bytes will not change when what stood in its way leaves, so the stamp comparison
+    /// would never look at it again.
+    verified: BTreeMap<PathBuf, DeploymentPlan>,
+    /// The folder needs judging: a file changed, or an earlier judgement could not finish.
+    unsettled: bool,
+    /// Why each path's latest bytes were refused while earlier content of it keeps serving.
+    held_back: BTreeMap<PathBuf, String>,
+    ledger: HolderLedger,
+    /// Something listed could not even be examined this scan, so what it holds is not known.
+    listing_incomplete: bool,
+    /// The engine this runs in has a database, which some channels need.
+    persistence: bool,
+    /// The first judgement of this process. What it finds on an endpoint an earlier engine let
+    /// deployments share was running before it, so it goes on running. Anything later is new.
+    booting: bool,
+    /// What was last said about deployments sharing such an endpoint, so it is said once.
+    already_shared_reported: Vec<String>,
 }
 
 impl DeploymentDirectory {
     /// Boot construction: verify the dir exists (fail-closed, [`DEPLOY_SOURCE_MISSING`])
     /// and run the first scan. Individual bad archives are rejected-and-logged, never
-    /// fatal — an empty or partially-bad dir boots an engine that serves the rest.
-    pub(crate) fn open(dir: PathBuf) -> Result<DeploymentDirectory, Box<dyn std::error::Error>> {
+    /// fatal — an empty or partially-bad dir boots an engine that serves the rest. The superseded
+    /// versions a boot finds go straight to DRAINING: instances parked on them before the restart
+    /// must have their definition to resume into.
+    ///
+    /// Blocks on `holders` when there is one, so it runs on a blocking thread.
+    pub(crate) fn open(
+        dir: PathBuf,
+        holders: Option<(PgEndpointHolderStore, Handle)>,
+        persistence: bool,
+    ) -> Result<DeploymentDirectory, Box<dyn std::error::Error>> {
         if !dir.is_dir() {
             return Err(format!(
                 "[{DEPLOY_SOURCE_MISSING}] sutra.deployments.dir '{}' is not a \
@@ -201,9 +384,28 @@ impl DeploymentDirectory {
             prepared: HashMap::new(),
             active: Vec::new(),
             draining: Vec::new(),
+            verified: BTreeMap::new(),
+            unsettled: true,
+            held_back: BTreeMap::new(),
+            ledger: HolderLedger {
+                held: BTreeMap::new(),
+                claimed: BTreeMap::new(),
+                store: holders,
+            },
+            listing_incomplete: false,
+            persistence,
+            booting: true,
+            already_shared_reported: Vec::new(),
         };
         directory.scan();
+        if directory.unsettled {
+            // Nothing can be judged without the record, and guessing could hand a holder's endpoint
+            // to another owner.
+            return Err("the endpoint holder record could not be read or written at boot".into());
+        }
+        directory.booting = false;
         directory.activate_desired();
+        directory.drain_inactive_at_boot();
         Ok(directory)
     }
 
@@ -212,64 +414,15 @@ impl DeploymentDirectory {
     /// from the current one (a flip is needed).
     pub(crate) fn scan(&mut self) -> bool {
         let dir = self.dir.clone();
-        let mut seen: HashSet<PathBuf> = HashSet::new();
-        for path in list_archives(&dir) {
-            seen.insert(path.clone());
-            let Some(stamp) = stamp_of(&path) else {
-                continue; // raced a writer/remover — next tick settles it
-            };
-            if self.files.get(&path).is_some_and(|f| f.stamp == stamp) {
-                continue;
-            }
-            // New or changed content — prepare fully off-line; rejection changes NOTHING.
-            match prepare_archive(&path) {
-                Ok(plan) => {
-                    let id = plan.dep.clone();
-                    info!(
-                        path = %path.display(),
-                        deployment = id.value(),
-                        "archive verified and prepared (REGISTERED)"
-                    );
-                    self.prepared.insert(id.value().to_string(), plan);
-                    self.files.insert(
-                        path,
-                        ArchiveFile {
-                            stamp,
-                            current: Some(id),
-                            last_error: None,
-                        },
-                    );
-                }
-                Err(e) => {
-                    error!(
-                        path = %path.display(),
-                        error = %e,
-                        "archive rejected — the deployments source keeps its previous \
-                         state for this path (a rejected archive changes nothing)"
-                    );
-                    let msg = e.to_string();
-                    match self.files.get_mut(&path) {
-                        // Known path: keep the previous contribution live, remember the
-                        // stamp so the same bad bytes are not re-verified every tick, and
-                        // record the error for the status endpoint.
-                        Some(file) => {
-                            file.stamp = stamp;
-                            file.last_error = Some(msg);
-                        }
-                        None => {
-                            self.files.insert(
-                                path,
-                                ArchiveFile {
-                                    stamp,
-                                    current: None,
-                                    last_error: Some(msg),
-                                },
-                            );
-                        }
-                    }
-                }
-            }
-        }
+        // A folder that cannot be listed says nothing about its files. Taking that as all of them
+        // gone would drain everything and let go of what they hold.
+        let Some(listed) = list_archives(&dir) else {
+            return self.desired_active() != self.active;
+        };
+        let seen: HashSet<PathBuf> = listed.iter().cloned().collect();
+        let files_before = self.files.len();
+        // Removals first: an archive swapped for a differently named one in the same tick must
+        // not collide with the file it replaces.
         self.files.retain(|path, file| {
             let kept = seen.contains(path);
             if !kept {
@@ -283,7 +436,467 @@ impl DeploymentDirectory {
             }
             kept
         });
+        let known = self.verified.len();
+        self.verified.retain(|path, _| seen.contains(path));
+        self.held_back.retain(|path, _| seen.contains(path));
+        if self.verified.len() != known || self.files.len() != files_before {
+            self.unsettled = true;
+        }
+        self.listing_incomplete = false;
+        let host = sutra_transport_spi::PreflightHost {
+            persistence: self.persistence,
+        };
+        for path in listed {
+            let Some(stamp) = stamp_of(&path) else {
+                // Raced a writer or a remover: the next tick settles it, and this one cannot say.
+                self.listing_incomplete = true;
+                continue;
+            };
+            if self.files.get(&path).is_some_and(|f| f.stamp == stamp) {
+                continue;
+            }
+            // New or changed content — prepare fully off-line; rejection changes NOTHING.
+            self.unsettled = true;
+            match prepare_archive(&path, host) {
+                Ok(plan) => {
+                    // A new verdict replaces any earlier refusal of this path's old bytes.
+                    self.held_back.remove(&path);
+                    let (current, superseded_by) = self
+                        .files
+                        .get(&path)
+                        .map(|f| (f.current.clone(), f.superseded_by.clone()))
+                        .unwrap_or_default();
+                    self.files.insert(
+                        path.clone(),
+                        ArchiveFile {
+                            stamp,
+                            current,
+                            last_error: None,
+                            superseded_by,
+                            unjudged: None,
+                        },
+                    );
+                    self.verified.insert(path, plan);
+                }
+                Err(ArchiveRejection { reason, unjudged }) => {
+                    error!(
+                        path = %path.display(),
+                        error = %reason,
+                        "archive rejected — the deployments source keeps its previous \
+                         state for this path (a rejected archive changes nothing)"
+                    );
+                    let msg = reason;
+                    self.verified.remove(&path);
+                    self.held_back.remove(&path);
+                    match self.files.get_mut(&path) {
+                        // Known path: keep the previous contribution live, remember the
+                        // stamp so the same bad bytes are not re-verified every tick, and
+                        // record the error for the status endpoint.
+                        Some(file) => {
+                            file.stamp = stamp;
+                            file.last_error = Some(msg);
+                            file.unjudged = unjudged;
+                        }
+                        None => {
+                            self.files.insert(
+                                path,
+                                ArchiveFile {
+                                    stamp,
+                                    current: None,
+                                    last_error: Some(msg),
+                                    superseded_by: Vec::new(),
+                                    unjudged,
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        // A refused archive is judged every scan: what stood in its way may have gone.
+        if self.unsettled || self.has_refused_archive() {
+            self.settle();
+        }
         self.desired_active() != self.active
+    }
+
+    fn has_refused_archive(&self) -> bool {
+        !self.held_back.is_empty()
+            || self.verified.keys().any(|path| {
+                self.files
+                    .get(path)
+                    .is_some_and(|f| f.current.is_none() && f.superseded_by.is_empty())
+            })
+    }
+
+    /// Judge the whole folder and apply the answer. It is a function of the files and the holder
+    /// record alone, so a restart, a new pod and a running engine all come to the same answer, and
+    /// nothing depends on the order files arrived in or on how they sort.
+    ///
+    /// If the record cannot be read or a peer keeps getting there first, nothing changes and the
+    /// next scan tries again.
+    fn settle(&mut self) {
+        if let Err(e) = self.ledger.refresh() {
+            error!(
+                error = %e,
+                "endpoint holder record unreadable — the deployments folder keeps its current state"
+            );
+            self.unsettled = true;
+            return;
+        }
+        for _ in 0..3 {
+            let (judged, outcomes) = self.judge();
+            let claims = active_claims(&judged, &outcomes);
+            match self.ledger.record(claims) {
+                Ok(true) => {
+                    self.apply_settlement(judged, outcomes);
+                    self.unsettled = false;
+                    return;
+                }
+                Ok(false) => {
+                    if let Err(e) = self.ledger.refresh() {
+                        error!(error = %e, "endpoint holder record unreadable");
+                        break;
+                    }
+                }
+                Err(e) => {
+                    error!(
+                        error = %e,
+                        "endpoint holder record unwritable — the deployments folder keeps its \
+                         current state"
+                    );
+                    break;
+                }
+            }
+        }
+        self.unsettled = true;
+    }
+
+    /// What each path offers, and what becomes of it. A path whose latest bytes are refused, or do
+    /// not verify, falls back on the content it already serves, and that content is judged again in
+    /// the same light: it may be all that path has left.
+    fn judge(&mut self) -> (Vec<JudgedArchive>, Vec<SettledClaim>) {
+        let mut fell_back: BTreeMap<PathBuf, String> = BTreeMap::new();
+        loop {
+            let judged = self.judged_archives(&fell_back);
+            let facts: Vec<DeploymentFacts> = judged
+                .iter()
+                .map(|archive| {
+                    let slot = archive
+                        .path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    archive.plan.facts.clone().in_slot(&slot)
+                })
+                .collect();
+            // What cannot serve here still claims: it goes after the archives, so the outcomes that
+            // get applied are the archives' alone.
+            let mut facts = facts;
+            facts.extend(self.unjudged_claims(&judged, &facts));
+            let outcomes = settle_claims(&facts, &self.holders_for(&facts));
+            let mut more = false;
+            for (archive, outcome) in judged.iter().zip(&outcomes) {
+                let SettledClaim::Refused { reason } = outcome else {
+                    continue;
+                };
+                let serves_other_content = self
+                    .files
+                    .get(&archive.path)
+                    .and_then(|f| f.current.as_ref())
+                    .is_some_and(|id| {
+                        id != &archive.plan.dep && self.prepared.contains_key(id.value())
+                    });
+                if archive.latest && serves_other_content {
+                    fell_back.insert(archive.path.clone(), reason.clone());
+                    more = true;
+                }
+            }
+            if !more {
+                self.held_back = fell_back;
+                return (judged, outcomes);
+            }
+        }
+    }
+
+    /// The archives to judge, one per path, the first path of any id, in path order.
+    fn judged_archives(&self, fell_back: &BTreeMap<PathBuf, String>) -> Vec<JudgedArchive> {
+        let ordered: BTreeMap<&PathBuf, &ArchiveFile> = self.files.iter().collect();
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut out = Vec::new();
+        for (path, file) in ordered {
+            let latest = self
+                .verified
+                .get(path)
+                .filter(|_| !fell_back.contains_key(path));
+            let judged = match latest {
+                Some(plan) => Some((plan, true)),
+                None => file
+                    .current
+                    .as_ref()
+                    .and_then(|id| self.prepared.get(id.value()))
+                    .map(|plan| (plan, false)),
+            };
+            let Some((plan, latest)) = judged else {
+                continue;
+            };
+            if seen.insert(plan.dep.value().to_string()) {
+                out.push(JudgedArchive {
+                    path: path.clone(),
+                    plan: plan.clone(),
+                    latest,
+                });
+            }
+        }
+        out
+    }
+
+    /// The claims of what this replica cannot judge. Another replica may serve these files, so they
+    /// must not lose what they hold because of this one: an endpoint passes on only when its holder's
+    /// file is gone, not when it is merely unjudged.
+    ///
+    /// A file that reads claims what it says, unless a version of its owner is being judged anyway:
+    /// what this replica cannot serve must not supersede what it can. A file that does not read could
+    /// be anyone, so while there is one, every recorded holder not otherwise accounted for stands.
+    fn unjudged_claims(
+        &self,
+        judged: &[JudgedArchive],
+        candidates: &[DeploymentFacts],
+    ) -> Vec<DeploymentFacts> {
+        let judged_paths: HashSet<&PathBuf> = judged.iter().map(|a| &a.path).collect();
+        let mut claims: Vec<DeploymentFacts> = Vec::new();
+        let mut unreadable = self.listing_incomplete;
+        let ordered: BTreeMap<&PathBuf, &ArchiveFile> = self.files.iter().collect();
+        for (path, file) in ordered {
+            if judged_paths.contains(path) {
+                continue;
+            }
+            match &file.unjudged {
+                Some(UnjudgedClaim::Known(facts)) => {
+                    if !candidates.iter().any(|c| c.owner == facts.owner) {
+                        let slot = path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        claims.push(facts.as_ref().clone().in_slot(&slot));
+                    }
+                }
+                Some(UnjudgedClaim::Unreadable) => unreadable = true,
+                None => {}
+            }
+        }
+        if !unreadable {
+            return claims;
+        }
+        for (key, holding) in &self.ledger.held {
+            let accounted_for = candidates.iter().chain(&claims).any(|c| {
+                c.owner == holding.owner
+                    && c.endpoints
+                        .iter()
+                        .any(|e| e.transport == key.0 && e.claim.identity == key.1)
+            });
+            let taken_by_another = candidates.iter().any(|c| {
+                c.owner != holding.owner
+                    && c.endpoints.iter().any(|e| {
+                        e.transport == key.0
+                            && e.claim.identity == key.1
+                            && e.claim.sharing != EndpointSharing::Broadcast
+                    })
+            });
+            if accounted_for || !taken_by_another {
+                continue;
+            }
+            claims.push(DeploymentFacts {
+                deployment_id: holding.deployment_id.clone(),
+                label: holding.label.clone(),
+                owner: holding.owner.clone(),
+                slot: "a file that cannot be read here".to_string(),
+                endpoints: vec![DeclaredEndpoint {
+                    deployment_id: holding.deployment_id.clone(),
+                    deployment_label: holding.label.clone(),
+                    owner: holding.owner.clone(),
+                    channel: String::new(),
+                    transport: key.0.clone(),
+                    claim: sutra_channels::EndpointClaim::exclusive(key.1.clone()),
+                }],
+                ..DeploymentFacts::default()
+            });
+        }
+        claims
+    }
+
+    /// Who holds each endpoint these candidates claim. The record says, when the owner it names
+    /// still claims the endpoint here; a record of an owner with no claim here is stale. Beneath the
+    /// record is what this engine serves right now, which holds an endpoint until told otherwise.
+    /// On an endpoint that can have several, everything serving it holds it.
+    ///
+    /// At boot, where nothing records an endpoint an earlier engine let deployments share, whoever
+    /// is on it now was running before: they all hold it.
+    fn holders_for(&self, facts: &[DeploymentFacts]) -> BTreeMap<EndpointKey, EndpointHolding> {
+        let mut holders: BTreeMap<EndpointKey, EndpointHolding> = BTreeMap::new();
+        for file in self.files.values() {
+            let Some(plan) = file
+                .current
+                .as_ref()
+                .and_then(|id| self.prepared.get(id.value()))
+            else {
+                continue;
+            };
+            for endpoint in &plan.facts.endpoints {
+                let key = (endpoint.transport.clone(), endpoint.claim.identity.clone());
+                add_holder(&mut holders, key, endpoint, &plan.facts);
+            }
+        }
+        if self.booting {
+            for candidate in facts {
+                for endpoint in &candidate.endpoints {
+                    if matches!(
+                        endpoint.claim.sharing,
+                        EndpointSharing::ExclusiveToNewDeployments { .. }
+                    ) {
+                        let key = (endpoint.transport.clone(), endpoint.claim.identity.clone());
+                        add_holder(&mut holders, key, endpoint, candidate);
+                    }
+                }
+            }
+        }
+        for (key, holding) in &self.ledger.held {
+            let claimed_here = facts.iter().any(|candidate| {
+                (candidate.owner == holding.owner || holding.names(&candidate.deployment_id))
+                    && candidate.endpoints.iter().any(|endpoint| {
+                        endpoint.transport == key.0 && endpoint.claim.identity == key.1
+                    })
+            });
+            if claimed_here {
+                holders.insert(key.clone(), holding.clone());
+            }
+        }
+        holders
+    }
+
+    fn apply_settlement(&mut self, judged: Vec<JudgedArchive>, outcomes: Vec<SettledClaim>) {
+        let judged_paths: HashSet<PathBuf> = judged.iter().map(|a| a.path.clone()).collect();
+        let mut first_path_of: HashMap<String, Option<DeploymentId>> = HashMap::new();
+        for (archive, outcome) in judged.into_iter().zip(outcomes) {
+            let JudgedArchive { path, plan, latest } = archive;
+            let id = plan.dep.clone();
+            let Some(file) = self.files.get_mut(&path) else {
+                continue;
+            };
+            match outcome {
+                SettledClaim::Active => {
+                    info!(
+                        path = %path.display(),
+                        deployment = id.value(),
+                        "archive verified and prepared (REGISTERED)"
+                    );
+                    file.current = Some(id.clone());
+                    file.superseded_by.clear();
+                    if latest {
+                        file.last_error = None;
+                    }
+                    first_path_of.insert(id.value().to_string(), Some(id));
+                    self.prepared.insert(plan.dep.value().to_string(), plan);
+                }
+                SettledClaim::Superseded { by } => {
+                    if file.superseded_by != by {
+                        warn!(
+                            code = sutra_channels::codes::DEPLOY_ENDPOINT_SUPERSEDED,
+                            path = %path.display(),
+                            deployment = id.value(),
+                            "{} is an older version than {}, on an endpoint they share: it takes \
+                             no new work. Its running instances stay on it, and its file may stay",
+                            plan.facts.label,
+                            by.join(", "),
+                        );
+                    }
+                    file.current = None;
+                    file.superseded_by = by;
+                    if latest {
+                        file.last_error = None;
+                    }
+                    first_path_of.insert(id.value().to_string(), None);
+                }
+                SettledClaim::Refused { reason } => {
+                    if file.last_error.as_ref() != Some(&reason) {
+                        error!(
+                            path = %path.display(),
+                            error = %reason,
+                            "archive refused — it is not deployed"
+                        );
+                    }
+                    file.current = None;
+                    file.superseded_by.clear();
+                    file.last_error = Some(reason);
+                    first_path_of.insert(id.value().to_string(), None);
+                }
+            }
+        }
+        // Latest bytes refused, earlier content still serving: the path reports the refusal.
+        for (path, reason) in &self.held_back {
+            if let Some(file) = self.files.get_mut(path) {
+                if file.last_error.as_ref() != Some(reason) {
+                    error!(
+                        path = %path.display(),
+                        error = %reason,
+                        "archive refused — the path keeps serving its previous content"
+                    );
+                }
+                file.last_error = Some(reason.clone());
+            }
+        }
+        let serving: Vec<DeploymentFacts> = self
+            .files
+            .values()
+            .filter_map(|f| f.current.as_ref())
+            .filter_map(|id| self.prepared.get(id.value()))
+            .map(|plan| plan.facts.clone())
+            .collect();
+        let shared = already_shared_endpoints(&serving);
+        if shared != self.already_shared_reported {
+            for message in &shared {
+                error!(
+                    code = sutra_channels::codes::DEPLOY_ENDPOINT_ALREADY_SHARED,
+                    "{message}"
+                );
+            }
+            self.already_shared_reported = shared;
+        }
+        // A second path holding a judged id contributes whatever the first came to.
+        for (path, file) in self.files.iter_mut() {
+            if judged_paths.contains(path) {
+                continue;
+            }
+            let Some(id) = self
+                .verified
+                .get(path)
+                .map(|plan| plan.dep.value().to_string())
+            else {
+                continue;
+            };
+            if let Some(contribution) = first_path_of.get(&id) {
+                file.current = contribution.clone();
+            }
+        }
+    }
+
+    /// What a boot verified and did not activate goes straight to DRAINING, registered so parked
+    /// instances can resume into it: a superseded version, and a refused archive too, which may be
+    /// what served before this restart. It carries no routes. Nothing pinned to it means the first
+    /// sweep retires it.
+    fn drain_inactive_at_boot(&mut self) {
+        let inactive: Vec<DeploymentPlan> = self
+            .verified
+            .values()
+            .filter(|plan| !self.active.contains(&plan.dep))
+            .cloned()
+            .collect();
+        for plan in inactive {
+            if !self.draining.contains(&plan.dep) {
+                self.draining.push(plan.dep.clone());
+            }
+            self.prepared.insert(plan.dep.value().to_string(), plan);
+        }
     }
 
     /// The desired ACTIVE archive set: each path's contribution in path order, first
@@ -413,11 +1026,17 @@ impl DeploymentDirectory {
                 })
             })
             .collect();
+        let facts = self
+            .active_plans()
+            .iter()
+            .map(|p| p.facts.clone().in_slot(&slot_of(&p.dep)))
+            .collect();
         DeploymentStatusSnapshot {
             active,
             pending: Vec::new(),
             draining,
             failed,
+            facts,
         }
     }
 
@@ -452,11 +1071,60 @@ impl DeploymentDirectory {
     }
 }
 
-/// List `*.sutra` files (sorted for deterministic first-claimant-wins ordering).
-fn list_archives(dir: &Path) -> Vec<PathBuf> {
+/// The exclusive endpoints of the deployments that came out active, as the record should hold them.
+fn active_claims(
+    judged: &[JudgedArchive],
+    outcomes: &[SettledClaim],
+) -> BTreeMap<EndpointKey, EndpointHolding> {
+    let mut claims = BTreeMap::new();
+    for (archive, outcome) in judged.iter().zip(outcomes) {
+        if *outcome != SettledClaim::Active {
+            continue;
+        }
+        let facts = &archive.plan.facts;
+        for endpoint in &facts.endpoints {
+            let key = (endpoint.transport.clone(), endpoint.claim.identity.clone());
+            add_holder(&mut claims, key, endpoint, facts);
+        }
+    }
+    claims
+}
+
+/// Add `facts` as a holder of `key`. An exclusive endpoint has one holder and the last word wins. One
+/// that can have several names them all, the lowest id first, so every replica writes the same row.
+fn add_holder(
+    holders: &mut BTreeMap<EndpointKey, EndpointHolding>,
+    key: EndpointKey,
+    endpoint: &DeclaredEndpoint,
+    facts: &DeploymentFacts,
+) {
+    let holding = EndpointHolding::by(facts);
+    if endpoint.claim.sharing == EndpointSharing::Exclusive {
+        holders.insert(key, holding);
+        return;
+    }
+    let Some(held) = holders.get_mut(&key) else {
+        holders.insert(key, holding);
+        return;
+    };
+    if held.names(&facts.deployment_id) {
+        return;
+    }
+    if holding.deployment_id < held.deployment_id {
+        let previous = std::mem::replace(held, holding);
+        held.also_held_by = previous.also_held_by;
+        held.also_held_by.insert(previous.deployment_id);
+    } else {
+        held.also_held_by.insert(holding.deployment_id);
+    }
+}
+
+/// List `*.sutra` files (sorted, so what a scan logs and reports comes in a stable order). `None` when
+/// the folder cannot be listed this tick.
+fn list_archives(dir: &Path) -> Option<Vec<PathBuf>> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         warn!(dir = %dir.display(), "deployments dir unreadable this tick");
-        return Vec::new();
+        return None;
     };
     let mut out: Vec<PathBuf> = entries
         .filter_map(|e| e.ok().map(|e| e.path()))
@@ -468,7 +1136,7 @@ fn list_archives(dir: &Path) -> Vec<PathBuf> {
         })
         .collect();
     out.sort();
-    out
+    Some(out)
 }
 
 fn stamp_of(path: &Path) -> Option<FileStamp> {
@@ -482,9 +1150,47 @@ fn stamp_of(path: &Path) -> Option<FileStamp> {
 /// Read + verify one archive and prepare its plan — the whole off-line phase of the
 /// two-phase activation. Any failure rejects the archive with its `SUTRA.DEPLOY.*`
 /// (or plan-time) diagnostic.
-fn prepare_archive(path: &Path) -> Result<DeploymentPlan, String> {
-    let archive = sutra_loader::read_archive_file(path).map_err(|e| format!("{e}"))?;
-    plan_deployment(&archive.deployment).map_err(|e| format!("{e}"))
+///
+/// A folder has no caller to answer, and what lands in it could displace what is serving. So an
+/// archive whose routes could never be served is rejected here, before it can supersede anything,
+/// and at a restart it gives the same answer it gave at runtime.
+///
+/// An archive that reads but cannot serve here still says what it claims, for a replica that can
+/// serve it may hold those endpoints. One the holder record could not store fails alone, and claims
+/// nothing: no replica can serve it.
+fn prepare_archive(
+    path: &Path,
+    host: sutra_transport_spi::PreflightHost,
+) -> Result<DeploymentPlan, ArchiveRejection> {
+    let archive = sutra_loader::read_archive_file(path).map_err(|e| ArchiveRejection {
+        reason: format!("{e}"),
+        unjudged: Some(UnjudgedClaim::Unreadable),
+    })?;
+    // A folder can't say whether a file was ever deployed. Refusing could strand instances parked
+    // on one that was, so it loads, and the log says what it dedupes.
+    report_unrecognised_dedup_keys(&archive.deployment);
+    let known = |reason: String| ArchiveRejection {
+        reason,
+        unjudged: Some(
+            DeploymentFacts::of_loaded(&archive.deployment, ConnectionView::Declared)
+                .map(|facts| UnjudgedClaim::Known(Box::new(facts)))
+                .unwrap_or(UnjudgedClaim::Unreadable),
+        ),
+    };
+    let plan = plan_deployment(&archive.deployment).map_err(|e| known(format!("{e}")))?;
+    if let Some(reason) = holder_record_refusal(&plan.facts) {
+        return Err(ArchiveRejection {
+            reason,
+            unjudged: None,
+        });
+    }
+    sutra_transport_spi::preflight_definitions(
+        &plan.definitions,
+        crate::assembly::envref_resolver,
+        host,
+    )
+    .map_err(|d| known(format!("[{}] {}", d.code, d.message)))?;
+    Ok(plan)
 }
 
 /// Verify + prepare a [`DeploymentPlan`] from in-memory archive bytes — the DB/API-source
@@ -492,7 +1198,37 @@ fn prepare_archive(path: &Path) -> Result<DeploymentPlan, String> {
 /// rejected `Err`, never a panic.
 pub(crate) fn prepare_archive_bytes(bytes: &[u8]) -> Result<DeploymentPlan, String> {
     let archive = sutra_loader::read_archive(bytes).map_err(|e| format!("{e}"))?;
+    report_unrecognised_dedup_keys(&archive.deployment);
     plan_deployment(&archive.deployment).map_err(|e| format!("{e}"))
+}
+
+/// A package that declares a `dedupKey` nothing reads keeps running, and each load says so.
+fn report_unrecognised_dedup_keys(deployment: &sutra_loader::LoadedDeployment) {
+    let package = format!(
+        "{}--{}--{}",
+        deployment.tenant, deployment.module, deployment.version
+    );
+    for found in sutra_loader::unrecognised_dedup_keys(deployment) {
+        error!(
+            code = sutra_bpmn::codes::PARSE_Q_SOURCE_DEDUP_KEY_UNRECOGNISED,
+            "{}",
+            found.describe_running(&package)
+        );
+    }
+}
+
+/// Why a NEW deploy of this package is refused, if it declares a `dedupKey` nothing reads.
+pub(crate) fn refuse_unrecognised_dedup_keys(
+    deployment: &sutra_loader::LoadedDeployment,
+) -> Result<(), String> {
+    match sutra_loader::unrecognised_dedup_keys(deployment).first() {
+        Some(found) => Err(format!(
+            "[{}] {}",
+            sutra_bpmn::codes::PARSE_Q_SOURCE_DEDUP_KEY_UNRECOGNISED,
+            found.describe_refusal()
+        )),
+        None => Ok(()),
+    }
 }
 
 /// Build the boot-active plan set from the DB store's active rows (`(store_id, bytes)`): verify +
@@ -517,6 +1253,129 @@ pub(crate) fn plans_from_store(archives: Vec<(String, Vec<u8>)>) -> Vec<Deployme
         }
     }
     plans
+}
+
+/// The `db` source's served set, settled: what a boot or a re-activation activates.
+pub(crate) struct SettledStoreSet {
+    pub(crate) active: Vec<DeploymentPlan>,
+    pub(crate) draining: Vec<DeploymentPlan>,
+    /// `(deployment id, slot)` of the active rows.
+    pub(crate) id_slots: Vec<(String, String)>,
+    /// `(slot, why)` of rows this settling took out of the active set.
+    pub(crate) refused: Vec<(String, String)>,
+}
+
+/// Read the store's served set and settle any rows that share an endpoint. Only rows an older engine
+/// accepted can: of two owners the earliest activated holds and the later stops being active; of two
+/// versions of one owner the highest stays. Every replica reads the same rows and comes to the same
+/// answer. A row that loses goes to draining rather than away, because instances may be parked on it.
+pub(crate) async fn settled_store_set(
+    store: &sutra_persistence::stores::PgDeploymentArchiveStore,
+) -> Result<SettledStoreSet, String> {
+    let served = store
+        .list_active_and_draining()
+        .await
+        .map_err(|e| e.to_string())?;
+    let (mut active_rows, mut draining_rows) = (Vec::new(), Vec::new());
+    for row in served {
+        match row.status {
+            sutra_persistence::stores::ArchiveStatus::Draining => draining_rows.push(row),
+            _ => active_rows.push(row),
+        }
+    }
+    let activated: HashMap<String, Option<OffsetDateTime>> = active_rows
+        .iter()
+        .map(|row| (row.archive.deployment_id.clone(), row.activated_at))
+        .collect();
+    let mut id_slots: Vec<(String, String)> = active_rows
+        .iter()
+        .map(|row| (row.archive.deployment_id.clone(), row.archive.slot.clone()))
+        .collect();
+    let slot_of = |id_slots: &[(String, String)], id: &str| {
+        id_slots
+            .iter()
+            .find(|(row, _)| row == id)
+            .map(|(_, slot)| slot.clone())
+            .unwrap_or_default()
+    };
+    let bytes_of = |rows: Vec<sutra_persistence::stores::ServedArchiveRow>| {
+        rows.into_iter()
+            .map(|row| (row.archive.deployment_id, row.archive.bytes))
+            .collect::<Vec<_>>()
+    };
+    let mut plans = plans_from_store(bytes_of(active_rows));
+    let mut draining = plans_from_store(bytes_of(draining_rows));
+
+    // The earliest activated first, so the first claimant of an endpoint is its holder.
+    let mut order: Vec<usize> = (0..plans.len()).collect();
+    order.sort_by_key(|i| {
+        let id = plans[*i].dep.value().to_string();
+        let at = activated.get(&id).copied().flatten();
+        (at.is_none(), at, id)
+    });
+    let mut holders: BTreeMap<EndpointKey, EndpointHolding> = BTreeMap::new();
+    for i in order {
+        let facts = &plans[i].facts;
+        for endpoint in &facts.endpoints {
+            let key = (endpoint.transport.clone(), endpoint.claim.identity.clone());
+            // An active row on an endpoint an earlier engine let several share keeps running. A
+            // new one was refused at its deploy, so a row here was admitted before.
+            if matches!(
+                endpoint.claim.sharing,
+                EndpointSharing::ExclusiveToNewDeployments { .. }
+            ) {
+                add_holder(&mut holders, key, endpoint, facts);
+            } else {
+                holders
+                    .entry(key)
+                    .or_insert_with(|| EndpointHolding::by(facts));
+            }
+        }
+    }
+    let facts: Vec<DeploymentFacts> = plans
+        .iter()
+        .map(|p| p.facts.clone().in_slot(&slot_of(&id_slots, p.dep.value())))
+        .collect();
+    let outcomes = settle_claims(&facts, &holders);
+    let mut refused = Vec::new();
+    let mut kept = Vec::new();
+    for message in already_shared_endpoints(&facts) {
+        error!(
+            code = sutra_channels::codes::DEPLOY_ENDPOINT_ALREADY_SHARED,
+            "{message}"
+        );
+    }
+    for (plan, outcome) in plans.drain(..).zip(outcomes) {
+        let reason = match outcome {
+            SettledClaim::Active => {
+                kept.push(plan);
+                continue;
+            }
+            SettledClaim::Superseded { by } => format!(
+                "[{}] {} is an older version than {}, on an endpoint they share",
+                sutra_channels::codes::DEPLOY_ENDPOINT_SUPERSEDED,
+                plan.facts.label,
+                by.join(", ")
+            ),
+            SettledClaim::Refused { reason } => reason,
+        };
+        let id = plan.dep.value().to_string();
+        store.demote_active(&id).await.map_err(|e| e.to_string())?;
+        error!(
+            deployment = %id,
+            error = %reason,
+            "stored deployment shares an endpoint with one that holds it — it is no longer active"
+        );
+        refused.push((slot_of(&id_slots, &id), reason));
+        id_slots.retain(|(row, _)| row != &id);
+        draining.push(plan);
+    }
+    Ok(SettledStoreSet {
+        active: kept,
+        draining,
+        id_slots,
+        refused,
+    })
 }
 
 /// Everything the watcher needs to drive a flip.
@@ -598,6 +1457,28 @@ pub(crate) async fn activate_plans(
         .iter()
         .flat_map(|plan| plan.definitions.iter().cloned())
         .collect();
+
+    // The last gate before anything changes. A deploy path has already judged its candidate; this
+    // catches a set that arrived by another route (a peer replica's commit, a row stored by an
+    // older engine), and asks every transport whether its rewire can succeed. A refusal here
+    // leaves every registry, route and consumer as it was.
+    let endpoints: Vec<DeclaredEndpoint> = active
+        .iter()
+        .flat_map(|plan| plan.facts.endpoints.iter().cloned())
+        // Refused to anything new, and allowed to go on for what already runs on it: a deploy path
+        // has judged those, and a set can only hold what those let through.
+        .filter(|endpoint| {
+            !matches!(
+                endpoint.claim.sharing,
+                EndpointSharing::ExclusiveToNewDeployments { .. }
+            )
+        })
+        .collect();
+    let collisions = find_endpoint_collisions(&endpoints);
+    if !collisions.is_empty() {
+        return Err(describe_endpoint_refusal(&collisions));
+    }
+    prepare_transports(&hooks.transports, &active_definitions)?;
 
     // The timer-start schedules the ACTIVE set declares, computed BEFORE `active` is moved into
     // the actor rebuild. The arming instant is read once so every relative `<timeDuration>` start
@@ -737,6 +1618,19 @@ pub(crate) async fn activate_plans(
     Ok(())
 }
 
+/// Ask every transport whether it can serve `definitions`, changing nothing.
+fn prepare_transports(
+    transports: &[Arc<dyn TransportChannels>],
+    definitions: &[ChannelDefinition],
+) -> Result<(), String> {
+    for transport in transports {
+        transport
+            .prepare_rewire(definitions)
+            .map_err(|d| format!("[{}] {}", d.code, d.message))?;
+    }
+    Ok(())
+}
+
 /// Arm the boot-time ACTIVE set's timer schedules.
 ///
 /// Boot does NOT go through [`activate_plans`] — it builds the engine actor directly from the
@@ -834,6 +1728,7 @@ pub(crate) struct DeployOutcome {
     pub(crate) deployment_id: String,
     pub(crate) slot: String,
     pub(crate) revision: i64,
+    pub(crate) warnings: Vec<DeployWarning>,
 }
 
 /// The result of an ACCEPTED async deploy (`202`) — the row is durably stored ACTIVE and marked
@@ -843,6 +1738,7 @@ pub(crate) struct DeployAccepted {
     pub(crate) deployment_id: String,
     pub(crate) slot: String,
     pub(crate) revision: i64,
+    pub(crate) warnings: Vec<DeployWarning>,
 }
 
 /// The synchronous deploy path for the `db` deployment source: validate the archive bytes →
@@ -868,14 +1764,55 @@ impl DeployController {
     /// fail-closed, store the row ACTIVE for its slot, re-activate the whole active set (the
     /// flip), and refresh the projections. Returns id/slot/revision once ACTIVE.
     pub(crate) async fn deploy(&self, bytes: Vec<u8>) -> Result<DeployOutcome, String> {
+        let (deployment_id, slot, revision, warnings) = self.admit_and_store(bytes).await?;
+        self.reactivate_from_store()
+            .await
+            .map_err(|e| flip_failed_after_store(&slot, &e))?;
+        info!(deployment = %deployment_id, slot = %slot, revision, "deployment ACTIVE via the sync deploy API");
+        Ok(DeployOutcome {
+            deployment_id,
+            slot,
+            revision,
+            warnings,
+        })
+    }
+
+    /// The durable half of a deploy: verify and plan the candidate, judge it against the store's
+    /// other active rows, and only then store it ACTIVE. A refusal has changed nothing.
+    ///
+    /// The judgement and the write hold a database-wide advisory lock, so two replicas taking
+    /// colliding deploys at once cannot each pass the check against a store without the other. All
+    /// of it runs on the lock's own connection: a waiter holds one connection and needs no other, so
+    /// waiters can never exhaust the pool out from under the deploy they are waiting for.
+    async fn admit_and_store(
+        &self,
+        bytes: Vec<u8>,
+    ) -> Result<(String, String, i64, Vec<DeployWarning>), String> {
         let archive = sutra_loader::read_archive(&bytes).map_err(|e| format!("{e}"))?;
+        refuse_unrecognised_dedup_keys(&archive.deployment)?;
+        // A bad candidate is refused here rather than stored and then dropped from every flip.
+        let plan = prepare_archive_bytes(&bytes)?;
         let dep = &archive.deployment;
         let deployment_id = dep.id.value().to_string();
         let (tenant, module, version) =
             (dep.tenant.clone(), dep.module.clone(), dep.version.clone());
         // The slot is the stable archive key — the tenant/module/version identity, which a
         // hot-deploy of new content targets in place (the ConfigMap-key / file-name analogue).
-        let slot = format!("{tenant}--{module}--{version}");
+        let slot = deployment_slot(&tenant, &module, &version, &deployment_id);
+
+        let mut tx = self.store.pool().begin().await.map_err(|e| e.to_string())?;
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(DEPLOY_ADMISSION_LOCK)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| e.to_string())?;
+        let served =
+            sutra_persistence::stores::PgDeploymentArchiveStore::list_active_and_draining_in(
+                &mut tx,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        let (warnings, superseded_slots) = self.admit(&plan, &slot, served)?;
         let new = sutra_persistence::stores::NewArchive {
             deployment_id: deployment_id.clone(),
             slot: slot.clone(),
@@ -887,18 +1824,77 @@ impl DeployController {
             checksum: deployment_id.clone(),
             bytes,
         };
-        let revision = self
-            .store
-            .upsert_active(&new)
+        let revision =
+            sutra_persistence::stores::PgDeploymentArchiveStore::upsert_active_superseding_in(
+                &mut tx,
+                &new,
+                &superseded_slots,
+            )
             .await
             .map_err(|e| e.to_string())?;
-        self.reactivate_from_store().await?;
-        info!(deployment = %deployment_id, slot = %slot, revision, "deployment ACTIVE via the sync deploy API");
-        Ok(DeployOutcome {
-            deployment_id,
-            slot,
-            revision,
-        })
+        tx.commit().await.map_err(|e| e.to_string())?;
+        Ok((deployment_id, slot, revision, warnings))
+    }
+
+    /// Judge a planned candidate against the store's other active rows: refuse an endpoint
+    /// collision, and refuse a set some transport could not rewire to. Returns the warnings and
+    /// the slots of the same tenant and module this candidate supersedes.
+    fn admit(
+        &self,
+        plan: &DeploymentPlan,
+        slot: &str,
+        served: Vec<sutra_persistence::stores::ServedArchiveRow>,
+    ) -> Result<(Vec<DeployWarning>, Vec<String>), String> {
+        let (active, _) = split_served_archives(served);
+        let mut others = Vec::new();
+        let mut other_definitions: Vec<(String, Vec<ChannelDefinition>)> = Vec::new();
+        for row in active.into_iter().filter(|row| row.slot != slot) {
+            // Only what the check reads: a full plan of every row belongs to the flip.
+            let loaded = match sutra_loader::read_archive(&row.bytes) {
+                Ok(archive) => archive.deployment,
+                Err(e) => {
+                    warn!(slot = %row.slot, error = %e, "stored archive skipped by the endpoint check");
+                    continue;
+                }
+            };
+            let facts = match DeploymentFacts::of_loaded(&loaded, ConnectionView::Resolved) {
+                Ok(facts) => facts.in_slot(&row.slot),
+                Err(e) => {
+                    warn!(slot = %row.slot, error = %e, "stored archive skipped by the endpoint check");
+                    continue;
+                }
+            };
+            if let Some(yaml) = &loaded.channels_yaml {
+                if let Ok(defs) = sutra_channels::load_channel_definitions(
+                    yaml.as_bytes(),
+                    &loaded.tenant,
+                    &loaded.module,
+                    &loaded.version,
+                    "channels.yaml",
+                ) {
+                    other_definitions.push((row.slot.clone(), defs));
+                }
+            }
+            others.push(facts);
+        }
+        let verdict = evaluate_candidate(&plan.facts.clone().in_slot(slot), &others);
+        if !verdict.collisions.is_empty() {
+            return Err(describe_endpoint_refusal(&verdict.collisions));
+        }
+        let superseded_slots: Vec<String> =
+            verdict.superseded.iter().map(|s| s.slot.clone()).collect();
+        // The set the flip will really serve: a superseded deployment is no part of it.
+        let mut definitions = plan.definitions.clone();
+        for (other_slot, defs) in other_definitions {
+            if !superseded_slots.contains(&other_slot) {
+                definitions.extend(defs);
+            }
+        }
+        prepare_transports(&self.hooks.transports, &definitions)?;
+        for warning in &verdict.warnings {
+            warn!(code = %warning.code, slot = %slot, "{}", warning.message);
+        }
+        Ok((verdict.warnings, superseded_slots))
     }
 
     /// Undeploy a slot (retire its active row) + re-activate the remaining set. `Ok(false)` when
@@ -910,7 +1906,9 @@ impl DeployController {
             .await
             .map_err(|e| e.to_string())?;
         if retired {
-            self.reactivate_from_store().await?;
+            self.reactivate_from_store()
+                .await
+                .map_err(|e| flip_failed_after_store(slot, &e))?;
         }
         Ok(retired)
     }
@@ -931,26 +1929,7 @@ impl DeployController {
         // Validate fail-closed and store ACTIVE — the same durable write the sync path does, so a
         // pod restart mid-flip boots the row from the store and pg LISTEN/NOTIFY converges the
         // fleet. Only the in-process flip is deferred.
-        let archive = sutra_loader::read_archive(&bytes).map_err(|e| format!("{e}"))?;
-        let dep = &archive.deployment;
-        let deployment_id = dep.id.value().to_string();
-        let (tenant, module, version) =
-            (dep.tenant.clone(), dep.module.clone(), dep.version.clone());
-        let slot = format!("{tenant}--{module}--{version}");
-        let new = sutra_persistence::stores::NewArchive {
-            deployment_id: deployment_id.clone(),
-            slot: slot.clone(),
-            tenant,
-            module,
-            version,
-            checksum: deployment_id.clone(),
-            bytes,
-        };
-        let revision = self
-            .store
-            .upsert_active(&new)
-            .await
-            .map_err(|e| e.to_string())?;
+        let (deployment_id, slot, revision, warnings) = self.admit_and_store(bytes).await?;
         // Publish the PENDING marker so a poller sees the accepted id before the flip lands (unless
         // a concurrent flip already made it active).
         if let Ok(mut s) = self.hooks.status.write() {
@@ -1000,6 +1979,7 @@ impl DeployController {
             deployment_id,
             slot,
             revision,
+            warnings,
         })
     }
 
@@ -1109,18 +2089,23 @@ impl DeployController {
     /// rather than from a resident plan is deliberate — it is what lets a fresh pod, or a peer
     /// replica that never saw the deploy, serve the pinned definition too.
     pub(crate) async fn reactivate_from_store(&self) -> Result<(), String> {
-        let served = self
-            .store
-            .list_active_and_draining()
-            .await
-            .map_err(|e| e.to_string())?;
-        let (active, draining) = split_served_archives(served);
-        let id_slots: Vec<(String, String)> = active
+        let SettledStoreSet {
+            active: plans,
+            draining: draining_plans,
+            id_slots,
+            refused,
+        } = settled_store_set(&self.store).await?;
+        let facts: Vec<DeploymentFacts> = plans
             .iter()
-            .map(|a| (a.deployment_id.clone(), a.slot.clone()))
+            .map(|p| {
+                let slot = id_slots
+                    .iter()
+                    .find(|(id, _)| id == p.dep.value())
+                    .map(|(_, slot)| slot.as_str())
+                    .unwrap_or_default();
+                p.facts.clone().in_slot(slot)
+            })
             .collect();
-        let plans = plans_from_store(archive_bytes(active));
-        let draining_plans = plans_from_store(archive_bytes(draining));
         let served_ids: std::collections::HashSet<String> =
             plans.iter().map(|p| p.dep.value().to_string()).collect();
         let draining_ids: Vec<String> = draining_plans
@@ -1177,7 +2162,8 @@ impl DeployController {
                 active,
                 pending,
                 draining: draining_ids,
-                failed: Vec::new(),
+                failed: refused,
+                facts,
             };
         }
         if let Ok(mut m) = self.hooks.specs.write() {
@@ -1241,6 +2227,16 @@ impl DeployController {
     }
 }
 
+/// The durable write landed and the flip after it did not. Not a refusal: the stored state is what a
+/// restart serves, so a caller that took this for "nothing happened" would be wrong.
+fn flip_failed_after_store(slot: &str, error: &str) -> String {
+    format!(
+        "[{}] slot {slot} is stored, but this replica could not flip to it and still serves its \
+         previous state; a restart serves what is stored: {error}",
+        sutra_channels::codes::DEPLOY_ACTIVATE_FLIP_FAILED
+    )
+}
+
 /// Split a served listing into `(active, draining)`, preserving the store's order (per slot,
 /// newest revision first) so the draining tail reaches the relay's scope walk most-recent-first.
 fn split_served_archives(
@@ -1256,15 +2252,6 @@ fn split_served_archives(
         }
     }
     (active, draining)
-}
-
-/// `(deployment_id, bytes)` pairs for [`plans_from_store`] — the store rows re-planned
-/// off-line into deployment plans.
-fn archive_bytes(archives: Vec<ActiveArchive>) -> Vec<(String, Vec<u8>)> {
-    archives
-        .into_iter()
-        .map(|a| (a.deployment_id, a.bytes))
-        .collect()
 }
 
 /// Spawn the db source's quiescence sweep: a boring interval poll that retires DRAINING
@@ -1417,9 +2404,12 @@ pub(crate) fn spawn_deployments_watch(
         if let Ok(mut m) = hooks.node_indexes.write() {
             *m = directory.node_indexes();
         }
-        // A failed apply (e.g. an active-set route conflict) retries every tick until a
-        // source change resolves it — the directory state is ahead of the engine then.
+        // A failed apply (e.g. an auth reference that does not resolve) retries every tick until
+        // a source change resolves it — the directory state is ahead of the engine then, and
+        // the status reports what the engine really serves, not what the directory wants.
         let mut pending_apply = false;
+        let mut apply_error: Option<String> = None;
+        let mut last_applied = directory.status_snapshot();
         loop {
             interval.tick().await;
             // Scan on a blocking thread (fs walk + archive verification + BPMN parse).
@@ -1458,7 +2448,11 @@ pub(crate) fn spawn_deployments_watch(
 
             if needs_apply || pending_apply {
                 match apply_activation(&directory, &hooks).await {
-                    Ok(()) => pending_apply = false,
+                    Ok(()) => {
+                        pending_apply = false;
+                        apply_error = None;
+                        last_applied = directory.status_snapshot();
+                    }
                     Err(e) => {
                         // The flip aborted — old state stays live; next tick retries.
                         pending_apply = true;
@@ -1466,6 +2460,7 @@ pub(crate) fn spawn_deployments_watch(
                             error = %e,
                             "deployment activation failed — previous state stays live"
                         );
+                        apply_error = Some(e);
                     }
                 }
             }
@@ -1473,7 +2468,11 @@ pub(crate) fn spawn_deployments_watch(
             // Republish the state-machine snapshot every tick so /sutra/deployments
             // reflects the current active/draining/failed set — cheap (a small struct clone).
             if let Ok(mut s) = hooks.status.write() {
-                *s = directory.status_snapshot();
+                let mut snapshot = directory.status_snapshot();
+                if let Some(error) = &apply_error {
+                    snapshot.report_unapplied(&last_applied, error);
+                }
+                *s = snapshot;
             }
             // Republish the per-deployment OpenAPI specs + node indexes in lockstep with status.
             if let Ok(mut m) = hooks.specs.write() {
@@ -1578,7 +2577,24 @@ mod status_snapshot_tests {
             pending: vec![("id-pending".into(), "t--m--v2".into())],
             draining: vec!["id-draining".into()],
             failed: vec![("t--m--v3".into(), "boom".into())],
+            facts: Vec::new(),
         }
+    }
+
+    #[test]
+    fn a_failed_flip_reports_the_unapplied_deployment_failed_not_active() {
+        let mut snap = snapshot();
+        let last_applied = DeploymentStatusSnapshot {
+            active: vec![("id-served".into(), "t--m--v".into())],
+            ..Default::default()
+        };
+        snap.report_unapplied(&last_applied, "[CODE] no");
+        assert_eq!(snap.active, last_applied.active);
+        assert!(snap
+            .failed
+            .contains(&("t--m--v".to_string(), "[CODE] no".to_string())));
+        assert!(snap.lookup("id-active").is_none());
+        assert_eq!(snap.lookup("id-served").unwrap()["phase"], "Active");
     }
 
     #[test]

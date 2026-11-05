@@ -9,6 +9,10 @@ pub const PARSE_Q_SOURCE_CODEC_NOT_ALLOWED: &str = "SUTRA.PARSE.Q_SOURCE.CODEC_N
 /// A hard deploy-time error: the attribute was a misnomer (a dedup key ≠ an idempotency assertion).
 pub const PARSE_Q_SOURCE_IDEMPOTENCY_KEY_RENAMED: &str =
     "SUTRA.PARSE.Q_SOURCE.IDEMPOTENCY_KEY_RENAMED";
+/// `<q:source dedupKey>` names a form nothing reads, so it dedupes nothing. Lint, sealing and a new
+/// deploy refuse it. A package already deployed with one keeps running, with an error in the log.
+pub const PARSE_Q_SOURCE_DEDUP_KEY_UNRECOGNISED: &str =
+    "SUTRA.PARSE.Q_SOURCE.DEDUP_KEY_UNRECOGNISED";
 pub const PARSE_Q_SOURCE_MESSAGE_TYPE_CONFLICT: &str = "SUTRA.PARSE.Q_SOURCE.MESSAGE_TYPE_CONFLICT";
 pub const PARSE_Q_SOURCE_MULTIPLE: &str = "SUTRA.PARSE.Q_SOURCE.MULTIPLE";
 pub const PARSE_Q_SIMPLE_VALIDATOR_INCOMPLETE: &str = "SUTRA.PARSE.Q_SIMPLE_VALIDATOR.INCOMPLETE";
@@ -16,6 +20,14 @@ pub const PARSE_Q_CASE_MISSING_WHEN: &str = "SUTRA.PARSE.Q_CASE_MISSING_WHEN";
 pub const PARSE_Q_CASE_MISSING_CALLED_ELEMENT: &str = "SUTRA.PARSE.Q_CASE_MISSING_CALLED_ELEMENT";
 pub const PARSE_Q_ALIAS_MISSING_NAME: &str = "SUTRA.PARSE.Q_ALIAS_MISSING_NAME";
 pub const PARSE_Q_ALIAS_MISSING_EXPRESSION: &str = "SUTRA.PARSE.Q_ALIAS_MISSING_EXPRESSION";
+pub const PARSE_Q_RECEIPT_ATTRIBUTE_MISSING_NAME: &str =
+    "SUTRA.PARSE.Q_RECEIPT_ATTRIBUTE_MISSING_NAME";
+pub const PARSE_Q_RECEIPT_ATTRIBUTE_MISSING_EXPRESSION: &str =
+    "SUTRA.PARSE.Q_RECEIPT_ATTRIBUTE_MISSING_EXPRESSION";
+/// Two `<q:attribute>` of one `<q:receipt>` share a name, so one would silently hide the other.
+pub const CONFIG_RECEIPT_ATTRIBUTE_DUPLICATE: &str = "SUTRA.CONFIG.RECEIPT.ATTRIBUTE_DUPLICATE";
+/// A `<q:attribute>` reads a `sensitive` variable, so the caller only ever sees the mask.
+pub const CONFIG_RECEIPT_ATTRIBUTE_SENSITIVE: &str = "SUTRA.CONFIG.RECEIPT.ATTRIBUTE_SENSITIVE";
 pub const PARSE_Q_REPLY_INVALID_MODE: &str = "SUTRA.PARSE.Q_REPLY_INVALID_MODE";
 pub const PARSE_Q_SEND_CHANNEL_OR_DESTINATION: &str = "SUTRA.PARSE.Q_SEND.CHANNEL_OR_DESTINATION";
 pub const PARSE_Q_HEADER_INCOMPLETE: &str = "SUTRA.PARSE.Q_HEADER.INCOMPLETE";

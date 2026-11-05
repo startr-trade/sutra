@@ -40,6 +40,7 @@ fn port() -> u16 {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "docker"]
 async fn tc_approval_hold_park_relay_resume_lifecycle() {
+    let _suite = sutra_testkit::hold_suite!("approval");
     let client = reqwest::Client::new();
     let port = port();
     let e2e = "E2E-APPROVAL-1";
@@ -85,6 +86,7 @@ async fn tc_approval_hold_park_relay_resume_lifecycle() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "docker"]
 async fn tc_approval_hold_template_showcase() {
+    let _suite = sutra_testkit::hold_suite!("approval");
     let client = reqwest::Client::new();
     let port = port();
 
@@ -118,6 +120,7 @@ async fn tc_approval_hold_template_showcase() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "docker"]
 async fn tc_approval_hold_script_showcase() {
+    let _suite = sutra_testkit::hold_suite!("approval");
     let client = reqwest::Client::new();
     let port = port();
 
@@ -156,6 +159,7 @@ async fn tc_approval_hold_script_showcase() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "docker"]
 async fn tc_approval_hold_throw_showcase() {
+    let _suite = sutra_testkit::hold_suite!("approval");
     let client = reqwest::Client::new();
     let port = port();
 
@@ -178,6 +182,7 @@ async fn tc_approval_hold_throw_showcase() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "docker"]
 async fn tc_approval_hold_subprocess_showcase() {
+    let _suite = sutra_testkit::hold_suite!("approval");
     let client = reqwest::Client::new();
     let port = port();
 
@@ -198,6 +203,7 @@ async fn tc_approval_hold_subprocess_showcase() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "docker"]
 async fn tc_approval_hold_datamapping_showcase() {
+    let _suite = sutra_testkit::hold_suite!("approval");
     let client = reqwest::Client::new();
     let port = port();
 

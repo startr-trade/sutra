@@ -278,6 +278,12 @@ Three surfaces, used together:
 back is only proof of durable receipt, not completion; the actual reply (if any) rides an outbound
 channel, not the original connection. Then check the audit trail for the instance.
 
+**"A message vanished from a broker channel."** A permanent refusal on a broker transport (a body the codec
+refused, a type it does not accept, no matching start event, a tenant quota) deletes, commits past or rejects
+the message, and from 0.6.18 logs a WARN with `SUTRA.INBOUND.DELIVERY_DROPPED`; its `cause_code` says why.
+Search the log for that code. See [Refused deliveries and connection
+references](inbound-refusals.md).
+
 **"The message never became an instance at all."** Run `sutra simulate --channel <name>
 --dry-run` against the deployed BPMN first — a `messageTypeValue`/`messageTypePattern` mismatch on
 the `q:source` is the most common cause, followed by the channel's codec rejecting the payload

@@ -90,7 +90,23 @@ pub struct FileChannelProperties {
     pub ack_mode: AckMode,
 }
 
+/// The connection properties this transport reads as written. A `${` in one is refused at wiring
+/// rather than taken as a literal name. Credentials and `inbound-auth` resolve separately.
+const UNEXPANDED_PROPERTIES: [&str; 2] = ["spool.dir", "directory"];
+
 impl FileChannelProperties {
+    /// [`Self::from_definition`] behind the refusal of a reference in a connection property
+    /// ([`codes::INBOUND_CONFIG_INVALID`]). This is what the wiring runs on, checked first so a
+    /// reference is reported as such and not as a value of the wrong shape.
+    pub(crate) fn for_wiring(def: &ChannelDefinition) -> Result<FileChannelProperties, Diagnostic> {
+        sutra_transport_spi::refuse_unexpanded_references(
+            def,
+            &UNEXPANDED_PROPERTIES,
+            codes::INBOUND_CONFIG_INVALID,
+        )?;
+        FileChannelProperties::from_definition(def)
+    }
+
     pub const DEFAULT_POLL_INTERVAL_MS: u64 = 1000;
 
     /// Read the typed properties off a channel definition. Fails closed

@@ -101,6 +101,44 @@ impl TransportChannels for DaprTransport {
     fn inbound_router(&self) -> Option<Router> {
         Some(self.router.clone())
     }
+
+    /// A channel with no topic, or with broken properties, refuses the flip while the old routes
+    /// and registries are still whole.
+    fn prepare_rewire(&self, active_definitions: &[ChannelDefinition]) -> Result<(), Diagnostic> {
+        dapr_routes_of(active_definitions).map(|_| ())
+    }
+}
+
+/// A topic gives every subscriber its own copy, so any number of deployments may subscribe. The
+/// pub/sub component is part of the identity: one topic name on two components is two topics.
+fn endpoint_claims(def: &ChannelDefinition) -> Vec<sutra_transport_spi::EndpointClaim> {
+    match DaprChannelProperties::from_definition(def) {
+        Ok(props) if props.has_topic() => {
+            let identity = match &props.pubsub_name {
+                Some(component) => format!("pubsub {component} topic {}", props.topic),
+                None => format!("topic {}", props.topic),
+            };
+            vec![sutra_transport_spi::EndpointClaim::broadcast(identity)]
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn preflight(
+    definitions: &[ChannelDefinition],
+    _resolver: sutra_transport_spi::EnvRefResolver,
+    _host: sutra_transport_spi::PreflightHost,
+) -> Result<(), Diagnostic> {
+    dapr_routes_of(definitions).map(|_| ())
+}
+
+inventory::submit! {
+    sutra_transport_spi::EndpointClaimFactory {
+        transport: TRANSPORT,
+        claims: endpoint_claims,
+        listener_prefix: Some("/dapr/"),
+        preflight: Some(preflight),
+    }
 }
 
 /// Factory `spawn` adapter — binds the Dapr channels + builds the transport (ignores `pool`

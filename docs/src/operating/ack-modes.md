@@ -9,13 +9,13 @@ native ack/nack, HTTP gets a status code — but the two values mean the same th
 - **`on-persist`** — acknowledge the moment the engine has durably captured the inbound, *before*
   the BPMN process runs. On a broker: ack immediately, releasing the delivery slot early (lower
   broker-side latency; a redelivery after a mid-process crash is caught by inbox dedup). On HTTP:
-  reply `202 Accepted` with no business body and process asynchronously — the fire-and-forget
+  reply `202 Accepted` with an acceptance receipt (see [Acceptance receipts](../building/acceptance-receipts.md)) and process asynchronously — the fire-and-forget
   intake, whose eventual reply (if any) rides an outbound channel instead of the original
   connection.
 - **`on-complete`** — acknowledge only once the instance reaches a terminal state
   (`INSTANCE_COMPLETED` or `INSTANCE_FAILED`). On a broker: the ack is *deferred* — registered
   against the engine's `DeferredAckRegistry` and held until the instance finishes. On HTTP: hold
-  the connection open until completion and return the reply body — the classic synchronous
+  the connection open until completion and return the reply body (the body of the flow's `<q:reply>`, or an empty body if it declares none; the flow's variables never answer the caller) — the classic synchronous
   request/reply.
 
 ```mermaid
@@ -26,7 +26,7 @@ sequenceDiagram
     S->>E: deliver
     E->>E: durably capture the inbound
     Note over E: on-persist acknowledges here
-    E-->>S: broker ack, or HTTP 202 Accepted with no business body
+    E-->>S: broker ack, or HTTP 202 Accepted with the receipt
     E->>P: start
     P-->>S: eventual reply, if any, on an outbound channel
 ```
@@ -67,7 +67,7 @@ channels:
 `on-persist` decides **when** the caller is answered — now, not when the work finishes. It does not
 decide **what** with. A process that renders a reply before it parks, with
 [`<q:reply continue="true">`](../building/q-namespace.md), sends that reply as the body of the
-`202`; a process that renders nothing gets a bare `202`.
+`202`; a process that renders nothing gets the receipt as the body of the `202`.
 
 That combination is what a long-running intake usually wants. The caller is not held for the work,
 and it still gets back something it can act on — a batch id to quote, a count of what was accepted —
@@ -118,6 +118,15 @@ A channel declaring `ack-mode: on-complete` on a transport whose factory reports
 it never fails silently — the engine emits `SUTRA.ACK.ON_COMPLETE_UNSUPPORTED` at startup and
 runs `on-persist`.
 
+**AWS SQS**, beyond the settle behaviour in the table:
+
+- A message with no `content-type` attribute is decoded with the channel's codec, or read as raw bytes on a
+  channel with no codec.
+- A refused message is deleted. It leaves a WARN `SUTRA.INBOUND.DELIVERY_DROPPED` and, if an audit sink is on,
+  an `inbound.DELIVERY_DROPPED` audit record. See [Refused deliveries and connection
+  references](inbound-refusals.md).
+- `region` and `queue.url` are required, and accept references.
+
 ## The deferred-ack registry
 
 The registry (`sutra-channels`) is a bounded, insertion-ordered structure with three operator
@@ -133,7 +142,7 @@ Eviction is an **operator-visible failure mode**, not a silent memory leak — r
 `SUTRA.ACK.DEFERRED_OVERFLOW` events mean either raise the capacity or find the runaway processes
 that aren't reaching a terminal state. Diagnostic codes at each stage:
 `SUTRA.ACK.DEFERRED_REGISTERED` (debug), `SUTRA.ACK.DEFERRED_ACKED` (debug),
-`SUTRA.ACK.DEFERRED_NACKED` (info — a permanent reject), `SUTRA.ACK.DEFERRED_OVERFLOW` (warn),
+`SUTRA.ACK.DEFERRED_NACKED` (warn — a permanent reject), `SUTRA.ACK.DEFERRED_OVERFLOW` (warn),
 `SUTRA.ACK.DEFERRED_TIMEOUT` (warn), `SUTRA.ACK.ON_COMPLETE_UNSUPPORTED` (warn, at startup).
 
 ```mermaid

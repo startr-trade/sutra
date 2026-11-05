@@ -113,7 +113,7 @@
 
     <!-- RESPOND AND CONTINUE. The render is flushed to the caller as the HTTP response body,
          then the instance parks with a due-now self-resume marker and the poller runs the tail.
-         Distinct from a bare 202 (ack-mode alone): the caller gets a real receipt.
+         Distinct from the engine's own receipt (ack-mode alone): the caller gets the flow's document.
 
          The channel runs `ack-mode: on-persist` (channels.yaml), so this render comes back as
          the body of a `202 Accepted` — the load is not waited on. Under `on-complete` the same

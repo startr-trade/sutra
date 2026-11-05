@@ -54,6 +54,7 @@ fn fixture() -> &'static Fixture {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "docker"]
 async fn tc_lane_leak_a_failed_send_never_reaches_the_next_request() {
+    let _suite = sutra_testkit::hold_suite!("laneleak");
     let client = reqwest::Client::new();
 
     // A sends and fails; the next request on the lane parks. It must succeed on its own terms.

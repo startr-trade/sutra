@@ -11,6 +11,37 @@ pub const CONFIG_PROPERTY_INVALID: &str = "SUTRA.CONFIG.PROPERTY.INVALID";
 pub const CHANNEL_AUTH_MISSING_SCHEME: &str = "SUTRA.CHANNEL.AUTH.MISSING_SCHEME";
 pub const CHANNEL_AUTH_SCHEME_INVALID: &str = "SUTRA.CHANNEL.AUTH.SCHEME_INVALID";
 pub const CHANNEL_NAME_COLLISION: &str = "SUTRA.CHANNEL.NAME.COLLISION";
+/// A deployment claims an exclusive inbound endpoint (an HTTP route, a queue, a subscription, a
+/// consumer group) another active deployment holds. The deploy is refused; the old state serves.
+pub const DEPLOY_ENDPOINT_COLLISION: &str = "SUTRA.DEPLOY.ENDPOINT.COLLISION";
+/// A deployment takes an endpoint from another version of the same tenant and module.
+/// Not a refusal: the older version drains, on every endpoint it held, and this says so.
+pub const DEPLOY_ENDPOINT_SUPERSEDED: &str = "SUTRA.DEPLOY.ENDPOINT.SUPERSEDED";
+/// A deployment in a folder is an older version than one its owner already has there on a shared
+/// endpoint, so it does not serve: in a folder the highest version wins, at every scan and restart.
+pub const DEPLOY_ENDPOINT_OUTRANKED: &str = "SUTRA.DEPLOY.ENDPOINT.OUTRANKED";
+/// `sutra lint`: the active set holds this same version under another file name. Replacing that file
+/// replaces it; under any other name a folder keeps the old content and refuses the new.
+pub const DEPLOY_ENDPOINT_SAME_VERSION_ELSEWHERE: &str =
+    "SUTRA.DEPLOY.ENDPOINT.SAME_VERSION_ELSEWHERE";
+/// Deployments running when the engine came up share an endpoint that now belongs to one owner. They
+/// keep running; a new deployment claiming it is refused.
+pub const DEPLOY_ENDPOINT_ALREADY_SHARED: &str = "SUTRA.DEPLOY.ENDPOINT.ALREADY_SHARED";
+/// A folder archive's label or endpoint identity cannot be stored in the holder record: too long, or
+/// it holds a NUL. Only that archive fails.
+pub const DEPLOY_ENDPOINT_UNRECORDABLE: &str = "SUTRA.DEPLOY.ENDPOINT.UNRECORDABLE";
+/// A channel binds a path another transport serves on the engine's shared listener, so that
+/// transport's route answers first and the channel never receives anything.
+pub const DEPLOY_ENDPOINT_SHADOWED: &str = "SUTRA.DEPLOY.ENDPOINT.SHADOWED";
+/// A deploy or undeploy was stored durably, but the flip that should have followed failed. The
+/// stored state is what a restart serves; this replica still serves its previous state.
+pub const DEPLOY_ACTIVATE_FLIP_FAILED: &str = "SUTRA.DEPLOY.ACTIVATE.FLIP_FAILED";
+/// A check ran where a channel's transport declares no endpoint claims, so that channel could not
+/// be checked. A warning: the engine that links the transport still runs the check at deploy.
+pub const DEPLOY_ENDPOINT_UNCHECKED: &str = "SUTRA.DEPLOY.ENDPOINT.UNCHECKED";
+/// A deployment's data stores would share rows with another deployment's. Sharing a connection is
+/// a legitimate deployment choice, so this only ever warns.
+pub const DEPLOY_DATASTORE_SHARED_CONNECTION: &str = "SUTRA.DEPLOY.DATASTORE.SHARED_CONNECTION";
 pub const CHANNEL_TRANSPORT_UNKNOWN: &str = "SUTRA.CHANNEL.TRANSPORT.UNKNOWN";
 /// A call on a synchronous outbound channel (`ack-mode: on-complete`) was reached by a pass that
 /// cannot carry an in-memory chain — a broadcast fan-out, or a resume driven by an outbox poison
@@ -56,6 +87,15 @@ pub const CONFIG_CHANNEL_SESSION_END_INVALID: &str = "SUTRA.CONFIG.CHANNEL.SESSI
 /// A channel's `pool-call-key:` is malformed (not `header.<name>`) or is declared on a channel
 /// that draws from no capacity pool (`pool:`).
 pub const CONFIG_CHANNEL_POOL_CALL_KEY_INVALID: &str = "SUTRA.CONFIG.CHANNEL.POOL_CALL_KEY_INVALID";
+/// An inbound broker delivery was refused for good and the transport's settle removes it: SQS
+/// deletes it, Kafka commits past it, Pub/Sub acks it, RabbitMQ and AMQP reject it to whatever
+/// dead-letter route the broker has, the file transport moves it to `.failed/`. Logged at WARN
+/// with the refusal's own code as `cause_code`, and recorded in the deployment's audit journal as
+/// `inbound.DELIVERY_DROPPED`.
+pub const INBOUND_DELIVERY_DROPPED: &str = "SUTRA.INBOUND.DELIVERY_DROPPED";
+/// An inbound broker delivery carried an event id already seen on its channel, so it was settled
+/// without running: the first delivery owns the event.
+pub const INBOUND_DUPLICATE_DELIVERY: &str = "SUTRA.INBOUND.DUPLICATE_DELIVERY";
 pub const INBOUND_CODEC_NOT_FOUND: &str = "SUTRA.INBOUND.CODEC_NOT_FOUND";
 pub const INBOUND_CAPABILITY_MISMATCH: &str = "SUTRA.INBOUND.CAPABILITY_MISMATCH";
 pub const INBOUND_NO_START_EVENT_FOR_MESSAGE_TYPE: &str =

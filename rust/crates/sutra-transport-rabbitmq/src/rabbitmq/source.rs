@@ -42,7 +42,8 @@ use sutra_channels::diag::Diagnostic;
 use sutra_channels::dispatch::InboundMessage;
 use sutra_channels::sink::BoxFuture;
 use sutra_channels::source::{
-    AckDecision, DeferredSettle, DeliveryDisposition, InboundIntake, LeaderGate, TriggerSource,
+    AckDecision, DeferredSettle, DeliveryDisposition, DeliveryDropRecord, InboundIntake,
+    LeaderGate, TriggerSource,
 };
 
 use super::{codes, stringify_field, AckMode, RabbitMqChannelProperties, TRANSPORT};
@@ -420,6 +421,10 @@ async fn run_session(
                             delivery_tag = delivery.delivery_tag,
                             "rabbitmq channel rejected delivery — credential did not match expected"
                         );
+                        DeliveryDropRecord::of(&message).audit(&Diagnostic::error(
+                            codes::INBOUND_AUTH_REJECTED,
+                            "the credential did not match the expected key",
+                        ));
                         if let Err(e) =
                             execute_decision(channel, &delivery, AckDecision::NackDrop).await
                         {
@@ -633,20 +638,29 @@ fn to_inbound_message(config: &RabbitMqSourceConfig, delivery: &Delivery) -> Inb
         .map(|s| s.as_str().to_string())
         .filter(|s| !s.trim().is_empty());
     let explicit_event_id = message_id.is_some();
+    // The broker's id, for a flow that declares it as its dedup key. Set here whatever a sender put
+    // in its headers under this name.
+    let mut headers = flatten_headers(delivery);
+    headers.retain(|name, _| !name.eq_ignore_ascii_case(sutra_channels::NATIVE_MESSAGE_ID_HEADER));
+    if let Some(id) = &message_id {
+        headers.insert(
+            sutra_channels::NATIVE_MESSAGE_ID_HEADER.to_string(),
+            id.clone(),
+        );
+    }
     let idempotency_key = message_id.unwrap_or_else(|| delivery.delivery_tag.to_string());
     let content_type = properties
         .content_type()
         .as_ref()
         .map(|s| s.as_str().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "application/octet-stream".to_string());
+        .filter(|s| !s.is_empty());
     InboundMessage {
         tenant: config.tenant.clone(),
         module_key: config.module_key.clone(),
         channel: config.channel.clone(),
-        headers: flatten_headers(delivery),
+        headers,
         body: delivery.data.clone().into(),
-        content_type: Some(content_type),
+        content_type,
         idempotency_key,
         explicit_event_id,
         received_at: now_rfc3339(),
@@ -795,6 +809,12 @@ mod tests {
 
         // FROZEN header names — the AMQP standard properties project under `x-amqp-*`.
         assert_eq!(m.headers.get("x-amqp-message-id").unwrap(), "msg-1");
+        assert_eq!(
+            m.headers
+                .get(sutra_channels::NATIVE_MESSAGE_ID_HEADER)
+                .unwrap(),
+            "msg-1"
+        );
         assert_eq!(m.headers.get("x-amqp-correlation-id").unwrap(), "corr-1");
         assert_eq!(m.headers.get("x-amqp-content-encoding").unwrap(), "utf-8");
         assert_eq!(
@@ -828,9 +848,9 @@ mod tests {
     }
 
     #[test]
-    fn content_type_defaults_to_octet_stream() {
+    fn an_unstated_content_type_stays_absent() {
         let m = to_inbound_message(&config(), &delivery(BasicProperties::default(), b"", 1));
-        assert_eq!(m.content_type.as_deref(), Some("application/octet-stream"));
+        assert_eq!(m.content_type, None);
     }
 
     #[test]

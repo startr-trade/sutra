@@ -142,8 +142,15 @@ impl KafkaChannels {
             .iter()
             .filter(|d| d.transport.as_deref() == Some(TRANSPORT) && !d.is_outbound())
         {
-            let Ok(props) = KafkaChannelProperties::from_definition(def) else {
-                continue;
+            let props = match KafkaChannelProperties::for_wiring(def) {
+                Ok(props) => props,
+                Err(d) => {
+                    warn!(
+                        code = %d.code,
+                        "kafka consumer NOT started during flip: {}", d.message
+                    );
+                    continue;
+                }
             };
             desired.insert(consumer_key(def), (def.clone(), props));
         }
@@ -253,7 +260,7 @@ fn build_and_start_consumer(
 ) -> Result<Option<(ConsumerKey, RunningConsumer)>, Diagnostic> {
     let channel = definition.binding.channel_name.clone();
     let tenant = definition.binding.tenant().to_string();
-    let properties = KafkaChannelProperties::from_definition(definition)?;
+    let properties = KafkaChannelProperties::for_wiring(definition)?;
     let fingerprint = properties.clone();
 
     let singleton = properties.singleton;
@@ -431,6 +438,46 @@ inventory::submit! {
     }
 }
 
+/// Consumers in one group share its membership and rebalances whatever each reads, so a group
+/// belongs to one deployment on any topic. Two deployments on one topic in different groups each
+/// read every message, and that sharing is allowed: the topic is no part of the identity. An unset
+/// `group.id` defaults from the channel name, so the same channel in two deployments lands in the
+/// same group. Earlier engines let that happen, so deployments already sharing a group keep running
+/// and only a new claimant is refused. The server list compares as a set: its order and host case
+/// mean nothing to a client.
+fn endpoint_claims(def: &ChannelDefinition) -> Vec<sutra_transport_spi::EndpointClaim> {
+    let Ok(props) = KafkaChannelProperties::from_definition(def) else {
+        return Vec::new();
+    };
+    if props.topic.is_empty() {
+        return Vec::new();
+    }
+    let mut servers: Vec<String> = props
+        .bootstrap_servers
+        .split(',')
+        .map(sutra_transport_spi::normalized_endpoint_host)
+        .filter(|server| !server.is_empty())
+        .collect();
+    servers.sort();
+    servers.dedup();
+    vec![
+        sutra_transport_spi::EndpointClaim::exclusive_to_new_deployments(
+            format!("{} group {}", servers.join(","), props.group_id),
+            "Set a group.id of its own on each channel; an unset group.id defaults to \
+             sutra-<channel>, so the same channel name in two deployments lands in one group",
+        ),
+    ]
+}
+
+inventory::submit! {
+    sutra_transport_spi::EndpointClaimFactory {
+        transport: TRANSPORT,
+        claims: endpoint_claims,
+        listener_prefix: None,
+        preflight: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -456,6 +503,93 @@ mod tests {
         let mut registry = SinkRegistry::new();
         register_kafka_sink(&mut registry, "");
         assert!(registry.resolve("kafka://t").is_some());
+    }
+}
+
+#[cfg(test)]
+mod connection_reference_guard {
+    use super::spawn_kafka_channels_with_intake;
+    use crate::kafka::KafkaChannelProperties;
+    use std::sync::Arc;
+    use sutra_channels::config::{ChannelBinding, Namespace};
+    use sutra_channels::{
+        AckDecision, BoxFuture, ChannelDefinition, DeploymentId, InboundIntake, InboundMessage,
+    };
+
+    struct NoIntake;
+    impl InboundIntake for NoIntake {
+        fn deliver(&self, _message: InboundMessage) -> BoxFuture<'_, AckDecision> {
+            Box::pin(async { AckDecision::Ack })
+        }
+    }
+
+    fn resolver(_reference: &str) -> Result<String, String> {
+        panic!("the guard runs before anything is resolved");
+    }
+
+    /// A valid inbound definition, with `extra` on top and `reference` set to a `${…}` value.
+    fn definition(extra: &[(&str, &str)], reference: Option<&str>) -> ChannelDefinition {
+        let mut properties: std::collections::BTreeMap<String, String> = [
+            ("bootstrap.servers", "broker:9092"),
+            ("topic", "orders"),
+            ("group.id", "g1"),
+        ]
+        .into_iter()
+        .chain(extra.iter().copied())
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect();
+        if let Some(key) = reference {
+            properties.insert(key.to_string(), "${CHANNEL_SETTING}".to_string());
+        }
+        ChannelDefinition {
+            binding: ChannelBinding::new(
+                "orders-in",
+                Namespace::new("acme", "orders", "v1"),
+                DeploymentId::unresolved(),
+                "opaque",
+            ),
+            transport: Some("kafka".to_string()),
+            bind_spec: None,
+            codec: None,
+            cloud_events_mode: None,
+            auth_scheme: None,
+            idempotency_key_header: None,
+            payload_cap_bytes: None,
+            properties,
+        }
+    }
+
+    #[test]
+    fn wiring_refuses_a_reference_in_each_connection_property() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        for key in ["bootstrap.servers", "topic", "group.id"] {
+            let def = definition(&[], Some(key));
+            let Err(err) = spawn_kafka_channels_with_intake(
+                &[def],
+                Arc::new(NoIntake),
+                None,
+                resolver,
+                runtime.handle().clone(),
+            ) else {
+                panic!("a reference in '{key}' must not wire");
+            };
+            assert_eq!(err.code, "SUTRA.INBOUND.KAFKA.CONFIG_INVALID", "for {key}");
+            assert!(err.message.contains("orders-in"), "{}", err.message);
+            assert!(err.message.contains(&format!("'{key}'")), "{}", err.message);
+            assert!(err.message.contains("later release"), "{}", err.message);
+            assert!(!err.message.contains("CHANNEL_SETTING"), "{}", err.message);
+        }
+    }
+
+    #[test]
+    fn a_literal_connection_property_is_unaffected() {
+        let literal = KafkaChannelProperties::for_wiring(&definition(&[], None))
+            .expect("literal values wire");
+        let plain =
+            KafkaChannelProperties::from_definition(&definition(&[], None)).expect("plain parse");
+        assert_eq!(literal, plain);
     }
 }
 

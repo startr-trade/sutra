@@ -40,6 +40,9 @@ active at once:
 | `sutra.audit.otel.endpoint` | `SUTRA_AUDIT_OTEL_ENDPOINT` | Ships audit events over OTLP to a collector. |
 | `sutra.audit.sql` | `SUTRA_AUDIT_SQL` | Persists audit rows durably in the engine's own datasource, under the same row-level-security policy as every other engine table — see [Multi-tenancy and isolation](../architecture/multi-tenancy.md). |
 
+`sutra.audit.sql` is off by default. With no sink on, an engine writes no audit record, including the
+`inbound.DELIVERY_DROPPED` record for a refused delivery; see [Refused deliveries](inbound-refusals.md).
+
 A process's events go to one sink: the one its `<q:audit sink="…">` names, or else the
 highest-priority sink that is switched on (`sql`, then `jsonl`, then `otel`).
 

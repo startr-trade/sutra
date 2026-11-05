@@ -31,11 +31,11 @@ use testcontainers::runners::SyncRunner;
 use testcontainers::{Container, ImageExt};
 use testcontainers_modules::postgres::Postgres;
 
-const API_KEY: &str = "flip-key";
+pub(crate) const API_KEY: &str = "flip-key";
 
 static SEQ: AtomicU32 = AtomicU32::new(0);
 
-fn temp_root(name: &str) -> PathBuf {
+pub(crate) fn temp_root(name: &str) -> PathBuf {
     let root = std::env::temp_dir().join(format!(
         "wsl-{name}-{}-{}",
         std::process::id(),
@@ -51,14 +51,14 @@ fn temp_root(name: &str) -> PathBuf {
 // channels.yaml + package.yaml) — the authoring unit `assemble_dir` seals into one
 // `.sutra`. The `.sutra` archive is the only deployment model.
 
-fn write(root: &Path, rel: &str, content: &str) {
+pub(crate) fn write(root: &Path, rel: &str, content: &str) {
     let path = root.join(rel);
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(path, content).unwrap();
 }
 
 /// A `package.yaml` for the given authoring triple (labels are opaque selectors).
-fn package_yaml(tenant: &str, module: &str) -> String {
+pub(crate) fn package_yaml(tenant: &str, module: &str) -> String {
     format!(
         "labels:\n  \"tenant\": \"{tenant}\"\n  \"module\": \"{module}\"\n  \"version\": \"1.0.0\"\nengine:\n  minContract: 1\n"
     )
@@ -182,7 +182,7 @@ fn stateful_app_package(sink: SocketAddr, marker: &str) -> PathBuf {
 }
 
 /// Seal one package directory → the single archive's bytes (the `sutra package` code path).
-fn package(package_dir: &Path) -> Vec<u8> {
+pub(crate) fn package(package_dir: &Path) -> Vec<u8> {
     let out = temp_root("pkg");
     let outcome =
         sutra_loader::assemble_dir(package_dir, &out, &sutra_loader::PackageOptions::default())
@@ -193,7 +193,7 @@ fn package(package_dir: &Path) -> Vec<u8> {
 
 // ---- archive tampering ------------------------------------------------------------------
 
-fn entries_of(bytes: &[u8]) -> BTreeMap<String, Vec<u8>> {
+pub(crate) fn entries_of(bytes: &[u8]) -> BTreeMap<String, Vec<u8>> {
     let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
     let mut out = BTreeMap::new();
     for i in 0..archive.len() {
@@ -228,7 +228,7 @@ fn add_stowaway(bytes: &[u8]) -> Vec<u8> {
 
 /// Write/replace an archive ATOMICALLY (temp file + rename) — a poll tick never observes
 /// a half-written or missing file. The operator contract for live swaps.
-fn place_archive(dir: &Path, name: &str, bytes: &[u8]) {
+pub(crate) fn place_archive(dir: &Path, name: &str, bytes: &[u8]) {
     let tmp = dir.join(format!("{name}.tmp"));
     std::fs::write(&tmp, bytes).expect("write temp archive");
     std::fs::rename(&tmp, dir.join(name)).expect("rename into place");
@@ -236,7 +236,7 @@ fn place_archive(dir: &Path, name: &str, bytes: &[u8]) {
 
 // ---- engine boot ---------------------------------------------------------------------------
 
-async fn boot_archive_engine(
+pub(crate) async fn boot_archive_engine(
     deployments_dir: PathBuf,
     datasource_url: Option<String>,
 ) -> RunningEngine {
@@ -277,7 +277,12 @@ async fn boot_archive_engine(
 
 // ---- tiny blocking HTTP client -------------------------------------------------------------
 
-fn http_request(addr: SocketAddr, method: &str, path: &str, body: &[u8]) -> (u16, String) {
+pub(crate) fn http_request(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    body: &[u8],
+) -> (u16, String) {
     let mut stream = TcpStream::connect(addr).expect("connect");
     write!(
         stream,
@@ -301,7 +306,7 @@ fn http_request(addr: SocketAddr, method: &str, path: &str, body: &[u8]) -> (u16
     (status, body)
 }
 
-async fn post(addr: SocketAddr, path: &str, body: &[u8]) -> (u16, String) {
+pub(crate) async fn post(addr: SocketAddr, path: &str, body: &[u8]) -> (u16, String) {
     let (path, body) = (path.to_string(), body.to_vec());
     tokio::task::spawn_blocking(move || http_request(addr, "POST", &path, &body))
         .await
@@ -321,7 +326,7 @@ async fn ready_deployments(addr: SocketAddr) -> Option<u64> {
 }
 
 /// Poll `probe` (≈10×/s) until it returns true or `secs` elapse.
-async fn wait_until<F, Fut>(secs: u64, mut probe: F) -> bool
+pub(crate) async fn wait_until<F, Fut>(secs: u64, mut probe: F) -> bool
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = bool>,
@@ -570,7 +575,7 @@ fn migration_roots() -> Vec<PathBuf> {
     ]
 }
 
-async fn fresh_db() -> (PgPool, String) {
+pub(crate) async fn fresh_db() -> (PgPool, String) {
     let base = format!(
         "postgres://postgres:postgres@127.0.0.1:{}",
         container_port()
@@ -612,12 +617,12 @@ async fn fresh_db() -> (PgPool, String) {
 type CapturedDelivery = (String, Vec<u8>);
 
 #[derive(Clone, Default)]
-struct Capture {
+pub(crate) struct Capture {
     requests: Arc<Mutex<Vec<CapturedDelivery>>>,
 }
 
 impl Capture {
-    fn delivered(&self, path: &str) -> usize {
+    pub(crate) fn delivered(&self, path: &str) -> usize {
         self.requests
             .lock()
             .unwrap()
@@ -640,7 +645,7 @@ async fn capture_handler(
     axum::http::StatusCode::ACCEPTED
 }
 
-async fn capture_server() -> (SocketAddr, Capture) {
+pub(crate) async fn capture_server() -> (SocketAddr, Capture) {
     let capture = Capture::default();
     let app = axum::Router::new()
         .fallback(axum::routing::post(capture_handler))
@@ -736,7 +741,14 @@ async fn pinned_instance_resumes_across_flip_then_old_deployment_retires() {
 /// The `db` deployment source: no folder anywhere — the archive bytes live in
 /// `deployment_archive` and deploys arrive through `POST /admin/deployments`. The poll interval
 /// still matters here: it is the cadence of the retire-when-quiescent sweep on this source.
-async fn boot_db_engine(datasource_url: String) -> RunningEngine {
+pub(crate) async fn boot_db_engine(datasource_url: String) -> RunningEngine {
+    boot_db_engine_with_pools(datasource_url, Default::default()).await
+}
+
+pub(crate) async fn boot_db_engine_with_pools(
+    datasource_url: String,
+    datasource_pools: sutra_engine::config::DatasourcePools,
+) -> RunningEngine {
     // The db source reads `deployment_archive` at boot — that table is the `deploy` migration
     // family, so the engine must see the FULL shipped root list (same value every IT writes).
     std::env::set_var(
@@ -756,7 +768,7 @@ async fn boot_db_engine(datasource_url: String) -> RunningEngine {
         datasource_password: None,
         outbox_tick_interval: std::time::Duration::from_millis(200),
         outbox_tuning: Default::default(),
-        datasource_pools: Default::default(),
+        datasource_pools,
         outbox_retry: Default::default(),
         deferred_ack: Default::default(),
         external_task: Default::default(),

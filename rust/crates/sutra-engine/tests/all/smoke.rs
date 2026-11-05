@@ -120,6 +120,66 @@ async fn boots_and_reports_ready_on_money_transfer_archive() {
     let _ = std::fs::remove_dir_all(&deployments_dir);
 }
 
+/// The status of a GET sending one optional `X-API-Key`.
+fn status_with_key(addr: SocketAddr, path: &str, key: Option<&str>) -> u16 {
+    let mut stream = TcpStream::connect(addr).expect("connect");
+    let key = key.map_or(String::new(), |k| format!("X-API-Key: {k}\r\n"));
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: localhost\r\n{key}Connection: close\r\n\r\n"
+    )
+    .expect("request");
+    let mut response = String::new();
+    stream.read_to_string(&mut response).expect("response");
+    response
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .expect("status code")
+}
+
+/// The real route table, through `serve()`: with admin auth on, the instance reads are behind the
+/// admin gate, and the routes that were never gated stay as they were.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_served_instance_reads_answer_only_to_the_admin_key_when_admin_auth_is_on() {
+    const KEY: &str = "smoke-admin-key";
+    let deployments_dir = money_transfer_deployments_dir();
+    let mut config = config_for(deployments_dir.clone());
+    config.admin_auth.auth_scheme = Some("apikey".to_string());
+    config.admin_auth.auth_key_ref = Some(KEY.to_string());
+    let engine = serve(config).await.expect("engine boots");
+    let addr = engine.local_addr;
+
+    let results = tokio::task::spawn_blocking(move || {
+        let id = "5f0c3d3a-3f0e-4d1e-9f53-7b1a2c9d4e10";
+        let mut seen = Vec::new();
+        for (path, with_key) in [
+            ("/sutra/instances".to_string(), 200),
+            ("/sutra/instances?alias=orderId:O-1".to_string(), 200),
+            (format!("/sutra/instances/{id}"), 404),
+        ] {
+            seen.push((path.clone(), None, status_with_key(addr, &path, None), 401));
+            let wrong = status_with_key(addr, &path, Some("not-the-key"));
+            seen.push((path.clone(), Some("wrong"), wrong, 401));
+            let right = status_with_key(addr, &path, Some(KEY));
+            seen.push((path, Some("right"), right, with_key));
+        }
+        let health = status_with_key(addr, "/sutra/health/live", None);
+        seen.push(("/sutra/health/live".to_string(), None, health, 200));
+        let deployments = status_with_key(addr, "/sutra/deployments", None);
+        seen.push(("/sutra/deployments".to_string(), None, deployments, 200));
+        seen
+    })
+    .await
+    .unwrap();
+    for (path, key, got, want) in results {
+        assert_eq!(got, want, "{path} with key {key:?}");
+    }
+
+    engine.shutdown().await;
+    let _ = std::fs::remove_dir_all(&deployments_dir);
+}
+
 /// The response body (after the header/body separator) of a raw HTTP/1.1 response.
 fn body_of(resp: &str) -> &str {
     resp.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("")

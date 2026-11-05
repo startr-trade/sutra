@@ -54,8 +54,22 @@ pub trait InboxStore {
     /// that processes the delivery commits (so the record and the effects are one transaction)
     /// writes any key no step consumed — `processed` = the dispatch completed, so a redelivery
     /// must be a duplicate — or drops it when the dispatch failed, so a redelivery runs. The
-    /// default is a no-op, for stores that write the record in `record_seen`.
-    async fn settle(&self, _processed: bool) {}
+    /// default is a no-op, for stores that write the record in `record_seen`. `instance_id` is
+    /// the instance the dispatch started or resumed, kept with the record so a later duplicate
+    /// can name it.
+    async fn settle(&self, _processed: bool, _instance_id: Option<&str>) {}
+
+    /// The instance recorded with a triple [`Self::record_seen`] reported as a duplicate. `None`
+    /// when the record names none: it predates records keeping one, or its delivery ended without
+    /// an instance. A read failure is also `None`: a receipt must not fail a duplicate's ack.
+    async fn original_instance(
+        &self,
+        _deployment: &DeploymentId,
+        _channel: &str,
+        _event_id: &str,
+    ) -> Option<String> {
+        None
+    }
 
     /// Dedup keys recorded but not yet written, handed over with a resume that continues on
     /// another lane (whose step then writes them). Default: none.
@@ -85,6 +99,9 @@ pub struct PendingDedup {
 #[derive(Debug, Default)]
 pub struct InMemoryInboxStore {
     seen: RefCell<HashSet<(String, String, String)>>,
+    /// Triples recorded since the last settle, which the settle gives an instance.
+    unsettled: RefCell<Vec<(String, String, String)>>,
+    originals: RefCell<HashMap<(String, String, String), String>>,
 }
 
 impl InMemoryInboxStore {
@@ -101,12 +118,14 @@ impl InboxStore for InMemoryInboxStore {
         channel: &str,
         event_id: &str,
     ) -> DedupCheckOutcome {
-        let first = self.seen.borrow_mut().insert((
+        let triple = (
             deployment.value().to_string(),
             channel.to_string(),
             event_id.to_string(),
-        ));
+        );
+        let first = self.seen.borrow_mut().insert(triple.clone());
         if first {
+            self.unsettled.borrow_mut().push(triple);
             DedupCheckOutcome::First
         } else {
             DedupCheckOutcome::Duplicate
@@ -114,12 +133,40 @@ impl InboxStore for InMemoryInboxStore {
     }
 
     async fn forget(&self, deployment: &DeploymentId, channel: &str, event_id: &str) -> bool {
-        self.seen.borrow_mut().remove(&(
+        let triple = (
             deployment.value().to_string(),
             channel.to_string(),
             event_id.to_string(),
-        ));
+        );
+        self.originals.borrow_mut().remove(&triple);
+        self.seen.borrow_mut().remove(&triple);
         true
+    }
+
+    async fn settle(&self, _processed: bool, instance_id: Option<&str>) {
+        let unsettled = std::mem::take(&mut *self.unsettled.borrow_mut());
+        if let Some(instance_id) = instance_id {
+            let mut originals = self.originals.borrow_mut();
+            for triple in unsettled {
+                originals.insert(triple, instance_id.to_string());
+            }
+        }
+    }
+
+    async fn original_instance(
+        &self,
+        deployment: &DeploymentId,
+        channel: &str,
+        event_id: &str,
+    ) -> Option<String> {
+        self.originals
+            .borrow()
+            .get(&(
+                deployment.value().to_string(),
+                channel.to_string(),
+                event_id.to_string(),
+            ))
+            .cloned()
     }
 }
 

@@ -1449,7 +1449,7 @@ fn explicit_event_id_dedups_the_second_delivery() {
     ));
     assert!(matches!(
         drive(h.engine.dispatch(&msg)).expect("second delivery"),
-        DispatchOutcome::Duplicate
+        DispatchOutcome::Duplicate { .. }
     ));
 }
 
@@ -1616,7 +1616,7 @@ fn wait_state_process_fails_fast_with_persistence_required() {
 // ===== body.<path> dedupKey derivation =====================
 // A `<q:source dedupKey="body.<path>">` spec re-derives the dedup key from the DECODED payload,
 // overriding the transport-supplied key AND driving inbox dedup on it; a missing/blank field
-// or a non-body spec falls back to the transport key untouched.
+// falls back to the transport key untouched.
 
 fn bpmn_with_idempotency(spec: &str) -> String {
     format!(
@@ -1699,10 +1699,26 @@ fn body_path_dedup_key_deduplicates_a_redelivery() {
         "sha256-b",
     )))
     .expect("second dispatch");
-    assert!(
-        matches!(second, DispatchOutcome::Duplicate),
-        "got {second:?}"
+    let DispatchOutcome::Completed {
+        instance_id: original,
+        ..
+    } = first
+    else {
+        unreachable!("checked above")
+    };
+    let DispatchOutcome::Duplicate {
+        original_instance_id,
+        dedup_key,
+    } = second
+    else {
+        panic!("got {second:?}")
+    };
+    assert_eq!(
+        original_instance_id,
+        Some(original),
+        "a duplicate names the instance the first delivery started"
     );
+    assert_eq!(dedup_key, "DUP-1", "the key it was recognised by");
 }
 
 #[test]
@@ -1766,11 +1782,9 @@ fn no_body_spec_leaves_the_transport_supplied_key_untouched() {
 }
 
 #[test]
-fn header_spec_is_left_to_transport_the_engine_does_not_override() {
-    // A `headers.*` (non-`body.`) spec is resolved transport-side; the engine must not
-    // touch the key post-decode.
+fn a_missing_declared_header_leaves_the_transport_key_untouched() {
     let h = build_harness(
-        &bpmn_with_idempotency("headers.X-Request-Id"),
+        &bpmn_with_idempotency("header.X-Request-Id"),
         "json",
         |_, _| {},
     );
@@ -2016,4 +2030,95 @@ fn schemaless_ingress_keeps_its_fail_open_posture() {
             .dispatch(&inbound("orders-in", b"not-json-at-all", "text/plain")),
     )
     .expect("schema-less ingress still proceeds");
+}
+
+// ---- a delivery that states no content type ------------------------------------------------
+
+/// A schema-backed codec that accepts one media type, and reports what it was handed.
+struct XmlOnlyCodec;
+
+impl sutra_codec_spi::PayloadCodec for XmlOnlyCodec {
+    fn name(&self) -> &str {
+        "xml-only"
+    }
+    fn accepted_content_types(&self) -> Vec<String> {
+        vec!["application/xml".to_string()]
+    }
+    fn decode(&self, body: &[u8], content_type: Option<&str>) -> sutra_codec_spi::DecodeResult {
+        sutra_codec_spi::DecodeResult::ok(
+            sutra_codec_spi::CodecValue::Bytes(body.to_vec()),
+            content_type.unwrap_or("none-stated"),
+        )
+    }
+    fn encode(
+        &self,
+        _payload: &sutra_codec_spi::CodecValue,
+        _content_type: Option<&str>,
+    ) -> Result<Vec<u8>, String> {
+        Err("decode only".to_string())
+    }
+}
+
+fn no_content_type_chain() -> InboundChain {
+    let mut codecs = CodecRegistry::with_builtins();
+    codecs.register(XmlOnlyCodec);
+    InboundChain::new(
+        codecs,
+        sutra_channels::FormatRegistry::with_builtins(),
+        ValidatorRegistry::new(),
+    )
+}
+
+fn binding_with_codec(codec: &str) -> ChannelBinding {
+    ChannelBinding::new(
+        "in",
+        Namespace::new("acme", "m", "1.0.0"),
+        DeploymentId::of("dep-000000000000000000000077").expect("valid deployment id"),
+        codec,
+    )
+}
+
+#[test]
+fn a_schema_codec_decodes_a_delivery_with_no_content_type() {
+    let decoded = no_content_type_chain()
+        .decode(&binding_with_codec("xml-only"), b"<a/>", None)
+        .expect("the channel's codec decodes it")
+        .expect("a decode result");
+    assert_eq!(decoded.outcome, sutra_codec_spi::DecodeOutcome::Ok);
+}
+
+#[test]
+fn a_schema_codec_still_refuses_a_stated_type_it_does_not_accept() {
+    let refused = no_content_type_chain()
+        .decode(
+            &binding_with_codec("xml-only"),
+            b"<a/>",
+            Some("application/octet-stream"),
+        )
+        .expect_err("a stated type is honoured");
+    assert_eq!(refused.code, "SUTRA.INBOUND.CAPABILITY_MISMATCH");
+}
+
+#[test]
+fn a_bare_format_decodes_a_delivery_with_no_content_type_with_itself() {
+    let decoded = no_content_type_chain()
+        .decode(&binding_with_codec("json"), br#"{"k":"v"}"#, None)
+        .expect("the declared format parses it")
+        .expect("a decode result");
+    assert!(matches!(
+        decoded.payload,
+        Some(sutra_codec_spi::CodecValue::Json(_))
+    ));
+}
+
+#[test]
+fn no_codec_and_no_content_type_stays_raw_bytes() {
+    let decoded = no_content_type_chain()
+        .decode(&binding_with_codec(""), b"\x00\x01", None)
+        .expect("a no-codec channel never rejects")
+        .expect("a decode result");
+    assert!(matches!(
+        decoded.payload,
+        Some(sutra_codec_spi::CodecValue::Bytes(_))
+    ));
 }

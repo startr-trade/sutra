@@ -668,8 +668,13 @@ impl InstanceBridge for PersistenceBridge {
         // live wait behind and still never loses a send.
         let retained = async {
             let mut tx = begin_deployment_tx(&self.pool, &dep).await?;
-            sutra_persistence::step::record_inbox_seen_in(&mut tx, &dep, &self.pending_for(&dep))
-                .await?;
+            sutra_persistence::step::record_inbox_seen_in(
+                &mut tx,
+                &dep,
+                &self.pending_for(&dep),
+                Some(instance),
+            )
+            .await?;
             let retained = if retain {
                 // Row-locking read, then the SAME key-patch shape `commit_failed` uses: the
                 // stored bytes are re-stamped COMPLETED and written straight back. No decode,
@@ -1034,8 +1039,13 @@ impl InstanceBridge for PersistenceBridge {
         // ONE deployment-scoped transaction — all rows, or none.
         let committed = async {
             let mut tx = begin_deployment_tx(&self.pool, &dep).await?;
-            sutra_persistence::step::record_inbox_seen_in(&mut tx, &dep, &self.pending_for(&dep))
-                .await?;
+            sutra_persistence::step::record_inbox_seen_in(
+                &mut tx,
+                &dep,
+                &self.pending_for(&dep),
+                entries.first().map(|entry| entry.instance_id),
+            )
+            .await?;
             let mut instances = Vec::new();
             for entry in &entries {
                 PgOutboxStore::enqueue_in(&mut tx, entry).await?;
@@ -1109,7 +1119,7 @@ impl ChannelInboxStore for PersistenceBridge {
         }
     }
 
-    async fn settle(&self, processed: bool) {
+    async fn settle(&self, processed: bool, instance_id: Option<&str>) {
         let pending: Vec<sutra_channels::PendingDedup> = self
             .pending_seen
             .lock()
@@ -1122,11 +1132,16 @@ impl ChannelInboxStore for PersistenceBridge {
         // The dispatch completed without a step consuming these keys (it persisted nothing, or
         // ended on another path): record them now, synchronously, so a redelivery is a
         // duplicate.
+        let instance = instance_id.and_then(|id| uuid::Uuid::parse_str(id).ok());
         for p in pending {
             let Ok(dep) = PersistDeploymentId::new(p.deployment.value()) else {
                 continue;
             };
-            match self.inbox.record_seen(&dep, &p.channel, &p.event_id).await {
+            match self
+                .inbox
+                .record_seen_for(&dep, &p.channel, &p.event_id, instance)
+                .await
+            {
                 Ok(true) => {}
                 // Only a delivery that raced another gets here: no step wrote its key, so what it
                 // did was not durable, and it has already run.
@@ -1146,6 +1161,22 @@ impl ChannelInboxStore for PersistenceBridge {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .is_empty()
+    }
+
+    async fn original_instance(
+        &self,
+        deployment: &sutra_executor::DeploymentId,
+        channel: &str,
+        event_id: &str,
+    ) -> Option<String> {
+        let dep = PersistDeploymentId::new(deployment.value()).ok()?;
+        match self.inbox.original_instance(&dep, channel, event_id).await {
+            Ok(found) => found.map(|id| id.to_string()),
+            Err(e) => {
+                warn!(channel, event_id, error = %e, "inbox original-instance read failed");
+                None
+            }
+        }
     }
 
     fn take_pending(&self) -> Vec<sutra_channels::PendingDedup> {
@@ -1236,7 +1267,7 @@ impl IncidentSink for PersistenceBridge {
 mod dedup_tests {
     use std::time::Duration;
 
-    use sutra_channels::{DedupCheckOutcome, InboxStore as _};
+    use sutra_channels::DedupCheckOutcome;
 
     use super::*;
 

@@ -98,6 +98,13 @@ fixtures register into the one registry and the one atexit hook reaps them toget
 consolidation does not weaken the reaper (it is exercised by any tier-2 run; a `docker ps`
 after a docker suite shows zero leaked fixtures).
 
+A conformance suite's docker network does not wait for that. Each test in a `tc_*` module starts
+with `let _suite = sutra_testkit::hold_suite!("<suite>");`, and when the module's last test ends,
+by returning or by panicking, the suite's containers and network go. Docker's address pools hold
+about 30 networks shared with the whole machine, and one binary holds a network per suite, so
+without this a full run can fail partway through with "all predefined address pools have been fully
+subnetted". A tier-1 test (`suite_guard_coverage`) fails on a test without the line.
+
 Caveat: `atexit` handlers — like every Rust destructor — do **not** run on `SIGKILL` or a
 hard crash. If a docker run is killed (e.g. `kill -9`, OOM, CI cancel), fixtures can
 survive. `make docker-clean` (`scripts/dev-docker-cleanup.sh`) reaps them, together with the

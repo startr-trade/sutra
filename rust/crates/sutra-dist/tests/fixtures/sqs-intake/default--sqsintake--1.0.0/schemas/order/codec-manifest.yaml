@@ -1,0 +1,3 @@
+# The contract of the orders queue (`urn:order`).
+schemaKind: xsd
+formats: [xml]

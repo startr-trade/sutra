@@ -274,7 +274,7 @@ async fn three_emissions_from_one_instance_all_deliver() {
     .expect("engine boots");
     let addr = engine.local_addr;
 
-    // Async intake: 202 Accepted, no business body.
+    // Async intake: 202 Accepted, with the engine's receipt and no business body.
     let status =
         tokio::task::spawn_blocking(move || http_post(addr, "/channels/wsa-in", "{\"amount\":42}"))
             .await

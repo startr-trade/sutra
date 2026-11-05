@@ -293,3 +293,19 @@ async fn a_callback_with_a_bad_signature_is_rejected_before_intake() {
         .unwrap();
     assert_eq!(status(unknown), StatusCode::NOT_FOUND);
 }
+
+/// A folder judges an archive with this before it can displace anything, so it has to refuse what
+/// the flip will refuse.
+#[test]
+fn a_job_channel_passes_preflight_only_where_there_is_a_database() {
+    let job = definitions(&job_yaml(&[("job", "")], "", &hooks_channel("")));
+    let host = |persistence| sutra_transport_spi::PreflightHost { persistence };
+    assert!(sutra_transport_spi::preflight_definitions(&job, resolver, host(true)).is_ok());
+    let refused = sutra_transport_spi::preflight_definitions(&job, resolver, host(false))
+        .expect_err("no database, no job channel");
+    assert!(
+        refused.message.contains("needs the engine database"),
+        "{}",
+        refused.message
+    );
+}

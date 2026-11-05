@@ -111,7 +111,7 @@ impl PgInflightChainStore {
             PersistenceError::InvalidArgument(format!("in-flight marker keys: {e}"))
         })?;
         let mut tx = begin_deployment_tx(&self.pool, deployment).await?;
-        crate::step::record_inbox_seen_in(&mut tx, deployment, dedup_keys).await?;
+        crate::step::record_inbox_seen_in(&mut tx, deployment, dedup_keys, Some(instance)).await?;
         sqlx::query(SQL_BEGIN)
             .bind(deployment.as_str())
             .bind(instance)

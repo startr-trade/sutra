@@ -707,7 +707,15 @@ jobs:
             # Only authored notes are re-pushed; --generate-notes would clobber a body someone
             # had edited by hand with GitHub's commit list.
             if [ -f ".github/releases/$TAG.md" ]; then
-              gh release edit "$TAG" --notes-file ".github/releases/$TAG.md"
+              n=1
+              until gh release edit "$TAG" --notes-file ".github/releases/$TAG.md"; do
+                if [ "$n" -ge 5 ]; then
+                  echo "gh release edit failed after $n attempts" >&2
+                  exit 1
+                fi
+                sleep $((n * 20))
+                n=$((n + 1))
+              done
             fi
           else
             gh release create "$TAG" \
@@ -716,7 +724,7 @@ jobs:
               --verify-tag \
               $prerelease
           fi
-          gh release upload "$TAG" dist/* --clobber
+          bash scripts/release-upload-assets.sh "$TAG" dist
 
   # ---------------------------------------------------------------------------
   # 4. crates.io — the library crates, in dependency order.

@@ -182,6 +182,7 @@ async fn surfaces_showing(secret: &str, instance: &str) -> Vec<&'static str> {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "docker"]
 async fn tc_masking_a_declared_flow_shows_the_raw_body_on_no_surface_and_still_resumes() {
+    let _suite = sutra_testkit::hold_suite!("masking");
     fixture();
     let secret = "RAW-SECRET-MASKED-1";
     post(
@@ -219,6 +220,7 @@ async fn tc_masking_a_declared_flow_shows_the_raw_body_on_no_surface_and_still_r
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "docker"]
 async fn tc_masking_a_flow_that_declares_nothing_shows_it_as_before() {
+    let _suite = sutra_testkit::hold_suite!("masking");
     fixture();
     let secret = "RAW-SECRET-PLAIN-1";
     post(
@@ -239,10 +241,41 @@ async fn tc_masking_a_flow_that_declares_nothing_shows_it_as_before() {
     }
 }
 
+/// A key only the flow declares is masked like a channel's, and still dedupes on its real value.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "docker"]
+async fn tc_masking_a_declared_dedup_key_shows_on_no_surface_and_still_dedupes() {
+    let _suite = sutra_testkit::hold_suite!("masking");
+    fixture();
+    let secret = "DECLARED-DEDUP-SECRET-7";
+    for _ in 0..2 {
+        let status = post_with(
+            "masked-keyed-in",
+            API_KEY,
+            &[("X-Dedup-Id", secret)],
+            r#"{"ref":"declared-key-ref"}"#.to_string(),
+        )
+        .await;
+        assert!((200..300).contains(&status), "{status}");
+    }
+    let instance = parked_instance("declared-key-ref").await;
+    assert_eq!(
+        sql(&format!(
+            "SELECT count(*) FROM inbox_seen WHERE event_id = '{secret}'"
+        )),
+        "1"
+    );
+    assert_eq!(
+        surfaces_showing(secret, &instance).await,
+        Vec::<&str>::new()
+    );
+}
+
 /// Masking changes what the surfaces show, not what the engine does with a header.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "docker"]
 async fn tc_masking_auth_idempotency_correlation_and_tracing_still_work() {
+    let _suite = sutra_testkit::hold_suite!("masking");
     fixture();
     // Inbound auth reads the real header.
     let refused = post_with(

@@ -181,7 +181,7 @@ impl EngineTransportAuditJournal {
             event_type,
             node_id: event.node_id.clone(),
             diagnostic_code: event.diagnostic_code.clone(),
-            diagnostic_json: None,
+            diagnostic_json: event.diagnostic_json.clone(),
             payload_json: transport_audit_payload(capture, event),
             // A transport event is about a delivery, not an instance pass: no alias keys.
             correlation: Default::default(),

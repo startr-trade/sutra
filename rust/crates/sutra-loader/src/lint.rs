@@ -533,12 +533,22 @@ pub fn validate_deployment_with_manifests(
     check_store_structures(deployment, &stores, &dep_label, out);
     check_node_references(deployment, &definitions, &dep_label, out);
     check_feel_sites(deployment, &dep_label, out);
+    check_receipt_attributes(deployment, &dep_label, out);
     check_timer_config_keys(deployment, &dep_label, out);
     out.extend(timer_expression_name_faults(deployment, &dep_label));
     check_template_inputs(deployment, &definitions, &dep_label, out);
     check_transient_reads(deployment, &dep_label, out);
     check_raw_body_masking(deployment, &dep_label, out);
     check_never_initialized(deployment, &dep_label, out);
+    for found in unrecognised_dedup_keys(deployment) {
+        out.push(
+            LintDiagnostic::error(
+                sutra_bpmn::codes::PARSE_Q_SOURCE_DEDUP_KEY_UNRECOGNISED,
+                found.describe_refusal(),
+            )
+            .at_node(&found.process, &found.node),
+        );
+    }
     check_validation_posture(deployment, &definitions, &dep_label, out);
     check_codec_manifests(deployment, &dep_label, out);
     check_navigation_paths(deployment, &definitions, &dep_label, out);
@@ -1513,10 +1523,23 @@ fn check_channel_uniqueness(
             }
         }
 
+        // WARN — a subscriber that gets its own copy, with no dedup key anything reads.
+        let own_copy = receives_its_own_copy(def);
+        if own_copy {
+            check_redelivery_dedup(channel, def, &subscribers, dep_label, out);
+        }
+
         // ERROR — non-broadcast uniqueness (broadcast channels are exempt: pub/sub, so any
         // predicate including an opaque one is accepted there).
         if !def.binding.broadcast {
-            check_non_broadcast_uniqueness(channel, &subscribers, &declared_list, dep_label, out);
+            check_non_broadcast_uniqueness(
+                channel,
+                &subscribers,
+                &declared_list,
+                dep_label,
+                own_copy,
+                out,
+            );
         }
     }
 
@@ -1812,11 +1835,64 @@ fn report_group(
     }
 }
 
+/// Does a channel hand each subscriber its own copy of every event: one flagged `broadcast`, or one
+/// bound to a topic, which fans out to every channel on it in any deployment. One delivery answers
+/// for all of those, so one failure brings the event back to all of them.
+fn receives_its_own_copy(def: &ChannelDefinition) -> bool {
+    def.binding.broadcast
+        || match def.transport.as_deref() {
+            Some("dapr" | "knative") => true,
+            Some("amqp") => def.properties.contains_key("topic"),
+            _ => false,
+        }
+}
+
+/// Is there a key to dedupe on? One the flow declares is read at dispatch, wherever it names. A
+/// channel's `idempotency-key-header` is an explicit signal of its own. Anything less leaves only
+/// whatever id an event happens to carry.
+fn has_a_dedup_key(source: &SourceBinding, def: &ChannelDefinition) -> bool {
+    source.dedup_key.is_some()
+        || def
+            .idempotency_key_header
+            .as_deref()
+            .is_some_and(|header| !header.trim().is_empty())
+}
+
+fn check_redelivery_dedup(
+    channel: &str,
+    def: &ChannelDefinition,
+    subscribers: &[Subscriber<'_>],
+    dep_label: &str,
+    out: &mut Vec<LintDiagnostic>,
+) {
+    for sub in subscribers {
+        if has_a_dedup_key(sub.source, def) {
+            continue;
+        }
+        out.push(
+            LintDiagnostic::warning(
+                codes::CHANNEL_NO_IDEMPOTENCY_KEY,
+                format!(
+                    "deployment {dep_label}: process '{}' gets its own copy of each event on \
+                     channel '{channel}', and declares no dedup key. When another subscriber fails \
+                     the event comes back to all of them, so this flow can run twice. A CloudEvents \
+                     id dedupes it where the event has one and the channel reads CloudEvents; to be \
+                     sure, declare <q:source dedupKey> (header.<name>, ce.id or body.<path>) or the \
+                     channel's idempotency-key-header",
+                    sub.process_id,
+                ),
+            )
+            .at_process(sub.process_id),
+        );
+    }
+}
+
 fn check_non_broadcast_uniqueness(
     channel: &str,
     subscribers: &[Subscriber<'_>],
     declared_list: &[String],
     dep_label: &str,
+    own_copy: bool,
     out: &mut Vec<LintDiagnostic>,
 ) {
     let mut catch_all = Vec::new();
@@ -1839,7 +1915,7 @@ fn check_non_broadcast_uniqueness(
     // transport-side explicit signal deduplicates.
     for sub in subscribers {
         let typed = sub.value().is_some() || sub.pattern().is_some();
-        if typed && sub.source.dedup_key.is_none() {
+        if typed && !own_copy && sub.source.dedup_key.is_none() {
             out.push(
                 LintDiagnostic::warning(
                     codes::CHANNEL_NO_IDEMPOTENCY_KEY,
@@ -3766,6 +3842,70 @@ fn check_feel_sites(deployment: &LoadedDeployment, dep_label: &str, out: &mut Ve
     }
 }
 
+/// `<q:receipt>` attributes: the expression must parse, each name may appear once (the receipt is a
+/// map, so a second would silently hide the first), and an attribute reading a `sensitive` variable
+/// is pointed out, because the engine masks it on every receipt and the caller learns nothing.
+/// Parse-checked rather than purity-checked: the value is computed once for one answer, never
+/// replayed.
+fn check_receipt_attributes(
+    deployment: &LoadedDeployment,
+    dep_label: &str,
+    out: &mut Vec<LintDiagnostic>,
+) {
+    let mut seen_processes = BTreeSet::new();
+    for module in deployment.processes.values() {
+        for process in module.processes() {
+            if !seen_processes.insert(process.id.clone()) {
+                continue;
+            }
+            let anchor = || DiagnosticAnchor::BpmnNode {
+                process: process.id.clone(),
+                node: process.id.clone(),
+            };
+            let mut names = BTreeSet::new();
+            for attribute in &process.receipt_attributes {
+                let site = format!(
+                    "process '{}' <q:receipt> attribute '{}'",
+                    process.id, attribute.name
+                );
+                check_feel_parses(&attribute.expression, &site, anchor(), dep_label, out);
+                if !names.insert(attribute.name.as_str()) {
+                    out.push(
+                        LintDiagnostic::error(
+                            sutra_bpmn::codes::CONFIG_RECEIPT_ATTRIBUTE_DUPLICATE,
+                            format!(
+                                "deployment {dep_label}: {site} is declared more than once; a \
+                                 receipt carries one value per name."
+                            ),
+                        )
+                        .at_anchor(anchor()),
+                    );
+                }
+                for declared in process.declared_variables.iter().filter(|d| d.sensitive) {
+                    if sutra_executor::audit_correlation::expression_reads(
+                        &attribute.expression,
+                        &declared.name,
+                    ) {
+                        out.push(
+                            LintDiagnostic::warning(
+                                sutra_bpmn::codes::CONFIG_RECEIPT_ATTRIBUTE_SENSITIVE,
+                                format!(
+                                    "deployment {dep_label}: {site} reads sensitive variable \
+                                     '{}', so every receipt shows it as {}. Expose a value that \
+                                     is safe for the caller to see, or remove the attribute.",
+                                    declared.name,
+                                    sutra_bpmn::REDACTED_PLACEHOLDER
+                                ),
+                            )
+                            .at_anchor(anchor()),
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// The assignment-side FEEL texts one node carries, each with a short label for the diagnostic.
 fn assignment_feel_sites(node: &Node) -> Vec<(String, String)> {
     let mut sites = Vec::new();
@@ -4676,6 +4816,69 @@ fn check_validation_posture(
 /// whole check is SUPPRESSED for any process that carries an opaque writer (see
 /// [`has_opaque_writer`]) — a `scriptTask` / `businessRuleTask` / non-template serviceTask can merge
 /// variable names the analyzer cannot see, so nothing in such a process is provably never-written.
+/// A `<q:source dedupKey>` in a form nothing reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnrecognisedDedupKey {
+    pub process: String,
+    pub node: String,
+    pub form: String,
+}
+
+impl UnrecognisedDedupKey {
+    /// Why a new seal, lint or deploy is refused.
+    pub fn describe_refusal(&self) -> String {
+        format!(
+            "process '{}' node '{}' declares dedupKey '{}', which nothing reads. The recognised \
+             forms are {}.",
+            self.process,
+            self.node,
+            self.form,
+            sutra_bpmn::qbindings::RECOGNISED_DEDUP_KEY_FORMS
+        )
+    }
+
+    /// What a deployment already running with one is told, at each load.
+    pub fn describe_running(&self, package: &str) -> String {
+        format!(
+            "package {package}: process '{}' node '{}' declares dedupKey '{}', which dedupes \
+             nothing, so it runs as if it declared no key. The package keeps running, and a new \
+             deploy of it is refused. The recognised forms are {}.",
+            self.process,
+            self.node,
+            self.form,
+            sutra_bpmn::qbindings::RECOGNISED_DEDUP_KEY_FORMS
+        )
+    }
+}
+
+/// Every `dedupKey` of `deployment` in a form nothing reads.
+pub fn unrecognised_dedup_keys(deployment: &LoadedDeployment) -> Vec<UnrecognisedDedupKey> {
+    let mut seen = BTreeSet::new();
+    let mut found = Vec::new();
+    for module in deployment.processes.values() {
+        for process in module.processes() {
+            if !seen.insert(process.id.clone()) {
+                continue;
+            }
+            for node in process.nodes() {
+                for source in &process.bindings_for(node.id()).sources {
+                    let Some(form) = source.dedup_key.as_deref() else {
+                        continue;
+                    };
+                    if !sutra_bpmn::qbindings::is_recognised_dedup_key(form) {
+                        found.push(UnrecognisedDedupKey {
+                            process: process.id.clone(),
+                            node: node.id().to_string(),
+                            form: form.to_string(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    found
+}
+
 fn check_never_initialized(
     deployment: &LoadedDeployment,
     dep_label: &str,
@@ -5512,9 +5715,14 @@ fn check_navigation_paths(
                     }
                 }
                 for source in &bindings.sources {
-                    if let Some(key) = &source.dedup_key {
+                    // Only a body path navigates the payload; the other forms name no field of it.
+                    if let Some(path) = source
+                        .dedup_key
+                        .as_deref()
+                        .and_then(|key| key.trim().strip_prefix("body."))
+                    {
                         check_nav_expression(
-                            key,
+                            &format!("payload.{path}"),
                             "dedupKey",
                             process,
                             &anchor,

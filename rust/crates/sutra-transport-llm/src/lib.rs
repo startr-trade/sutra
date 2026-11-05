@@ -234,8 +234,9 @@ impl TransportChannels for LlmTransport {
         self.table.len() + self.callbacks.len()
     }
 
-    /// Rebuild from the newly active set; a bad channel is logged and left out, the rest
-    /// go live.
+    /// Rebuild from the newly active set. [`Self::prepare_rewire`] has already accepted it, so a
+    /// failure here means a reference stopped resolving in between: that channel is logged and left
+    /// out, and the rest go live.
     async fn rewire(&self, active: &[ChannelDefinition]) {
         for diagnostic in self.install(active) {
             tracing::warn!(
@@ -244,6 +245,19 @@ impl TransportChannels for LlmTransport {
                 "llm channel skipped on activation flip: {}",
                 diagnostic.message
             );
+        }
+    }
+
+    /// A channel that does not parse, or whose callback secret does not resolve, refuses the flip
+    /// while the old channels and registries are still whole.
+    fn prepare_rewire(&self, active: &[ChannelDefinition]) -> Result<(), Diagnostic> {
+        let mut parsed = parse_all(active, self.resolver);
+        if self.jobs.is_none() {
+            without_jobs(&mut parsed.channels, &mut parsed.failures);
+        }
+        match parsed.failures.into_iter().next() {
+            Some(failure) => Err(failure),
+            None => Ok(()),
         }
     }
 
@@ -331,5 +345,90 @@ inventory::submit! {
     InlineCallerFactory {
         transport: TRANSPORT,
         build: build_inline,
+    }
+}
+
+/// A callback path answers one provider call, so it belongs to one deployment. Only inbound
+/// `transport: llm` channels reach this; their bind is the served callback route. The identity is
+/// the method and path the callback table serves, not the bind as written: any case of the method
+/// and any whitespace name one route.
+fn endpoint_claims(def: &ChannelDefinition) -> Vec<sutra_transport_spi::EndpointClaim> {
+    let bind = def.bind_spec.as_deref().map(str::trim).unwrap_or("");
+    if bind.is_empty() {
+        return Vec::new();
+    }
+    let identity = match bind.split_once(char::is_whitespace) {
+        Some((method, path)) => format!("{} {}", method.to_ascii_uppercase(), path.trim()),
+        None => bind.to_string(),
+    };
+    vec![sutra_transport_spi::EndpointClaim::exclusive(identity)]
+}
+
+/// Would the channels parse? Secrets resolve through the engine's resolver, as a flip would.
+fn preflight(
+    definitions: &[ChannelDefinition],
+    resolver: EnvRefResolver,
+    host: sutra_transport_spi::PreflightHost,
+) -> Result<(), Diagnostic> {
+    let mut parsed = parse_all(definitions, resolver);
+    if !host.persistence {
+        without_jobs(&mut parsed.channels, &mut parsed.failures);
+    }
+    match parsed.failures.into_iter().next() {
+        Some(failure) => Err(failure),
+        None => Ok(()),
+    }
+}
+
+inventory::submit! {
+    sutra_transport_spi::EndpointClaimFactory {
+        transport: TRANSPORT,
+        claims: endpoint_claims,
+        listener_prefix: Some(CALLBACK_PATH_PREFIX),
+        preflight: Some(preflight),
+    }
+}
+
+#[cfg(test)]
+mod endpoint_claim_tests {
+    use super::*;
+
+    fn definitions(body: &str) -> Vec<ChannelDefinition> {
+        let yaml = format!("channels:\n  - name: in\n{body}");
+        sutra_channels::load_channel_definitions(yaml.as_bytes(), "t", "m", "1", "channels.yaml")
+            .expect("channel yaml")
+    }
+
+    fn resolve_nothing(reference: &str) -> Result<String, String> {
+        Err(format!("cannot resolve {reference}"))
+    }
+
+    #[test]
+    fn any_spelling_of_a_callback_bind_is_one_endpoint() {
+        let claim = |bind: &str| {
+            endpoint_claims(&definitions(&format!("    transport: llm\n    bind: \"{bind}\"\n"))[0])
+        };
+        assert_eq!(claim("POST /llm/x"), claim("post   /llm/x"));
+        assert_ne!(claim("POST /llm/x"), claim("POST /llm/y"));
+    }
+
+    /// A callback whose provider or secret does not hold refuses the flip whole. It used to go ahead
+    /// with that one channel left out, with the registries already flipped.
+    #[test]
+    fn a_callback_that_cannot_be_served_refuses_the_flip() {
+        let bad = definitions(
+            "    transport: llm\n    bind: \"POST /llm/x\"\n    llm:\n      callback-for: no-such-provider\n      callback-secret: env:NEVER_SET\n",
+        );
+        let host = sutra_transport_spi::PreflightHost { persistence: true };
+        assert!(preflight(&bad, resolve_nothing, host).is_err());
+        let transport = LlmTransport {
+            table: Default::default(),
+            callbacks: Default::default(),
+            resolver: resolve_nothing,
+            jobs: None,
+            publish: false,
+        };
+        assert!(transport.prepare_rewire(&bad).is_err());
+        assert!(transport.prepare_rewire(&[]).is_ok());
     }
 }

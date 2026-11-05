@@ -63,6 +63,7 @@ fn build_topology() -> Topology {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "docker"]
 async fn tc_money_transfer_acid_ledger() {
+    let _suite = sutra_testkit::hold_suite!("mt");
     let port = topology().engine.http_port;
     let client = reqwest::Client::new();
 

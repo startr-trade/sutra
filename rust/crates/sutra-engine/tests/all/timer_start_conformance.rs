@@ -46,6 +46,7 @@ fn container_port() -> u16 {
                 .with_tag("16-alpine")
                 .start()
                 .expect("postgres container starts");
+            sutra_testkit::reap_on_exit(container.id());
             let port = container
                 .get_host_port_ipv4(5432)
                 .expect("mapped postgres port");

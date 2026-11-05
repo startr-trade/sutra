@@ -128,8 +128,15 @@ impl FileChannels {
             .iter()
             .filter(|d| d.transport.as_deref() == Some(TRANSPORT) && !d.is_outbound())
         {
-            let Ok(props) = FileChannelProperties::from_definition(def) else {
-                continue;
+            let props = match FileChannelProperties::for_wiring(def) {
+                Ok(props) => props,
+                Err(d) => {
+                    warn!(
+                        code = %d.code,
+                        "file consumer NOT started during flip: {}", d.message
+                    );
+                    continue;
+                }
             };
             desired.insert(consumer_key(def), (def.clone(), props));
         }
@@ -248,7 +255,7 @@ fn build_and_start_consumer(
 ) -> Result<Option<(ConsumerKey, RunningConsumer)>, Diagnostic> {
     let channel = definition.binding.channel_name.clone();
     let tenant = definition.binding.tenant().to_string();
-    let properties = FileChannelProperties::from_definition(definition)?;
+    let properties = FileChannelProperties::for_wiring(definition)?;
     let fingerprint = properties.clone();
 
     let singleton = properties.singleton;
@@ -423,6 +430,34 @@ inventory::submit! {
     }
 }
 
+/// A spool directory hands each file to one reader, so it belongs to one deployment. `.` segments,
+/// doubled and trailing slashes mean nothing, so they go. `..` stays: with a symlink in the path,
+/// removing it lexically could name another directory.
+fn endpoint_claims(def: &ChannelDefinition) -> Vec<sutra_transport_spi::EndpointClaim> {
+    let Ok(props) = FileChannelProperties::from_definition(def) else {
+        return Vec::new();
+    };
+    let dir = props.spool_dir.to_string_lossy();
+    let rooted = if dir.starts_with('/') { "/" } else { "" };
+    let segments: Vec<&str> = dir
+        .split('/')
+        .filter(|segment| !segment.is_empty() && *segment != ".")
+        .collect();
+    vec![sutra_transport_spi::EndpointClaim::exclusive(format!(
+        "spool {rooted}{}",
+        segments.join("/")
+    ))]
+}
+
+inventory::submit! {
+    sutra_transport_spi::EndpointClaimFactory {
+        transport: TRANSPORT,
+        claims: endpoint_claims,
+        listener_prefix: None,
+        preflight: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -437,5 +472,89 @@ mod tests {
         assert!(registry.resolve("file://relative/dir/").is_some());
         assert!(registry.resolve("https://host/cb").is_none());
         assert!(registry.resolve("kafka://topic").is_none());
+    }
+}
+
+#[cfg(test)]
+mod connection_reference_guard {
+    use super::spawn_file_channels_with_intake;
+    use crate::file::FileChannelProperties;
+    use std::sync::Arc;
+    use sutra_channels::config::{ChannelBinding, Namespace};
+    use sutra_channels::{
+        AckDecision, BoxFuture, ChannelDefinition, DeploymentId, InboundIntake, InboundMessage,
+    };
+
+    struct NoIntake;
+    impl InboundIntake for NoIntake {
+        fn deliver(&self, _message: InboundMessage) -> BoxFuture<'_, AckDecision> {
+            Box::pin(async { AckDecision::Ack })
+        }
+    }
+
+    fn resolver(_reference: &str) -> Result<String, String> {
+        panic!("the guard runs before anything is resolved");
+    }
+
+    /// A valid inbound definition, with `extra` on top and `reference` set to a `${…}` value.
+    fn definition(extra: &[(&str, &str)], reference: Option<&str>) -> ChannelDefinition {
+        let mut properties: std::collections::BTreeMap<String, String> =
+            [("spool.dir", "/data/in")]
+                .into_iter()
+                .chain(extra.iter().copied())
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect();
+        if let Some(key) = reference {
+            properties.insert(key.to_string(), "${CHANNEL_SETTING}".to_string());
+        }
+        ChannelDefinition {
+            binding: ChannelBinding::new(
+                "orders-in",
+                Namespace::new("acme", "orders", "v1"),
+                DeploymentId::unresolved(),
+                "opaque",
+            ),
+            transport: Some("file".to_string()),
+            bind_spec: None,
+            codec: None,
+            cloud_events_mode: None,
+            auth_scheme: None,
+            idempotency_key_header: None,
+            payload_cap_bytes: None,
+            properties,
+        }
+    }
+
+    #[test]
+    fn wiring_refuses_a_reference_in_each_connection_property() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        for key in ["spool.dir", "directory"] {
+            let def = definition(&[], Some(key));
+            let Err(err) = spawn_file_channels_with_intake(
+                &[def],
+                Arc::new(NoIntake),
+                None,
+                resolver,
+                runtime.handle().clone(),
+            ) else {
+                panic!("a reference in '{key}' must not wire");
+            };
+            assert_eq!(err.code, "SUTRA.INBOUND.FILE.CONFIG_INVALID", "for {key}");
+            assert!(err.message.contains("orders-in"), "{}", err.message);
+            assert!(err.message.contains(&format!("'{key}'")), "{}", err.message);
+            assert!(err.message.contains("later release"), "{}", err.message);
+            assert!(!err.message.contains("CHANNEL_SETTING"), "{}", err.message);
+        }
+    }
+
+    #[test]
+    fn a_literal_connection_property_is_unaffected() {
+        let literal =
+            FileChannelProperties::for_wiring(&definition(&[], None)).expect("literal values wire");
+        let plain =
+            FileChannelProperties::from_definition(&definition(&[], None)).expect("plain parse");
+        assert_eq!(literal, plain);
     }
 }

@@ -645,13 +645,16 @@ impl StatusCounts {
     }
 }
 
-/// `GET /sutra/instances?includeTerminal=true` — the unauthenticated, cluster-internal operate
-/// surface (NOT `/admin/*`; no OIDC gate to reach), reused rather than re-decoding snapshot
-/// bytes here: the engine's own handler already applies the correct snapshot codec (typed
+/// `GET /sutra/instances?includeTerminal=true` on the engine this command booted itself. That
+/// engine never configures admin auth, so the route needs no key. Reused rather than re-decoding
+/// snapshot bytes here: the engine's own handler already applies the correct snapshot codec (typed
 /// values, encryption) and is the single source of truth for status classification.
 async fn fetch_instance_statuses(base_url: &str) -> Result<StatusCounts, String> {
     let url = format!("{base_url}/sutra/instances?includeTerminal=true");
-    let response = reqwest::get(&url).await.map_err(|e| e.to_string())?;
+    let response = reqwest::get(&url)
+        .await
+        .and_then(reqwest::Response::error_for_status)
+        .map_err(|e| e.to_string())?;
     let body: serde_json::Value = response.json().await.map_err(|e| e.to_string())?;
     let mut counts = StatusCounts::default();
     for instance in body["instances"].as_array().into_iter().flatten() {

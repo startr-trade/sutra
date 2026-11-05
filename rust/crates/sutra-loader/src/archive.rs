@@ -600,14 +600,14 @@ fn read_archive_internal(
     let deployment = parse_deployment(&id, &manifest, &entries)?;
     let mut diagnostics: Vec<LintDiagnostic> = Vec::new();
     validate_deployment(&deployment, &mut diagnostics);
-    if let Some(first) = diagnostics
-        .iter()
-        .find(|d| d.severity == LintSeverity::Error)
-    {
-        let error_count = diagnostics
-            .iter()
-            .filter(|d| d.severity == LintSeverity::Error)
-            .count();
+    // A sealed archive may come from an earlier CLI, which accepted any `dedupKey`. Whoever reads it
+    // decides: what is already deployed keeps running, and a new deploy is refused.
+    let refuses = |d: &&LintDiagnostic| {
+        d.severity == LintSeverity::Error
+            && d.code != sutra_bpmn::codes::PARSE_Q_SOURCE_DEDUP_KEY_UNRECOGNISED
+    };
+    if let Some(first) = diagnostics.iter().find(refuses) {
+        let error_count = diagnostics.iter().filter(refuses).count();
         return Err(LoaderError::new(
             codes::DEPLOY_ARCHIVE_CONTENT_INVALID,
             format!(

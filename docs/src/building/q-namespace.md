@@ -78,7 +78,9 @@ payload lands in:
   (`payload.fromId`, `payload.body.CdtTrfTxInf...` for a structured codec).
 - `ack` (default `on-persist`) — see [Acknowledgement modes](../operating/ack-modes.md).
 - `dedupKey` — an expression identifying a redelivered duplicate (e.g. `header.X-Request-Id`),
-  distinct from the process-level retry-safety assertion below.
+  distinct from the process-level retry-safety assertion below. `dedupKey` accepts `header.<name>`,
+  `ce.id`, `body.<path>` and `amqp.message-id`; any other form is refused at lint, package and deploy
+  with `SUTRA.PARSE.Q_SOURCE.DEDUP_KEY_UNRECOGNISED`. It dedupes on a start event and on a wait.
 - `dataClass` (default `none`) — `pii` / `pci` / `phi` / `financial`; drives redaction policy.
 - `filterExpression` — a FEEL predicate over the message *attributes* the codec reported. It
   narrows whichever of the message-type selectors above applies rather than replacing one, so
@@ -190,6 +192,9 @@ headers/application-properties.
 completes, then park the instance and self-resume the remaining nodes asynchronously — the caller
 gets its answer without waiting on the tail of the flow.
 
+A flow with no `<q:reply>` answers a synchronous HTTP call with `200` and an empty body; see
+[Upgrading to 0.6.18](../operating/upgrading-0-6-18.md).
+
 ```mermaid
 sequenceDiagram
     participant C as Caller
@@ -277,7 +282,62 @@ A friendly key derived from a FEEL expression over the process variables — dur
 re-evaluated on rehydration. `unique="true"` with `onConflict="correlate"` is what lets a later
 message on a different channel find and resume the exact parked instance it belongs to, by a key
 *you* named (an `EndToEndId`, an order reference) rather than an engine-internal id. See
-[Wait states and human tasks](wait-states.md).
+[Wait states and human tasks](wait-states.md). A correlation alias's value also appears in an acceptance
+receipt, masked if sensitive; see [Acceptance receipts](acceptance-receipts.md).
+
+## `q:receipt` — what a 202 names
+
+An HTTP channel with `ack-mode: on-persist` answers `202 Accepted` with a receipt the engine writes
+itself, so a caller learns which instance it started without the flow doing anything:
+
+| Field | What it is |
+|---|---|
+| `instanceId` | The instance started or resumed: the handle for `GET /sutra/instances/{id}`. |
+| `deploymentId`, `labels` | The deployment serving the channel, and its `tenant`, `module`, `version`. |
+| `aliases` | The instance's `<q:alias>` values at the moment of the answer, masked by the rules below. |
+| `idempotencyKey` | The key the caller supplied, or the one a `<q:source dedupKey>` derived. Absent otherwise: the body hash used in its place recognises no retry. |
+| `duplicate`, `originalInstanceId` | This delivery was already seen; the instance the first one started. |
+| `attributes` | The values the flow chose to expose, below. |
+
+It travels in two headers: `Sutra-Instance-Id` and `Sutra-Receipt` (the whole receipt as one line of
+ASCII JSON, cut down to its identifying fields with `"truncated": true` if it would pass 4 KiB). A
+flow that replied nothing also gets it as the `application/json` body; a body the flow authored with
+`<q:reply continue="true">` is left untouched. Other channels answer as before, except that a duplicate on
+any HTTP channel gets this 202. Queue transports have no synchronous answer, so no
+receipt.
+
+`<q:receipt>` adds values of the flow's choosing. It hangs off the process's own
+`extensionElements`, and without it the flow exposes nothing:
+
+```xml
+<bpmn:process id="case-open">
+  <bpmn:extensionElements>
+    <q:receipt>
+      <q:attribute name="caseId" expression="req.caseId"/>
+    </q:receipt>
+  </bpmn:extensionElements>
+```
+
+**When it is evaluated.** At the answer, over the variables a `<q:reply continue="true">` renders
+against: everything the intake bound, plus what the flow computed before replying or parking.
+
+**What is masked.** An expression reading a `sensitive` variable shows `***REDACTED***`, an alias
+included. One reading a redactor-controlled variable shows that path of its masked projection, or the
+mask if it is not a plain path. While a redactor is active, anything under `event` other than
+`channel`, `contentType`, `dedupKey`, `idempotencyKey` and `receivedAt` is masked too, since it
+repeats the payload. A null is left out, and an expression that fails to evaluate is left out and
+logged: the work is already accepted and does not fail over its receipt. Values are strings.
+
+`sutra lint` refuses an expression that does not parse and a repeated name
+(`SUTRA.CONFIG.RECEIPT.ATTRIBUTE_DUPLICATE`), and warns about an attribute reading a sensitive
+variable (`SUTRA.CONFIG.RECEIPT.ATTRIBUTE_SENSITIVE`), since the caller would only ever see the mask.
+
+**A duplicate's receipt** names the original instance, and carries no aliases or attributes: nothing
+ran to produce them. It names no instance when the first delivery ended without one or was recorded
+before 0.6.18.
+
+**A caller that lost its 202** can ask `GET /sutra/instances?alias=<name>:<value>`. See
+[Acceptance receipts](acceptance-receipts.md#6-find-the-instance-after-losing-the-202).
 
 ## `q:retry` — per-task retry policies {#qretry--per-task-retry-policies}
 

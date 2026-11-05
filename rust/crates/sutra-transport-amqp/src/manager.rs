@@ -154,8 +154,15 @@ impl AmqpChannels {
             .iter()
             .filter(|d| d.transport.as_deref() == Some(TRANSPORT) && !d.is_outbound())
         {
-            let Ok(props) = AmqpChannelProperties::from_definition(def) else {
-                continue;
+            let props = match AmqpChannelProperties::for_wiring(def) {
+                Ok(props) => props,
+                Err(d) => {
+                    warn!(
+                        code = %d.code,
+                        "amqp consumer NOT started during flip: {}", d.message
+                    );
+                    continue;
+                }
             };
             desired.insert(consumer_key(def), (def.clone(), props));
         }
@@ -265,7 +272,7 @@ fn build_and_start_consumer(
 ) -> Result<Option<(ConsumerKey, RunningConsumer)>, Diagnostic> {
     let channel = definition.binding.channel_name.clone();
     let tenant = definition.binding.tenant().to_string();
-    let properties = AmqpChannelProperties::from_definition(definition)?;
+    let properties = AmqpChannelProperties::for_wiring(definition)?;
     let fingerprint = properties.clone();
 
     let (username, password) = match (
@@ -491,6 +498,53 @@ inventory::submit! {
     }
 }
 
+/// A queue address hands each message to one receiver, so it belongs to one deployment; a topic
+/// address gives every receiver its own copy, so it may be shared. Read from the raw properties:
+/// the credentials `from_definition` validates are no part of an address's identity.
+fn endpoint_claims(def: &ChannelDefinition) -> Vec<sutra_transport_spi::EndpointClaim> {
+    use sutra_transport_spi::EndpointClaim;
+    let prop = |key: &str| {
+        def.properties
+            .get(key)
+            .map(|v| v.trim())
+            .filter(|v| !v.is_empty())
+    };
+    let Some(host) = prop("host") else {
+        return Vec::new();
+    };
+    let host = sutra_transport_spi::normalized_endpoint_host(host);
+    // The same defaults the connection applies, so an omitted port and the default one are one
+    // endpoint.
+    let default_port = if prop("tls").is_some_and(|tls| tls.eq_ignore_ascii_case("true")) {
+        crate::amqp::DEFAULT_TLS_PORT
+    } else {
+        crate::amqp::DEFAULT_PORT
+    };
+    let port = prop("port")
+        .map(str::to_string)
+        .unwrap_or_else(|| default_port.to_string());
+    let mut claims = Vec::new();
+    if let Some(queue) = prop("queue") {
+        claims.push(EndpointClaim::exclusive(format!(
+            "{host}:{port} queue {queue}"
+        )));
+    } else if let Some(topic) = prop("topic") {
+        claims.push(EndpointClaim::broadcast(format!(
+            "{host}:{port} topic {topic}"
+        )));
+    }
+    claims
+}
+
+inventory::submit! {
+    sutra_transport_spi::EndpointClaimFactory {
+        transport: TRANSPORT,
+        claims: endpoint_claims,
+        listener_prefix: None,
+        preflight: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -510,6 +564,98 @@ mod tests {
         );
         assert!(registry.resolve("kafka://t").is_none());
         assert!(registry.resolve("https://host/cb").is_none());
+    }
+}
+
+#[cfg(test)]
+mod connection_reference_guard {
+    use super::spawn_amqp_channels_with_intake;
+    use crate::amqp::AmqpChannelProperties;
+    use std::sync::Arc;
+    use sutra_channels::config::{ChannelBinding, Namespace};
+    use sutra_channels::{
+        AckDecision, BoxFuture, ChannelDefinition, DeploymentId, InboundIntake, InboundMessage,
+    };
+
+    struct NoIntake;
+    impl InboundIntake for NoIntake {
+        fn deliver(&self, _message: InboundMessage) -> BoxFuture<'_, AckDecision> {
+            Box::pin(async { AckDecision::Ack })
+        }
+    }
+
+    fn resolver(_reference: &str) -> Result<String, String> {
+        panic!("the guard runs before anything is resolved");
+    }
+
+    /// A valid inbound definition, with `extra` on top and `reference` set to a `${…}` value.
+    fn definition(extra: &[(&str, &str)], reference: Option<&str>) -> ChannelDefinition {
+        let mut properties: std::collections::BTreeMap<String, String> = [
+            ("host", "broker"),
+            ("port", "5672"),
+            ("queue", "orders"),
+            ("topic", "events"),
+        ]
+        .into_iter()
+        .chain(extra.iter().copied())
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect();
+        if let Some(key) = reference {
+            properties.insert(key.to_string(), "${CHANNEL_SETTING}".to_string());
+        }
+        ChannelDefinition {
+            binding: ChannelBinding::new(
+                "orders-in",
+                Namespace::new("acme", "orders", "v1"),
+                DeploymentId::unresolved(),
+                "opaque",
+            ),
+            transport: Some("amqp".to_string()),
+            bind_spec: None,
+            codec: None,
+            cloud_events_mode: None,
+            auth_scheme: None,
+            idempotency_key_header: None,
+            payload_cap_bytes: None,
+            properties,
+        }
+    }
+
+    #[test]
+    fn wiring_refuses_a_reference_in_each_connection_property() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        for key in ["host", "port", "queue", "topic"] {
+            let def = definition(&[], Some(key));
+            let Err(err) = spawn_amqp_channels_with_intake(
+                &[def],
+                Arc::new(NoIntake),
+                None,
+                resolver,
+                runtime.handle().clone(),
+            ) else {
+                panic!("a reference in '{key}' must not wire");
+            };
+            assert_eq!(err.code, "SUTRA.INBOUND.AMQP.CONFIG_INVALID", "for {key}");
+            assert!(err.message.contains("orders-in"), "{}", err.message);
+            assert!(err.message.contains(&format!("'{key}'")), "{}", err.message);
+            assert!(err.message.contains("later release"), "{}", err.message);
+            assert!(!err.message.contains("CHANNEL_SETTING"), "{}", err.message);
+        }
+    }
+
+    #[test]
+    fn a_literal_connection_property_is_unaffected() {
+        let literal =
+            AmqpChannelProperties::for_wiring(&definition(&[], None)).expect("literal values wire");
+        let plain =
+            AmqpChannelProperties::from_definition(&definition(&[], None)).expect("plain parse");
+        assert_eq!(literal, plain);
+        // A credential reference is resolved later, not refused here.
+        let with_credentials = definition(&[("username", "${BROKER_USER}")], None);
+        AmqpChannelProperties::for_wiring(&with_credentials)
+            .expect("a credential reference passes");
     }
 }
 

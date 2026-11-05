@@ -29,7 +29,7 @@ use sutra_channels::{
 use sutra_transport_spi::{
     EnvRefResolver, InlineCallerFactory, TransportChannels, TransportFactory,
 };
-use tracing::warn;
+use tracing::error;
 
 /// The `transport:` discriminator this transport binds (the HTTP channel default scheme).
 pub const TRANSPORT: &str = "http";
@@ -98,13 +98,14 @@ impl TransportChannels for HttpTransport {
         0
     }
 
-    /// Activation flip (HTTP half): rebuild the route set from the new active
-    /// definitions and swap the table. Non-fatal + idempotent, mirroring the broker rewire —
-    /// a rebuild error WARNs and keeps the current routes (the engine keeps running).
+    /// Activation flip (HTTP half): rebuild the route set from the new active definitions and
+    /// swap the table. [`Self::prepare_rewire`] has already accepted this set, so a failure here
+    /// means an auth value stopped resolving in between: the flip is past undoing, the current
+    /// routes stay, and that mismatch is worth an error.
     async fn rewire(&self, active_definitions: &[ChannelDefinition]) {
         match http_routes_of_resolved(active_definitions, &auth_resolver(self.resolver)) {
             Ok(route_set) => self.routes.swap(route_set),
-            Err(d) => warn!(
+            Err(d) => error!(
                 code = %d.code,
                 "HTTP route rebuild failed on activation flip: {}", d.message
             ),
@@ -120,6 +121,38 @@ impl TransportChannels for HttpTransport {
 
     fn inbound_router(&self) -> Option<Router> {
         Some(self.router.clone())
+    }
+
+    /// A definition set whose routes do not build (a collision, an unresolvable auth value)
+    /// refuses the flip here, while the old routes and registries are still whole.
+    fn prepare_rewire(&self, active_definitions: &[ChannelDefinition]) -> Result<(), Diagnostic> {
+        http_routes_of_resolved(active_definitions, &auth_resolver(self.resolver)).map(|_| ())
+    }
+}
+
+/// An HTTP route answers one caller, so `METHOD path` belongs to one deployment.
+fn endpoint_claims(def: &ChannelDefinition) -> Vec<sutra_transport_spi::EndpointClaim> {
+    let (method, path) = def.bind_method_and_path();
+    vec![sutra_transport_spi::EndpointClaim::exclusive(format!(
+        "{method} {path}"
+    ))]
+}
+
+/// Would the routes build? Auth values resolve through the engine's resolver, as a flip would.
+fn preflight(
+    definitions: &[ChannelDefinition],
+    resolver: EnvRefResolver,
+    _host: sutra_transport_spi::PreflightHost,
+) -> Result<(), Diagnostic> {
+    http_routes_of_resolved(definitions, &auth_resolver(resolver)).map(|_| ())
+}
+
+inventory::submit! {
+    sutra_transport_spi::EndpointClaimFactory {
+        transport: TRANSPORT,
+        claims: endpoint_claims,
+        listener_prefix: None,
+        preflight: Some(preflight),
     }
 }
 

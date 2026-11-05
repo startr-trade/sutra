@@ -11,9 +11,14 @@
 
 use std::sync::Arc;
 
+use crate::codes;
 use crate::diag::Diagnostic;
 use crate::dispatch::InboundMessage;
 use crate::sink::BoxFuture;
+use crate::transport_audit::{
+    transport_audit, TransportAuditEvent, TransportAuditOutcome, TransportAuditRegistry,
+    TransportAuditScope,
+};
 
 /// The leadership token gating a singleton consumer — the minimal view of the
 /// DB-lease election daemon (`LeaderElection` role
@@ -83,6 +88,99 @@ pub enum DeliveryDisposition {
     /// parked at a wait state. The source must NOT settle; the registered ack/nack fires
     /// at the instance's terminal event (or registry timeout/overflow).
     Deferred,
+}
+
+/// The audit event type of a dropped inbound delivery is `inbound.DELIVERY_DROPPED`: the namespace
+/// a [`DeliveryDropRecord`] writes under, whichever transport the delivery came from.
+const DROPPED_DELIVERY_NAMESPACE: &str = "inbound";
+/// See [`DROPPED_DELIVERY_NAMESPACE`].
+const DROPPED_DELIVERY_EVENT: &str = "DELIVERY_DROPPED";
+
+/// What the engine records about an inbound delivery it settles without running: the delivery's
+/// identity, taken before the message moves into the dispatch. Never the body or the headers,
+/// which are business data and must not reach a log line.
+#[derive(Debug, Clone)]
+pub struct DeliveryDropRecord {
+    tenant: String,
+    module_key: String,
+    channel: String,
+    dedup_key: String,
+    content_type: Option<String>,
+    body_bytes: usize,
+}
+
+impl DeliveryDropRecord {
+    /// The record of `message`.
+    pub fn of(message: &InboundMessage) -> DeliveryDropRecord {
+        DeliveryDropRecord {
+            tenant: message.tenant.clone(),
+            module_key: message.module_key.clone(),
+            channel: message.channel.clone(),
+            dedup_key: message.idempotency_key.clone(),
+            content_type: message.content_type.clone(),
+            body_bytes: message.body.len(),
+        }
+    }
+
+    /// A permanent refusal: a WARN carrying [`codes::INBOUND_DELIVERY_DROPPED`] and the refusal's
+    /// own code, and the deployment's audit record. Every delivery the engine refuses for good
+    /// passes through here, whichever transport carried it.
+    pub fn report(&self, cause: &Diagnostic) {
+        tracing::warn!(
+            code = codes::INBOUND_DELIVERY_DROPPED,
+            cause_code = %cause.code,
+            channel = %self.channel,
+            module = %self.module_key,
+            tenant = %self.tenant,
+            dedup_key = %self.dedup_key,
+            content_type = self.content_type.as_deref().unwrap_or(""),
+            body_bytes = self.body_bytes,
+            detail = %cause.message,
+            "inbound delivery refused and dropped: the transport settles it and it will not run"
+        );
+        self.audit(cause);
+    }
+
+    /// The audit record alone, for a refusal the transport has already logged under its own code.
+    pub fn audit(&self, cause: &Diagnostic) -> TransportAuditOutcome {
+        self.audit_into(transport_audit(), cause)
+    }
+
+    fn audit_into(
+        &self,
+        registry: &TransportAuditRegistry,
+        cause: &Diagnostic,
+    ) -> TransportAuditOutcome {
+        let detail = serde_json::json!({
+            "channel": self.channel,
+            "dedupKey": self.dedup_key,
+            "contentType": self.content_type,
+            "bodyBytes": self.body_bytes,
+            "message": cause.message,
+        });
+        registry.append(
+            TransportAuditScope::Deployment {
+                module_key: self.module_key.clone(),
+            },
+            TransportAuditEvent::new(DROPPED_DELIVERY_NAMESPACE, DROPPED_DELIVERY_EVENT)
+                .with_diagnostic_code(&cause.code)
+                .with_diagnostic_json(&detail),
+        )
+    }
+
+    /// A delivery whose event id was already seen: it is settled without running, and the first
+    /// delivery owns the event. Not a drop, so INFO and no audit record; a sender that reused an id
+    /// for a different message shows up here.
+    pub fn report_duplicate(&self) {
+        tracing::info!(
+            code = codes::INBOUND_DUPLICATE_DELIVERY,
+            channel = %self.channel,
+            module = %self.module_key,
+            tenant = %self.tenant,
+            dedup_key = %self.dedup_key,
+            "inbound delivery settled without running: its event id was already seen"
+        );
+    }
 }
 
 /// The intake side of the seam — delivery of one transport message into the intake
@@ -236,6 +334,88 @@ mod tests {
                 Ok(())
             })
         }
+    }
+
+    /// Runs `body` with a subscriber that keeps what is logged, and answers it.
+    fn logged(body: impl FnOnce()) -> String {
+        #[derive(Clone, Default)]
+        struct Kept(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Kept {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("lock").extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let kept = Kept::default();
+        let writer = kept.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, body);
+        let text = String::from_utf8_lossy(&kept.0.lock().expect("lock")).into_owned();
+        text
+    }
+
+    #[test]
+    fn a_dropped_delivery_is_logged_at_warn_with_the_code_and_never_the_body() {
+        let mut message = inbound("m-1");
+        message.body = b"BODY-MUST-NOT-BE-LOGGED".to_vec().into();
+        let record = DeliveryDropRecord::of(&message);
+        let cause = Diagnostic::error(codes::INBOUND_VALIDATION_REJECT, "refused by the codec");
+        let log = logged(|| record.report(&cause));
+        assert!(log.contains(" WARN "), "{log}");
+        assert!(log.contains("SUTRA.INBOUND.DELIVERY_DROPPED"), "{log}");
+        assert!(log.contains(codes::INBOUND_VALIDATION_REJECT), "{log}");
+        assert!(log.contains("transfer-queue"), "{log}");
+        assert!(log.contains("refused by the codec"), "{log}");
+        assert!(!log.contains("BODY-MUST-NOT-BE-LOGGED"), "{log}");
+    }
+
+    #[test]
+    fn a_duplicate_is_logged_at_info_with_its_code_and_key() {
+        let record = DeliveryDropRecord::of(&inbound("m-7"));
+        let log = logged(|| record.report_duplicate());
+        assert!(log.contains(" INFO "), "{log}");
+        assert!(log.contains("SUTRA.INBOUND.DUPLICATE_DELIVERY"), "{log}");
+        assert!(log.contains("m-7"), "{log}");
+    }
+
+    #[test]
+    fn a_dropped_delivery_is_audited_in_the_deployment_journal() {
+        let journal = Arc::new(crate::transport_audit::CapturingTransportAuditJournal::new());
+        let registry = TransportAuditRegistry::new();
+        registry.install(journal.clone());
+        let outcome = DeliveryDropRecord::of(&inbound("m-1")).audit_into(
+            &registry,
+            &Diagnostic::error(codes::INBOUND_VALIDATION_REJECT, "refused"),
+        );
+        assert_eq!(outcome, TransportAuditOutcome::Queued);
+        let events = journal.events();
+        assert_eq!(events.len(), 1);
+        let (scope, event) = &events[0];
+        assert_eq!(
+            *scope,
+            TransportAuditScope::Deployment {
+                module_key: "acme/orders/1.0.0".to_string()
+            }
+        );
+        assert_eq!(
+            event.event_type().as_deref(),
+            Ok("inbound.DELIVERY_DROPPED")
+        );
+        assert_eq!(
+            event.diagnostic_code.as_deref(),
+            Some(codes::INBOUND_VALIDATION_REJECT)
+        );
+        // The channel survives metadata capture, which records none of the event's fields.
+        let detail = event.diagnostic_json.as_deref().expect("detail");
+        assert!(detail.contains("transfer-queue"), "{detail}");
+        assert!(detail.contains("m-1"), "{detail}");
+        assert!(event.fields.is_empty());
     }
 
     #[tokio::test]

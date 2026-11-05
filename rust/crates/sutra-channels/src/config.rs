@@ -91,6 +91,9 @@ pub struct ChannelBinding {
     /// holds, releasing its slot before the instance reaches End. `None` = only End (or a
     /// failure) releases.
     pub session_end: Option<SessionEnd>,
+    /// An HTTP channel with `ack-mode: on-persist`: its 202 carries an acceptance receipt, so a
+    /// dispatch on it collects the receipt's facts. No other channel has a reader for them.
+    pub answers_with_receipt: bool,
 }
 
 /// An inbound channel's `session-end:` block: the events that release an instance's slots (its
@@ -131,6 +134,7 @@ impl ChannelBinding {
             pool: None,
             pool_call_key: None,
             session_end: None,
+            answers_with_receipt: false,
         }
     }
 
@@ -399,8 +403,9 @@ pub fn load_channel_definitions(
             pool,
             pool_call_key,
             session_end,
+            answers_with_receipt: false,
         };
-        out.push(ChannelDefinition {
+        let mut definition = ChannelDefinition {
             binding,
             transport: optional_string(entry, "transport"),
             bind_spec: optional_string(entry, "bind"),
@@ -410,7 +415,12 @@ pub fn load_channel_definitions(
             idempotency_key_header: optional_string(entry, "idempotency-key-header"),
             payload_cap_bytes: optional_long(entry, "payload-cap-bytes", i, source_for_errors)?,
             properties: extract_properties(entry),
-        });
+        };
+        definition.binding.answers_with_receipt = definition.transport.as_deref() == Some("http")
+            && definition
+                .effective_ack_mode()
+                .eq_ignore_ascii_case("on-persist");
+        out.push(definition);
     }
     validate_session_ends(&out, source_for_errors)?;
     Ok(out)

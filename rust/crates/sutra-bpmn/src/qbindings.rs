@@ -117,10 +117,12 @@ pub struct SourceBinding {
     pub name: String,
     pub ack: AckMode,
     /// `<q:source dedupKey>`: an expression that extracts a **duplicate-detection** value
-    /// (`header.<field>`, `ce.id`, or `body.<path>`) for inbox dedup. Renamed from the misnamed
+    /// (`header.<field>`, `ce.id`, `body.<path>`, or `amqp.message-id`) for inbox dedup. Any other
+    /// form loads, because a package an earlier engine accepted has to keep running, and is read as
+    /// no key at all. Lint, sealing and a new deploy refuse one. Renamed from the misnamed
     /// `idempotencyKey` — a dedup key detects redelivery; it does NOT assert idempotency (that is
-    /// the process-level `<q:process idempotent>` boolean). A `body.<path>` form drives inbox dedup
-    /// post-decode; `header.*` / `ce.id` forms are resolved transport-side.
+    /// the process-level `<q:process idempotent>` boolean). Dispatch reads it where it says, whatever
+    /// the channel's own settings, and drives inbox dedup on what it finds.
     pub dedup_key: Option<String>,
     pub message_type: Option<String>,
     pub data_class: DataClass,
@@ -170,6 +172,15 @@ pub struct AliasBinding {
     pub unique: bool,
     pub on_conflict: Option<AliasConflict>,
     pub multi: bool,
+}
+
+/// Parsed `<q:attribute>` of a process's `<q:receipt>`: one value the flow chooses to expose on
+/// the engine's acceptance receipt. The expression is FEEL, held as source text like
+/// [`AliasBinding::expression`]; `sutra-channels` evaluates it and masks what it reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReceiptAttribute {
+    pub name: String,
+    pub expression: String,
 }
 
 /// Parsed `<q:reply>` — an outbound reply on a Service Task or End Event.
@@ -367,4 +378,18 @@ impl NodeBindings {
             && self.output.is_none()
             && self.retry.is_none()
     }
+}
+
+/// What a `<q:source dedupKey>` may say, as a refusal or a log line words it.
+pub const RECOGNISED_DEDUP_KEY_FORMS: &str =
+    "header.<name>, ce.id, body.<path> and amqp.message-id";
+
+/// Is this a `dedupKey` dispatch can read?
+pub fn is_recognised_dedup_key(key: &str) -> bool {
+    let key = key.trim();
+    let named = |prefix: &str| {
+        key.strip_prefix(prefix)
+            .is_some_and(|rest| !rest.is_empty())
+    };
+    key == "ce.id" || key == "amqp.message-id" || named("header.") || named("body.")
 }

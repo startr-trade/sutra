@@ -62,3 +62,5 @@ tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }
+# Reads what a dispatch logs where the log is the behaviour under test.
+tracing-subscriber = { version = "0.3", features = ["fmt"] }

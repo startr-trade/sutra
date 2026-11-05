@@ -232,6 +232,7 @@ impl MssqlDeploymentArchiveStore {
 fn served_of(row: &tiberius::Row) -> Result<ServedArchiveRow> {
     let status: &str = req(row, "status")?;
     Ok(ServedArchiveRow {
+        activated_at: None,
         archive: active_of(row)?,
         status: ArchiveStatus::parse(status)?,
     })

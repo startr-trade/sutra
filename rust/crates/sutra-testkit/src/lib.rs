@@ -112,6 +112,43 @@ pub fn reap_network_on_exit(network: impl Into<String>) {
     install_reaper();
 }
 
+/// Remove a docker network this process owns, with every container still on it, running or
+/// stopped: docker refuses to remove a network with an attached container, and a container a suite
+/// ran by hand (`docker run --rm` per call) or one caught mid-start is in no registry. Returns
+/// `true` once the network is gone. Only for a network this process created: everything on it goes.
+pub fn release_network(network: &str) -> bool {
+    if let Ok(mut nets) = NETWORK_REGISTRY.lock() {
+        nets.retain(|name| name != network);
+    }
+    remove_network(network)
+}
+
+fn remove_network(network: &str) -> bool {
+    let attached = Command::new("docker")
+        .args(["ps", "-aq", "--filter", &format!("network={network}")])
+        .stderr(Stdio::null())
+        .output();
+    if let Ok(attached) = attached {
+        let ids = String::from_utf8_lossy(&attached.stdout);
+        let ids: Vec<&str> = ids.split_whitespace().collect();
+        if !ids.is_empty() {
+            let _ = Command::new("docker")
+                .arg("rm")
+                .arg("-f")
+                .args(&ids)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+    }
+    Command::new("docker")
+        .args(["network", "rm", network])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
 /// atexit hook: force-remove every registered container, then every registered network.
 /// Best-effort — the process is on its way out, so already-gone objects or a missing `docker`
 /// binary are silently ignored. Containers are reaped FIRST so their networks are then free.
@@ -130,14 +167,61 @@ extern "C" fn reap() {
             .stderr(Stdio::null())
             .status();
     }
-    let nets = lock(&NETWORK_REGISTRY);
-    if !nets.is_empty() {
-        let _ = Command::new("docker")
-            .arg("network")
-            .arg("rm")
-            .args(&nets)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+    for network in lock(&NETWORK_REGISTRY) {
+        remove_network(&network);
+    }
+}
+
+#[cfg(test)]
+mod reaper_coverage {
+    use std::path::Path;
+
+    fn rust_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("a source directory") {
+            let path = entry.expect("a directory entry").path();
+            if path.is_dir() {
+                rust_files(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// A container held for the whole test process never drops, and testcontainers here has no
+    /// reaper of its own, so a start that does not register is a container left running after
+    /// every run. Nothing fails when that happens; this check is what keeps it visible.
+    #[test]
+    fn every_testcontainer_start_registers_with_the_reaper() {
+        let crates = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("the crates directory");
+        let mut files = Vec::new();
+        rust_files(crates, &mut files);
+        let mut starts = 0;
+        let mut missing = Vec::new();
+        for file in files {
+            let source = std::fs::read_to_string(&file).expect("a source file");
+            if !source.contains("testcontainers::") {
+                continue;
+            }
+            let lines: Vec<&str> = source.lines().collect();
+            for (index, line) in lines.iter().enumerate() {
+                let line = line.trim();
+                let start = line.ends_with(".start()")
+                    || line.contains(".start().expect")
+                    || line.contains(".start().unwrap")
+                    || line.contains(".start().await");
+                if !start {
+                    continue;
+                }
+                starts += 1;
+                let window = lines[index..lines.len().min(index + 14)].join("\n");
+                if !window.contains("reap_on_exit") {
+                    missing.push(format!("{}:{}", file.display(), index + 1));
+                }
+            }
+        }
+        assert!(missing.is_empty(), "no reap_on_exit after: {missing:#?}");
+        assert!(starts > 30, "the starts were found: {starts}");
     }
 }

@@ -49,6 +49,7 @@ pub mod projected;
 /// is derived from. Pure (no connection, no dialect, no SQL), so it compiles alongside `config`
 /// in a `--no-default-features` lint/wasm build.
 pub mod projection;
+pub mod shared_connection;
 
 /// Microsoft SQL Server dialect on the tiberius TDS stack (feature `mssql`, on by default).
 #[cfg(feature = "mssql")]
@@ -85,4 +86,8 @@ pub use projected::{table_for, ActualColumn, ProjectedStore, SqlDialect, ValueCl
 pub use projection::{
     default_column_name, NamingFault, NamingRules, NotFlatFault, NotFlatReason, ProjectedField,
     Projection, ProjectionError,
+};
+pub use shared_connection::{
+    declared_store_connections, resolved_store_connections, shared_store_connections,
+    stores_without_deployment_specific_connection, SharedStoreConnection, StoreConnectionUse,
 };

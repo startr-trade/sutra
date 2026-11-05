@@ -12,8 +12,9 @@
 # That settles WHEN the caller is answered. WHAT it is answered with is the flow's business:
 # <q:reply continue="true"> on the Accept task in cdr-load.bpmn renders a receipt before the
 # instance parks, and that receipt is the 202's body. So the caller gets a real document — a batch
-# id and a row count it can quote in a support call — and the load runs detached behind it. A flow
-# that replies nothing still gets a bare 202.
+# id and a row count it can quote in a support call — and the load runs detached behind it. The
+# engine adds its own receipt in the response headers either way, and a flow that replies nothing
+# gets that receipt as the body.
 #
 # The BPMN does NOT restate this. The ack mode is a property of the transport binding, and naming
 # it in one place means the two can never disagree.

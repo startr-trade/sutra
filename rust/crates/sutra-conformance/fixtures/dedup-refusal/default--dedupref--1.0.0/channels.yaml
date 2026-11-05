@@ -30,6 +30,31 @@ channels:
         value: env:DEDUP_REFUSAL_API_KEY
         header: X-Api-Key
 
+  # Neither names an id in the channel: each flow declares the key it dedupes on.
+  - name: declared-header-in
+    transport: http
+    bind: "POST /channels/declared-header-in"
+    codec: json
+    ack-mode: on-persist
+    cloudevents-mode: none
+    auth:
+      scheme: apikey
+      apikey:
+        value: env:DEDUP_REFUSAL_API_KEY
+        header: X-Api-Key
+
+  - name: declared-ce-in
+    transport: http
+    bind: "POST /channels/declared-ce-in"
+    codec: json
+    ack-mode: on-persist
+    cloudevents-mode: none
+    auth:
+      scheme: apikey
+      apikey:
+        value: env:DEDUP_REFUSAL_API_KEY
+        header: X-Api-Key
+
   - name: callback-out
     direction: outbound
     transport: http

@@ -68,7 +68,8 @@ use sutra_channels::diag::Diagnostic;
 use sutra_channels::dispatch::InboundMessage;
 use sutra_channels::sink::BoxFuture;
 use sutra_channels::source::{
-    AckDecision, DeferredSettle, DeliveryDisposition, InboundIntake, LeaderGate, TriggerSource,
+    AckDecision, DeferredSettle, DeliveryDisposition, DeliveryDropRecord, InboundIntake,
+    LeaderGate, TriggerSource,
 };
 
 use super::{
@@ -420,6 +421,10 @@ async fn run_session(
                         code = codes::INBOUND_AUTH_REJECTED,
                         "aws-sqs channel rejected a message — credential did not match expected"
                     );
+                    DeliveryDropRecord::of(&projected).audit(&Diagnostic::error(
+                        codes::INBOUND_AUTH_REJECTED,
+                        "the credential did not match the expected key",
+                    ));
                     settle(config, client, message, AckDecision::NackDrop).await;
                     continue;
                 }
@@ -615,7 +620,7 @@ fn project_message(config: &SqsSourceConfig, message: &Message) -> InboundMessag
 /// The pure attributes→[`InboundMessage`] projection (the broker-free core, unit-tested):
 /// the idempotency key is the FIFO dedup id, else the `sutra-outbox-key` attribute
 /// (EXPLICIT), else SQS's `MessageId` (NON-explicit); `content-type` attribute → content
-/// type (default `application/octet-stream`).
+/// type, absent when the sender stated none (see [`InboundMessage::content_type`]).
 fn project_inbound(
     config: &SqsSourceConfig,
     headers: BTreeMap<String, String>,
@@ -637,15 +642,14 @@ fn project_inbound(
         .iter()
         .find(|(k, _)| k.eq_ignore_ascii_case(HEADER_CONTENT_TYPE))
         .map(|(_, v)| v.clone())
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| "application/octet-stream".to_string());
+        .filter(|v| !v.is_empty());
     InboundMessage {
         tenant: config.tenant.clone(),
         module_key: config.module_key.clone(),
         channel: config.channel.clone(),
         headers,
         body: body.into(),
-        content_type: Some(content_type),
+        content_type,
         idempotency_key,
         explicit_event_id,
         received_at: now_rfc3339(),
@@ -771,7 +775,7 @@ mod tests {
     }
 
     #[test]
-    fn content_type_defaults_to_octet_stream() {
+    fn an_unstated_content_type_stays_absent() {
         let m = project_inbound(
             &config(),
             headers(&[]),
@@ -779,7 +783,7 @@ mod tests {
             Some("mid".to_string()),
             Vec::new(),
         );
-        assert_eq!(m.content_type.as_deref(), Some("application/octet-stream"));
+        assert_eq!(m.content_type, None);
     }
 
     #[test]

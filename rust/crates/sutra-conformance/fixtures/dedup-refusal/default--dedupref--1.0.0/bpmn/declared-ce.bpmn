@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Takes an event and sends one callback: a run-to-end flow whose step commits an outbox row. -->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0"
+                  id="Definitions_declared_ce"
+                  targetNamespace="urn:sutra:module:dedupref:1.0.0">
+  <bpmn:process id="declared-ce" name="Send a callback" isExecutable="true">
+    <bpmn:extensionElements>
+      <q:variables>
+        <q:variable name="responseBody" type="object"/>
+      </q:variables>
+    </bpmn:extensionElements>
+    <bpmn:startEvent id="Start" name="Event received">
+      <bpmn:extensionElements>
+        <q:source channel="declared-ce-in" dedupKey="ce.id"/>
+      </bpmn:extensionElements>
+    </bpmn:startEvent>
+    <bpmn:serviceTask id="Build" name="Build the callback (FEEL)">
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment>
+          <bpmn:from>{ref: payload.ref}</bpmn:from>
+          <bpmn:to>responseBody</bpmn:to>
+        </bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sendTask id="Call" name="Call back">
+      <bpmn:extensionElements>
+        <q:send channel="callback-out"/>
+      </bpmn:extensionElements>
+    </bpmn:sendTask>
+    <bpmn:endEvent id="End" name="Done"/>
+    <bpmn:sequenceFlow id="F1" sourceRef="Start" targetRef="Build"/>
+    <bpmn:sequenceFlow id="F2" sourceRef="Build" targetRef="Call"/>
+    <bpmn:sequenceFlow id="F3" sourceRef="Call" targetRef="End"/>
+  </bpmn:process>
+</bpmn:definitions>

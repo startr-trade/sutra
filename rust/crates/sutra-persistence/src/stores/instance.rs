@@ -72,6 +72,10 @@ pub struct InstanceFilter {
     /// Pushed into SQL on the PostgreSQL store (the column is indexed); the mysql/mssql stores
     /// have no terminal writer and therefore no terminal rows, so they ignore it.
     pub include_terminal: bool,
+    /// Narrow to the instances bound to `(alias name, alias value)`. Live bindings only, served
+    /// by the live-alias index, unless [`Self::include_terminal`] asks for history as well: an
+    /// instance's aliases retire when it finishes.
+    pub alias: Option<(String, String)>,
 }
 
 /// One lightweight instance summary for the operate-time list surface: the row key
@@ -227,6 +231,19 @@ const SQL_LIST_ACTIVE: &str = "SELECT instance_id, serialised FROM instance_stat
 /// ([`InstanceFilter::include_terminal`]).
 const SQL_LIST_ALL: &str = "SELECT instance_id, serialised FROM instance_state \
      WHERE deployment_id = $1 ORDER BY updated_at DESC";
+
+/// The list narrowed to a live alias binding; `alias_index_live_lookup` serves the subquery.
+const SQL_LIST_ACTIVE_BY_ALIAS: &str = "SELECT instance_id, serialised FROM instance_state \
+     WHERE deployment_id = $1 AND terminal_at IS NULL AND instance_id IN \
+     (SELECT instance_id FROM alias_index WHERE deployment_id = $1 AND alias_name = $2 \
+      AND alias_value = $3 AND live = TRUE) ORDER BY updated_at DESC";
+
+/// The history form: retired bindings count too, and they have no index of their own, so this
+/// walks the deployment's alias rows. An operator's question, not a hot path.
+const SQL_LIST_ALL_BY_ALIAS: &str = "SELECT instance_id, serialised FROM instance_state \
+     WHERE deployment_id = $1 AND instance_id IN \
+     (SELECT instance_id FROM alias_index WHERE deployment_id = $1 AND alias_name = $2 \
+      AND alias_value = $3) ORDER BY updated_at DESC";
 
 /// The retain-at-terminal write: swap in the re-stamped snapshot, stamp `terminal_at`, and clear
 /// the ownership claim — one statement inside the caller's terminal transaction.
@@ -514,13 +531,23 @@ impl InstanceStore for PgInstanceStore {
         filter: &InstanceFilter,
     ) -> Result<Vec<InstanceSummary>> {
         let mut tx = begin_deployment_tx(&self.pool, deployment).await?;
-        let sql = if filter.include_terminal {
-            SQL_LIST_ALL
-        } else {
-            SQL_LIST_ACTIVE
-        };
-        let rows: Vec<(Uuid, Vec<u8>)> = sqlx::query_as(sql)
+        let query = match &filter.alias {
+            Some((name, value)) => sqlx::query_as(if filter.include_terminal {
+                SQL_LIST_ALL_BY_ALIAS
+            } else {
+                SQL_LIST_ACTIVE_BY_ALIAS
+            })
             .bind(deployment.as_str())
+            .bind(name)
+            .bind(value),
+            None => sqlx::query_as(if filter.include_terminal {
+                SQL_LIST_ALL
+            } else {
+                SQL_LIST_ACTIVE
+            })
+            .bind(deployment.as_str()),
+        };
+        let rows: Vec<(Uuid, Vec<u8>)> = query
             .fetch_all(&mut *tx)
             .await
             .map_err(PersistenceError::db("instance list"))?;

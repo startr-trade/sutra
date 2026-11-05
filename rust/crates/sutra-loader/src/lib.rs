@@ -46,7 +46,9 @@ pub use layer_stack::{
     assemble_stack, compose_stack, lint_stack, LayerStack, StackLayer, StackOverride, StackRemoval,
     StackResolution,
 };
-pub use lint::{LintDiagnostic, LintReport, LintSeverity};
+pub use lint::{
+    unrecognised_dedup_keys, LintDiagnostic, LintReport, LintSeverity, UnrecognisedDedupKey,
+};
 pub use overlay::{
     assemble_dir_with_overlays, compose_overlays, lint_dir_with_overlays, ComposedPackage,
 };

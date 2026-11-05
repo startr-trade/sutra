@@ -175,6 +175,9 @@ pub struct TransportAuditEvent {
     pub node_id: Option<String>,
     /// A stable diagnostic code the event carries.
     pub diagnostic_code: Option<String>,
+    /// The diagnostic's detail as a JSON document, recorded at every level the event is written
+    /// at. For facts that identify the event, never for payload: payload goes in `fields`.
+    pub diagnostic_json: Option<String>,
     /// The event's fields. Recorded only when the process captures at `payload` level.
     pub fields: serde_json::Map<String, serde_json::Value>,
     /// The names of the fields whose values are sensitive: recorded as the redaction
@@ -189,6 +192,7 @@ impl TransportAuditEvent {
             name: name.to_string(),
             node_id: None,
             diagnostic_code: None,
+            diagnostic_json: None,
             fields: serde_json::Map::new(),
             sensitive: BTreeSet::new(),
         }
@@ -207,6 +211,11 @@ impl TransportAuditEvent {
 
     pub fn with_node(mut self, node_id: &str) -> Self {
         self.node_id = Some(node_id.to_string());
+        self
+    }
+
+    pub fn with_diagnostic_json(mut self, detail: &serde_json::Value) -> Self {
+        self.diagnostic_json = Some(detail.to_string());
         self
     }
 

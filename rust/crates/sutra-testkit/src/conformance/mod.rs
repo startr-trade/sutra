@@ -31,4 +31,5 @@ pub mod callback;
 pub mod compose;
 pub mod engine;
 pub mod k8s;
+pub mod suite;
 pub mod util;

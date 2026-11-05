@@ -71,7 +71,8 @@ use sutra_channels::diag::Diagnostic;
 use sutra_channels::dispatch::InboundMessage;
 use sutra_channels::sink::BoxFuture;
 use sutra_channels::source::{
-    AckDecision, DeferredSettle, DeliveryDisposition, InboundIntake, LeaderGate, TriggerSource,
+    AckDecision, DeferredSettle, DeliveryDisposition, DeliveryDropRecord, InboundIntake,
+    LeaderGate, TriggerSource,
 };
 
 use super::{
@@ -395,6 +396,10 @@ async fn run_session(
                         code = codes::INBOUND_AUTH_REJECTED,
                         "gcp-pubsub channel rejected a message — credential did not match expected"
                     );
+                    DeliveryDropRecord::of(&inbound).audit(&Diagnostic::error(
+                        codes::INBOUND_AUTH_REJECTED,
+                        "the credential did not match the expected key",
+                    ));
                     settle(config, &message, AckDecision::NackDrop).await;
                     continue;
                 }
@@ -521,7 +526,7 @@ fn to_inbound_message(config: &GcpPubSubSourceConfig, message: &ReceivedMessage)
 /// The pure message→[`InboundMessage`] projection (the broker-free core, unit-tested): the
 /// `sutra-outbox-key` attribute is the EXPLICIT idempotency key when set; otherwise the
 /// broker-assigned `message_id` (NON-explicit); `content-type` attribute → content type
-/// (default `application/octet-stream`); the message id + ordering key ride as informational
+/// (absent when the sender stated none); the message id + ordering key ride as informational
 /// `x-gcp-pubsub-*` headers.
 fn project_inbound(
     config: &GcpPubSubSourceConfig,
@@ -542,8 +547,7 @@ fn project_inbound(
         .iter()
         .find(|(k, _)| k.eq_ignore_ascii_case(ATTR_CONTENT_TYPE))
         .map(|(_, v)| v.clone())
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| "application/octet-stream".to_string());
+        .filter(|v| !v.is_empty());
     if !message_id.is_empty() {
         headers.insert(HEADER_MESSAGE_ID.to_string(), message_id.to_string());
     }
@@ -556,7 +560,7 @@ fn project_inbound(
         channel: config.channel.clone(),
         headers,
         body: body.into(),
-        content_type: Some(content_type),
+        content_type,
         idempotency_key,
         explicit_event_id,
         received_at: now_rfc3339(),
@@ -652,9 +656,9 @@ mod tests {
     }
 
     #[test]
-    fn content_type_defaults_to_octet_stream_and_ordering_key_rides() {
+    fn an_unstated_content_type_stays_absent_and_ordering_key_rides() {
         let m = project_inbound(&config(), attrs(&[]), "id", "order-3", Vec::new());
-        assert_eq!(m.content_type.as_deref(), Some("application/octet-stream"));
+        assert_eq!(m.content_type, None);
         assert_eq!(
             m.headers
                 .get("x-gcp-pubsub-ordering-key")

@@ -57,13 +57,13 @@
     <xsd:attribute name="dedupKey" type="xsd:string">
       <xsd:annotation>
         <xsd:documentation>
-          Expression to extract a DUPLICATE-DETECTION value (a "dedup key") for inbox dedup,
-          e.g. header.X-Request-Id, amqp.message-id, ce.id, or body.&lt;path&gt; (a body.&lt;path&gt;
-          form drives inbox dedup post-decode). Renamed from the misnamed "idempotencyKey": a dedup
+          Where to read a DUPLICATE-DETECTION value (a "dedup key") for inbox dedup. The recognised
+          forms are header.&lt;name&gt;, ce.id, body.&lt;path&gt; and amqp.message-id; any other form
+          is refused at lint, sealing and a new deploy. The value is stored in the inbox and can appear in a refusal
+          and in the check-failure log, so do not key on a secret header. Renamed from the misnamed "idempotencyKey": a dedup
           key detects redelivery of the SAME message; it does NOT, on its own, assert that the
           process is safe to retry — that assertion is the process-level &lt;q:process
-          idempotent="true|false"&gt; boolean. When CloudEvents wrap mode is configured for the
-          channel and type="" is set below, dedupKey defaults to ce.id. Declaring the retired
+          idempotent="true|false"&gt; boolean. Declaring the retired
           @idempotencyKey attribute is a deploy-time error (SUTRA.PARSE.Q_SOURCE.IDEMPOTENCY_KEY_RENAMED).
         </xsd:documentation>
       </xsd:annotation>
@@ -701,6 +701,38 @@
 
   <xsd:complexType name="ProcessType">
     <xsd:attribute name="idempotent" type="xsd:boolean" default="false"/>
+  </xsd:complexType>
+
+  <!-- ===================== Acceptance receipt attributes ===================== -->
+
+  <xsd:element name="receipt" type="q:ReceiptType">
+    <xsd:annotation>
+      <xsd:documentation>
+        Acceptance receipt attributes (0.6.18, additive): hung off the &lt;bpmn:process&gt;'s own
+        &lt;bpmn:extensionElements&gt;. An HTTP channel with ack-mode: on-persist answers 202 with an
+        engine-owned receipt (instance id, deployment, correlation aliases, idempotency key, duplicate
+        flag); these are the values the flow chooses to add to it. Opt-in: a process without this
+        element exposes no flow data. Each @expression is FEEL over the instance variables at the
+        moment the 202 is answered: the same variables a &lt;q:reply continue="true"&gt; renders against
+        (so a value set before the reply is visible), or the variables at the park or the end of the
+        pass when the flow replied nothing. The value is rendered as a string; a null is left out, and
+        an expression that fails to evaluate is left out and logged, never failing the accepted work.
+        An expression reading a @sensitive variable shows ***REDACTED***, and one reading a
+        redactor-controlled variable shows its masked projection. Not used on queue transports, which
+        have no synchronous answer. See the book's "Acceptance receipts" chapter.
+      </xsd:documentation>
+    </xsd:annotation>
+  </xsd:element>
+
+  <xsd:complexType name="ReceiptType">
+    <xsd:sequence>
+      <xsd:element name="attribute" type="q:ReceiptAttributeType" minOccurs="0" maxOccurs="unbounded"/>
+    </xsd:sequence>
+  </xsd:complexType>
+
+  <xsd:complexType name="ReceiptAttributeType">
+    <xsd:attribute name="name" type="xsd:string" use="required"/>
+    <xsd:attribute name="expression" type="xsd:string" use="required"/>
   </xsd:complexType>
 
   <!-- ===================== Audit configuration per process ===================== -->

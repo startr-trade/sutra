@@ -14,6 +14,7 @@ mod channel;
 mod data_key;
 mod dead_letter;
 mod deployment_archive;
+mod endpoint_holder;
 mod external_task;
 mod inbox;
 mod inflight;
@@ -41,6 +42,10 @@ pub use dead_letter::{
 pub use deployment_archive::{
     ActiveArchive, ArchiveStatus, ArchiveStatusRow, NewArchive, PgDeploymentArchiveStore,
     ServedArchiveRow,
+};
+pub use endpoint_holder::{
+    EndpointHolderRow, PgEndpointHolderStore, ENDPOINT_HOLDER_IDENTITY_MAX,
+    ENDPOINT_HOLDER_LABEL_MAX, ENDPOINT_HOLDER_OWNER_MAX, ENDPOINT_HOLDER_TRANSPORT_MAX,
 };
 pub use external_task::{ExternalTaskRow, ExternalTaskStore, PgExternalTaskStore};
 pub use inbox::{InboxSeenState, InboxStore, PgInboxStore};

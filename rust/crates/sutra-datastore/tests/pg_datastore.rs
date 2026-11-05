@@ -58,14 +58,21 @@ impl PgContainer {
             .find_map(|l| l.rsplit(':').next()?.trim().parse().ok())
             .unwrap_or_else(|| panic!("no host port in docker port output: {mapping}"));
 
-        // Readiness: pg_isready, then an actual query (postgres restarts once during init).
+        // Readiness: a query over TCP, as the tests connect. The image runs a temporary server
+        // during init and then restarts: that server listens only on the unix socket, so a psql
+        // through the socket can succeed moments before the shutdown, and the test's first
+        // connection then gets a reset.
         let container = PgContainer { id, port };
         for attempt in 0..240 {
             let ready = Command::new("docker")
                 .args([
                     "exec",
+                    "-e",
+                    "PGPASSWORD=sutra",
                     &container.id,
                     "psql",
+                    "-h",
+                    "127.0.0.1",
                     "-U",
                     "sutra",
                     "-d",

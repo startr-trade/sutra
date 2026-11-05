@@ -157,8 +157,15 @@ impl GcpPubSubChannels {
             .iter()
             .filter(|d| d.transport.as_deref() == Some(TRANSPORT) && !d.is_outbound())
         {
-            let Ok(props) = GcpPubSubChannelProperties::from_definition(def) else {
-                continue;
+            let props = match GcpPubSubChannelProperties::for_wiring(def) {
+                Ok(props) => props,
+                Err(d) => {
+                    warn!(
+                        code = %d.code,
+                        "gcp-pubsub consumer NOT started during flip: {}", d.message
+                    );
+                    continue;
+                }
             };
             desired.insert(consumer_key(def), (def.clone(), props));
         }
@@ -267,7 +274,7 @@ fn build_and_start_consumer(
 ) -> Result<Option<(ConsumerKey, RunningConsumer)>, Diagnostic> {
     let channel = definition.binding.channel_name.clone();
     let tenant = definition.binding.tenant().to_string();
-    let properties = GcpPubSubChannelProperties::from_definition(definition)?;
+    let properties = GcpPubSubChannelProperties::for_wiring(definition)?;
     let fingerprint = properties.clone();
 
     let singleton = properties.singleton;
@@ -442,6 +449,36 @@ inventory::submit! {
     }
 }
 
+/// A subscription hands each message to one of its subscribers, so it belongs to one deployment.
+/// Two deployments reading one topic each hold their own subscription, and that sharing is
+/// allowed: the topic is no part of the identity.
+fn endpoint_claims(def: &ChannelDefinition) -> Vec<sutra_transport_spi::EndpointClaim> {
+    let Ok(props) = GcpPubSubChannelProperties::from_definition(def) else {
+        return Vec::new();
+    };
+    if props.subscription.is_empty() {
+        return Vec::new();
+    }
+    let endpoint = props
+        .endpoint_override
+        .as_deref()
+        .map(sutra_transport_spi::normalized_endpoint_host)
+        .unwrap_or_else(|| "default".to_string());
+    vec![sutra_transport_spi::EndpointClaim::exclusive(format!(
+        "project {} endpoint {endpoint} subscription {}",
+        props.project_id, props.subscription
+    ))]
+}
+
+inventory::submit! {
+    sutra_transport_spi::EndpointClaimFactory {
+        transport: TRANSPORT,
+        claims: endpoint_claims,
+        listener_prefix: None,
+        preflight: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -464,6 +501,97 @@ mod tests {
         let mut registry = SinkRegistry::new();
         register_gcp_pubsub_sink(&mut registry, "", None);
         assert!(registry.resolve("gcp-pubsub://t").is_some());
+    }
+}
+
+#[cfg(test)]
+mod connection_reference_guard {
+    use super::spawn_gcp_pubsub_channels_with_intake;
+    use crate::gcp_pubsub::GcpPubSubChannelProperties;
+    use std::sync::Arc;
+    use sutra_channels::config::{ChannelBinding, Namespace};
+    use sutra_channels::{
+        AckDecision, BoxFuture, ChannelDefinition, DeploymentId, InboundIntake, InboundMessage,
+    };
+
+    struct NoIntake;
+    impl InboundIntake for NoIntake {
+        fn deliver(&self, _message: InboundMessage) -> BoxFuture<'_, AckDecision> {
+            Box::pin(async { AckDecision::Ack })
+        }
+    }
+
+    fn resolver(_reference: &str) -> Result<String, String> {
+        panic!("the guard runs before anything is resolved");
+    }
+
+    /// A valid inbound definition, with `extra` on top and `reference` set to a `${…}` value.
+    fn definition(extra: &[(&str, &str)], reference: Option<&str>) -> ChannelDefinition {
+        let mut properties: std::collections::BTreeMap<String, String> = [
+            ("project-id", "p1"),
+            ("subscription", "s1"),
+            ("topic", "t1"),
+            ("endpoint-override", "localhost:8085"),
+        ]
+        .into_iter()
+        .chain(extra.iter().copied())
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect();
+        if let Some(key) = reference {
+            properties.insert(key.to_string(), "${CHANNEL_SETTING}".to_string());
+        }
+        ChannelDefinition {
+            binding: ChannelBinding::new(
+                "orders-in",
+                Namespace::new("acme", "orders", "v1"),
+                DeploymentId::unresolved(),
+                "opaque",
+            ),
+            transport: Some("gcp-pubsub".to_string()),
+            bind_spec: None,
+            codec: None,
+            cloud_events_mode: None,
+            auth_scheme: None,
+            idempotency_key_header: None,
+            payload_cap_bytes: None,
+            properties,
+        }
+    }
+
+    #[test]
+    fn wiring_refuses_a_reference_in_each_connection_property() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        for key in ["project-id", "subscription", "topic", "endpoint-override"] {
+            let def = definition(&[], Some(key));
+            let Err(err) = spawn_gcp_pubsub_channels_with_intake(
+                &[def],
+                Arc::new(NoIntake),
+                None,
+                resolver,
+                runtime.handle().clone(),
+            ) else {
+                panic!("a reference in '{key}' must not wire");
+            };
+            assert_eq!(
+                err.code, "SUTRA.INBOUND.GCP_PUBSUB.CONFIG_INVALID",
+                "for {key}"
+            );
+            assert!(err.message.contains("orders-in"), "{}", err.message);
+            assert!(err.message.contains(&format!("'{key}'")), "{}", err.message);
+            assert!(err.message.contains("later release"), "{}", err.message);
+            assert!(!err.message.contains("CHANNEL_SETTING"), "{}", err.message);
+        }
+    }
+
+    #[test]
+    fn a_literal_connection_property_is_unaffected() {
+        let literal = GcpPubSubChannelProperties::for_wiring(&definition(&[], None))
+            .expect("literal values wire");
+        let plain = GcpPubSubChannelProperties::from_definition(&definition(&[], None))
+            .expect("plain parse");
+        assert_eq!(literal, plain);
     }
 }
 

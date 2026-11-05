@@ -10,6 +10,7 @@
 
 use sqlx::{PgConnection, PgPool};
 use time::OffsetDateTime;
+use uuid::Uuid;
 
 use crate::scope::begin_deployment_tx;
 use crate::{DeploymentId, PersistenceError, Result};
@@ -44,8 +45,9 @@ pub struct PgInboxStore {
     pool: PgPool,
 }
 
-const SQL_INSERT: &str = "INSERT INTO inbox_seen (deployment_id, channel, event_id, seen_at) \
-     VALUES ($1, $2, $3, $4) \
+const SQL_INSERT: &str = "INSERT INTO inbox_seen \
+     (deployment_id, channel, event_id, seen_at, instance_id) \
+     VALUES ($1, $2, $3, $4, $5) \
      ON CONFLICT (deployment_id, channel, event_id) DO NOTHING";
 
 const SQL_PRUNE: &str = "DELETE FROM inbox_seen WHERE seen_at < $1";
@@ -67,11 +69,24 @@ impl PgInboxStore {
         channel: &str,
         event_id: &str,
     ) -> Result<bool> {
+        Self::record_seen_for_in(conn, deployment, channel, event_id, None).await
+    }
+
+    /// [`Self::record_seen_in`], keeping the instance the delivery started or resumed so a later
+    /// duplicate can name it.
+    pub async fn record_seen_for_in(
+        conn: &mut PgConnection,
+        deployment: &DeploymentId,
+        channel: &str,
+        event_id: &str,
+        instance_id: Option<Uuid>,
+    ) -> Result<bool> {
         let inserted = sqlx::query(SQL_INSERT)
             .bind(deployment.as_str())
             .bind(channel)
             .bind(event_id)
             .bind(OffsetDateTime::now_utc())
+            .bind(instance_id)
             .execute(conn)
             .await
             .map_err(PersistenceError::db("inbox recordSeen"))?
@@ -149,6 +164,48 @@ impl PgInboxStore {
             .await
             .map_err(PersistenceError::db("inbox seen commit"))?;
         Ok(found.is_some())
+    }
+
+    /// The instance kept with a recorded delivery. `None` for no record, and for a record that
+    /// names none: its delivery ended without an instance, or it predates the column.
+    pub async fn original_instance(
+        &self,
+        deployment: &DeploymentId,
+        channel: &str,
+        event_id: &str,
+    ) -> Result<Option<Uuid>> {
+        let mut tx = begin_deployment_tx(&self.pool, deployment).await?;
+        let found: Option<Option<Uuid>> = sqlx::query_scalar(
+            "SELECT instance_id FROM inbox_seen \
+             WHERE deployment_id = $1 AND channel = $2 AND event_id = $3",
+        )
+        .bind(deployment.as_str())
+        .bind(channel)
+        .bind(event_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(PersistenceError::db("inbox original instance"))?;
+        tx.commit()
+            .await
+            .map_err(PersistenceError::db("inbox original instance commit"))?;
+        Ok(found.flatten())
+    }
+
+    /// Record `(deployment, channel, event_id)` with its instance, in a transaction of its own.
+    pub async fn record_seen_for(
+        &self,
+        deployment: &DeploymentId,
+        channel: &str,
+        event_id: &str,
+        instance_id: Option<Uuid>,
+    ) -> Result<bool> {
+        let mut tx = begin_deployment_tx(&self.pool, deployment).await?;
+        let first =
+            Self::record_seen_for_in(&mut tx, deployment, channel, event_id, instance_id).await?;
+        tx.commit()
+            .await
+            .map_err(PersistenceError::db("inbox recordSeen commit"))?;
+        Ok(first)
     }
 }
 

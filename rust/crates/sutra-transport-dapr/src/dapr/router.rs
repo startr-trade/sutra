@@ -1,7 +1,8 @@
 //! The Dapr inbound route table + axum router — the topic-keyed analogue of
 //! `sutra_channels::http`'s `(METHOD, path)` route table. Dapr's sidecar delivers every
 //! subscribed topic to ONE catch-all route (`POST /dapr/{topic}`); the topic path segment
-//! resolves the served channel.
+//! resolves the served channels. A topic is broadcast: every channel bound to it, in any
+//! deployment, receives its own copy of each delivery.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, RwLock};
@@ -39,7 +40,7 @@ struct DaprChannel {
     idempotency_key_header: Option<String>,
 }
 
-type RouteSnapshot = Arc<HashMap<String, DaprChannel>>;
+type RouteSnapshot = Arc<HashMap<String, Vec<DaprChannel>>>;
 
 /// The swappable topic → channel table the mounted [`Router`] reads dynamically — the Dapr
 /// half of the binding-flip route swap, exactly like
@@ -65,15 +66,15 @@ impl DaprRouteTable {
 
 /// A validated, servable Dapr route set (opaque — build via [`dapr_routes_of`]).
 #[derive(Debug)]
-pub struct DaprRouteSet(HashMap<String, DaprChannel>);
+pub struct DaprRouteSet(HashMap<String, Vec<DaprChannel>>);
 
 /// Resolve every `transport: dapr` inbound channel of `definitions` to its topic binding.
-/// Fail-closed on a missing topic ([`codes::INBOUND_TOPIC_NOT_BOUND`]) and on two channels
-/// claiming the same topic ([`shared_codes::CHANNEL_NAME_COLLISION`]).
+/// Fail-closed on a missing topic ([`codes::INBOUND_TOPIC_NOT_BOUND`]). Several channels may bind
+/// one topic.
 /// `direction: outbound` definitions are skipped (a `<q:send>` target, not a served
 /// route — resolved by the outbox dispatcher via [`super::sink::DaprMessageSink`] instead).
 pub fn dapr_routes_of(definitions: &[ChannelDefinition]) -> Result<DaprRouteSet, Diagnostic> {
-    let mut by_topic: HashMap<String, DaprChannel> = HashMap::new();
+    let mut by_topic: HashMap<String, Vec<DaprChannel>> = HashMap::new();
     for def in definitions {
         if def.transport.as_deref() != Some(TRANSPORT) {
             continue;
@@ -100,16 +101,10 @@ pub fn dapr_routes_of(definitions: &[ChannelDefinition]) -> Result<DaprRouteSet,
             ce_source_default: props.source.clone(),
             idempotency_key_header: def.idempotency_key_header.clone(),
         };
-        if by_topic.insert(props.topic.clone(), channel).is_some() {
-            return Err(Diagnostic::error(
-                shared_codes::CHANNEL_NAME_COLLISION,
-                format!(
-                    "dapr topic '{}' is already bound; refusing to bind a second channel \
-                     ('{}') to it.",
-                    props.topic, def.binding.channel_name
-                ),
-            ));
-        }
+        by_topic
+            .entry(props.topic.clone())
+            .or_default()
+            .push(channel);
     }
     Ok(DaprRouteSet(by_topic))
 }
@@ -138,7 +133,7 @@ async fn handle_post(
     body: Bytes,
 ) -> Response {
     let routes = state.routes.current();
-    let Some(channel) = routes.get(&topic) else {
+    let Some(channels) = routes.get(&topic) else {
         return StatusCode::NOT_FOUND.into_response();
     };
 
@@ -164,6 +159,124 @@ async fn handle_post(
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
 
+    // One catch-all route serves every component, so a topic name on two components needs telling
+    // apart here: an event must never reach a subscriber of another component.
+    let channels = match subscribers_of_delivery(channels, &body) {
+        Ok(channels) => channels,
+        Err(status) => {
+            tracing::warn!(
+                code = %codes::INBOUND_TOPIC_MISMATCH,
+                topic = %topic,
+                "dapr delivery on a topic several pub/sub components use names no subscribed component"
+            );
+            return status.into_response();
+        }
+    };
+
+    if let [only] = channels.as_slice() {
+        return deliver(
+            state.handle.clone(),
+            only.clone(),
+            topic,
+            copied_headers,
+            content_type,
+            body,
+        )
+        .await
+        .into_response();
+    }
+
+    // Broadcast: each subscriber gets its own copy, concurrently, so a slow one does not delay
+    // the rest. Anything short of all-accepted answers non-2xx so the sidecar redelivers, to every
+    // subscriber. What stops one that already accepted from running again is its inbox: an event id
+    // or a declared key dedupes per subscriber. With neither, a redelivery runs again, and the lint
+    // warns the author of such a flow.
+    let mut deliveries = tokio::task::JoinSet::new();
+    for channel in channels {
+        deliveries.spawn(deliver(
+            state.handle.clone(),
+            channel,
+            topic.clone(),
+            copied_headers.clone(),
+            content_type.clone(),
+            body.clone(),
+        ));
+    }
+    let mut worst = StatusCode::OK;
+    while let Some(result) = deliveries.join_next().await {
+        let status = result.unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        if delivery_severity(status) > delivery_severity(worst) {
+            worst = status;
+        }
+    }
+    worst.into_response()
+}
+
+/// The channels of a topic this delivery belongs to. Dapr's envelope names the component, and a
+/// channel that names another component does not get it. Without an envelope (a raw payload) a topic
+/// several components use cannot attribute the delivery, so nobody gets it rather than a stranger.
+/// Either way the answer is a 404: the sidecar drops the message on a 404 and retries anything else
+/// that is not a 2xx, and neither case can ever come out differently.
+fn subscribers_of_delivery(
+    channels: &[DaprChannel],
+    body: &[u8],
+) -> Result<Vec<DaprChannel>, StatusCode> {
+    let mut components: Vec<&str> = channels
+        .iter()
+        .filter_map(|c| c.pubsub_name.as_deref())
+        .collect();
+    components.sort_unstable();
+    components.dedup();
+    if components.is_empty() {
+        return Ok(channels.to_vec());
+    }
+    let envelope: Option<serde_json::Value> = serde_json::from_slice(body).ok();
+    let Some(component) = envelope
+        .as_ref()
+        .and_then(|e| e.get("pubsubname"))
+        .and_then(serde_json::Value::as_str)
+    else {
+        if components.len() == 1 {
+            return Ok(channels.to_vec());
+        }
+        return Err(StatusCode::NOT_FOUND);
+    };
+    let matching: Vec<DaprChannel> = channels
+        .iter()
+        .filter(|c| {
+            c.pubsub_name
+                .as_deref()
+                .is_none_or(|name| name == component)
+        })
+        .cloned()
+        .collect();
+    if matching.is_empty() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    Ok(matching)
+}
+
+/// How badly a subscriber's answer should weigh on the one answer the sidecar gets: a retryable
+/// failure outranks a rejection, which outranks success.
+fn delivery_severity(status: StatusCode) -> u8 {
+    if status.is_success() {
+        0
+    } else if status.is_client_error() {
+        1
+    } else {
+        2
+    }
+}
+
+/// Deliver one topic message to one subscribing channel.
+async fn deliver(
+    handle: EngineHandle,
+    channel: DaprChannel,
+    topic: String,
+    copied_headers: BTreeMap<String, String>,
+    content_type: Option<String>,
+    body: Bytes,
+) -> StatusCode {
     let extraction = match cloudevents::extract(
         channel.ce_mode,
         &channel.channel_name,
@@ -176,11 +289,11 @@ async fn handle_post(
         },
     ) {
         Ok(x) => x,
-        Err(diagnostic) => return problem_status(&diagnostic).into_response(),
+        Err(diagnostic) => return problem_status(&diagnostic),
     };
 
     let (idempotency_key, explicit) = resolve_idempotency_key(
-        channel,
+        &channel,
         &copied_headers,
         extraction.explicit_id.as_deref(),
         &body,
@@ -209,24 +322,24 @@ async fn handle_post(
         cloud_event: extraction.cloud_event.map(Box::new),
     };
 
-    match state.handle.dispatch(message).await {
+    match handle.dispatch(message).await {
         // Per Dapr's at-least-once contract 2xx acks the delivery; unlike the synchronous
         // HTTP transport there is no `<q:reply>` to render back — Dapr pub/sub is
         // fire-and-forget push, so the handler answers with a bare 200.
         // A dead-lettered (non-idempotent, failed) delivery is CONSUMED at-most-once with a
         // durable incident recorded; a 2xx suppresses the sidecar's at-least-once retry (a retry
         // would only re-fail and re-dead-letter).
-        Ok(DispatchOutcome::Duplicate)
+        Ok(DispatchOutcome::Duplicate { .. })
         | Ok(DispatchOutcome::Completed { .. })
-        | Ok(DispatchOutcome::DeadLettered { .. }) => StatusCode::OK.into_response(),
+        | Ok(DispatchOutcome::DeadLettered { .. }) => StatusCode::OK,
         // Unreachable: `EngineHandle::dispatch` consumes every shard handoff on the router
         // side. Non-2xx so the sidecar retries per its at-least-once contract.
         Ok(DispatchOutcome::Handoff { .. } | DispatchOutcome::InlineCalls(_)) => {
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            StatusCode::INTERNAL_SERVER_ERROR
         }
         // A reject/runtime diagnostic maps to a non-2xx so the sidecar retries per its
         // at-least-once contract (a rejected CloudEvent is a 400, anything else a 500).
-        Err(diagnostic) => problem_status(&diagnostic).into_response(),
+        Err(diagnostic) => problem_status(&diagnostic),
     }
 }
 
@@ -347,13 +460,87 @@ mod tests {
         assert_eq!(err.code, codes::INBOUND_TOPIC_NOT_BOUND);
     }
 
+    fn channel_on(component: Option<&str>) -> DaprChannel {
+        DaprChannel {
+            channel_name: format!("in-{}", component.unwrap_or("any")),
+            module_key: "m".to_string(),
+            tenant: "t".to_string(),
+            pubsub_name: component.map(str::to_string),
+            ce_mode: CeMode::parse(None),
+            ce_source_default: None,
+            idempotency_key_header: None,
+        }
+    }
+
     #[test]
-    fn duplicate_topic_across_channels_collides() {
+    fn a_delivery_reaches_only_the_subscribers_of_its_component() {
+        let channels = [channel_on(Some("bus-a")), channel_on(Some("bus-b"))];
+        let found =
+            subscribers_of_delivery(&channels, br#"{"id":"1","pubsubname":"bus-b"}"#).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].pubsub_name.as_deref(), Some("bus-b"));
+    }
+
+    #[test]
+    fn a_delivery_that_names_no_component_is_refused_when_several_share_the_topic() {
+        let channels = [channel_on(Some("bus-a")), channel_on(Some("bus-b"))];
+        assert_eq!(
+            subscribers_of_delivery(&channels, br#"{"pubsubname":"bus-c"}"#).unwrap_err(),
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[test]
+    fn one_component_needs_no_envelope() {
+        let channels = [channel_on(Some("bus-a")), channel_on(Some("bus-a"))];
+        assert_eq!(subscribers_of_delivery(&channels, b"raw").unwrap().len(), 2);
+    }
+
+    /// One channel names a component and one names none: the delivery still says which it came from.
+    #[test]
+    fn a_delivery_from_another_component_skips_a_subscriber_that_named_its_own() {
+        let channels = [channel_on(Some("bus-a")), channel_on(None)];
+        let found =
+            subscribers_of_delivery(&channels, br#"{"id":"1","pubsubname":"bus-z"}"#).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].pubsub_name, None);
+        let only = [channel_on(Some("bus-a"))];
+        assert_eq!(
+            subscribers_of_delivery(&only, br#"{"pubsubname":"bus-z"}"#).unwrap_err(),
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    /// The sidecar retries anything but a 2xx or a 404, and this delivery can never be attributed.
+    #[test]
+    fn a_delivery_that_can_never_be_attributed_is_not_retried() {
+        let channels = [channel_on(Some("bus-a")), channel_on(Some("bus-b"))];
+        assert_eq!(
+            subscribers_of_delivery(&channels, b"raw").unwrap_err(),
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[test]
+    fn a_topic_broadcasts_to_every_channel_bound_to_it() {
         let defs = vec![
             definition("orders-in-1", "dapr", &[("topic", "orders.created")]),
             definition("orders-in-2", "dapr", &[("topic", "orders.created")]),
         ];
-        let err = dapr_routes_of(&defs).unwrap_err();
-        assert_eq!(err.code, shared_codes::CHANNEL_NAME_COLLISION);
+        let set = dapr_routes_of(&defs).unwrap();
+        let bound: Vec<&str> = set.0["orders.created"]
+            .iter()
+            .map(|c| c.channel_name.as_str())
+            .collect();
+        assert_eq!(bound, ["orders-in-1", "orders-in-2"]);
+    }
+
+    #[test]
+    fn the_worst_subscriber_answer_wins() {
+        assert!(
+            delivery_severity(StatusCode::INTERNAL_SERVER_ERROR)
+                > delivery_severity(StatusCode::BAD_REQUEST)
+        );
+        assert!(delivery_severity(StatusCode::BAD_REQUEST) > delivery_severity(StatusCode::OK));
     }
 }

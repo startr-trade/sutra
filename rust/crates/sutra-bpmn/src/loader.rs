@@ -78,6 +78,8 @@ struct DocScan {
     audit_by_process_id: HashMap<String, ProcessAudit>,
     /// Process-level `<q:process idempotent>` assertion (absent ⇒ fail-closed `false`).
     idempotent_by_process_id: HashMap<String, bool>,
+    /// Process-level `<q:receipt>` attributes (absent ⇒ the flow exposes nothing).
+    receipt_by_process_id: HashMap<String, Vec<crate::qbindings::ReceiptAttribute>>,
     error_code_by_id: HashMap<String, String>,
     escalation_code_by_id: HashMap<String, String>,
     signal_name_by_id: HashMap<String, String>,
@@ -250,6 +252,8 @@ impl BpmnModelLoader {
         let mut coverage_paths_by_process_id = HashMap::new();
         let mut audit_by_process_id: HashMap<String, ProcessAudit> = HashMap::new();
         let mut idempotent_by_process_id: HashMap<String, bool> = HashMap::new();
+        let mut receipt_by_process_id: HashMap<String, Vec<crate::qbindings::ReceiptAttribute>> =
+            HashMap::new();
         for process in root.collect_descendants_ns(BPMN_NS, "process") {
             let id = process.attr_or_empty("id");
             if id.trim().is_empty() {
@@ -307,6 +311,11 @@ impl BpmnModelLoader {
                         break 'idem;
                     }
                 }
+            }
+
+            let receipt = parse_receipt_attributes(process, id)?;
+            if !receipt.is_empty() {
+                receipt_by_process_id.insert(id.to_string(), receipt);
             }
 
             let mut decls: Vec<DeclaredVariable> = Vec::new();
@@ -413,6 +422,7 @@ impl BpmnModelLoader {
             coverage_paths_by_process_id,
             audit_by_process_id,
             idempotent_by_process_id,
+            receipt_by_process_id,
             error_code_by_id,
             escalation_code_by_id,
             signal_name_by_id,
@@ -469,6 +479,11 @@ impl BpmnModelLoader {
             .get(&id)
             .copied()
             .unwrap_or(false);
+        let receipts = scan
+            .receipt_by_process_id
+            .get(&id)
+            .cloned()
+            .unwrap_or_default();
         let shadowed = scan
             .shadowed_variables_by_process_id
             .get(&id)
@@ -477,6 +492,7 @@ impl BpmnModelLoader {
         Ok(process
             .with_audit(audit)
             .with_idempotent(idempotent)
+            .with_receipt_attributes(receipts)
             .with_shadowed_bpmn_variables(shadowed))
     }
 
@@ -2841,6 +2857,45 @@ fn parse_aliases(ext: &XmlElement, host_id: &str) -> Result<Vec<AliasBinding>, S
             on_conflict: parse_alias_conflict(a.attr_or_empty("onConflict"))?,
             multi: a.attr_or_empty("multi") == "true",
         });
+    }
+    Ok(out)
+}
+
+/// The `<q:attribute>` children of a process's `<q:receipt>`, in document order.
+fn parse_receipt_attributes(
+    process: &XmlElement,
+    process_id: &str,
+) -> Result<Vec<crate::qbindings::ReceiptAttribute>, SutraError> {
+    let mut out = Vec::new();
+    for ext in process.children_ns(BPMN_NS, "extensionElements") {
+        for receipt in ext.children_ns(Q_NS, "receipt") {
+            for a in receipt.children_ns(Q_NS, "attribute") {
+                let name = a.attr_or_empty("name").trim();
+                if name.is_empty() {
+                    return Err(err(
+                        codes::PARSE_Q_RECEIPT_ATTRIBUTE_MISSING_NAME,
+                        format!(
+                            "<q:receipt><q:attribute> on process {process_id} missing required \
+                             @name attribute"
+                        ),
+                    ));
+                }
+                let expression = a.attr_or_empty("expression").trim();
+                if expression.is_empty() {
+                    return Err(err(
+                        codes::PARSE_Q_RECEIPT_ATTRIBUTE_MISSING_EXPRESSION,
+                        format!(
+                            "<q:receipt><q:attribute {name}> on process {process_id} missing \
+                             required @expression attribute"
+                        ),
+                    ));
+                }
+                out.push(crate::qbindings::ReceiptAttribute {
+                    name: name.to_string(),
+                    expression: expression.to_string(),
+                });
+            }
+        }
     }
     Ok(out)
 }

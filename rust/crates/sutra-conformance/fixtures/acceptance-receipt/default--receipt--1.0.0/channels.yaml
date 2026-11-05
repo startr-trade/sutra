@@ -1,0 +1,45 @@
+# Channels for the acceptance-receipt conformance suite. All answer 202 (ack-mode on-persist).
+#
+#   POST /channels/case-open      parks, replies nothing: the receipt becomes the JSON body
+#   POST /channels/case-release   resumes that parked instance, correlated on orderId
+#   POST /channels/case-authored  replies with <q:reply continue="true">: that body is untouched
+#   POST /channels/case-run       runs to its end and persists nothing, keyed by body.ref
+
+channels:
+  - name: case-open
+    transport: http
+    bind: "POST /channels/case-open"
+    codec: json
+    ack-mode: on-persist
+    idempotency-key-header: Idempotency-Key
+    cloudevents-mode: none
+    auth: &auth
+      scheme: apikey
+      apikey:
+        value: env:RECEIPT_API_KEY
+        header: X-Api-Key
+
+  - name: case-release
+    transport: http
+    bind: "POST /channels/case-release"
+    codec: json
+    ack-mode: on-persist
+    cloudevents-mode: none
+    auth: *auth
+
+  - name: case-authored
+    transport: http
+    bind: "POST /channels/case-authored"
+    codec: json
+    ack-mode: on-persist
+    idempotency-key-header: Idempotency-Key
+    cloudevents-mode: none
+    auth: *auth
+
+  - name: case-run
+    transport: http
+    bind: "POST /channels/case-run"
+    codec: json
+    ack-mode: on-persist
+    cloudevents-mode: none
+    auth: *auth

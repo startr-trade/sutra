@@ -1019,6 +1019,9 @@ struct HttpChannel {
     ce_type_default: Option<String>,
     /// `reply-stream: sse` — a streamed synchronous call answers as server-sent events.
     reply_stream_sse: bool,
+    /// The serving deployment, as a receipt names it.
+    deployment_id: String,
+    labels: std::collections::BTreeMap<String, String>,
 }
 
 /// The swappable `(METHOD, path)` → channel table the HTTP transport serves from — the
@@ -1135,6 +1138,8 @@ pub fn http_routes_of_resolved(
             ce_source_default: def.properties.get("ce.source").cloned(),
             ce_type_default: def.properties.get("ce.type").cloned(),
             reply_stream_sse: def.wants_reply_stream_sse(),
+            deployment_id: def.binding.deployment_id().value().to_string(),
+            labels: def.binding.labels(),
         };
         if by_route
             .insert((method.clone(), path.clone()), channel)
@@ -1287,8 +1292,27 @@ async fn serve_route(
         state.handle.dispatch(message).await
     };
     match dispatched {
-        Ok(DispatchOutcome::Duplicate) => StatusCode::ACCEPTED.into_response(),
-        Ok(DispatchOutcome::Completed { reply, outputs, .. }) => {
+        // Whatever the ack mode: the work is already accepted, and the caller is told by which
+        // instance.
+        Ok(DispatchOutcome::Duplicate {
+            original_instance_id,
+            dedup_key,
+        }) => accepted_response(
+            channel,
+            original_instance_id,
+            true,
+            crate::receipt::AcceptanceFacts {
+                idempotency_key: Some(dedup_key),
+                ..Default::default()
+            },
+            None,
+        ),
+        Ok(DispatchOutcome::Completed {
+            instance_id,
+            reply,
+            acceptance,
+            ..
+        }) => {
             if async_ack {
                 // on-persist ⇒ asynchronous channel: the answer does not wait for the work to
                 // finish. That settles WHEN we respond, not WHETHER the flow had something to
@@ -1296,20 +1320,21 @@ async fn serve_route(
                 // deliberately, before parking, precisely so a long-running load could hand the
                 // caller a batch id and then detach — so that receipt IS the 202's body. A 202
                 // carrying a representation of the accepted work is exactly what the status is
-                // for. Only a flow that replied nothing gets the bare 202.
+                // for. A flow that replied nothing gets the engine's own receipt as the body.
                 //
                 // It used to be dropped unconditionally, which made the two declarations
                 // silently exclusive: the asynchronous ack mode a long load wants and the
                 // receipt it wants to send could not coexist, and nothing said so — the caller
                 // just got an empty body.
-                return match reply {
-                    Some(r) => {
-                        response_with(StatusCode::ACCEPTED, &r.content_type, r.body.into_inner())
-                    }
-                    None => StatusCode::ACCEPTED.into_response(),
-                };
+                return accepted_response(
+                    channel,
+                    Some(instance_id).filter(|id| !id.is_empty()),
+                    false,
+                    acceptance.map(|facts| *facts).unwrap_or_default(),
+                    reply,
+                );
             }
-            render_ok(reply, outputs, content_type.as_deref())
+            render_ok(reply, content_type.as_deref())
         }
         // A non-idempotent process failed and was dead-lettered (consumed + recorded as a
         // durable incident). HTTP is synchronous with no engine-managed redelivery, so surface the
@@ -1339,12 +1364,50 @@ async fn serve_route(
     }
 }
 
-/// Render the sync response — the `HttpRequestProcessor.renderOk` contract: the flow's
-/// reply verbatim; else the outputs map as JSON; empty outputs → 200 empty with the
-/// symmetric (inbound) content type.
+/// The 202: the engine's receipt in its headers, always, over the flow's own reply verbatim or,
+/// when the flow replied nothing, the receipt again as a JSON body.
+fn accepted_response(
+    channel: &HttpChannel,
+    instance_id: Option<String>,
+    duplicate: bool,
+    facts: crate::receipt::AcceptanceFacts,
+    reply: Option<crate::dispatch::SyncReply>,
+) -> Response {
+    let receipt = crate::receipt::AcceptanceReceipt {
+        instance_id,
+        deployment_id: channel.deployment_id.clone(),
+        labels: channel.labels.clone(),
+        duplicate,
+        facts,
+    };
+    let mut response = match reply {
+        Some(r) => response_with(StatusCode::ACCEPTED, &r.content_type, r.body.into_inner()),
+        None => response_with(
+            StatusCode::ACCEPTED,
+            "application/json",
+            receipt.to_json().to_string().into_bytes(),
+        ),
+    };
+    let headers = response.headers_mut();
+    if let Some(value) = receipt
+        .instance_id
+        .as_deref()
+        .and_then(|id| axum::http::HeaderValue::from_str(id).ok())
+    {
+        headers.insert(crate::receipt::INSTANCE_ID_HEADER, value);
+    }
+    if let Ok(value) = axum::http::HeaderValue::from_str(&receipt.header_value()) {
+        headers.insert(crate::receipt::RECEIPT_HEADER, value);
+    }
+    response
+}
+
+/// Render the sync response: the reply the flow declared with `<q:reply>`, verbatim, else a 200
+/// with an empty body. A flow that wants to return data says so with `<q:reply>`. The instance's
+/// variables never answer the caller: they hold the whole inbound event, its headers and any
+/// credential the caller sent included.
 fn render_ok(
     reply: Option<crate::dispatch::SyncReply>,
-    outputs: serde_json::Value,
     inbound_content_type: Option<&str>,
 ) -> Response {
     let symmetric = match inbound_content_type {
@@ -1354,13 +1417,7 @@ fn render_ok(
     if let Some(reply) = reply {
         return response_with(StatusCode::OK, &reply.content_type, reply.body.into_inner());
     }
-    match &outputs {
-        serde_json::Value::Object(map) if !map.is_empty() => {
-            let body = serde_json::to_vec(&outputs).unwrap_or_default();
-            response_with(StatusCode::OK, "application/json", body)
-        }
-        _ => response_with(StatusCode::OK, &symmetric, Vec::new()),
-    }
+    response_with(StatusCode::OK, &symmetric, Vec::new())
 }
 
 /// A `text/event-stream` response over the remaining frames of a streamed chain: `chunk`

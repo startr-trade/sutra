@@ -53,3 +53,9 @@ conformance = [
     "dep:tokio",
     "dep:serde_json",
 ]
+
+# Not libtest on purpose: it stands in for a doc-test binary, which ignores `--list`.
+[[test]]
+name = "suite_listing_no_respawn"
+harness = false
+required-features = ["conformance"]

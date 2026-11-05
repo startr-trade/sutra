@@ -1,0 +1,8 @@
+datastores:
+  - name: seen
+    type: sql
+    sql:
+      url-ref: env:SQSI_STORE_URL
+      username-ref: env:SQSI_STORE_USER
+      password-ref: env:SQSI_STORE_PASSWORD
+      migrations: migrations/seen

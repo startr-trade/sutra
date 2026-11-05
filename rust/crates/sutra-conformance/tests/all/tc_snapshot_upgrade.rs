@@ -71,6 +71,7 @@ async fn wait_for(what: &str, within: Duration, mut done: impl FnMut() -> bool) 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "docker"]
 async fn tc_snapshot_upgrade_instances_parked_by_earlier_releases_resume_once() {
+    let _suite = sutra_testkit::hold_suite!("upgrade");
     let from = std::env::var("SUTRA_UPGRADE_FROM_IMAGES").unwrap_or_else(|_| DEFAULT_FROM.into());
     let archives = archives();
     for (n, old_image) in from

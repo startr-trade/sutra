@@ -335,29 +335,12 @@ pub async fn serve(config: EngineConfig) -> Result<RunningEngine, Box<dyn std::e
             // instances pinned to those revisions have no definition to resume against and both
             // resume paths fail closed. The tail carries no channel bindings — it exists to be
             // resumed into, never to accept new intake — and leaves on the quiescence sweep.
-            let served = store
-                .list_active_and_draining()
-                .await
-                .map_err(|e| e.to_string())?;
-            let (active, draining): (Vec<_>, Vec<_>) = served.into_iter().partition(|row| {
-                !matches!(
-                    row.status,
-                    sutra_persistence::stores::ArchiveStatus::Draining
-                )
-            });
-            // (id, slot) for the boot deploy-status snapshot (the db source has no watcher to
-            // publish it, so it is seeded here after assembly).
-            let id_slots: Vec<(String, String)> = active
-                .iter()
-                .map(|row| (row.archive.deployment_id.clone(), row.archive.slot.clone()))
-                .collect();
-            let archives_of = |rows: Vec<sutra_persistence::stores::ServedArchiveRow>| {
-                rows.into_iter()
-                    .map(|row| (row.archive.deployment_id, row.archive.bytes))
-                    .collect::<Vec<(String, Vec<u8>)>>()
-            };
-            let plans = crate::deploy::plans_from_store(archives_of(active));
-            let draining_plans = crate::deploy::plans_from_store(archives_of(draining));
+            let crate::deploy::SettledStoreSet {
+                active: plans,
+                draining: draining_plans,
+                id_slots,
+                refused,
+            } = crate::deploy::settled_store_set(&store).await?;
             let specs = plans
                 .iter()
                 .chain(draining_plans.iter())
@@ -369,24 +352,48 @@ pub async fn serve(config: EngineConfig) -> Result<RunningEngine, Box<dyn std::e
                 draining = draining_plans.len(),
                 "booted active set + draining tail from the deployment_archive store"
             );
-            (None, plans, draining_plans, specs, Some((store, id_slots)))
+            (
+                None,
+                plans,
+                draining_plans,
+                specs,
+                Some((store, id_slots, refused)),
+            )
         }
         crate::config::DeploymentSourceKind::Dir => {
             let deployments_dir = config.deployments_dir.clone().expect(
                 "sutra.deployments.dir is required for the dir source (enforced by EngineConfig::load)",
             );
+            // With a database the holder of each endpoint is recorded there, so a restart and every
+            // replica read one answer. An engine pointed at a migration root without that table
+            // has what any engine without a database has: its own memory.
+            let holders = match &pool {
+                Some(pool) => {
+                    let store = sutra_persistence::stores::PgEndpointHolderStore::new(pool.clone());
+                    if store.available().await.map_err(|e| e.to_string())? {
+                        Some((store, tokio::runtime::Handle::current()))
+                    } else {
+                        tracing::error!(
+                            "the deployment_endpoint_holder table is missing from the datasource: \
+                             endpoint holders are not recorded across restarts"
+                        );
+                        None
+                    }
+                }
+                None => None,
+            };
+            let persistence = pool.is_some();
             let directory = tokio::task::spawn_blocking(
                 move || -> Result<crate::deploy::DeploymentDirectory, String> {
-                    crate::deploy::DeploymentDirectory::open(deployments_dir)
+                    crate::deploy::DeploymentDirectory::open(deployments_dir, holders, persistence)
                         .map_err(|e| e.to_string())
                 },
             )
             .await??;
             let plans = directory.active_plans();
+            let draining = directory.draining_plans();
             let specs = directory.api_specs();
-            // The dir source boots with an EMPTY draining tail: nothing has been flipped away
-            // yet in this process, and the directory is the whole truth of what is deployed.
-            (Some(directory), plans, Vec::new(), specs, None)
+            (Some(directory), plans, draining, specs, None)
         }
     };
 
@@ -414,6 +421,8 @@ pub async fn serve(config: EngineConfig) -> Result<RunningEngine, Box<dyn std::e
         .iter()
         .map(|p| p.dep.value().to_string())
         .collect();
+    let boot_facts: Vec<crate::deployment_facts::DeploymentFacts> =
+        boot_plans.iter().map(|p| p.facts.clone()).collect();
     // Crypto key provider — HkdfKeyProvider from the master key, or the envelope
     // EnvelopeKeyProvider loading sealed DEKs from the `data_key` store (async, so built here in
     // serve() before the runtime-less actor thread). The one provider is shared by the persistence
@@ -568,7 +577,7 @@ pub async fn serve(config: EngineConfig) -> Result<RunningEngine, Box<dyn std::e
             );
             (Some(watch), None)
         }
-        (None, Some((store, id_slots))) => {
+        (None, Some((store, id_slots, refused))) => {
             // Seed the boot deploy-status so /sutra/health/ready reports the active count
             // immediately (the db source runs no watcher to publish it).
             if let Ok(mut s) = deploy_status.write() {
@@ -576,6 +585,8 @@ pub async fn serve(config: EngineConfig) -> Result<RunningEngine, Box<dyn std::e
                     .into_iter()
                     .filter(|(id, _)| boot_ids.contains(id))
                     .collect();
+                s.facts = boot_facts;
+                s.failed = refused;
             }
             let controller = Arc::new(crate::deploy::DeployController::new(store, hooks));
             (None, Some(controller))
@@ -731,6 +742,7 @@ pub async fn serve(config: EngineConfig) -> Result<RunningEngine, Box<dyn std::e
 
     // NB: this route set is the canonical [`PLATFORM_ROUTES`] table — keep the two in sync (the
     // openapi/platform.yaml drift gate enforces the spec side).
+    let instance_reads = instance_read_routes(&admin_gate);
     let router = Router::new()
         .route("/sutra/health/live", get(live))
         .route("/sutra/health/ready", get(readiness))
@@ -739,11 +751,10 @@ pub async fn serve(config: EngineConfig) -> Result<RunningEngine, Box<dyn std::e
         // The per-deployment OpenAPI 3.1 surface, generated from the archive manifest and
         // served live (YAML by default; Accept: application/json / ?format=json for JSON).
         .route("/sutra/deployments/{id}/openapi", get(deployment_openapi))
-        // Operate-time inspection surface (list / inspect / cancel). Unauthenticated
-        // internal-ops posture (cluster-internal); the SAME operations behind OIDC gating are the
-        // `/admin/*` surface, mounted below.
-        .route("/sutra/instances", get(instances_list))
-        .route("/sutra/instances/{id}", get(instance_by_id))
+        // Operate-time inspection surface: the reads answer to the admin gate once admin auth is
+        // on, because an instance's variables and aliases are business data. Cancel keeps the
+        // internal-ops posture of the other `/sutra/*` routes; its gated twin is under `/admin/*`.
+        .merge(instance_reads)
         .route("/sutra/instances/{id}/cancel", post(instance_cancel))
         // Structured JSON logs to stdout are the baseline observability surface.
         .with_state(state.clone())
@@ -782,6 +793,24 @@ pub async fn serve(config: EngineConfig) -> Result<RunningEngine, Box<dyn std::e
         transports,
         runtime: handle,
     })
+}
+
+/// The instance reads (`GET /sutra/instances`, with its `?alias=` search, and
+/// `GET /sutra/instances/{id}`), behind the admin gate. See
+/// [`crate::admin::gate_instance_reads`] for which postures that closes.
+fn instance_read_routes(gate: &crate::admin::AdminGate) -> Router<AppState> {
+    crate::admin::gate_instance_reads(
+        Router::new()
+            .route("/sutra/instances", get(instances_list))
+            .route("/sutra/instances/{id}", get(instance_by_id)),
+        gate,
+    )
+}
+
+/// The instance read routes alone, as [`serve`] mounts them, for the gate's unit tests.
+#[cfg(test)]
+pub(crate) fn instance_read_router_for_test(gate: &crate::admin::AdminGate) -> Router {
+    instance_read_routes(gate).with_state(app_state_for_test())
 }
 
 /// Open the engine-internal pool (`postgres://` / `postgresql://` URL — the canonical
@@ -1030,22 +1059,137 @@ pub(crate) async fn deploy_response(
             .into_response();
     };
     match controller.deploy(body.to_vec()).await {
-        Ok(out) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
+        Ok(out) => {
+            let mut response = serde_json::json!({
                 "deploymentId": out.deployment_id,
                 "slot": out.slot,
                 "revision": out.revision,
                 "phase": "Active",
+            });
+            attach_deploy_warnings(&mut response, &out.warnings);
+            (StatusCode::OK, Json(response)).into_response()
+        }
+        Err(e) => deploy_refusal_response(e),
+    }
+}
+
+/// A clean deploy's body is unchanged: `warnings` appears only when there is one to report.
+fn attach_deploy_warnings(
+    response: &mut serde_json::Value,
+    warnings: &[crate::deployment_facts::DeployWarning],
+) {
+    if !warnings.is_empty() {
+        response["warnings"] = warnings
+            .iter()
+            .map(crate::deployment_facts::DeployWarning::to_json)
+            .collect();
+    }
+}
+
+/// A refused deploy: `409` when another deployment holds the endpoint (the archive is fine, the
+/// target's state is the obstacle), `400` for everything wrong with the archive itself. A `500`
+/// is not a refusal: the row is stored, and only this replica's flip failed.
+fn deploy_refusal_response(error: String) -> axum::response::Response {
+    let collision = format!("[{}]", sutra_channels::codes::DEPLOY_ENDPOINT_COLLISION);
+    let flip_failed = format!("[{}]", sutra_channels::codes::DEPLOY_ACTIVATE_FLIP_FAILED);
+    if error.starts_with(&flip_failed) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "code": sutra_channels::codes::DEPLOY_ACTIVATE_FLIP_FAILED,
+                "error": error,
             })),
         )
-            .into_response(),
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": e })),
-        )
-            .into_response(),
+            .into_response();
     }
+    if error.starts_with(&collision) {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "code": sutra_channels::codes::DEPLOY_ENDPOINT_COLLISION,
+                "error": error,
+            })),
+        )
+            .into_response();
+    }
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({ "error": error })),
+    )
+        .into_response()
+}
+
+/// `POST /admin/deployments/check` body — judge an archive against the ACTIVE set, changing
+/// nothing. A verdict is always `200`; only an archive that does not verify is a `400`.
+pub(crate) fn deployment_check_response(
+    state: &AppState,
+    slot: Option<&str>,
+    body: &[u8],
+) -> axum::response::Response {
+    let judged = sutra_loader::read_archive(body)
+        .map_err(|e| format!("{e}"))
+        .and_then(|archive| {
+            crate::deploy::refuse_unrecognised_dedup_keys(&archive.deployment)?;
+            crate::deployment_facts::DeploymentFacts::of_loaded(
+                &archive.deployment,
+                crate::deployment_facts::ConnectionView::Resolved,
+            )
+        });
+    let candidate = match judged {
+        Ok(facts) => match slot.filter(|s| !s.is_empty()) {
+            Some(slot) => facts.in_slot(slot),
+            None => facts,
+        },
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": e })),
+            )
+                .into_response();
+        }
+    };
+    // Judging against nothing would answer `ok: true` for a set this engine cannot read.
+    let Ok(status) = state.deploy_status.read() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "deployment status is unavailable" })),
+        )
+            .into_response();
+    };
+    let others: Vec<crate::deployment_facts::DeploymentFacts> = status
+        .facts
+        .iter()
+        .filter(|f| f.slot != candidate.slot)
+        .cloned()
+        .collect();
+    drop(status);
+    let mut verdict = crate::deployment_facts::evaluate_candidate(&candidate, &others);
+    // With no deploy controller this engine serves a folder.
+    if state.deploy.is_none() {
+        verdict.warn_for_folder_target(&candidate);
+    }
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "deploymentId": candidate.deployment_id,
+            "slot": candidate.slot,
+            "ok": verdict.collisions.is_empty(),
+            "collisions": verdict.collisions.iter().map(|c| serde_json::json!({
+                "code": sutra_channels::codes::DEPLOY_ENDPOINT_COLLISION,
+                "transport": c.transport,
+                "endpoint": c.identity,
+                "holder": c.holder_label,
+                "holderChannel": c.holder_channel,
+                "claimant": c.claimant_label,
+                "claimantChannel": c.claimant_channel,
+                "message": c.describe(),
+            })).collect::<Vec<_>>(),
+            "warnings": verdict.warnings.iter()
+                .map(crate::deployment_facts::DeployWarning::to_json)
+                .collect::<Vec<_>>(),
+        })),
+    )
+        .into_response()
 }
 
 /// `POST /admin/deployments?mode=async` body (db source) — the async long-running deploy: validate +
@@ -1069,22 +1213,18 @@ pub(crate) async fn deploy_async_response(
             .into_response();
     };
     match controller.deploy_async(body.to_vec(), sinks).await {
-        Ok(acc) => (
-            StatusCode::ACCEPTED,
-            Json(serde_json::json!({
+        Ok(acc) => {
+            let mut response = serde_json::json!({
                 "deploymentId": acc.deployment_id,
                 "slot": acc.slot,
                 "revision": acc.revision,
                 "phase": "Pending",
                 "statusUrl": format!("/sutra/deployments/{}", acc.deployment_id),
-            })),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": e })),
-        )
-            .into_response(),
+            });
+            attach_deploy_warnings(&mut response, &acc.warnings);
+            (StatusCode::ACCEPTED, Json(response)).into_response()
+        }
+        Err(e) => deploy_refusal_response(e),
     }
 }
 
@@ -1179,6 +1319,7 @@ pub const PLATFORM_ROUTES: &[(&str, &str)] = &[
     ("GET", "/sutra/deployments"),
     ("GET", "/sutra/deployments/{id}"),
     ("GET", "/sutra/deployments/{id}/openapi"),
+    // Admin-gated once admin auth is on (`crate::admin::gate_instance_reads`).
     ("GET", "/sutra/instances"),
     ("GET", "/sutra/instances/{id}"),
     ("POST", "/sutra/instances/{id}/cancel"),
@@ -1195,6 +1336,7 @@ pub const PLATFORM_ROUTES: &[(&str, &str)] = &[
     // handlers + the `AdminGate` layer live in [`crate::admin`].
     ("GET", "/admin/deployments"),
     ("POST", "/admin/deployments"),
+    ("POST", "/admin/deployments/check"),
     ("GET", "/admin/deployments/{id}"),
     ("DELETE", "/admin/deployments/{id}"),
     ("GET", "/admin/instances"),
@@ -1263,12 +1405,31 @@ pub(crate) async fn instances_list_response(
     let asked_for_terminal_status = status
         .as_deref()
         .is_some_and(|s| s == STATUS_COMPLETED || s == STATUS_TERMINATED);
+    // `?alias=<name>:<value>`: split at the FIRST colon, since a value may hold more of them.
+    let alias = match params.get("alias") {
+        None => None,
+        Some(raw) => match raw.split_once(':') {
+            Some((name, value)) if !name.is_empty() && !value.is_empty() => {
+                Some((name.to_string(), value.to_string()))
+            }
+            _ => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "alias must have the form <name>:<value>"
+                    })),
+                )
+                    .into_response();
+            }
+        },
+    };
     let filter = InstanceFilter {
         include_terminal: asked_for_terminal_status
             || params
                 .get("includeTerminal")
                 .is_some_and(|v| matches!(v.trim(), "true" | "1" | "yes")),
         status,
+        alias,
     };
     // An explicit ?deployment= wins; otherwise scan the live deployment set.
     let deployments: Vec<PersistDeploymentId> = match params.get("deployment") {
@@ -2340,6 +2501,7 @@ pub(crate) async fn instances_migrate_batch_response(
     let listing = InstanceFilter {
         status: filter.status.clone(),
         include_terminal: filter.include_terminal,
+        alias: None,
     };
     let mut summaries = match store.list(&source, &listing).await {
         Ok(rows) => rows,
@@ -3003,7 +3165,9 @@ fn dispatch_outcome_label(outcome: &sutra_channels::DispatchOutcome) -> serde_js
         sutra_channels::DispatchOutcome::Completed { instance_id, .. } => serde_json::json!({
             "kind": "Completed", "instanceId": instance_id,
         }),
-        sutra_channels::DispatchOutcome::Duplicate => serde_json::json!({ "kind": "Duplicate" }),
+        sutra_channels::DispatchOutcome::Duplicate { .. } => {
+            serde_json::json!({ "kind": "Duplicate" })
+        }
         sutra_channels::DispatchOutcome::DeadLettered {
             code, cause_code, ..
         } => serde_json::json!({

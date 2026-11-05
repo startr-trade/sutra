@@ -44,6 +44,39 @@ pub struct CloudEvent {
     pub data_content_type: Option<String>,
     pub data_schema: Option<String>,
     pub extensions: BTreeMap<String, String>,
+    /// The engine made `id` up for a wrapped message that carried none. It differs at every
+    /// delivery, so it identifies nothing and must never be taken for the event's own.
+    pub id_generated: bool,
+}
+
+/// The CloudEvents id a message carries, whatever its channel made of it: from the event the
+/// transport parsed, from the binary-mode `ce-id` header, or from a structured envelope still in the
+/// body of a channel that does not read CloudEvents. `None` when it has no id of its own.
+pub fn carried_event_id(
+    headers: &BTreeMap<String, String>,
+    cloud_event: Option<&CloudEvent>,
+    body: &[u8],
+) -> Option<String> {
+    if let Some(id) = cloud_event
+        .filter(|ce| !ce.id_generated)
+        .and_then(|ce| ce.id.clone())
+        .and_then(non_blank)
+    {
+        return Some(id);
+    }
+    if let Some(id) = lookup_ci(headers, "ce-id").and_then(non_blank) {
+        return Some(id);
+    }
+    if cloud_event.is_some() {
+        return None;
+    }
+    let envelope: serde_json::Value = serde_json::from_slice(body).ok()?;
+    envelope.get("specversion")?;
+    envelope
+        .get("id")?
+        .as_str()
+        .map(str::to_string)
+        .and_then(non_blank)
 }
 
 /// The declared `cloudevents.mode` (YAML `cloudevents-mode`).
@@ -215,6 +248,7 @@ fn parse_structured(channel: &str, body: &[u8]) -> Result<CeExtraction, Diagnost
         data_content_type: get_str("datacontenttype"),
         data_schema: get_str("dataschema"),
         extensions: BTreeMap::new(),
+        id_generated: false,
     };
     require_core(channel, &ce, "structured")?;
     if ce.spec_version.is_none() {
@@ -274,6 +308,7 @@ fn wrap_native(
     let header_id = lookup_ci(headers, "x-request-id")
         .and_then(non_blank)
         .or_else(|| lookup_ci(headers, "ce-id").and_then(non_blank));
+    let id_generated = header_id.is_none();
     let (id, explicit_id) = match header_id {
         Some(id) => (id.clone(), Some(id)),
         None => (generated_id(), None),
@@ -298,6 +333,7 @@ fn wrap_native(
         data_content_type: content_type.map(str::to_string),
         data_schema: None,
         extensions: BTreeMap::new(),
+        id_generated,
     };
     CeExtraction {
         cloud_event: Some(ce),

@@ -99,6 +99,7 @@ fn called_back(prefix: &str) -> (BTreeSet<String>, usize) {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "docker"]
 async fn tc_wait_race_an_answer_that_beats_the_wait_is_held_until_the_wait_parks() {
+    let _suite = sutra_testkit::hold_suite!("waitrace");
     let f = fixture();
     let client = reqwest::Client::new();
     let mut accepted = BTreeSet::new();
