@@ -104,7 +104,7 @@ async fn status_of(addr: SocketAddr) -> serde_json::Value {
     json_of(&body)
 }
 
-fn failed_slots(status: &serde_json::Value) -> Vec<String> {
+pub(crate) fn failed_slots(status: &serde_json::Value) -> Vec<String> {
     let mut slots: Vec<String> = status["failed"]
         .as_array()
         .map(|failed| {
@@ -1091,7 +1091,7 @@ async fn a_new_version_on_a_topic_replaces_the_old_one_in_a_folder() {
 }
 
 /// An active row as an older engine could have left it, with no notification to wake a listener.
-async fn insert_active_row(
+pub(crate) async fn insert_active_row(
     pool: &sqlx::PgPool,
     module: &str,
     version: &str,

@@ -186,8 +186,9 @@ impl PersistenceBridge {
     }
 
     /// After the commit: on success hand the reserved local rows to the dispatcher and wake it
-    /// for the rest; on failure release the reservation (nothing was inserted).
-    fn after_enqueue(
+    /// for the rest; on failure release the reservation (nothing was inserted). Reserved rows the
+    /// hand-off can no longer take are made due now (see [`crate::outbox::hand_off_or_make_due`]).
+    async fn after_enqueue(
         &self,
         deployment: &sutra_executor::DeploymentId,
         entries: &[OutboxEntry],
@@ -208,14 +209,13 @@ impl PersistenceBridge {
             .iter()
             .filter(|e| reserved.contains(&e.entry_id.to_string()))
             .cloned()
-            .map(crate::outbox::to_claimed)
             .collect();
         let rest = entries.len() - handed.len();
-        if !handed.is_empty() {
-            signal.hand_off(deployment, handed);
-        }
         if rest > 0 {
             signal.wake();
+        }
+        if !handed.is_empty() {
+            crate::outbox::hand_off_or_make_due(signal, &self.pool, deployment, handed).await;
         }
     }
 
@@ -576,7 +576,8 @@ impl InstanceBridge for PersistenceBridge {
         // only becomes meaningful from the first RESUME onwards, which is where the claim
         // is taken and `commit_repark` hands it back.
         let committed = commit_step_with_timers(&self.pool, &step, &timers).await;
-        self.after_enqueue(deployment, &step.outbox, reserved, committed.is_ok());
+        self.after_enqueue(deployment, &step.outbox, reserved, committed.is_ok())
+            .await;
         committed.map_err(|e| persistence_diag("park step commit failed", &e))?;
         info!(
             instance_id,
@@ -749,7 +750,8 @@ impl InstanceBridge for PersistenceBridge {
             Ok::<bool, PersistenceError>(retained)
         }
         .await;
-        self.after_enqueue(deployment, &entries, reserved, retained.is_ok());
+        self.after_enqueue(deployment, &entries, reserved, retained.is_ok())
+            .await;
         let retained = retained.map_err(|e| persistence_diag("terminal step failed", &e))?;
         info!(
             instance_id,
@@ -850,7 +852,8 @@ impl InstanceBridge for PersistenceBridge {
             &retired,
         )
         .await;
-        self.after_enqueue(deployment, &step.outbox, reserved, committed.is_ok());
+        self.after_enqueue(deployment, &step.outbox, reserved, committed.is_ok())
+            .await;
         committed.map_err(|e| persistence_diag("re-park step commit failed", &e))?;
         info!(
             instance_id,
@@ -1062,7 +1065,8 @@ impl InstanceBridge for PersistenceBridge {
                 .map_err(PersistenceError::db("sync-path outbox commit"))
         }
         .await;
-        self.after_enqueue(deployment, &entries, reserved, committed.is_ok());
+        self.after_enqueue(deployment, &entries, reserved, committed.is_ok())
+            .await;
         committed.map_err(|e| persistence_diag("sync-path outbox commit failed", &e))?;
         info!(
             deployment = deployment.value(),

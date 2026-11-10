@@ -8,6 +8,8 @@ use std::any::Any;
 use testcontainers::runners::SyncRunner;
 use testcontainers::ImageExt;
 
+#[path = "../coverage_cycle_contract/contract.rs"]
+mod coverage_cycle_contract;
 #[path = "../mysql_datastore/fixture.rs"]
 mod fixture;
 #[path = "../mysql_datastore/suite.rs"]

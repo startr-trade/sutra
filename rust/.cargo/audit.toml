@@ -4,11 +4,19 @@
 # advisories stay as WARNINGS here (non-fatal) — the "unmaintained = WARN" posture — so they
 # remain visible on every run. Only VULNERABILITY advisories that have been triaged and
 # accepted / tracked are listed below; the full rationale is in deny.toml. Keep this list
-# identical to deny.toml's `[advisories] ignore`.
+# identical to deny.toml's `[advisories] ignore`, except for a lock-only entry that cargo-deny
+# cannot see (each says so).
 
 [advisories]
 ignore = [
     "RUSTSEC-2026-0387",  # crypto-bigint 0.5.5 timing (via jsonwebtoken EC verify only; no fix upstream)
     "RUSTSEC-2023-0071",  # rsa 0.9.10 Marvin timing (SHIPPED via sqlx-mysql; no fix; trusted DB link)
+    # libsqlite3-sys 0.30.1, SQLite WAL page-size memory exposure (published 2026-10-30; fixed in
+    # 0.39). LOCK-ONLY: sqlx declares its optional sqlite driver through a weak feature, so the crate
+    # is in Cargo.lock, but no workspace crate enables sqlite and it is compiled into nothing
+    # (`cargo tree -i libsqlite3-sys -e all --target all` is empty). No sqlx release allows 0.39 yet
+    # (0.9.0 caps it below 0.38). cargo-deny resolves the real graph and does not see it, which is
+    # why this entry is here and not in deny.toml. Drop it when sqlx allows libsqlite3-sys 0.39.
+    "RUSTSEC-2026-0459",
     # (the six rustls 0.21 / rustls-webpki 0.101 entries left with tiberius 0.13 in 0.6.5)
 ]

@@ -24,16 +24,16 @@ async fn applies_java_migrations_once_and_is_idempotent() {
     let scripts = collect_migrations(&refs).unwrap();
     assert_eq!(
         scripts.len(),
-        27,
+        28,
         "V101..V802 subsystems + V304 inbox instance + V404 terminal-retention marker + V604 outbox poison flag + V606 outbox emitting node + \
-         V605 external-task pull parking + V1001 deployment-archive + V1002 endpoint holder (deploy family) + \
+         V605 external-task pull parking + V1001 deployment-archive + V1002 endpoint holder + V1003 retained channels (deploy family) + \
          V1101 subject-index + V1201 dead-letter + V1202 dead-letter payload capture + \
          V1301 data-key + V202 audit transport events + V203 audit journal ordinal"
     );
 
     let mut conn = migrated_pool.acquire().await.unwrap();
     let first_run = apply_migrations(&mut conn, &scripts).await.unwrap();
-    assert_eq!(first_run, 27);
+    assert_eq!(first_run, 28);
     let second_run = apply_migrations(&mut conn, &scripts).await.unwrap();
     assert_eq!(second_run, 0, "already-applied versions are skipped");
     drop(conn);
@@ -47,7 +47,7 @@ async fn applies_java_migrations_once_and_is_idempotent() {
         history,
         vec![
             101, 201, 202, 203, 301, 304, 401, 402, 403, 404, 501, 601, 602, 603, 604, 605, 606,
-            701, 702, 801, 802, 1001, 1002, 1101, 1201, 1202, 1301
+            701, 702, 801, 802, 1001, 1002, 1003, 1101, 1201, 1202, 1301
         ]
     );
 

@@ -261,6 +261,14 @@ const SQL_RENEW_CLAIMS: &str = "UPDATE outbox_entry SET next_attempt_at = $3 \
        ORDER BY entry_id \
        FOR UPDATE SKIP LOCKED))";
 
+/// Make entries due at `$3` that are still exactly as inserted: due at the time named for each in
+/// `$4` (parallel to the ids in `$2`) and never attempted. A row a claim has since leased (its due
+/// time moved to the lease end), deferred, poisoned or deleted no longer matches and is left alone.
+const SQL_MAKE_DUE_IF_UNCLAIMED: &str = "UPDATE outbox_entry o SET next_attempt_at = $3 \
+     FROM UNNEST($2::uuid[], $4::timestamptz[]) AS h(entry_id, due_at) \
+     WHERE o.deployment_id = $1 AND o.entry_id = h.entry_id \
+       AND o.next_attempt_at = h.due_at AND o.attempt_count = 0 AND NOT o.poisoned";
+
 /// The batched delete of delivered entries (one transaction for a burst of deliveries). It may
 /// wait for a row lock, but only ever behind a statement that does not wait in turn (a lease
 /// renewal skips locked rows, a deferral or poison touches one row), so it cannot be part of a
@@ -495,6 +503,38 @@ impl PgOutboxStore {
                 .map_err(PersistenceError::db("outbox renewClaims commit"))?;
         }
         Ok(renewed)
+    }
+
+    /// Make the entries in `inserted` due at `now`, each only while it is still exactly as it was
+    /// inserted: due at the paired time and never attempted. Used when rows committed for an
+    /// in-process hand-off (and so inserted due only after the hand-off grace) could not be handed
+    /// off after all: without this they would wait out the grace before any claim saw them. A row
+    /// that was claimed, deferred, poisoned or deleted in the meantime is not touched, so a live
+    /// claim lease is never cut short. Returns how many rows were made due.
+    pub async fn make_due_if_unclaimed(
+        &self,
+        deployment: &DeploymentId,
+        inserted: &[(Uuid, OffsetDateTime)],
+        now: OffsetDateTime,
+    ) -> Result<u64> {
+        if inserted.is_empty() {
+            return Ok(0);
+        }
+        let (ids, due): (Vec<Uuid>, Vec<OffsetDateTime>) = inserted.iter().copied().unzip();
+        let mut tx = begin_deployment_tx(&self.pool, deployment).await?;
+        let updated = sqlx::query(SQL_MAKE_DUE_IF_UNCLAIMED)
+            .bind(deployment.as_str())
+            .bind(&ids)
+            .bind(now)
+            .bind(&due)
+            .execute(&mut *tx)
+            .await
+            .map_err(PersistenceError::db("outbox makeDueIfUnclaimed"))?
+            .rows_affected();
+        tx.commit()
+            .await
+            .map_err(PersistenceError::db("outbox makeDueIfUnclaimed commit"))?;
+        Ok(updated)
     }
 
     /// Deletes several delivered entries in ONE transaction; missing rows are no-ops.

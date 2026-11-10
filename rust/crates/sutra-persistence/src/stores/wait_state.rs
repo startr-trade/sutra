@@ -125,6 +125,30 @@ impl PgWaitStateStore {
         Self { pool }
     }
 
+    /// How many distinct instances of `deployment` are parked on a message wait at any of `nodes`,
+    /// on the caller's connection and inside its transaction: the deployment scope is set for the
+    /// rest of it. Timer rows (`kind = 'TIMER'`, a boundary's `#timeout` included) never count.
+    pub async fn count_parked_on_nodes_in(
+        conn: &mut PgConnection,
+        deployment: &DeploymentId,
+        nodes: &[String],
+    ) -> Result<u64> {
+        if nodes.is_empty() {
+            return Ok(0);
+        }
+        crate::scope::set_deployment_guc(conn, deployment).await?;
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(DISTINCT instance_id) FROM waiting_event WHERE deployment_id = $1 \
+             AND node_id = ANY($2) AND status = 'WAITING' AND kind = 'MESSAGE'",
+        )
+        .bind(deployment.as_str())
+        .bind(nodes)
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(PersistenceError::db("waiting_event count parked"))?;
+        Ok(u64::try_from(count).unwrap_or(0))
+    }
+
     /// UPSERT on a caller-supplied connection (the transactional-step building block).
     pub async fn record_waiting_in(
         conn: &mut PgConnection,

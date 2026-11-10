@@ -23,6 +23,10 @@
 //!    trace_id, …)` — one cross-process reconstruction fragment per injected-segment completion,
 //!    the union-find reconstruction input. Deliberately decoupled from the audit stream.
 //!
+//! Those rows are what "no cycle" means. Compliance cycles keep theirs beside them, in
+//! `coverage_cycle_metric` and `coverage_cycle_fragment`, with `coverage_cycle` as the registry and
+//! `coverage_active_cycle` holding the one active label per deployment (see [`CoverageRowScope`]).
+//!
 //! ## Portability, and the two properties it must not cost
 //!
 //! The first cut of this store was PostgreSQL-only (`count(*) FILTER (WHERE covered)`,
@@ -63,21 +67,24 @@ pub const IN_CHUNK: usize = 500;
 // ---- the engine-shipped DDL ---------------------------------------------------------------
 
 /// PostgreSQL coverage DDL, embedded at build time (the reference dialect).
-const DDL_POSTGRES: [&str; 2] = [
+const DDL_POSTGRES: [&str; 3] = [
     include_str!("../migrations/coverage/postgres/V901__coverage_metric.sql"),
     include_str!("../migrations/coverage/postgres/V902__coverage_fragment.sql"),
+    include_str!("../migrations/coverage/postgres/V904__coverage_cycle.sql"),
 ];
 
 /// MySQL / MariaDB coverage DDL.
-const DDL_MYSQL: [&str; 2] = [
+const DDL_MYSQL: [&str; 3] = [
     include_str!("../migrations/coverage/mysql/V901__coverage_metric.sql"),
     include_str!("../migrations/coverage/mysql/V902__coverage_fragment.sql"),
+    include_str!("../migrations/coverage/mysql/V904__coverage_cycle.sql"),
 ];
 
 /// SQL Server coverage DDL.
-const DDL_MSSQL: [&str; 2] = [
+const DDL_MSSQL: [&str; 3] = [
     include_str!("../migrations/coverage/mssql/V901__coverage_metric.sql"),
     include_str!("../migrations/coverage/mssql/V902__coverage_fragment.sql"),
+    include_str!("../migrations/coverage/mssql/V904__coverage_cycle.sql"),
 ];
 
 /// The engine-shipped coverage DDL for `dialect`, in apply order.
@@ -213,68 +220,133 @@ fn flag_predicate(dialect: SqlDialect, value: bool) -> String {
     }
 }
 
-/// Seed one declared path as uncovered. PostgreSQL states the conflict branch inline; the other
-/// two dialects let the duplicate-key rejection say it (their drivers surface it as a catchable
-/// error instead of poisoning the transaction).
-pub fn seed_sql(dialect: SqlDialect) -> String {
-    let (p1, p2) = (dialect.placeholder(1), dialect.placeholder(2));
+/// Which rows a statement addresses: the deployment's plain rows, which are what "no cycle" means,
+/// or one compliance cycle's. The two live in separate tables, so an in-cycle statement differs in
+/// its table and in carrying `cycle_label` as a second key, always bound straight after the
+/// deployment id. A no-cycle statement is exactly what it was before cycles existed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoverageRowScope {
+    /// `coverage_metric` / `coverage_fragment`.
+    NoCycle,
+    /// `coverage_cycle_metric` / `coverage_cycle_fragment`.
+    InCycle,
+}
+
+impl CoverageRowScope {
+    fn metric_table(self) -> &'static str {
+        match self {
+            CoverageRowScope::NoCycle => "coverage_metric",
+            CoverageRowScope::InCycle => "coverage_cycle_metric",
+        }
+    }
+
+    fn fragment_table(self) -> &'static str {
+        match self {
+            CoverageRowScope::NoCycle => "coverage_fragment",
+            CoverageRowScope::InCycle => "coverage_cycle_fragment",
+        }
+    }
+
+    fn key_columns(self) -> &'static str {
+        match self {
+            CoverageRowScope::NoCycle => "deployment_id",
+            CoverageRowScope::InCycle => "deployment_id, cycle_label",
+        }
+    }
+
+    /// How many key binds lead the statement.
+    fn key_count(self) -> usize {
+        match self {
+            CoverageRowScope::NoCycle => 1,
+            CoverageRowScope::InCycle => 2,
+        }
+    }
+
+    /// The placeholders for [`Self::key_columns`], comma-separated.
+    fn key_binds(self, dialect: SqlDialect) -> String {
+        (1..=self.key_count())
+            .map(|n| dialect.placeholder(n))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// The `WHERE` predicate that isolates this scope's rows.
+    fn key_predicate(self, dialect: SqlDialect) -> String {
+        match self {
+            CoverageRowScope::NoCycle => format!("deployment_id = {}", dialect.placeholder(1)),
+            CoverageRowScope::InCycle => format!(
+                "deployment_id = {} AND cycle_label = {}",
+                dialect.placeholder(1),
+                dialect.placeholder(2)
+            ),
+        }
+    }
+}
+
+/// Insert one flag row with the given value. PostgreSQL states the conflict branch inline; the
+/// other two dialects let the duplicate-key rejection say it (their drivers surface it as a
+/// catchable error instead of poisoning the transaction).
+fn insert_flag_sql(dialect: SqlDialect, scope: CoverageRowScope, value: bool) -> String {
+    let columns = scope.key_columns();
+    let path = dialect.placeholder(scope.key_count() + 1);
     let base = format!(
-        "INSERT INTO coverage_metric (deployment_id, path_urn, covered) VALUES ({p1}, {p2}, {})",
-        flag(dialect, false)
+        "INSERT INTO {} ({columns}, path_urn, covered) VALUES ({}, {path}, {})",
+        scope.metric_table(),
+        scope.key_binds(dialect),
+        flag(dialect, value)
     );
     match dialect {
-        SqlDialect::Postgres => format!("{base} ON CONFLICT (deployment_id, path_urn) DO NOTHING"),
+        SqlDialect::Postgres => format!("{base} ON CONFLICT ({columns}, path_urn) DO NOTHING"),
         _ => base,
     }
+}
+
+/// Seed one declared path as uncovered.
+pub fn seed_sql(dialect: SqlDialect, scope: CoverageRowScope) -> String {
+    insert_flag_sql(dialect, scope, false)
 }
 
 /// Flip a seeded path to covered. The `AND NOT covered` guard makes the affected-row count the
 /// durable first-covers-wins answer: 1 = THIS call covered it, 0 = it was already covered (or the
 /// row does not exist yet, which [`mark_insert_sql`] then settles).
-pub fn mark_update_sql(dialect: SqlDialect) -> String {
-    let (p1, p2) = (dialect.placeholder(1), dialect.placeholder(2));
+pub fn mark_update_sql(dialect: SqlDialect, scope: CoverageRowScope) -> String {
     format!(
-        "UPDATE coverage_metric SET covered = {} WHERE deployment_id = {p1} AND path_urn = {p2} \
-         AND {}",
+        "UPDATE {} SET covered = {} WHERE {} AND path_urn = {} AND {}",
+        scope.metric_table(),
         flag(dialect, true),
+        scope.key_predicate(dialect),
+        dialect.placeholder(scope.key_count() + 1),
         flag_predicate(dialect, false)
     )
 }
 
 /// Insert an already-covered path (a mark on a path that was never seeded). A conflict means a
 /// concurrent marker won the race, i.e. this call did NOT newly cover it.
-pub fn mark_insert_sql(dialect: SqlDialect) -> String {
-    let (p1, p2) = (dialect.placeholder(1), dialect.placeholder(2));
-    let base = format!(
-        "INSERT INTO coverage_metric (deployment_id, path_urn, covered) VALUES ({p1}, {p2}, {})",
-        flag(dialect, true)
-    );
-    match dialect {
-        SqlDialect::Postgres => format!("{base} ON CONFLICT (deployment_id, path_urn) DO NOTHING"),
-        _ => base,
-    }
+pub fn mark_insert_sql(dialect: SqlDialect, scope: CoverageRowScope) -> String {
+    insert_flag_sql(dialect, scope, true)
 }
 
 /// `total` + `covered` as one aggregate. `COUNT(CASE WHEN … THEN 1 END)` is the portable pivot for
 /// the PostgreSQL-only `count(*) FILTER (WHERE covered)`: NULLs are not counted, so the CASE with
 /// no ELSE counts exactly the covered rows, and the result stays a count type on every dialect.
 /// Column order is positional: 0 = total, 1 = covered.
-pub fn counts_sql(dialect: SqlDialect) -> String {
+pub fn counts_sql(dialect: SqlDialect, scope: CoverageRowScope) -> String {
     format!(
-        "SELECT COUNT(*) AS total, COUNT(CASE WHEN {} THEN 1 END) AS covered FROM coverage_metric \
-         WHERE deployment_id = {}",
+        "SELECT COUNT(*) AS total, COUNT(CASE WHEN {} THEN 1 END) AS covered FROM {} WHERE {}",
         flag_predicate(dialect, true),
-        dialect.placeholder(1)
+        scope.metric_table(),
+        scope.key_predicate(dialect)
     )
 }
 
 /// The still-uncovered path URNs, ascending. Its own ordered query rather than an `array_agg(…
 /// ORDER BY …) FILTER` — run in the same `REPEATABLE READ` transaction as [`counts_sql`], so the
 /// pair still describes one snapshot.
-pub fn uncovered_sql(dialect: SqlDialect) -> String {
+pub fn uncovered_sql(dialect: SqlDialect, scope: CoverageRowScope) -> String {
     format!(
-        "SELECT path_urn FROM coverage_metric WHERE deployment_id = {} AND {} ORDER BY path_urn",
-        dialect.placeholder(1),
+        "SELECT path_urn FROM {} WHERE {} AND {} ORDER BY path_urn",
+        scope.metric_table(),
+        scope.key_predicate(dialect),
         flag_predicate(dialect, false)
     )
 }
@@ -282,60 +354,135 @@ pub fn uncovered_sql(dialect: SqlDialect) -> String {
 /// Which of `count` caller-supplied paths are covered — the `coverage:report` substrate, one round
 /// trip per chunk instead of one `get` per declared path. A path with no row is simply absent from
 /// the result, i.e. reads as uncovered.
-pub fn covered_among_sql(dialect: SqlDialect, count: usize) -> String {
+pub fn covered_among_sql(dialect: SqlDialect, scope: CoverageRowScope, count: usize) -> String {
     format!(
-        "SELECT path_urn FROM coverage_metric WHERE deployment_id = {} AND {} AND path_urn IN {}",
-        dialect.placeholder(1),
+        "SELECT path_urn FROM {} WHERE {} AND {} AND path_urn IN {}",
+        scope.metric_table(),
+        scope.key_predicate(dialect),
         flag_predicate(dialect, true),
-        in_list(dialect, count, 2)
+        in_list(dialect, count, scope.key_count() + 1)
     )
 }
 
 /// Clear the covered flag on the named paths (the rows stay seeded). Only rows actually covered
 /// are touched, so the affected-row count IS the `cleared` count.
-pub fn clear_paths_sql(dialect: SqlDialect, count: usize) -> String {
+pub fn clear_paths_sql(dialect: SqlDialect, scope: CoverageRowScope, count: usize) -> String {
     format!(
-        "UPDATE coverage_metric SET covered = {} WHERE deployment_id = {} AND {} AND path_urn IN {}",
+        "UPDATE {} SET covered = {} WHERE {} AND {} AND path_urn IN {}",
+        scope.metric_table(),
         flag(dialect, false),
-        dialect.placeholder(1),
+        scope.key_predicate(dialect),
         flag_predicate(dialect, true),
-        in_list(dialect, count, 2)
+        in_list(dialect, count, scope.key_count() + 1)
     )
 }
 
-/// Re-seed every declared path of the deployment to uncovered.
-pub fn reset_metrics_sql(dialect: SqlDialect) -> String {
+/// Re-seed every declared path of the scope to uncovered.
+pub fn reset_metrics_sql(dialect: SqlDialect, scope: CoverageRowScope) -> String {
     format!(
-        "UPDATE coverage_metric SET covered = {} WHERE deployment_id = {}",
+        "UPDATE {} SET covered = {} WHERE {}",
+        scope.metric_table(),
         flag(dialect, false),
-        dialect.placeholder(1)
+        scope.key_predicate(dialect)
     )
 }
 
-/// Drop the deployment's reconstruction fragments (the other half of a reset).
-pub fn delete_fragments_sql(dialect: SqlDialect) -> String {
+/// Drop the scope's reconstruction fragments (the other half of a reset).
+pub fn delete_fragments_sql(dialect: SqlDialect, scope: CoverageRowScope) -> String {
     format!(
-        "DELETE FROM coverage_fragment WHERE deployment_id = {}",
-        dialect.placeholder(1)
+        "DELETE FROM {} WHERE {}",
+        scope.fragment_table(),
+        scope.key_predicate(dialect)
     )
 }
 
 /// Append one reconstruction fragment.
-pub fn write_fragment_sql(dialect: SqlDialect) -> String {
-    let binds: Vec<String> = (1..=6).map(|n| dialect.placeholder(n)).collect();
+pub fn write_fragment_sql(dialect: SqlDialect, scope: CoverageRowScope) -> String {
+    let binds: Vec<String> = (1..=scope.key_count() + 5)
+        .map(|n| dialect.placeholder(n))
+        .collect();
     format!(
-        "INSERT INTO coverage_fragment (deployment_id, route_urn, segment_process, instance_id, \
-         business_key, trace_id) VALUES ({})",
+        "INSERT INTO {} ({}, route_urn, segment_process, instance_id, business_key, trace_id) \
+         VALUES ({})",
+        scope.fragment_table(),
+        scope.key_columns(),
         binds.join(", ")
     )
 }
 
-/// Every fragment of the deployment in insertion order — the union-find input.
-pub fn read_fragments_sql(dialect: SqlDialect) -> String {
+/// Every fragment of the scope in insertion order — the union-find input.
+pub fn read_fragments_sql(dialect: SqlDialect, scope: CoverageRowScope) -> String {
     format!(
-        "SELECT route_urn, segment_process, instance_id, business_key, trace_id FROM \
-         coverage_fragment WHERE deployment_id = {} ORDER BY id",
+        "SELECT route_urn, segment_process, instance_id, business_key, trace_id FROM {} WHERE {} \
+         ORDER BY id",
+        scope.fragment_table(),
+        scope.key_predicate(dialect)
+    )
+}
+
+// ---- the cycle registry statements. Two binds at most, all of them labels or ids. --------------
+
+/// Declare a cycle: `[deployment_id, cycle_label]`. A repeat declaration inserts nothing.
+pub fn declare_cycle_sql(dialect: SqlDialect) -> String {
+    let base = format!(
+        "INSERT INTO coverage_cycle (deployment_id, cycle_label) VALUES ({}, {})",
+        dialect.placeholder(1),
+        dialect.placeholder(2)
+    );
+    match dialect {
+        SqlDialect::Postgres => {
+            format!("{base} ON CONFLICT (deployment_id, cycle_label) DO NOTHING")
+        }
+        _ => base,
+    }
+}
+
+/// Whether a cycle is declared: `[deployment_id, cycle_label]`, one row or none.
+pub fn cycle_declared_sql(dialect: SqlDialect) -> String {
+    format!(
+        "SELECT cycle_label FROM coverage_cycle WHERE deployment_id = {} AND cycle_label = {}",
+        dialect.placeholder(1),
+        dialect.placeholder(2)
+    )
+}
+
+/// Every declared cycle of a deployment, oldest first: `[deployment_id]`.
+pub fn list_cycles_sql(dialect: SqlDialect) -> String {
+    format!(
+        "SELECT cycle_label FROM coverage_cycle WHERE deployment_id = {} \
+         ORDER BY declared_at, cycle_label",
         dialect.placeholder(1)
+    )
+}
+
+/// Claim the deployment's single active slot: `[deployment_id, cycle_label]`. The primary key
+/// answers the race, so one affected row means this call holds the slot.
+pub fn claim_active_cycle_sql(dialect: SqlDialect) -> String {
+    let base = format!(
+        "INSERT INTO coverage_active_cycle (deployment_id, cycle_label) VALUES ({}, {})",
+        dialect.placeholder(1),
+        dialect.placeholder(2)
+    );
+    match dialect {
+        SqlDialect::Postgres => format!("{base} ON CONFLICT (deployment_id) DO NOTHING"),
+        _ => base,
+    }
+}
+
+/// The deployment's active cycle: `[deployment_id]`, one row or none.
+pub fn active_cycle_sql(dialect: SqlDialect) -> String {
+    format!(
+        "SELECT cycle_label FROM coverage_active_cycle WHERE deployment_id = {}",
+        dialect.placeholder(1)
+    )
+}
+
+/// Release the active slot if this cycle holds it: `[deployment_id, cycle_label]`.
+pub fn release_active_cycle_sql(dialect: SqlDialect) -> String {
+    format!(
+        "DELETE FROM coverage_active_cycle WHERE deployment_id = {} AND cycle_label = {}",
+        dialect.placeholder(1),
+        dialect.placeholder(2)
     )
 }
 
@@ -356,6 +503,42 @@ pub fn check_deployment_id(deployment_id: &str) -> Result<(), DataStoreError> {
         )));
     }
     Ok(())
+}
+
+/// The longest cycle label, matching the `cycle_label` columns.
+pub const CYCLE_LABEL_MAX_CHARS: usize = 128;
+
+/// Fail-closed guard on a cycle label. Labels are free-form, so this refuses only what could not
+/// be told apart in a report or stored whole: a blank label, one with control characters, and one
+/// longer than the column.
+pub fn check_cycle_label(label: &str) -> Result<(), DataStoreError> {
+    if label.trim().is_empty()
+        || label.chars().any(char::is_control)
+        || label.chars().count() > CYCLE_LABEL_MAX_CHARS
+    {
+        return Err(DataStoreError::new(format!(
+            "coverage store: invalid cycle label '{label}' (non-blank, no control characters, \
+             1..={CYCLE_LABEL_MAX_CHARS} characters)"
+        )));
+    }
+    Ok(())
+}
+
+/// What asking to activate a cycle came to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CoverageCycleActivation {
+    /// The cycle now holds the deployment's active slot. Reactivating an earlier cycle lands here
+    /// too, and continues it: covered flags are set-only, so its marks are still there.
+    Activated,
+    /// The cycle already held the slot, so nothing changed.
+    AlreadyActive,
+    /// Another cycle holds the slot, and it was left active. Deactivate it first.
+    Refused {
+        /// The cycle that holds the slot.
+        active_cycle: String,
+    },
+    /// No such cycle has been declared on this deployment.
+    Undeclared,
 }
 
 // ---- the dialect-dispatching store ----------------------------------------------------------
@@ -420,6 +603,154 @@ impl CoverageStore {
     /// The declared store name (the author's — always `coverage` in practice).
     pub fn name(&self) -> &str {
         dispatch!(self, s => s.name())
+    }
+
+    /// The same store, its metric and fragment methods addressing `cycle`'s rows, or the plain
+    /// "no cycle" rows for `None`. Cheap: the handle shares its pool.
+    pub fn in_cycle(&self, cycle: Option<&str>) -> CoverageStore {
+        match self {
+            CoverageStore::Pg(s) => CoverageStore::Pg(s.in_cycle(cycle)),
+            #[cfg(feature = "mysql")]
+            CoverageStore::Mysql(s) => CoverageStore::Mysql(s.in_cycle(cycle)),
+            #[cfg(feature = "mssql")]
+            CoverageStore::Mssql(s) => CoverageStore::Mssql(s.in_cycle(cycle)),
+        }
+    }
+
+    /// The dialect of this store's connection.
+    fn dialect(&self) -> SqlDialect {
+        match self {
+            CoverageStore::Pg(_) => SqlDialect::Postgres,
+            #[cfg(feature = "mysql")]
+            CoverageStore::Mysql(_) => SqlDialect::Mysql,
+            #[cfg(feature = "mssql")]
+            CoverageStore::Mssql(_) => SqlDialect::Mssql,
+        }
+    }
+
+    /// Run a cycle-registry write; the affected-row count, with a duplicate key counting as zero.
+    async fn cycle_write(
+        &self,
+        sql: &str,
+        binds: &[&str],
+        op: &'static str,
+    ) -> Result<u64, DataStoreError> {
+        dispatch!(self, s => s.cycle_write(sql, binds, op).await)
+    }
+
+    /// Run a cycle-registry read; the labels of its single text column.
+    async fn cycle_labels(
+        &self,
+        sql: &str,
+        binds: &[&str],
+        op: &'static str,
+    ) -> Result<Vec<String>, DataStoreError> {
+        dispatch!(self, s => s.cycle_labels(sql, binds, op).await)
+    }
+
+    /// Declare a cycle on a deployment. `true` when this call declared it, `false` when it already
+    /// was. Declaring records nothing by itself: only activation routes coverage to the cycle.
+    pub async fn declare_cycle(
+        &self,
+        deployment_id: &str,
+        label: &str,
+    ) -> Result<bool, DataStoreError> {
+        check_deployment_id(deployment_id)?;
+        check_cycle_label(label)?;
+        let sql = declare_cycle_sql(self.dialect());
+        Ok(self
+            .cycle_write(&sql, &[deployment_id, label], "cycle declare")
+            .await?
+            > 0)
+    }
+
+    /// Whether a cycle is declared on a deployment.
+    pub async fn cycle_is_declared(
+        &self,
+        deployment_id: &str,
+        label: &str,
+    ) -> Result<bool, DataStoreError> {
+        check_deployment_id(deployment_id)?;
+        check_cycle_label(label)?;
+        let sql = cycle_declared_sql(self.dialect());
+        Ok(!self
+            .cycle_labels(&sql, &[deployment_id, label], "cycle lookup")
+            .await?
+            .is_empty())
+    }
+
+    /// Every cycle declared on a deployment, oldest first.
+    pub async fn list_cycles(&self, deployment_id: &str) -> Result<Vec<String>, DataStoreError> {
+        check_deployment_id(deployment_id)?;
+        let sql = list_cycles_sql(self.dialect());
+        self.cycle_labels(&sql, &[deployment_id], "cycle list")
+            .await
+    }
+
+    /// The deployment's active cycle, if any. Read on every mark rather than cached, so an
+    /// operator's activation takes effect at once on every replica with nothing to signal.
+    pub async fn active_cycle(
+        &self,
+        deployment_id: &str,
+    ) -> Result<Option<String>, DataStoreError> {
+        check_deployment_id(deployment_id)?;
+        let sql = active_cycle_sql(self.dialect());
+        Ok(self
+            .cycle_labels(&sql, &[deployment_id], "active cycle")
+            .await?
+            .into_iter()
+            .next())
+    }
+
+    /// Activate a declared cycle. Refuses while another cycle is active: switching would move the
+    /// marks of whatever is still running under that cycle, with nothing to tell its owner.
+    pub async fn activate_cycle(
+        &self,
+        deployment_id: &str,
+        label: &str,
+    ) -> Result<CoverageCycleActivation, DataStoreError> {
+        if !self.cycle_is_declared(deployment_id, label).await? {
+            return Ok(CoverageCycleActivation::Undeclared);
+        }
+        let claim = claim_active_cycle_sql(self.dialect());
+        // A holder can release between a lost claim and the read of its label; claim again then.
+        // Only a sustained stream of activations could use all three tries.
+        for _ in 0..3 {
+            if self
+                .cycle_write(&claim, &[deployment_id, label], "cycle activate")
+                .await?
+                > 0
+            {
+                return Ok(CoverageCycleActivation::Activated);
+            }
+            match self.active_cycle(deployment_id).await? {
+                Some(active) if active == label => {
+                    return Ok(CoverageCycleActivation::AlreadyActive)
+                }
+                Some(active_cycle) => return Ok(CoverageCycleActivation::Refused { active_cycle }),
+                None => {}
+            }
+        }
+        Err(DataStoreError::new(format!(
+            "coverage store: could not activate cycle '{label}': the active slot of deployment \
+             {deployment_id} kept changing"
+        )))
+    }
+
+    /// Deactivate a cycle. `true` when it held the active slot; `false` when it did not, which
+    /// leaves any other active cycle alone.
+    pub async fn deactivate_cycle(
+        &self,
+        deployment_id: &str,
+        label: &str,
+    ) -> Result<bool, DataStoreError> {
+        check_deployment_id(deployment_id)?;
+        check_cycle_label(label)?;
+        let sql = release_active_cycle_sql(self.dialect());
+        Ok(self
+            .cycle_write(&sql, &[deployment_id, label], "cycle deactivate")
+            .await?
+            > 0)
     }
 
     /// Idempotently seed every declared path as uncovered — the "total to cover".
@@ -531,10 +862,14 @@ mod tests {
     fn shipped_ddl_is_embedded_and_idempotent_per_dialect() {
         for dialect in [SqlDialect::Postgres, SqlDialect::Mysql, SqlDialect::Mssql] {
             let scripts = shipped_ddl(dialect);
-            assert_eq!(scripts.len(), 2, "metric + fragment DDL for {dialect:?}");
-            assert!(scripts
-                .iter()
-                .all(|s| s.contains("coverage_metric") || s.contains("coverage_fragment")));
+            assert_eq!(
+                scripts.len(),
+                3,
+                "metric + fragment + cycle DDL for {dialect:?}"
+            );
+            assert!(scripts.iter().all(|s| s.contains("coverage_metric")
+                || s.contains("coverage_fragment")
+                || s.contains("coverage_cycle")));
             // Re-runnable on every dialect: the engine applies these ledger-lessly on first use.
             let guarded = match dialect {
                 SqlDialect::Mssql => "IF OBJECT_ID",
@@ -569,38 +904,50 @@ mod tests {
     #[test]
     fn the_mark_is_a_guarded_flip_not_a_read_then_write() {
         // The guard is what makes the affected-row count the first-covers-wins answer.
-        assert!(mark_update_sql(SqlDialect::Postgres).ends_with("AND NOT covered"));
-        assert!(mark_update_sql(SqlDialect::Mysql).ends_with("AND covered = 0"));
-        assert!(mark_update_sql(SqlDialect::Mssql).ends_with("AND covered = 0"));
+        assert!(
+            mark_update_sql(SqlDialect::Postgres, CoverageRowScope::NoCycle)
+                .ends_with("AND NOT covered")
+        );
+        assert!(
+            mark_update_sql(SqlDialect::Mysql, CoverageRowScope::NoCycle)
+                .ends_with("AND covered = 0")
+        );
+        assert!(
+            mark_update_sql(SqlDialect::Mssql, CoverageRowScope::NoCycle)
+                .ends_with("AND covered = 0")
+        );
         // …and the insert half never overwrites a concurrent winner.
-        assert!(mark_insert_sql(SqlDialect::Postgres).contains("ON CONFLICT"));
-        assert!(!mark_insert_sql(SqlDialect::Mysql).contains("IGNORE"));
+        assert!(
+            mark_insert_sql(SqlDialect::Postgres, CoverageRowScope::NoCycle)
+                .contains("ON CONFLICT")
+        );
+        assert!(!mark_insert_sql(SqlDialect::Mysql, CoverageRowScope::NoCycle).contains("IGNORE"));
     }
 
     #[test]
     fn the_counts_are_a_portable_aggregate() {
         assert_eq!(
-            counts_sql(SqlDialect::Postgres),
+            counts_sql(SqlDialect::Postgres, CoverageRowScope::NoCycle),
             "SELECT COUNT(*) AS total, COUNT(CASE WHEN covered THEN 1 END) AS covered FROM \
              coverage_metric WHERE deployment_id = $1"
         );
         assert_eq!(
-            counts_sql(SqlDialect::Mysql),
+            counts_sql(SqlDialect::Mysql, CoverageRowScope::NoCycle),
             "SELECT COUNT(*) AS total, COUNT(CASE WHEN covered = 1 THEN 1 END) AS covered FROM \
              coverage_metric WHERE deployment_id = ?"
         );
         assert_eq!(
-            counts_sql(SqlDialect::Mssql),
+            counts_sql(SqlDialect::Mssql, CoverageRowScope::NoCycle),
             "SELECT COUNT(*) AS total, COUNT(CASE WHEN covered = 1 THEN 1 END) AS covered FROM \
              coverage_metric WHERE deployment_id = @P1"
         );
         // No PostgreSQL-only spelling survives anywhere in the statement set.
         for dialect in [SqlDialect::Postgres, SqlDialect::Mysql, SqlDialect::Mssql] {
             for sql in [
-                counts_sql(dialect),
-                uncovered_sql(dialect),
-                covered_among_sql(dialect, 3),
-                clear_paths_sql(dialect, 2),
+                counts_sql(dialect, CoverageRowScope::NoCycle),
+                uncovered_sql(dialect, CoverageRowScope::NoCycle),
+                covered_among_sql(dialect, CoverageRowScope::NoCycle, 3),
+                clear_paths_sql(dialect, CoverageRowScope::NoCycle, 2),
             ] {
                 assert!(!sql.contains("FILTER (WHERE"), "{sql}");
                 assert!(!sql.contains("array_agg"), "{sql}");
@@ -611,15 +958,28 @@ mod tests {
 
     #[test]
     fn in_lists_are_numbered_per_dialect() {
-        assert!(covered_among_sql(SqlDialect::Postgres, 3).ends_with("IN ($2, $3, $4)"));
-        assert!(covered_among_sql(SqlDialect::Mysql, 3).ends_with("IN (?, ?, ?)"));
-        assert!(covered_among_sql(SqlDialect::Mssql, 3).ends_with("IN (@P2, @P3, @P4)"));
-        assert!(clear_paths_sql(SqlDialect::Mssql, 2).ends_with("IN (@P2, @P3)"));
+        assert!(
+            covered_among_sql(SqlDialect::Postgres, CoverageRowScope::NoCycle, 3)
+                .ends_with("IN ($2, $3, $4)")
+        );
+        assert!(
+            covered_among_sql(SqlDialect::Mysql, CoverageRowScope::NoCycle, 3)
+                .ends_with("IN (?, ?, ?)")
+        );
+        assert!(
+            covered_among_sql(SqlDialect::Mssql, CoverageRowScope::NoCycle, 3)
+                .ends_with("IN (@P2, @P3, @P4)")
+        );
+        assert!(
+            clear_paths_sql(SqlDialect::Mssql, CoverageRowScope::NoCycle, 2)
+                .ends_with("IN (@P2, @P3)")
+        );
     }
 
     #[test]
     fn the_uncovered_list_is_ordered_and_the_percentage_math_is_frozen() {
-        assert!(uncovered_sql(SqlDialect::Mysql).ends_with("ORDER BY path_urn"));
+        assert!(uncovered_sql(SqlDialect::Mysql, CoverageRowScope::NoCycle)
+            .ends_with("ORDER BY path_urn"));
         let m = CoverageMetrics {
             total: 3,
             covered: 1,
@@ -643,5 +1003,66 @@ mod tests {
         assert!(check_deployment_id("dep-1").is_ok());
         assert!(check_deployment_id("").is_err());
         assert!(check_deployment_id(&"x".repeat(65)).is_err());
+    }
+
+    #[test]
+    fn no_cycle_statements_are_what_they_were_before_cycles() {
+        let d = SqlDialect::Postgres;
+        let s = CoverageRowScope::NoCycle;
+        assert_eq!(
+            seed_sql(d, s),
+            "INSERT INTO coverage_metric (deployment_id, path_urn, covered) VALUES ($1, $2, \
+             false) ON CONFLICT (deployment_id, path_urn) DO NOTHING"
+        );
+        assert_eq!(
+            mark_update_sql(d, s),
+            "UPDATE coverage_metric SET covered = true WHERE deployment_id = $1 AND path_urn = \
+             $2 AND NOT covered"
+        );
+        assert_eq!(
+            clear_paths_sql(SqlDialect::Mssql, s, 1),
+            "UPDATE coverage_metric SET covered = 0 WHERE deployment_id = @P1 AND covered = 1 \
+             AND path_urn IN (@P2)"
+        );
+        assert_eq!(
+            write_fragment_sql(SqlDialect::Mysql, s),
+            "INSERT INTO coverage_fragment (deployment_id, route_urn, segment_process, \
+             instance_id, business_key, trace_id) VALUES (?, ?, ?, ?, ?, ?)"
+        );
+        assert_eq!(
+            read_fragments_sql(d, s),
+            "SELECT route_urn, segment_process, instance_id, business_key, trace_id FROM \
+             coverage_fragment WHERE deployment_id = $1 ORDER BY id"
+        );
+    }
+
+    #[test]
+    fn in_cycle_statements_address_the_cycle_tables_with_the_label_second() {
+        let d = SqlDialect::Postgres;
+        let s = CoverageRowScope::InCycle;
+        assert_eq!(
+            seed_sql(d, s),
+            "INSERT INTO coverage_cycle_metric (deployment_id, cycle_label, path_urn, covered) \
+             VALUES ($1, $2, $3, false) ON CONFLICT (deployment_id, cycle_label, path_urn) DO \
+             NOTHING"
+        );
+        assert!(mark_update_sql(d, s).contains("deployment_id = $1 AND cycle_label = $2"));
+        assert!(mark_update_sql(d, s).contains("path_urn = $3"));
+        assert!(covered_among_sql(d, s, 2).ends_with("IN ($3, $4)"));
+        assert!(clear_paths_sql(SqlDialect::Mssql, s, 1).ends_with("IN (@P3)"));
+        assert!(write_fragment_sql(d, s).contains("coverage_cycle_fragment"));
+        assert!(write_fragment_sql(d, s).ends_with("VALUES ($1, $2, $3, $4, $5, $6, $7)"));
+        assert!(delete_fragments_sql(d, s).contains("coverage_cycle_fragment"));
+        assert!(reset_metrics_sql(d, s).contains("coverage_cycle_metric"));
+    }
+
+    #[test]
+    fn cycle_labels_are_free_form_but_bounded() {
+        assert!(check_cycle_label("Release 4.2 / QA").is_ok());
+        assert!(check_cycle_label(&"x".repeat(CYCLE_LABEL_MAX_CHARS)).is_ok());
+        assert!(check_cycle_label("").is_err());
+        assert!(check_cycle_label("   ").is_err());
+        assert!(check_cycle_label("a\nb").is_err());
+        assert!(check_cycle_label(&"x".repeat(CYCLE_LABEL_MAX_CHARS + 1)).is_err());
     }
 }

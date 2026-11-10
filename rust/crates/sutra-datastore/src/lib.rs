@@ -65,8 +65,9 @@ pub use config::{
 #[cfg(feature = "providers")]
 pub use coverage::CoverageStore;
 pub use coverage::{
-    dialect_for_url, shipped_ddl, CoverageCounts, CoverageFragmentRow, CoverageMetrics,
-    COVERAGE_STORE_NAME,
+    check_cycle_label, dialect_for_url, shipped_ddl, CoverageCounts, CoverageCycleActivation,
+    CoverageFragmentRow, CoverageMetrics, CoverageRowScope, COVERAGE_STORE_NAME,
+    CYCLE_LABEL_MAX_CHARS,
 };
 pub use error::DataStoreError;
 pub use keyquery::{

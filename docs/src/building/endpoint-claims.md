@@ -130,9 +130,9 @@ neither the tenant nor the module, because any co-hosted copy of the package wou
 
 **A new version takes over from an old one.** Versions of one tenant and module count as one owner, so
 `acme--orders--2.0.0` on 1.0.0's route is accepted, and `SUTRA.DEPLOY.ENDPOINT.SUPERSEDED` warns. New requests
-reach 2.0.0, and 1.0.0 drains. In 0.6.18 it drains whole: every channel of 1.0.0 stops taking new work,
-including one that 2.0.0 doesn't have. The warning names what stops being served, so check it before you
-deploy.
+reach 2.0.0, and 1.0.0 drains. Since 0.6.20 the old version keeps serving the channels only it declares until it retires, and another owner
+is refused those endpoints meanwhile: see [Upgrading a deployment in place](upgrading-in-place.md). Before 0.6.20 it
+drained whole: every channel of 1.0.0 stopped taking new work, including one that 2.0.0 doesn't have.
 
 **A package with no `tenant` or `module` label owns only itself.** It can't take a route, or a channel
 name, from anything. Moving it to a new route is refused until you undeploy the old one. Label the package and

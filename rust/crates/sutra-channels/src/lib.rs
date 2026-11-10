@@ -152,9 +152,11 @@ pub use policy::{
     InMemoryConcurrencyStore, PayloadCapPolicy, QuotaCheckResult, StaticTenantConfigSource,
     SystemClock, TenantConfig, TenantConfigSource, TenantQuotaEnforcer, TenantQuotas,
 };
+pub use registry::{message_types_can_overlap, wait_subscriptions};
 pub use registry::{
     ChannelRegistry, CodecRegistry, DrainingSink, FormatRegistry, HandlerMatch, HandlerResolution,
-    PredicateFault, ProcessModuleRegistry, RelayTarget, SelectorFault, CODEC_BUILTIN_URN_PREFIX,
+    PredicateFault, ProcessModuleRegistry, RelayTarget, SelectorFault, WaitSubscription,
+    CODEC_BUILTIN_URN_PREFIX,
 };
 pub use shard_metrics::{ShardLaneMetrics, ShardRouterMetrics};
 pub use sink::{

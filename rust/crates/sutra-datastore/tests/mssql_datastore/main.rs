@@ -4,5 +4,7 @@
 //! behaviour-for-behaviour: the dialect-parity proof for the user datastore
 //! SQL surface on SQL Server, which (having no sqlx driver) runs on the tiberius TDS stack.
 
+#[path = "../coverage_cycle_contract/contract.rs"]
+mod coverage_cycle_contract;
 mod fixture;
 mod suite;

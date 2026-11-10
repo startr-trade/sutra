@@ -164,6 +164,7 @@ fn run_check(bpmn: &Path) -> (i32, String) {
                     db_user: None,
                     db_password: None,
                     threshold: 100.0,
+                    cycle: None,
                 }),
             },
             &GlobalArgs::default(),

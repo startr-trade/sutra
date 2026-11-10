@@ -10,6 +10,8 @@ mod feel_external_functions;
 mod feel_intervals;
 #[path = "all/feel_parse_spaced_builtins.rs"]
 mod feel_parse_spaced_builtins;
+#[path = "all/feel_path_lookup.rs"]
+mod feel_path_lookup;
 #[path = "all/feel_paths.rs"]
 mod feel_paths;
 #[path = "all/feel_type_conversions.rs"]

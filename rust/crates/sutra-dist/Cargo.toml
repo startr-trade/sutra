@@ -60,11 +60,18 @@ sutra-llm-gemini = { path = "../sutra-llm-gemini", optional = true }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time"] }
 tracing = { workspace = true }
 
+# jemalloc does not build for MSVC, so the dependency exists only off it.
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = { version = "0.6", optional = true }
+
 # Transport bundling — one feature per transport, each pulling its optional crate. `default`
 # bundles HTTP + the five network brokers + file + dapr + knative (the general image). A
 # hardened / air-gapped build uses `--no-default-features` + only the transports it needs.
 [features]
-default = ["http", "kafka", "rabbitmq", "aws-sqs", "gcp-pubsub", "amqp", "file", "dapr", "knative", "llm-openai", "llm-anthropic", "llm-bedrock", "llm-gemini"]
+# jemalloc as the process allocator (see `GLOBAL_ALLOCATOR` in main.rs). On by default; a build
+# without it falls back to the system allocator. MSVC targets never link it.
+jemalloc = ["dep:tikv-jemallocator"]
+default = ["jemalloc", "http", "kafka", "rabbitmq", "aws-sqs", "gcp-pubsub", "amqp", "file", "dapr", "knative", "llm-openai", "llm-anthropic", "llm-bedrock", "llm-gemini"]
 http = ["dep:sutra-transport-http"]
 kafka = ["dep:sutra-transport-kafka"]
 rabbitmq = ["dep:sutra-transport-rabbitmq"]

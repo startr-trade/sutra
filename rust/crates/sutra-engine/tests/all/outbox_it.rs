@@ -307,3 +307,66 @@ async fn enqueue_fail_defer_redeliver() {
         .expect("claim final");
     assert!(remaining.is_empty(), "redelivered row must be deleted");
 }
+
+/// A row committed for an in-process hand-off is inserted due only after the hand-off grace.
+/// When the hand-off has closed by the time the commit lands, the fallback makes the row due at
+/// once: the very next poll tick delivers it, instead of a tick 30 s later. A row that was
+/// attempted in the meantime is left as it is.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "docker"]
+async fn a_closed_hand_off_delivers_on_the_next_poll_tick() {
+    let pool = fresh_pool().await;
+    let store = PgOutboxStore::new(pool.clone());
+    let (addr, capture) = capture_server(vec![202]).await;
+    let grace = time::Duration::try_from(sutra_channels::outbox_dispatch::HANDOFF_GRACE)
+        .expect("grace fits");
+
+    // As the bridge commits a row it means to hand off: reserved, due after the grace.
+    let mut e = entry(&format!("http://{addr}/cb"));
+    e.next_attempt_at += grace;
+    let signal = sutra_channels::OutboxSignal::new();
+    signal.reserve(&[e.entry_id.to_string()]);
+    store.enqueue(&e).await.expect("enqueue");
+
+    // Without the fallback a poll tick now finds nothing: the row waits out the grace.
+    let stats = dispatcher(pool.clone())
+        .dispatch_deployment(&channel_dep())
+        .await;
+    assert_eq!(stats.attempted, 0, "the row is not due before the grace");
+
+    // No dispatcher takes the hand-off (it has closed), so the row is made due now.
+    assert!(!signal.accepts_hand_off());
+    sutra_engine::outbox::hand_off_or_make_due(&signal, &pool, &channel_dep(), vec![e.clone()])
+        .await;
+    assert_eq!(signal.inflight_count(), 0, "the reservation is released");
+
+    // The next poll tick, at the real clock, delivers it once.
+    let stats = dispatcher(pool.clone())
+        .dispatch_deployment(&channel_dep())
+        .await;
+    assert_eq!(stats.succeeded, 1, "the next tick delivers the row");
+    assert_eq!(capture.requests.lock().unwrap().len(), 1);
+
+    // A row attempted since its insert keeps the due time that attempt gave it.
+    let mut attempted = entry(&format!("http://{addr}/cb"));
+    attempted.next_attempt_at += grace;
+    store.enqueue(&attempted).await.expect("enqueue");
+    let deferred_to = OffsetDateTime::now_utc() + time::Duration::minutes(5);
+    store
+        .defer(&dep(), attempted.entry_id, deferred_to, None)
+        .await
+        .expect("defer");
+    let made_due = store
+        .make_due_if_unclaimed(
+            &dep(),
+            &[(attempted.entry_id, attempted.next_attempt_at)],
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .expect("make due");
+    assert_eq!(made_due, 0, "an attempted row is not made due");
+    let stats = dispatcher(pool.clone())
+        .dispatch_deployment(&channel_dep())
+        .await;
+    assert_eq!(stats.attempted, 0, "the attempted row keeps its deferral");
+}

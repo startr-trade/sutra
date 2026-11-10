@@ -162,3 +162,108 @@ async fn an_undeployed_slot_still_serves_its_pinned_instances() {
     assert_eq!(drained.archive.deployment_id, ID1);
     assert_eq!(drained.archive.bytes, b"one".to_vec());
 }
+
+#[ignore = "docker"]
+#[tokio::test]
+async fn a_superseded_row_retains_its_channels_and_an_undeployed_one_does_not() {
+    let store = PgDeploymentArchiveStore::new(fresh_pool().await);
+    store
+        .upsert_active(&archive(ID1, SLOT, b"one"))
+        .await
+        .unwrap();
+    store
+        .upsert_active_superseding(&archive(ID2, OTHER_SLOT, b"two"), &[SLOT.to_owned()])
+        .await
+        .unwrap();
+    let served = store.list_active_and_draining().await.unwrap();
+    let row = |id: &str| {
+        served
+            .iter()
+            .find(|r| r.archive.deployment_id == id)
+            .unwrap()
+    };
+    assert!(row(ID1).retains_channels, "superseded by another slot");
+    assert!(!row(ID2).retains_channels, "the active row");
+
+    // A replace in place supersedes too.
+    let store2 = PgDeploymentArchiveStore::new(fresh_pool().await);
+    store2
+        .upsert_active(&archive(ID1, SLOT, b"one"))
+        .await
+        .unwrap();
+    store2
+        .upsert_active(&archive(ID2, SLOT, b"two"))
+        .await
+        .unwrap();
+    let served = store2.list_active_and_draining().await.unwrap();
+    assert!(
+        served[1].retains_channels,
+        "{:?}",
+        served[1].archive.deployment_id
+    );
+
+    // An undeploy does not, and neither does a row an older engine drained.
+    let store3 = PgDeploymentArchiveStore::new(fresh_pool().await);
+    store3
+        .upsert_active(&archive(ID1, SLOT, b"one"))
+        .await
+        .unwrap();
+    assert!(store3.retire_slot(SLOT).await.unwrap());
+    let served = store3.list_active_and_draining().await.unwrap();
+    assert!(!served[0].retains_channels);
+
+    // A rollback re-activates the row and clears it.
+    store2
+        .upsert_active(&archive(ID1, SLOT, b"one"))
+        .await
+        .unwrap();
+    let served = store2.list_active_and_draining().await.unwrap();
+    let active = served
+        .iter()
+        .find(|r| r.status == ArchiveStatus::Active)
+        .unwrap();
+    assert_eq!(active.archive.deployment_id, ID1);
+    assert!(!active.retains_channels);
+}
+
+#[ignore = "docker"]
+#[tokio::test]
+async fn reopen_retired_turns_a_retired_row_back_to_draining() {
+    let store = PgDeploymentArchiveStore::new(fresh_pool().await);
+    store
+        .upsert_active(&archive(ID1, SLOT, b"one"))
+        .await
+        .unwrap();
+    store
+        .upsert_active(&archive(ID2, SLOT, b"two"))
+        .await
+        .unwrap();
+    assert!(store.retire_deployment(ID1).await.unwrap());
+    assert!(store.reopen_retired(ID1).await.unwrap());
+    let served = store.list_active_and_draining().await.unwrap();
+    let reopened = served
+        .iter()
+        .find(|r| r.archive.deployment_id == ID1)
+        .expect("served again");
+    assert_eq!(reopened.status, ArchiveStatus::Draining);
+    assert!(reopened.retains_channels, "it keeps what it had");
+}
+
+#[ignore = "docker"]
+#[tokio::test]
+async fn reopen_retired_touches_only_retired_rows() {
+    let store = PgDeploymentArchiveStore::new(fresh_pool().await);
+    store
+        .upsert_active(&archive(ID1, SLOT, b"one"))
+        .await
+        .unwrap();
+    store
+        .upsert_active(&archive(ID2, SLOT, b"two"))
+        .await
+        .unwrap();
+    assert!(!store.reopen_retired(ID2).await.unwrap(), "active");
+    assert!(!store.reopen_retired(ID1).await.unwrap(), "draining");
+    assert!(!store.reopen_retired("dep-does-not-exist").await.unwrap());
+    let served = store.list_active_and_draining().await.unwrap();
+    assert_eq!(served[0].status, ArchiveStatus::Active);
+}

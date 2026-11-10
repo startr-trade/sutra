@@ -40,7 +40,9 @@ pub type EnvRefResolver = fn(&str) -> Result<String, String>;
 /// reference that cannot be resolved fails with `code`, naming the channel and the property and
 /// never a resolved value, so the channel fails closed at wiring instead of connecting to a literal
 /// `${…}`. A reference that resolves to blank leaves the property blank, which every reader treats
-/// as unset, so `${NAME:}` is how an author writes an optional setting.
+/// as unset, so `${NAME:}` is how an author writes an optional setting. Any other reference that
+/// resolves to blank logs a WARN with [`sutra_channels::codes::CONFIG_PROPERTY_BLANK_REFERENCE`],
+/// because the transport's built-in default then applies where the author named a value.
 pub fn resolve_channel_properties(
     definition: &ChannelDefinition,
     keys: &[&str],
@@ -59,10 +61,44 @@ pub fn resolve_channel_properties(
                     ),
                 )
             })?;
+            if let Some(warning) =
+                blank_reference_warning(&definition.binding.channel_name, key, raw, &value)
+            {
+                tracing::warn!(
+                    code = %warning.code,
+                    channel = %definition.binding.channel_name,
+                    property = %key,
+                    "{}",
+                    warning.message
+                );
+            }
             resolved.properties.insert((*key).to_string(), value);
         }
     }
     Ok(resolved)
+}
+
+/// The WARN for a property whose reference resolved to blank, unless the author wrote it blank on
+/// purpose (`${NAME:}`) or wrote no reference at all. It names the channel, the property and the
+/// reference as written, never a resolved value.
+fn blank_reference_warning(channel: &str, key: &str, raw: &str, value: &str) -> Option<Diagnostic> {
+    let written = raw.trim();
+    if written.is_empty()
+        || written == value.trim()
+        || !value.trim().is_empty()
+        || sutra_envref_spi::is_explicit_empty_default(written)
+    {
+        return None;
+    }
+    Some(Diagnostic::error(
+        sutra_channels::codes::CONFIG_PROPERTY_BLANK_REFERENCE,
+        format!(
+            "channel '{channel}' property '{key}' reference '{written}' resolved to blank, so the \
+             property is unset: the transport's built-in default applies, or a required property \
+             is refused. Write the reference with an empty default, such as ${{NAME:}}, to leave \
+             it blank on purpose"
+        ),
+    ))
 }
 
 /// Refuses a port that came from a reference and is not a port. A transport's own parser quotes
@@ -440,5 +476,65 @@ mod endpoint_host_tests {
         assert_eq!(host("Host-${BROKER_A}:9092"), "host-${BROKER_A}:9092");
         assert_eq!(host("${vault:a@b}"), "${vault:a@b}");
         assert_eq!(host("${USER}:${PASS}@Broker:9092"), "broker:9092");
+    }
+}
+
+#[cfg(test)]
+mod blank_reference_tests {
+    use super::{blank_reference_warning, resolve_channel_properties};
+    use sutra_channels::codes::CONFIG_PROPERTY_BLANK_REFERENCE;
+    use sutra_channels::config::{ChannelBinding, Namespace};
+    use sutra_channels::{ChannelDefinition, DeploymentId};
+
+    #[test]
+    fn a_blank_reference_warns_naming_channel_property_and_reference() {
+        let warning = blank_reference_warning("orders-in", "host", "${BROKER_HOST}", "")
+            .expect("a set-but-empty variable warns");
+        assert_eq!(warning.code, CONFIG_PROPERTY_BLANK_REFERENCE);
+        for part in ["'orders-in'", "'host'", "'${BROKER_HOST}'"] {
+            assert!(warning.message.contains(part), "{}", warning.message);
+        }
+        assert!(blank_reference_warning("c", "group.id", "env:GROUP", "  ").is_some());
+        assert!(blank_reference_warning("c", "queue", "secret:queue-name", "").is_some());
+    }
+
+    #[test]
+    fn the_explicit_empty_default_and_non_blank_values_do_not_warn() {
+        assert!(blank_reference_warning("c", "host", "${BROKER_HOST:}", "").is_none());
+        assert!(blank_reference_warning("c", "host", "${secret:host-key:}", "").is_none());
+        assert!(blank_reference_warning("c", "host", "${BROKER_HOST}", "broker").is_none());
+        assert!(blank_reference_warning("c", "host", "", "").is_none());
+        assert!(blank_reference_warning("c", "host", "broker", "broker").is_none());
+    }
+
+    #[test]
+    fn resolution_keeps_a_blank_reference_blank() {
+        let definition = ChannelDefinition {
+            binding: ChannelBinding::new(
+                "orders-in",
+                Namespace::new("acme", "orders", "v1"),
+                DeploymentId::unresolved(),
+                "opaque",
+            ),
+            transport: Some("test".to_string()),
+            bind_spec: None,
+            codec: None,
+            cloud_events_mode: None,
+            auth_scheme: None,
+            idempotency_key_header: None,
+            payload_cap_bytes: None,
+            properties: [("host".to_string(), "${BROKER_HOST}".to_string())]
+                .into_iter()
+                .collect(),
+        };
+        fn blank(_: &str) -> Result<String, String> {
+            Ok(String::new())
+        }
+        let resolved =
+            resolve_channel_properties(&definition, &["host"], "TEST.CODE", blank).unwrap();
+        assert_eq!(
+            resolved.properties.get("host").map(String::as_str),
+            Some("")
+        );
     }
 }

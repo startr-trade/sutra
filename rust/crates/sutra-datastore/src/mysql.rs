@@ -254,6 +254,8 @@ fn store_inner(
 #[derive(Clone)]
 pub struct MysqlCoverageStore {
     inner: Arc<StoreInner>,
+    /// The compliance cycle whose rows this handle addresses; `None` for the plain rows.
+    cycle: Option<String>,
 }
 
 impl MysqlCoverageStore {
@@ -266,7 +268,36 @@ impl MysqlCoverageStore {
                 None,
                 None,
             )?),
+            cycle: None,
         })
+    }
+
+    /// The same store, addressing `cycle`'s rows (or the plain rows for `None`).
+    pub fn in_cycle(&self, cycle: Option<&str>) -> MysqlCoverageStore {
+        MysqlCoverageStore {
+            inner: Arc::clone(&self.inner),
+            cycle: cycle.map(str::to_string),
+        }
+    }
+
+    fn row_scope(&self) -> coverage::CoverageRowScope {
+        match self.cycle {
+            Some(_) => coverage::CoverageRowScope::InCycle,
+            None => coverage::CoverageRowScope::NoCycle,
+        }
+    }
+
+    /// A statement with its scope's keys bound: the deployment id, then the cycle label if any.
+    fn scoped<'q>(
+        &'q self,
+        sql: &'q str,
+        deployment_id: &'q str,
+    ) -> sqlx::query::Query<'q, MySql, sqlx::mysql::MySqlArguments> {
+        let query = sqlx::query(sql).bind(deployment_id);
+        match &self.cycle {
+            Some(cycle) => query.bind(cycle.as_str()),
+            None => query,
+        }
     }
 
     /// The declared store name this coverage store was built from.
@@ -316,12 +347,12 @@ impl MysqlCoverageStore {
         if path_urns.is_empty() {
             return Ok(0);
         }
-        let sql = coverage::seed_sql(DIALECT);
+        let sql = coverage::seed_sql(DIALECT, self.row_scope());
         let mut tx = self.begin().await?;
         let mut inserted = 0u64;
         for urn in path_urns {
-            match sqlx::query(&sql)
-                .bind(deployment_id)
+            match self
+                .scoped(&sql, deployment_id)
                 .bind(urn)
                 .execute(&mut *tx)
                 .await
@@ -347,8 +378,11 @@ impl MysqlCoverageStore {
     ) -> Result<bool, DataStoreError> {
         check_deployment_id(deployment_id)?;
         let mut tx = self.begin().await?;
-        let flipped = sqlx::query(&coverage::mark_update_sql(DIALECT))
-            .bind(deployment_id)
+        let flipped = self
+            .scoped(
+                &coverage::mark_update_sql(DIALECT, self.row_scope()),
+                deployment_id,
+            )
             .bind(path_urn)
             .execute(&mut *tx)
             .await
@@ -357,8 +391,11 @@ impl MysqlCoverageStore {
         let newly = if flipped > 0 {
             true
         } else {
-            match sqlx::query(&coverage::mark_insert_sql(DIALECT))
-                .bind(deployment_id)
+            match self
+                .scoped(
+                    &coverage::mark_insert_sql(DIALECT, self.row_scope()),
+                    deployment_id,
+                )
                 .bind(path_urn)
                 .execute(&mut *tx)
                 .await
@@ -392,8 +429,8 @@ impl MysqlCoverageStore {
             .map_err(|e| cov_err(&self.inner.name, "connect", e))?;
         let mut covered = BTreeSet::new();
         for chunk in path_urns.chunks(coverage::IN_CHUNK) {
-            let sql = coverage::covered_among_sql(DIALECT, chunk.len());
-            let mut query = sqlx::query(&sql).bind(deployment_id);
+            let sql = coverage::covered_among_sql(DIALECT, self.row_scope(), chunk.len());
+            let mut query = self.scoped(&sql, deployment_id);
             for urn in chunk {
                 query = query.bind(urn);
             }
@@ -424,8 +461,8 @@ impl MysqlCoverageStore {
         let mut tx = self.begin().await?;
         let mut cleared = 0u64;
         for chunk in path_urns.chunks(coverage::IN_CHUNK) {
-            let sql = coverage::clear_paths_sql(DIALECT, chunk.len());
-            let mut query = sqlx::query(&sql).bind(deployment_id);
+            let sql = coverage::clear_paths_sql(DIALECT, self.row_scope(), chunk.len());
+            let mut query = self.scoped(&sql, deployment_id);
             for urn in chunk {
                 query = query.bind(urn);
             }
@@ -448,8 +485,11 @@ impl MysqlCoverageStore {
     ) -> Result<CoverageCounts, DataStoreError> {
         check_deployment_id(deployment_id)?;
         let mut tx = self.begin().await?;
-        let row = sqlx::query(&coverage::counts_sql(DIALECT))
-            .bind(deployment_id)
+        let row = self
+            .scoped(
+                &coverage::counts_sql(DIALECT, self.row_scope()),
+                deployment_id,
+            )
             .fetch_one(&mut *tx)
             .await
             .map_err(|e| cov_err(&self.inner.name, "count", e))?;
@@ -473,13 +513,19 @@ impl MysqlCoverageStore {
             .begin()
             .await
             .map_err(|e| cov_err(&self.inner.name, "connect", e))?;
-        let counts = sqlx::query(&coverage::counts_sql(DIALECT))
-            .bind(deployment_id)
+        let counts = self
+            .scoped(
+                &coverage::counts_sql(DIALECT, self.row_scope()),
+                deployment_id,
+            )
             .fetch_one(&mut *tx)
             .await
             .map_err(|e| cov_err(&self.inner.name, "count", e))?;
-        let uncovered = sqlx::query(&coverage::uncovered_sql(DIALECT))
-            .bind(deployment_id)
+        let uncovered = self
+            .scoped(
+                &coverage::uncovered_sql(DIALECT, self.row_scope()),
+                deployment_id,
+            )
             .fetch_all(&mut *tx)
             .await
             .map_err(|e| cov_err(&self.inner.name, "uncovered", e))?;
@@ -504,16 +550,18 @@ impl MysqlCoverageStore {
     ) -> Result<(), DataStoreError> {
         check_deployment_id(deployment_id)?;
         let mut tx = self.begin().await?;
-        sqlx::query(&coverage::write_fragment_sql(DIALECT))
-            .bind(deployment_id)
-            .bind(&row.route_urn)
-            .bind(&row.segment_process)
-            .bind(&row.instance_id)
-            .bind(&row.business_key)
-            .bind(&row.trace_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| cov_err(&self.inner.name, "fragment insert", e))?;
+        self.scoped(
+            &coverage::write_fragment_sql(DIALECT, self.row_scope()),
+            deployment_id,
+        )
+        .bind(&row.route_urn)
+        .bind(&row.segment_process)
+        .bind(&row.instance_id)
+        .bind(&row.business_key)
+        .bind(&row.trace_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| cov_err(&self.inner.name, "fragment insert", e))?;
         tx.commit()
             .await
             .map_err(|e| cov_err(&self.inner.name, "fragment commit", e))?;
@@ -527,8 +575,11 @@ impl MysqlCoverageStore {
     ) -> Result<Vec<CoverageFragmentRow>, DataStoreError> {
         check_deployment_id(deployment_id)?;
         let mut tx = self.begin().await?;
-        let rows = sqlx::query(&coverage::read_fragments_sql(DIALECT))
-            .bind(deployment_id)
+        let rows = self
+            .scoped(
+                &coverage::read_fragments_sql(DIALECT, self.row_scope()),
+                deployment_id,
+            )
             .fetch_all(&mut *tx)
             .await
             .map_err(|e| cov_err(&self.inner.name, "fragment read", e))?;
@@ -554,20 +605,69 @@ impl MysqlCoverageStore {
     pub async fn reset(&self, deployment_id: &str) -> Result<(), DataStoreError> {
         check_deployment_id(deployment_id)?;
         let mut tx = self.begin().await?;
-        sqlx::query(&coverage::reset_metrics_sql(DIALECT))
-            .bind(deployment_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| cov_err(&self.inner.name, "reset", e))?;
-        sqlx::query(&coverage::delete_fragments_sql(DIALECT))
-            .bind(deployment_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| cov_err(&self.inner.name, "fragment reset", e))?;
+        self.scoped(
+            &coverage::reset_metrics_sql(DIALECT, self.row_scope()),
+            deployment_id,
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| cov_err(&self.inner.name, "reset", e))?;
+        self.scoped(
+            &coverage::delete_fragments_sql(DIALECT, self.row_scope()),
+            deployment_id,
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| cov_err(&self.inner.name, "fragment reset", e))?;
         tx.commit()
             .await
             .map_err(|e| cov_err(&self.inner.name, "reset commit", e))?;
         Ok(())
+    }
+
+    /// Run a cycle-registry write; the affected-row count, with a duplicate key counting as zero.
+    pub(crate) async fn cycle_write(
+        &self,
+        sql: &str,
+        binds: &[&str],
+        op: &'static str,
+    ) -> Result<u64, DataStoreError> {
+        let mut tx = self.begin().await?;
+        let mut query = sqlx::query(sql);
+        for bind in binds {
+            query = query.bind(*bind);
+        }
+        let affected = match query.execute(&mut *tx).await {
+            Ok(done) => done.rows_affected(),
+            Err(e) if is_duplicate_key(&e) => 0,
+            Err(e) => return Err(cov_err(&self.inner.name, op, e)),
+        };
+        tx.commit()
+            .await
+            .map_err(|e| cov_err(&self.inner.name, op, e))?;
+        Ok(affected)
+    }
+
+    /// Run a cycle-registry read; the labels of its single text column.
+    pub(crate) async fn cycle_labels(
+        &self,
+        sql: &str,
+        binds: &[&str],
+        op: &'static str,
+    ) -> Result<Vec<String>, DataStoreError> {
+        let mut tx = self.begin().await?;
+        let mut query = sqlx::query(sql);
+        for bind in binds {
+            query = query.bind(*bind);
+        }
+        let rows = query
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|e| cov_err(&self.inner.name, op, e))?;
+        tx.commit()
+            .await
+            .map_err(|e| cov_err(&self.inner.name, op, e))?;
+        rows.iter().map(|r| text_of(r, 0)).collect()
     }
 }
 

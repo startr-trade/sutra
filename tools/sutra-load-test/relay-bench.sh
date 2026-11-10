@@ -39,6 +39,9 @@
 #                `perf` usable by your user (kernel.perf_event_paranoid <= 1) and inferno
 #                (`cargo install inferno`); build the engine with frame pointers for whole stacks.
 #
+# The block also carries the shared per-step resource table (step-metrics.sh): engine CPU and RSS,
+# PostgreSQL CPU, IOPS and WAL, for the measured step.
+#
 # Exit codes: 0 every order settled exactly once; 1 lost or duplicated settles; 3 harness error.
 
 set -u -o pipefail
@@ -233,6 +236,10 @@ pg_ticks() {
 read -r C0 F0 B0 S0 < <("${PSQL[@]}" -d sutra -F ' ' -c "$stats_sql")
 "${PSQL[@]}" -d sutra -c "SELECT pg_stat_statements_reset()" >/dev/null
 DL0="$("${PSQL[@]}" -d sutra -c "SELECT deadlocks FROM pg_stat_database WHERE datname = 'sutra'")"
+. "$SCRIPT_DIR/step-metrics.sh"
+export ENGINE_PID PG_PID="$(head -1 "$PGDATA/postmaster.pid")"
+PG_PSQL="$PG_BIN_DIR/psql -h 127.0.0.1 -p $PG_PORT -U sutra -d sutra"
+sm_snapshot "$WORK/sm-before"
 T0="$(cpu_ticks)"; P0="$(pg_ticks)"; W0="$(date +%s.%N)"
 
 PERF_PIDS=()
@@ -252,6 +259,7 @@ if wait_settled "$SENT"; then drained=yes; else drained=no; fi
 for pid in "${PERF_PIDS[@]}"; do kill -INT "$pid" 2>/dev/null; done
 for pid in "${PERF_PIDS[@]}"; do wait "$pid" 2>/dev/null; done
 read -r C1 F1 B1 S1 < <("${PSQL[@]}" -d sutra -F ' ' -c "$stats_sql")
+sm_snapshot "$WORK/sm-after"
 T1="$(cpu_ticks)"; P1="$(pg_ticks)"; W1="$(date +%s.%N)"
 SINK_STATS="$(curl -s "$SINK/stats")"
 SETTLED="$(jq -r .settled <<<"$SINK_STATS")"
@@ -292,7 +300,7 @@ outbox="$("${PSQL[@]}" -d sutra -F ' | ' -c "SELECT calls, rows, round(mean_exec
   ORDER BY total_exec_time DESC")"
 DL1="$("${PSQL[@]}" -d sutra -c "SELECT deadlocks FROM pg_stat_database WHERE datname = 'sutra'")"
 {
-    printf '%s\n\nTop statements by calls (calls | total ms | query):\n\n```\n%s\n```\n' "$report" "$top"
+    printf '%s\n\n%s\n\nTop statements by calls (calls | total ms | query):\n\n```\n%s\n```\n' "$report" "$(sm_report "$WORK/sm-before" "$WORK/sm-after" "relay ${RATE}/s x $DURATION")" "$top"
     printf '\nOutbox lease renewals and deletes (calls | rows | mean ms | max ms | total ms | query), deadlocks %s:\n\n```\n%s\n```\n' \
         "$((DL1 - DL0))" "$outbox"
 } | tee ${OUT:+"$OUT"}

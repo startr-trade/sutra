@@ -134,6 +134,10 @@ pub(crate) struct DeploymentPlan {
     /// What this deployment claims from the engine's shared namespaces (endpoints, data-store
     /// connections), for the checks that run before a flip.
     pub(crate) facts: crate::deployment_facts::DeploymentFacts,
+    /// Set by the deployment source on a DRAINING plan that a newer version of its owner
+    /// superseded: it keeps serving the inbound channels nothing newer declares until it retires
+    /// ([`crate::deploy::retained_definitions`]). `false` when planned, and for an undeploy.
+    pub(crate) retains_channels: bool,
 }
 
 impl DeploymentPlan {
@@ -452,12 +456,11 @@ pub(crate) fn build_engine_runtime(
     // draws from, so it never waits behind the lanes for a connection. `None` = use `pool`.
     dispatch_pool: Option<PgPool>,
 ) -> Result<EngineRuntime, Box<dyn std::error::Error>> {
-    // Channel topology comes from the ACTIVE plans only — a draining definition claims no
-    // binding and no route (it exists to be resumed into, never to accept new intake).
-    let all_definitions: Vec<ChannelDefinition> = plans
-        .iter()
-        .flat_map(|plan| plan.definitions.iter().cloned())
-        .collect();
+    // Channel topology comes from the ACTIVE plans, plus the channels a superseded DRAINING plan
+    // keeps because nothing newer declares them. Any other draining definition claims no route: it
+    // exists to be resumed into.
+    let all_definitions: Vec<ChannelDefinition> =
+        crate::deploy::served_definitions(&plans, &draining_plans);
     // The background loops (outbox dispatcher, timer poller) DO cover the draining tail —
     // pinned instances still fire timers and still drain emissions while their deployment winds
     // down (the same active+draining set `activate_plans` republishes on every flip).
@@ -1518,6 +1521,7 @@ pub(crate) fn plan_deployment(
         coverage_fault,
         openapi_spec,
         facts,
+        retains_channels: false,
     })
 }
 

@@ -147,6 +147,81 @@ async fn data_task_reads_assigns_and_writes_the_store() {
     assert_eq!(alice.get("frozen"), Some(&boolean(false)));
 }
 
+/// One data task that reads, assigns twice and writes: each operation evaluates against the
+/// variables as the previous operation left them (the read feeds the first assignment, the first
+/// assignment feeds the second, and both the write's key and its value come from assignments
+/// made in the same task).
+const ONE_TASK_CHAIN_BPMN: &str = r#"<?xml version="1.0"?>
+    <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                      xmlns:q="urn:sutra:q:1.0">
+      <bpmn:process id="chain">
+        <bpmn:dataObject id="doFrom" name="fromAccount"/>
+        <bpmn:dataObject id="doDoubled" name="doubled"/>
+        <bpmn:dataStore id="accounts" name="accounts"/>
+        <bpmn:dataStoreReference id="refRead" dataStoreRef="accounts">
+          <bpmn:extensionElements><q:store key="fromId"/></bpmn:extensionElements>
+        </bpmn:dataStoreReference>
+        <bpmn:dataStoreReference id="refWrite" dataStoreRef="accounts">
+          <bpmn:extensionElements><q:store key="dest"/></bpmn:extensionElements>
+        </bpmn:dataStoreReference>
+        <bpmn:startEvent id="S"/>
+        <bpmn:serviceTask id="Chain">
+          <bpmn:dataInputAssociation>
+            <bpmn:sourceRef>refRead</bpmn:sourceRef>
+            <bpmn:targetRef>doFrom</bpmn:targetRef>
+          </bpmn:dataInputAssociation>
+          <bpmn:dataInputAssociation>
+            <bpmn:assignment><bpmn:from>fromAccount.balance + 1</bpmn:from><bpmn:to>bumped</bpmn:to></bpmn:assignment>
+            <bpmn:assignment><bpmn:from>bumped * 2</bpmn:from><bpmn:to>doubled</bpmn:to></bpmn:assignment>
+            <bpmn:assignment><bpmn:from>fromId + "-copy"</bpmn:from><bpmn:to>dest</bpmn:to></bpmn:assignment>
+          </bpmn:dataInputAssociation>
+          <bpmn:dataOutputAssociation>
+            <bpmn:sourceRef>doDoubled</bpmn:sourceRef>
+            <bpmn:targetRef>refWrite</bpmn:targetRef>
+          </bpmn:dataOutputAssociation>
+        </bpmn:serviceTask>
+        <bpmn:endEvent id="E"/>
+        <bpmn:sequenceFlow id="f1" sourceRef="S" targetRef="Chain"/>
+        <bpmn:sequenceFlow id="f2" sourceRef="Chain" targetRef="E"/>
+      </bpmn:process>
+    </bpmn:definitions>"#;
+
+#[tokio::test]
+async fn each_data_task_operation_sees_what_the_previous_one_bound() {
+    let process = proc(ONE_TASK_CHAIN_BPMN, "chain");
+    match process.node("Chain").unwrap() {
+        Node::DataTask { data_mapping, .. } => {
+            assert_eq!(data_mapping.store_reads.len(), 1);
+            assert_eq!(data_mapping.assignments.len(), 3);
+            assert_eq!(data_mapping.store_writes.len(), 1);
+        }
+        other => panic!("expected one DataTask carrying every operation, got {other:?}"),
+    }
+
+    let accounts = Rc::new(InMemoryDataStore::new("accounts"));
+    accounts.put("alice", account(100, false)).await.unwrap();
+    let lookup = Rc::clone(&accounts);
+    let result = TokenExecutor::builder(TaskRegistry::new())
+        .with_value_evaluator(feel_value_evaluator())
+        .with_data_stores(move |_, name| {
+            (name == "accounts").then(|| Rc::clone(&lookup) as Rc<dyn DataStore>)
+        })
+        .build()
+        .execute_sync(&process, vars(&[("fromId", string("alice"))]))
+        .await
+        .unwrap();
+
+    assert_eq!(result.output("bumped"), Some(&num(101)));
+    assert_eq!(result.output("doubled"), Some(&num(202)));
+    assert_eq!(result.output("dest"), Some(&string("alice-copy")));
+    // The write's key and value were both bound earlier in the same task.
+    assert_eq!(
+        accounts.get("alice-copy").await.unwrap(),
+        Some(num(202)),
+        "the write saw the assignments made before it in the same task"
+    );
+}
+
 // ---- DataMappingTest ------------------------------------------------------------------
 
 #[tokio::test]
@@ -622,4 +697,72 @@ async fn commit_does_not_compensate() {
     assert!(result.visited_nodes.contains("Done"));
     assert!(!result.visited_nodes.contains("Rejected"));
     assert_eq!(effects.borrow().as_slice(), &["book"]);
+}
+
+// ---- a coded store refusal keeps its code ----------------------------------------------
+
+/// A store whose every operation is refused with a stable code, the way a dialect store refuses
+/// first use after an applied migration script was edited.
+struct RefusedStore;
+
+const CHECKSUM_CODE: &str = "SUTRA.RUNTIME.DATASTORE.MIGRATION_CHECKSUM";
+
+fn refused() -> StoreError {
+    StoreError::with_code(
+        CHECKSUM_CODE,
+        "data store 'accounts': migration 'V1__init.sql' (version 1) was applied with checksum \
+         aa but now has checksum bb",
+    )
+}
+
+#[async_trait(?Send)]
+impl DataStore for RefusedStore {
+    fn name(&self) -> &str {
+        "accounts"
+    }
+    async fn get(&self, _key: &str) -> Result<Option<FeelValue>, StoreError> {
+        Err(refused())
+    }
+    async fn put(&self, _key: &str, _value: FeelValue) -> Result<(), StoreError> {
+        Err(refused())
+    }
+    async fn delete(&self, _key: &str) -> Result<(), StoreError> {
+        Err(refused())
+    }
+    async fn revision(&self, _key: &str) -> Result<i64, StoreError> {
+        Err(refused())
+    }
+    async fn put_if_revision(
+        &self,
+        _key: &str,
+        _value: FeelValue,
+        _expected_rev: i64,
+    ) -> Result<bool, StoreError> {
+        Err(refused())
+    }
+    async fn begin(&self) -> Result<Option<Rc<dyn DataStoreTx>>, StoreError> {
+        Err(refused())
+    }
+}
+
+#[tokio::test]
+async fn a_coded_store_refusal_fails_the_task_with_that_code_naming_store_and_script() {
+    let process = proc(CAS_BPMN, "cas");
+    let store: Rc<dyn DataStore> = Rc::new(RefusedStore);
+    let e = TokenExecutor::builder(TaskRegistry::new())
+        .with_feel()
+        .with_data_stores(move |_, name| (name == "accounts").then(|| Rc::clone(&store)))
+        .build()
+        .execute_sync(&process, vars(&[]))
+        .await
+        .unwrap_err();
+    assert_eq!(e.code(), CHECKSUM_CODE);
+    assert!(e.message().contains("'accounts'"), "{}", e.message());
+    assert!(e.message().contains("V1__init.sql"), "{}", e.message());
+}
+
+#[test]
+fn an_uncoded_store_error_has_no_code() {
+    assert_eq!(StoreError::new("connection reset").code(), None);
+    assert_eq!(refused().code(), Some(CHECKSUM_CODE));
 }

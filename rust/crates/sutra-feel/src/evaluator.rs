@@ -480,7 +480,7 @@ impl Evaluator<'_> {
                 self.eval_filter(src, predicate, ctx)
             }
             FeelExpr::FieldAccess { base, field, .. } => {
-                Ok(field_access(&self.eval_internal(base, ctx)?, field))
+                Ok(field_access_owned(self.eval_internal(base, ctx)?, field))
             }
             FeelExpr::InstanceOf {
                 expr, type_shape, ..
@@ -2584,15 +2584,40 @@ fn pow_decimal(base: &BigDecimal, exp: &BigDecimal) -> FeelValue {
 /// `.day` needs `field_access`'s temporal-component arm, never reached via a bare `Map` match) or
 /// a `List` projection. `field_access`'s own `Map` arm is behaviorally identical to the old
 /// inline match, so this is a pure superset — no change for any already-working Map chain.
+///
+/// The walk borrows: while the value in hand is a `Map`, the next segment is looked up in place,
+/// and only the value the path ends on is cloned. A missing entry is `null`, and every further
+/// segment of `null` stays `null`, so the walk stops there. The first value that is not a `Map`
+/// hands the remaining segments to [`field_access`], which computes owned values (a temporal
+/// component, a `List` projection, a range bound).
 fn resolve_path(segments: &[String], ctx: &FeelContext) -> FeelValue {
-    let mut current = match ctx.get(&segments[0]) {
-        Some(v) => v.clone(),
-        None => return FeelValue::Null,
+    let Some(mut current) = ctx.get(&segments[0]) else {
+        return FeelValue::Null;
     };
-    for seg in &segments[1..] {
-        current = field_access(&current, seg);
+    let mut rest = &segments[1..];
+    while let (Some((seg, tail)), FeelValue::Map(m)) = (rest.split_first(), current) {
+        match m.get(seg.as_str()) {
+            Some(v) => current = v,
+            None => return FeelValue::Null,
+        }
+        rest = tail;
     }
-    current
+    let Some((seg, tail)) = rest.split_first() else {
+        return current.clone();
+    };
+    let mut owned = field_access(current, seg);
+    for seg in tail {
+        owned = field_access_owned(owned, seg);
+    }
+    owned
+}
+
+/// [`field_access`] on a value the caller owns: a `Map` entry is moved out rather than cloned.
+fn field_access_owned(v: FeelValue, field: &str) -> FeelValue {
+    match v {
+        FeelValue::Map(mut m) => m.remove(field).unwrap_or(FeelValue::Null),
+        other => field_access(&other, field),
+    }
 }
 
 /// Aggregation argument unwrapping: a lone list argument is its own elements; otherwise the

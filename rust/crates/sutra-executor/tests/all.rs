@@ -29,6 +29,8 @@ mod gateways_test;
 mod integration_examples_test;
 #[path = "all/message_decode_test.rs"]
 mod message_decode_test;
+#[path = "all/render_model_test.rs"]
+mod render_model_test;
 #[path = "all/retry_policy_test.rs"]
 mod retry_policy_test;
 #[path = "all/task_kinds_test.rs"]

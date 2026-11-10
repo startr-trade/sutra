@@ -38,6 +38,8 @@ mod draining_version_it;
 mod endpoint_claims_it;
 #[path = "all/external_task_pull_e2e.rs"]
 mod external_task_pull_e2e;
+#[path = "all/first_delivery_latency_it.rs"]
+mod first_delivery_latency_it;
 #[path = "all/incident_dead_letter_it.rs"]
 mod incident_dead_letter_it;
 #[path = "all/instance_migration_it.rs"]

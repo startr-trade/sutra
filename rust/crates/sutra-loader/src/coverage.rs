@@ -31,6 +31,72 @@ use crate::scanner::{LoadedArtifact, LoadedDeployment};
 /// Coverage files are single-extension (`.yaml`/`.yml`) — so the URN OMITS the extension.
 pub(crate) const COVERAGE_SUFFIXES: &[&str] = &[".yaml", ".yml"];
 
+/// The reserved file at the root of `coverage/` that maps declared paths to what a compliance
+/// report states about them. It travels in the sealed archive with the coverage files, but it is
+/// not one of them: it declares no routes.
+pub const REQUIREMENTS_MAP_FILE: &str = "requirements-map.yaml";
+
+/// The weight of a declared path that states none, or that the map does not mention.
+pub const DEFAULT_ROUTE_WEIGHT: f64 = 1.0;
+
+/// The parsed `coverage/requirements-map.yaml`: declared path → what it stands for. A package with
+/// no such file has no compliance view, and `coverage check` reports as it always has.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RequirementsMap {
+    /// Keyed by the path's metric URN, as `coverage check` lists it: a cross-process route's
+    /// `urn:sutra:coverage:<file>:<path>`, or an intra-process `<q:coverage>` path id.
+    #[serde(default)]
+    pub routes: BTreeMap<String, RouteRequirements>,
+}
+
+/// What one declared path stands for in a compliance report.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouteRequirements {
+    /// The requirement ids this path evidences.
+    #[serde(default)]
+    pub requirements: Vec<String>,
+    /// This path's share of the weighted percentage, relative to the others.
+    #[serde(default = "default_route_weight")]
+    pub weight: f64,
+    /// The ids of the test cases that walk this path. Opaque here: a case is the test client's
+    /// concept, and the report only hands these back.
+    #[serde(default)]
+    pub cases: Vec<String>,
+}
+
+fn default_route_weight() -> f64 {
+    DEFAULT_ROUTE_WEIGHT
+}
+
+/// Parse and validate a requirements map. Every declared path counts, so a weight of zero is
+/// refused along with a negative one: it would be an exclusion by another name. An unknown key,
+/// `exclude` among them, is refused by the parser for the same reason.
+pub fn parse_requirements_map(content: &str) -> Result<RequirementsMap, String> {
+    let map: RequirementsMap = serde_yaml::from_str(content).map_err(|e| e.to_string())?;
+    for (route, entry) in &map.routes {
+        if !entry.weight.is_finite() || entry.weight <= 0.0 {
+            return Err(format!(
+                "route '{route}': weight {} must be a number above zero; every declared path \
+                 counts",
+                entry.weight
+            ));
+        }
+        if let Some(blank) = entry
+            .requirements
+            .iter()
+            .chain(&entry.cases)
+            .find(|id| id.trim().is_empty())
+        {
+            return Err(format!(
+                "route '{route}': a requirement or case id is blank ('{blank}')"
+            ));
+        }
+    }
+    Ok(map)
+}
+
 /// One parsed `coverage/**` file: a set of [`BusinessCorrelation`]s plus its derived URN.
 /// `urn` is NOT present in the YAML — it is derived from the archive-local subpath by
 /// [`coverage_urn`] after the body is deserialized.
@@ -133,6 +199,9 @@ pub(crate) fn build_coverage_files(
 ) -> Result<Vec<CoverageFile>, LoaderError> {
     let mut out = Vec::with_capacity(files.len());
     for (sub, artifact) in files {
+        if sub == REQUIREMENTS_MAP_FILE {
+            continue;
+        }
         let body: CoverageFileBody = serde_yaml::from_str(&artifact.content).map_err(|e| {
             LoaderError::new(
                 err_code,
@@ -154,7 +223,47 @@ impl LoadedDeployment {
     pub(crate) fn resolve_coverage(&mut self, err_code: &'static str) -> Result<(), LoaderError> {
         self.coverages = build_coverage_files(&self.coverage_files, err_code)?;
         self.inject_coverage_paths();
+        if let Some(artifact) = self.coverage_files.get(REQUIREMENTS_MAP_FILE) {
+            parse_requirements_map(&artifact.content).map_err(|e| {
+                LoaderError::new(
+                    err_code,
+                    format!("coverage/{REQUIREMENTS_MAP_FILE} is not a valid mapping: {e}"),
+                )
+            })?;
+        }
         Ok(())
+    }
+
+    /// The package's requirements map, or `None` when it ships none. Loading already refused a
+    /// malformed one; the `Err` is the same refusal for a deployment assembled some other way.
+    pub fn requirements_map(&self) -> Result<Option<RequirementsMap>, String> {
+        self.coverage_files
+            .get(REQUIREMENTS_MAP_FILE)
+            .map(|artifact| parse_requirements_map(&artifact.content))
+            .transpose()
+    }
+
+    /// Every declared path by its metric URN, ascending: the "total to cover". The intra-process
+    /// paths and injected sub-paths collapse through the same mapping seeding and marking use, and
+    /// a route over a process this deployment does not declare still counts, because it is
+    /// declared and nothing can ever cover it.
+    pub fn declared_coverage_urns(&self) -> Vec<String> {
+        let mut ids: Vec<String> = Vec::new();
+        for (pid, module) in &self.processes {
+            if let Ok(process) = module.process(pid) {
+                ids.extend(process.coverage_paths.iter().map(|p| p.id.clone()));
+            }
+        }
+        for file in &self.coverages {
+            for corr in &file.correlations {
+                ids.extend(
+                    corr.coverages
+                        .iter()
+                        .map(|route| format!("{}:{}", file.urn, route.path)),
+                );
+            }
+        }
+        sutra_executor::coverage::seed_urns(ids)
     }
 
     /// Desugar-inject at load: for each coverage route `segments[p]` (processId → flow
@@ -485,5 +594,78 @@ mod tests {
             2
         );
         assert!(!dep.processes.contains_key("p3"));
+    }
+
+    #[test]
+    fn the_requirements_map_parses_with_a_default_weight() {
+        let map = parse_requirements_map(
+            "routes:\n  accept:\n    requirements: [REQ-1]\n    weight: 2.5\n    cases: [c1, c2]\n  reject: {}\n",
+        )
+        .unwrap();
+        assert_eq!(map.routes["accept"].weight, 2.5);
+        assert_eq!(map.routes["accept"].cases, vec!["c1", "c2"]);
+        assert_eq!(map.routes["reject"].weight, DEFAULT_ROUTE_WEIGHT);
+        assert!(map.routes["reject"].requirements.is_empty());
+    }
+
+    #[test]
+    fn the_requirements_map_has_no_way_to_exclude_a_path() {
+        for bad in [
+            "routes:\n  accept: { weight: 0 }\n",
+            "routes:\n  accept: { weight: -1 }\n",
+            "routes:\n  accept: { weight: .inf }\n",
+            "routes:\n  accept: { exclude: true }\n",
+            "routes:\n  accept: { requirements: [''] }\n",
+            "paths: {}\n",
+        ] {
+            assert!(parse_requirements_map(bad).is_err(), "accepted: {bad}");
+        }
+    }
+
+    #[test]
+    fn the_requirements_map_is_not_read_as_a_coverage_file() {
+        let artifact = |content: &str| LoadedArtifact {
+            path: PathBuf::from("coverage/x.yaml"),
+            content: content.to_string(),
+        };
+        let files = BTreeMap::from([
+            (ORDERS_E2E_SUBPATH.to_string(), artifact(ORDERS_E2E)),
+            (
+                REQUIREMENTS_MAP_FILE.to_string(),
+                artifact("routes:\n  accept: { weight: 2 }\n"),
+            ),
+        ]);
+        let parsed = build_coverage_files(&files, codes::CONFIG_MODULE_LAYOUT_INVALID).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].urn, "urn:sutra:coverage:orders:e2e");
+    }
+
+    #[test]
+    fn a_malformed_requirements_map_fails_the_load() {
+        let mut dep = deployment_with_shared_module(vec![]);
+        dep.coverage_files.insert(
+            REQUIREMENTS_MAP_FILE.to_string(),
+            LoadedArtifact {
+                path: PathBuf::from("coverage/requirements-map.yaml"),
+                content: "routes:\n  accept: { weight: 0 }\n".to_string(),
+            },
+        );
+        let err = dep
+            .resolve_coverage(codes::CONFIG_MODULE_LAYOUT_INVALID)
+            .unwrap_err();
+        assert!(err.to_string().contains("requirements-map.yaml"), "{err}");
+    }
+
+    #[test]
+    fn declared_urns_collapse_sub_paths_and_count_every_route() {
+        let mut dep = deployment_with_shared_module(vec![parse_fixture()]);
+        dep.inject_coverage_paths();
+        assert_eq!(
+            dep.declared_coverage_urns(),
+            vec![
+                "urn:sutra:coverage:orders:e2e:reply1".to_string(),
+                "urn:sutra:coverage:orders:e2e:reply2".to_string(),
+            ]
+        );
     }
 }

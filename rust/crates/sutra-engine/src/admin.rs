@@ -595,6 +595,7 @@ async fn admin_deployment_check(
     body: axum::body::Bytes,
 ) -> impl IntoResponse {
     crate::server::deployment_check_response(&state, params.get("slot").map(String::as_str), &body)
+        .await
 }
 
 /// `DELETE /admin/deployments/{slot}` (db source) — retire the slot's active archive + re-flip.

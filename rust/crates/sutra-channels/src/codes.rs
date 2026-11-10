@@ -8,6 +8,13 @@ pub const RESOLVE_MODULE_NOT_FOUND: &str = "SUTRA.RESOLVE.MODULE.NOT_FOUND";
 /// construction/validation time (the `SUTRA.CONFIG.PROPERTY.INVALID` code).
 pub const CONFIG_PROPERTY_INVALID: &str = "SUTRA.CONFIG.PROPERTY.INVALID";
 
+/// A connection property written as a reference resolved to blank — a set-but-empty variable, an
+/// empty secret file — so the transport treats it as unset and its built-in default applies (or a
+/// required property is refused). Logged at WARN, naming the channel, the property and the
+/// reference; not a refusal. The explicit-empty form `${NAME:}` says blank is intended and is not
+/// warned about.
+pub const CONFIG_PROPERTY_BLANK_REFERENCE: &str = "SUTRA.CONFIG.PROPERTY.BLANK_REFERENCE";
+
 pub const CHANNEL_AUTH_MISSING_SCHEME: &str = "SUTRA.CHANNEL.AUTH.MISSING_SCHEME";
 pub const CHANNEL_AUTH_SCHEME_INVALID: &str = "SUTRA.CHANNEL.AUTH.SCHEME_INVALID";
 pub const CHANNEL_NAME_COLLISION: &str = "SUTRA.CHANNEL.NAME.COLLISION";
@@ -15,8 +22,18 @@ pub const CHANNEL_NAME_COLLISION: &str = "SUTRA.CHANNEL.NAME.COLLISION";
 /// consumer group) another active deployment holds. The deploy is refused; the old state serves.
 pub const DEPLOY_ENDPOINT_COLLISION: &str = "SUTRA.DEPLOY.ENDPOINT.COLLISION";
 /// A deployment takes an endpoint from another version of the same tenant and module.
-/// Not a refusal: the older version drains, on every endpoint it held, and this says so.
+/// Not a refusal: the older version drains. Its running instances finish on it, and the channels
+/// only it declares stay served by it until it retires; this names them, and the timer starts that
+/// stop with the drain.
 pub const DEPLOY_ENDPOINT_SUPERSEDED: &str = "SUTRA.DEPLOY.ENDPOINT.SUPERSEDED";
+/// A deployment changes an inbound channel an older version of its owner has instances parked on:
+/// its inbound auth, codec, schema, address or transport, or it serves that channel's endpoint
+/// under another name. A warning: the parked instances resume through what the new version serves.
+pub const DEPLOY_ENDPOINT_CHANNEL_CHANGED: &str = "SUTRA.DEPLOY.ENDPOINT.CHANNEL_CHANGED";
+/// A deployment adds a start event on a channel an older version of its owner waits on, with a
+/// message type that can overlap. Start events are tried first, so a reply meant for a parked
+/// instance starts a new one instead. A warning.
+pub const DEPLOY_ENDPOINT_START_ON_WAIT: &str = "SUTRA.DEPLOY.ENDPOINT.START_ON_WAIT";
 /// A deployment in a folder is an older version than one its owner already has there on a shared
 /// endpoint, so it does not serve: in a folder the highest version wins, at every scan and restart.
 pub const DEPLOY_ENDPOINT_OUTRANKED: &str = "SUTRA.DEPLOY.ENDPOINT.OUTRANKED";

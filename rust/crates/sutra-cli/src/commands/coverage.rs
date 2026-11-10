@@ -36,6 +36,7 @@ use sutra_bpmn::{BpmnModelLoader, Node, ProcessDefinition, ProcessModule, SutraE
 use sutra_executor::{CoverageFragment, CoverageMetricStore, CoverageMetrics, StoreError};
 use sutra_loader::{CoverageFile, CoverageRoute};
 
+use super::coverage_compliance::{compliance_report, ComplianceReport};
 use crate::exit;
 use crate::output::{report_format, Diagnostic, Io, ReportFormat, Severity};
 use crate::routes::{
@@ -47,7 +48,10 @@ use crate::GlobalArgs;
 /// Coverage diagnostic codes surfaced by this command. The first three are the engine's
 /// own load-time family (`sutra-bpmn`); STORE_MISSING mirrors the executor's runtime code
 /// (this is its static, package-side check); ROUTE_UNDECLARED is CLI-informational.
-mod codes {
+pub(super) mod codes {
+    pub const CYCLE_ALREADY_ACTIVE: &str = "SUTRA.RUNTIME.COVERAGE.CYCLE_ALREADY_ACTIVE";
+    pub const CYCLE_UNDECLARED: &str = "SUTRA.RUNTIME.COVERAGE.CYCLE_UNDECLARED";
+    pub const CYCLE_NOT_ACTIVE: &str = "SUTRA.RUNTIME.COVERAGE.CYCLE_NOT_ACTIVE";
     pub const INVALID_ROUTE: &str = "SUTRA.CONFIG.COVERAGE.INVALID_ROUTE";
     pub const STORE_MISSING: &str = "SUTRA.CONFIG.COVERAGE.STORE_MISSING";
     pub const ROUTE_UNDECLARED: &str = "SUTRA.CONFIG.COVERAGE.ROUTE_UNDECLARED";
@@ -73,6 +77,8 @@ pub enum CoverageAction {
     /// Reset a deployment's coverage store: re-seed every declared path
     /// `covered = false` and clear its reconstruction fragments.
     Reset(ResetArgs),
+    /// Declare, activate, deactivate and list compliance cycles.
+    Cycle(super::coverage_cycle::CycleArgs),
 }
 
 #[derive(Debug, clap::Args)]
@@ -156,6 +162,11 @@ pub struct CheckArgs {
     /// path must be covered).
     #[arg(long, value_name = "PERCENT", default_value_t = 100.0)]
     pub threshold: f64,
+
+    /// Report this compliance cycle. Without it, the check reports the marks recorded outside any
+    /// cycle, whether or not a cycle is active.
+    #[arg(long, value_name = "LABEL")]
+    pub cycle: Option<String>,
 }
 
 /// `sutra coverage reset` — re-seed a deployment's coverage store to the fully-uncovered
@@ -183,6 +194,11 @@ pub struct ResetArgs {
         value_name = "PASSWORD"
     )]
     pub db_password: Option<String>,
+
+    /// Reset this compliance cycle's marks. Without it, the reset covers the marks recorded
+    /// outside any cycle, and no cycle is touched.
+    #[arg(long, value_name = "LABEL")]
+    pub cycle: Option<String>,
 }
 
 pub fn execute(args: CoverageArgs, global: &GlobalArgs, io: &mut Io<'_>) -> i32 {
@@ -197,6 +213,7 @@ pub fn execute(args: CoverageArgs, global: &GlobalArgs, io: &mut Io<'_>) -> i32 
         CoverageAction::Init(a) => init(a, format, io),
         CoverageAction::Check(a) => check(a, format, io),
         CoverageAction::Reset(a) => reset(a, format, io),
+        CoverageAction::Cycle(a) => super::coverage_cycle::execute(a, format, io),
     }
 }
 
@@ -1779,8 +1796,35 @@ async fn run_correlation_reset(
 /// connection the deployment's `coverage` store declares) onto the executor's
 /// `CoverageMetricStore` SPI, so the store-agnostic `run_correlation_*` logic runs live unchanged
 /// — on any of the three shipped dialects, since the store dispatches on the connection's scheme.
-struct DeclaredMetricStore {
-    inner: sutra_datastore::CoverageStore,
+pub(super) struct DeclaredMetricStore {
+    pub(super) inner: sutra_datastore::CoverageStore,
+}
+
+impl DeclaredMetricStore {
+    /// This store addressing `cycle`'s rows, after checking the cycle exists: a typo in a label
+    /// must not read as a cycle with nothing covered. `None` is the plain "no cycle" rows.
+    async fn scoped_to(
+        self,
+        deployment_id: &str,
+        cycle: Option<&str>,
+    ) -> Result<DeclaredMetricStore, String> {
+        if let Some(label) = cycle {
+            let declared = self
+                .inner
+                .cycle_is_declared(deployment_id, label)
+                .await
+                .map_err(|e| format!("coverage store error: {e}"))?;
+            if !declared {
+                return Err(format!(
+                    "{}: cycle '{label}' has not been declared on deployment {deployment_id}",
+                    codes::CYCLE_UNDECLARED
+                ));
+            }
+        }
+        Ok(DeclaredMetricStore {
+            inner: self.inner.in_cycle(cycle),
+        })
+    }
 }
 
 fn store_err(e: sutra_datastore::DataStoreError) -> StoreError {
@@ -1876,7 +1920,7 @@ impl CoverageMetricStore for DeclaredMetricStore {
 /// is the same store the ENGINE writes: point it at the database the deployment's `coverage`
 /// store declares, in any of the three shipped dialects (the URL scheme picks it). Nothing is
 /// created here that the engine would not create — the DDL is the engine's and idempotent.
-fn open_coverage_store(
+pub(super) fn open_coverage_store(
     url: Option<&str>,
     user: Option<&str>,
     password: Option<&str>,
@@ -1926,21 +1970,68 @@ fn check_correlation(args: CheckArgs, format: ReportFormat, io: &mut Io<'_>) -> 
     };
     let deployment_id = loaded.id.value().to_string();
     let coverages = loaded.deployment.coverages.clone();
+    let declared = loaded.deployment.declared_coverage_urns();
+    let requirements = match loaded.deployment.requirements_map() {
+        Ok(map) => map,
+        Err(e) => {
+            let _ = writeln!(io.err, "coverage check: invalid requirements map: {e}");
+            return exit::USAGE;
+        }
+    };
 
     // The pool MUST be created and used within ONE runtime: sqlx binds a connection's IO to the
     // ambient tokio reactor at establish time, so a pool built under one `block_on` runtime and then
     // driven under a second (whose reactor is already dropped) wedges `begin()` until the acquire
     // timeout — the "pool timed out while waiting for an open connection" symptom. Connect + check
     // run in ONE async so the pool never outlives its runtime.
-    let report = match block_on(async {
+    let (report, view) = match block_on(async {
         let store = open_coverage_store(
             args.database_url.as_deref(),
             args.db_user.as_deref(),
             args.db_password.as_deref(),
         )?;
-        run_correlation_check(&store, &deployment_id, &coverages, args.threshold)
+        let active_cycle = store
+            .inner
+            .active_cycle(&deployment_id)
             .await
-            .map_err(|e| format!("coverage store error: {}", e.message()))
+            .map_err(|e| format!("coverage store error: {e}"))?;
+        let store = store
+            .scoped_to(&deployment_id, args.cycle.as_deref())
+            .await?;
+        let spi_err = |e: StoreError| format!("coverage store error: {}", e.message());
+        // Both views count every declared path, so make sure each has a row even if nothing has
+        // walked it. The plain check with no map keeps its own narrower seed, unchanged.
+        if args.cycle.is_some() || requirements.is_some() {
+            store
+                .seed_declared(&deployment_id, &declared)
+                .await
+                .map_err(spi_err)?;
+        }
+        let mut report = run_correlation_check(&store, &deployment_id, &coverages, args.threshold)
+            .await
+            .map_err(spi_err)?;
+        let compliance = match &requirements {
+            Some(map) => {
+                let covered = store
+                    .covered_among(&deployment_id, &declared)
+                    .await
+                    .map_err(spi_err)?;
+                let compliance = compliance_report(map, &declared, &covered);
+                // With a map, the weighted percentage is the compliance figure, so it is what the
+                // threshold gates. With every weight at its default the two agree.
+                report.passed = compliance.weighted_percentage >= args.threshold;
+                Some(compliance)
+            }
+            None => None,
+        };
+        Ok::<_, String>((
+            report,
+            CheckView {
+                cycle: args.cycle.clone(),
+                active_cycle,
+                compliance,
+            },
+        ))
     }) {
         Ok(r) => r,
         Err(msg) => {
@@ -1949,7 +2040,7 @@ fn check_correlation(args: CheckArgs, format: ReportFormat, io: &mut Io<'_>) -> 
         }
     };
 
-    render_correlation_report(&report, &deployment_id, format, io);
+    render_correlation_report(&report, &view, &deployment_id, format, io);
     if report.passed {
         exit::OK
     } else {
@@ -1957,8 +2048,20 @@ fn check_correlation(args: CheckArgs, format: ReportFormat, io: &mut Io<'_>) -> 
     }
 }
 
+/// What a check adds to the plain report. All empty for a package with no requirements map and no
+/// cycle in play, so that report stays what it has always been.
+#[derive(Debug, Clone, Default)]
+struct CheckView {
+    /// The cycle this report reads, when one was asked for.
+    cycle: Option<String>,
+    /// The deployment's active cycle, whichever cycle this report reads.
+    active_cycle: Option<String>,
+    compliance: Option<ComplianceReport>,
+}
+
 fn render_correlation_report(
     report: &CorrelationReport,
+    view: &CheckView,
     deployment_id: &str,
     format: ReportFormat,
     io: &mut Io<'_>,
@@ -1969,6 +2072,15 @@ fn render_correlation_report(
                 io.out,
                 "coverage check (cross-process) — deployment {deployment_id}"
             );
+            if let Some(cycle) = &view.cycle {
+                let _ = writeln!(io.out, "  cycle: {cycle}");
+            } else if let Some(active) = &view.active_cycle {
+                let _ = writeln!(
+                    io.out,
+                    "  note: cycle '{active}' is active and receiving coverage; this reports the \
+                     marks outside any cycle. Pass --cycle to report it."
+                );
+            }
             let _ = writeln!(
                 io.out,
                 "  total: {}  covered: {}  coveragePercentage: {:.2}%",
@@ -1992,6 +2104,9 @@ fn render_correlation_report(
                     let _ = writeln!(io.out, "    - {urn}");
                 }
             }
+            if let Some(compliance) = &view.compliance {
+                compliance.render_text(&mut *io.out);
+            }
             let verdict = if report.passed { "PASS" } else { "FAIL" };
             let _ = writeln!(
                 io.out,
@@ -2000,7 +2115,7 @@ fn render_correlation_report(
             );
         }
         ReportFormat::Json => {
-            let payload = serde_json::json!({
+            let mut payload = serde_json::json!({
                 "command": "coverage check",
                 "form": "cross-process",
                 "deploymentId": deployment_id,
@@ -2012,6 +2127,15 @@ fn render_correlation_report(
                 "newlyCovered": report.newly_covered,
                 "passed": report.passed,
             });
+            if let Some(cycle) = &view.cycle {
+                payload["cycle"] = serde_json::json!(cycle);
+            }
+            if let Some(active) = &view.active_cycle {
+                payload["activeCycle"] = serde_json::json!(active);
+            }
+            if let Some(compliance) = &view.compliance {
+                payload["compliance"] = compliance.to_json();
+            }
             let _ = writeln!(io.out, "{payload}");
         }
     }
@@ -2041,6 +2165,9 @@ fn reset(args: ResetArgs, format: ReportFormat, io: &mut Io<'_>) -> i32 {
             args.db_user.as_deref(),
             args.db_password.as_deref(),
         )?;
+        let store = store
+            .scoped_to(&deployment_id, args.cycle.as_deref())
+            .await?;
         run_correlation_reset(&store, &deployment_id)
             .await
             .map_err(|e| format!("coverage store error: {}", e.message()))
@@ -2085,7 +2212,7 @@ fn render_reset_report(
     }
 }
 
-fn block_on<F: std::future::Future>(future: F) -> F::Output {
+pub(super) fn block_on<F: std::future::Future>(future: F) -> F::Output {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -2318,6 +2445,7 @@ datastores:
                         db_user: None,
                         db_password: None,
                         threshold: 100.0,
+                        cycle: None,
                     }),
                 },
                 &GlobalArgs::default(),
@@ -2720,6 +2848,7 @@ datastores:
                         db_user: None,
                         db_password: None,
                         threshold: 100.0,
+                        cycle: None,
                     }),
                 },
                 &GlobalArgs {
@@ -3066,7 +3195,13 @@ datastores:
         #[test]
         fn check_json_shape_is_frozen() {
             let (_, out, _) = crate::output::run_captured("", |io| {
-                render_correlation_report(&sample_report(), DEP, ReportFormat::Json, io);
+                render_correlation_report(
+                    &sample_report(),
+                    &CheckView::default(),
+                    DEP,
+                    ReportFormat::Json,
+                    io,
+                );
                 0
             });
             assert_eq!(
@@ -3078,7 +3213,13 @@ datastores:
         #[test]
         fn check_text_shape_is_frozen() {
             let (_, out, _) = crate::output::run_captured("", |io| {
-                render_correlation_report(&sample_report(), DEP, ReportFormat::Text, io);
+                render_correlation_report(
+                    &sample_report(),
+                    &CheckView::default(),
+                    DEP,
+                    ReportFormat::Text,
+                    io,
+                );
                 0
             });
             assert_eq!(
@@ -3091,6 +3232,49 @@ datastores:
                  - urn:sutra:coverage:orders:e2e:reply1\n  \
                  threshold: 100.00%  =>  FAIL\n"
             );
+        }
+
+        #[test]
+        fn a_cycle_and_a_requirements_map_only_add_to_the_report() {
+            let map = sutra_loader::parse_requirements_map(
+                "routes:\n  a: { requirements: [REQ-1], weight: 3, cases: [case-a] }\n",
+            )
+            .unwrap();
+            let view = CheckView {
+                cycle: Some("rel-1".to_string()),
+                active_cycle: Some("rel-1".to_string()),
+                compliance: Some(compliance_report(
+                    &map,
+                    &["a".to_string(), "b".to_string()],
+                    &BTreeSet::from(["b".to_string()]),
+                )),
+            };
+            let (_, json, _) = crate::output::run_captured("", |io| {
+                render_correlation_report(&sample_report(), &view, DEP, ReportFormat::Json, io);
+                0
+            });
+            let json: serde_json::Value = serde_json::from_str(json.trim_end()).unwrap();
+            assert_eq!(json["coveragePercentage"], 75.0, "the plain figure stays");
+            assert_eq!(json["cycle"], "rel-1");
+            assert_eq!(json["activeCycle"], "rel-1");
+            assert_eq!(json["compliance"]["weightedPercentage"], 25.0);
+            assert_eq!(
+                json["compliance"]["uncoveredRoutes"][0]["cases"],
+                serde_json::json!(["case-a"])
+            );
+
+            let (_, text, _) = crate::output::run_captured("", |io| {
+                render_correlation_report(&sample_report(), &view, DEP, ReportFormat::Text, io);
+                0
+            });
+            assert!(text.contains("  cycle: rel-1\n"), "{text}");
+            assert!(text.contains("  weighted: 25.00%"), "{text}");
+            assert!(
+                text.contains("    REQ-1: 0.00%  (0 of 1 routes)\n"),
+                "{text}"
+            );
+            assert!(text.contains("    - a: case-a\n"), "{text}");
+            assert!(text.contains("not in the requirements map"), "{text}");
         }
 
         #[test]

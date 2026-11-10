@@ -155,7 +155,9 @@ layers and never interact — see [External tasks](external-tasks.md#how-it-comp
 ## The outbox poison ceiling
 
 Outbound deliveries retry with backoff **forever** by default: an unreachable counterpart is
-treated as temporarily unreachable, and giving up silently is worse than waiting.
+treated as temporarily unreachable, and giving up silently is worse than waiting. Since 0.6.20 each failed attempt
+that will be retried logs a WARN with the destination, the cause's code and message, the attempt number and
+`next_attempt_at`. The backoff base, `sutra.outbox.retry.base-delay`, defaults to `PT1S`.
 
 `sutra.outbox.retry.max-attempts` is the opt-in ceiling. A delivery that exhausts it becomes
 terminally **poisoned**: retained with its last error, never retried again, one incident recorded

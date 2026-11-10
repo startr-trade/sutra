@@ -1246,6 +1246,17 @@ impl OutboxDispatcher {
             return;
         }
         let next_at = self.retry.next_attempt((self.now)(), row.attempt_count + 1);
+        // Every failed attempt is visible: a delivery that fails once and then succeeds would
+        // otherwise show only as a gap of several seconds before it arrived.
+        warn!(
+            entry_id = %row.entry_id,
+            destination = %row.destination,
+            code = %diagnostic.code,
+            error = %diagnostic.message,
+            attempt = row.attempt_count + 1,
+            next_attempt_at = %rfc3339(next_at),
+            "outbox delivery attempt failed — retried at next_attempt_at"
+        );
         // Carry any existing incident marker forward: a transient failure AFTER a poison must not
         // erase the record that this entry's incident was already raised.
         self.defer_row(deployment, row, next_at, diagnostic, incident_recorded(row))
@@ -1748,8 +1759,10 @@ impl OutboxSignal {
 
     /// Hand committed, reserved rows straight to the dispatcher. With no dispatcher running the
     /// rows are released and the dispatcher woken instead, so they go out through the ordinary
-    /// claim — nothing is ever dropped.
-    pub fn hand_off(&self, deployment: &DeploymentId, rows: Vec<ClaimedOutboxRow>) {
+    /// claim — nothing is ever dropped. Returns the ids of the rows that were NOT handed off: the
+    /// caller made them due only after [`HANDOFF_GRACE`], so it should make them due now, or the
+    /// claim will not see them until the grace has passed.
+    pub fn hand_off(&self, deployment: &DeploymentId, rows: Vec<ClaimedOutboxRow>) -> Vec<String> {
         let sender = self
             .inner
             .handoff
@@ -1771,6 +1784,7 @@ impl OutboxSignal {
             self.release(&unsent);
             self.wake();
         }
+        unsent
     }
 
     /// The rows were delivered and their delete committed: release them, and remember them for
@@ -2620,6 +2634,51 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains(codes::OUTBOUND_SEND_FAILED));
+    }
+
+    #[tokio::test]
+    async fn a_retryable_failure_is_logged_at_warn_with_its_code_and_next_attempt() {
+        #[derive(Clone, Default)]
+        struct Kept(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Kept {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("lock").extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let kept = Kept::default();
+        let writer = kept.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let store = Arc::new(InMemoryRows::default());
+        store.enqueue(row("e1", "http://reply.example/cb", 0), t0());
+        let sink = Arc::new(FixedSink::always(
+            "http",
+            SendOutcome::RetryableFailure(Diagnostic::error(
+                codes::OUTBOUND_SEND_FAILED,
+                "connection refused",
+            )),
+        ));
+        dispatcher(Arc::clone(&store), sink, 10)
+            .dispatch_deployment(&dep())
+            .await;
+
+        let log = String::from_utf8_lossy(&kept.0.lock().expect("lock")).into_owned();
+        assert!(log.contains(" WARN "), "{log}");
+        assert!(log.contains(codes::OUTBOUND_SEND_FAILED), "{log}");
+        assert!(log.contains("connection refused"), "{log}");
+        assert!(log.contains("attempt=1"), "{log}");
+        assert!(
+            log.contains("next_attempt_at=2026-05-20T10:00:02Z"),
+            "{log}"
+        );
     }
 
     /// A delivered row waiting for the delete batcher is left out of the lease renewal (the
@@ -4060,7 +4119,7 @@ mod concurrent_tests {
             let r = row(&format!("h{i:02}"), &format!("inst-{i}"), "test://local");
             signal.reserve(std::slice::from_ref(&r.entry_id));
             table.insert(r.clone()); // the "commit"
-            signal.hand_off(&dep(), vec![r]);
+            assert!(signal.hand_off(&dep(), vec![r]).is_empty());
         }
         wait_until(|| table.remaining() == 0).await;
         handle.shutdown().await;
@@ -4076,7 +4135,8 @@ mod concurrent_tests {
         let r = row("x1", "inst", "test://local");
         signal.reserve(std::slice::from_ref(&r.entry_id));
         assert!(!signal.accepts_hand_off());
-        signal.hand_off(&dep(), vec![r]);
+        // The row comes back as not handed off, so the caller can make it due at once.
+        assert_eq!(signal.hand_off(&dep(), vec![r]), vec!["x1".to_string()]);
         assert_eq!(signal.inflight_count(), 0);
     }
 

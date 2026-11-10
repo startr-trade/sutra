@@ -1,6 +1,8 @@
-//! What a same-owner upgrade does today to the version it drains, with v2 holding the routes and v1
-//! still holding running instances. These record behaviour, ahead of a decision on how a draining
-//! version should work. A test the engine does not pass yet is ignored with what it found.
+//! What a same-owner upgrade does to the version it drains, with v2 holding the routes and v1 still
+//! holding running instances: v1's instances finish on v1, the channels only v1 declares stay served
+//! by v1 until it retires, another owner is refused them meanwhile, and a literal `local://` send
+//! does not cross packages. Tests named `what_*` still only record behaviour that a later change
+//! decides.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -641,7 +643,7 @@ fn package_with_or_without_extra(version: &str, extra: bool, sink: SocketAddr) -
             &definitions("omit", version, "extra", &started),
         );
         channels.push_str(&format!(
-            "  - name: extra-release\n    transport: http\n    bind: \"POST /o/extra-release\"\n    codec: json\n{AUTH}  - name: only-v1-start\n    transport: http\n    bind: \"POST /o/only-v1-start\"\n    codec: json\n{AUTH}"
+            "  - name: extra-release\n    transport: http\n    bind: \"POST /o/extra-release\"\n    codec: json\n{V1_AUTH}  - name: only-v1-start\n    transport: http\n    bind: \"POST /o/only-v1-start\"\n    codec: json\n{V1_AUTH}"
         ));
     }
     write(&root, "channels.yaml", &channels);
@@ -649,13 +651,44 @@ fn package_with_or_without_extra(version: &str, extra: bool, sink: SocketAddr) -
     root
 }
 
-/// 8. Not an assertion of what should happen: the user decides that after this. It prints what
-/// happens to a resume and a start on a channel only v1 declares, and whether v1 retires; it asserts
-/// only that the scenario was set up.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "docker"]
-async fn what_happens_to_a_channel_only_the_old_version_has() {
-    let (_pool, url) = fresh_db().await;
+/// The v1-only channels of [`package_with_or_without_extra`] authenticate with a key of their own.
+const V1_AUTH: &str = "    auth:\n      scheme: apikey\n      apikey:\n        value: v1-key\n        header: X-Api-Key\n";
+
+/// A POST carrying `key` as its API key.
+async fn post_keyed(addr: SocketAddr, path: &str, key: &str, body: &[u8]) -> (u16, String) {
+    use std::io::{Read, Write};
+    let port = addr.port();
+    let head = format!(
+        "POST {path} HTTP/1.1\r\nHost: localhost\r\nX-Api-Key: {key}\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    let body = body.to_vec();
+    tokio::task::spawn_blocking(move || {
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        stream.write_all(head.as_bytes()).expect("head");
+        stream.write_all(&body).expect("body");
+        let mut response = String::new();
+        stream.read_to_string(&mut response).expect("response");
+        let status = response
+            .split_whitespace()
+            .nth(1)
+            .and_then(|code| code.parse().ok())
+            .expect("status code");
+        let body = response
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| body.to_string())
+            .unwrap_or_default();
+        (status, body)
+    })
+    .await
+    .expect("post task")
+}
+
+/// v1 has `extra-release` and `only-v1-start`, which v2 lacks, with `keys` parked on
+/// `extra-release`, and v2 deployed over it.
+async fn v1_parked_on_its_own_channel(keys: &[&str]) -> (Drained, String) {
+    let (pool, url) = fresh_db().await;
     let (sink, capture) = capture_server().await;
     let v1 = package(&package_with_or_without_extra("1.0.0", true, sink));
     let v2 = package(&package_with_or_without_extra("2.0.0", false, sink));
@@ -663,30 +696,577 @@ async fn what_happens_to_a_channel_only_the_old_version_has() {
     let addr = engine.local_addr;
     let (status, body) = post(addr, "/admin/deployments", &v1).await;
     assert_eq!(status, 200, "v1: {body}");
-    let (status, body) = post(addr, "/o/kept-start", br#"{"key":"K"}"#).await;
-    assert_eq!(status, 200, "park on the v1-only channel: {body}");
-    let (status, body) = post(addr, "/o/only-v1-start", b"{}").await;
-    println!("OBSERVED before v2: start on the v1-only channel: {status} {body}");
+    for key in keys {
+        let start = format!(r#"{{"key":"{key}"}}"#);
+        let (status, body) = post(addr, "/o/kept-start", start.as_bytes()).await;
+        assert_eq!(status, 200, "park {key}: {body}");
+    }
     let (status, body) = post(addr, "/admin/deployments", &v2).await;
     assert_eq!(status, 200, "v2: {body}");
-    println!("OBSERVED v2 deploy: {body}");
-    println!("OBSERVED status after v2: {}", status_of(addr).await);
+    assert_eq!(draining_count(addr).await, 1, "v1 is draining");
+    (
+        Drained {
+            engine,
+            capture,
+            pool,
+        },
+        body,
+    )
+}
 
-    let (status, body) = post(addr, "/o/extra-release", br#"{"key":"K"}"#).await;
-    println!("OBSERVED resume on the v1-only channel: {status} {body}");
+async fn release_on_v1s_channel(addr: SocketAddr, key: &str) -> (u16, String) {
+    let body = format!(r#"{{"key":"{key}"}}"#);
+    post_keyed(addr, "/o/extra-release", "v1-key", body.as_bytes()).await
+}
+
+/// 8. A channel only v1 declares stays served by v1: a resume reaches the parked instance, and a
+/// start runs on v1. The deploy says so.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "docker"]
+async fn a_channel_only_the_old_version_has_stays_served() {
+    let (run, deployed) = v1_parked_on_its_own_channel(&["K"]).await;
+    let addr = run.engine.local_addr;
+    assert!(
+        deployed.contains("Channels only it declares stay served by it until it retires"),
+        "{deployed}"
+    );
+    assert!(deployed.contains("POST /o/extra-release"), "{deployed}");
+    let (status, body) = post_keyed(addr, "/o/only-v1-start", "v1-key", b"{}").await;
+    assert_eq!(status, 200, "a start on v1's own channel: {body}");
+    let (status, body) = release_on_v1s_channel(addr, "K").await;
+    assert_eq!(status, 200, "the resume: {body}");
+    assert!(
+        wait_until(30, || async {
+            run.capture.delivered("/1.0.0-held-done") == 1
+                && run.capture.delivered("/1.0.0-extra-done") == 1
+        })
+        .await,
+        "both ran on v1. outbox: {}",
+        outbox_state(&run.pool).await
+    );
+    assert_eq!(run.capture.delivered("/2.0.0-held-done"), 0);
+    assert_eq!(run.capture.delivered("/2.0.0-extra-done"), 0);
+    run.engine.shutdown().await;
+}
+
+/// The kept channel is v1's, auth included: v2's key does not open it.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "docker"]
+async fn its_auth_is_v1s() {
+    let (run, _) = v1_parked_on_its_own_channel(&["K"]).await;
+    let addr = run.engine.local_addr;
     let (status, body) = post(addr, "/o/only-v1-start", b"{}").await;
-    println!("OBSERVED start on the v1-only channel: {status} {body}");
+    assert_eq!(status, 401, "v2's key: {body}");
+    let (status, body) = post_keyed(addr, "/o/only-v1-start", "v1-key", b"{}").await;
+    assert_eq!(status, 200, "v1's key: {body}");
+    run.engine.shutdown().await;
+}
+
+/// Undeploying v2 does not stop what v1 keeps: it serves until v1 itself retires, and then stops.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "docker"]
+async fn undeploying_the_new_version_keeps_v1s_channel_until_v1_retires() {
+    let (run, _) = v1_parked_on_its_own_channel(&["K"]).await;
+    let addr = run.engine.local_addr;
+    let (status, body) = tokio::task::spawn_blocking(move || {
+        http_request(addr, "DELETE", "/admin/deployments/t1--omit--2.0.0", b"")
+    })
+    .await
+    .expect("delete task");
+    assert_eq!(status, 200, "undeploy v2: {body}");
+    let (status, body) = post_keyed(addr, "/o/only-v1-start", "v1-key", b"{}").await;
+    assert_eq!(status, 200, "still served after v2 is gone: {body}");
+    let (status, body) = release_on_v1s_channel(addr, "K").await;
+    assert_eq!(status, 200, "the resume: {body}");
+    assert!(
+        wait_until(30, || async {
+            run.capture.delivered("/1.0.0-held-done") == 1
+                && run.capture.delivered("/1.0.0-extra-done") == 1
+        })
+        .await,
+        "ran on v1. outbox: {}",
+        outbox_state(&run.pool).await
+    );
+    assert!(
+        wait_until(30, || async { draining_count(addr).await == 0 }).await,
+        "then v1 retires (and v2 with it): {}",
+        status_of(addr).await
+    );
+    assert!(
+        wait_until(10, || async {
+            post_keyed(addr, "/o/only-v1-start", "v1-key", b"{}")
+                .await
+                .0
+                == 404
+        })
+        .await,
+        "and its channel stops"
+    );
+    run.engine.shutdown().await;
+}
+
+/// Undeploying v2 while v1 drains rolls back: v1 serves again the channel it shared with v2
+/// (`kept-start`), so a new start there runs on v1. That too ends when v1 retires.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "docker"]
+async fn undeploying_the_new_version_gives_v1_back_the_channels_it_shared() {
+    let (run, _) = v1_parked_on_its_own_channel(&["K"]).await;
+    let addr = run.engine.local_addr;
+    let (status, body) = tokio::task::spawn_blocking(move || {
+        http_request(addr, "DELETE", "/admin/deployments/t1--omit--2.0.0", b"")
+    })
+    .await
+    .expect("delete task");
+    assert_eq!(status, 200, "undeploy v2: {body}");
+    let (status, body) = post(addr, "/o/kept-start", br#"{"key":"N"}"#).await;
+    assert_eq!(status, 200, "the shared channel after v2 is gone: {body}");
+    // v1's process waits on v1's own release channel, so both instances resume there.
+    for key in ["K", "N"] {
+        let (status, body) = release_on_v1s_channel(addr, key).await;
+        assert_eq!(status, 200, "the resume of {key}: {body}");
+    }
+    assert!(
+        wait_until(30, || async {
+            run.capture.delivered("/1.0.0-held-done") == 2
+        })
+        .await,
+        "both ran on v1. outbox: {}",
+        outbox_state(&run.pool).await
+    );
+    assert_eq!(run.capture.delivered("/2.0.0-held-done"), 0);
+    assert!(
+        wait_until(30, || async { draining_count(addr).await == 0 }).await,
+        "then v1 retires: {}",
+        status_of(addr).await
+    );
+    assert!(
+        wait_until(10, || async {
+            post(addr, "/o/kept-start", br#"{"key":"L"}"#).await.0 == 404
+        })
+        .await,
+        "and the shared channel stops with it"
+    );
+    run.engine.shutdown().await;
+}
+
+/// 8b. A resume on v2's channel of another name cannot reach v1's instance parked on its own
+/// channel (Q2: no runtime mapping), and v1's own channel still can.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "docker"]
+async fn a_resume_on_the_new_versions_other_channel_does_not_reach_v1() {
+    let (run, _) = v1_parked_on_its_own_channel(&["K"]).await;
+    let addr = run.engine.local_addr;
     let (status, body) = post(addr, "/o/kept-release", br#"{"key":"K"}"#).await;
-    println!("OBSERVED resume on v2's different channel: {status} {body}");
-    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-    println!(
-        "OBSERVED after 5s: v1 held-done {}, v2 held-done {}, v1 extra-done {}, draining {}",
-        capture.delivered("/1.0.0-held-done"),
-        capture.delivered("/2.0.0-held-done"),
-        capture.delivered("/1.0.0-extra-done"),
-        draining_count(addr).await
+    assert_ne!(status, 200, "v2's channel: {body}");
+    let (status, body) = release_on_v1s_channel(addr, "K").await;
+    assert_eq!(status, 200, "v1's channel: {body}");
+    assert!(
+        wait_until(30, || async {
+            run.capture.delivered("/1.0.0-held-done") == 1
+        })
+        .await
+    );
+    run.engine.shutdown().await;
+}
+
+// ---- R6: another owner on what v1 keeps ---------------------------------------------------------
+
+/// Another owner's package serving `POST /o/extra-release`, v1's kept route.
+fn grabbing_package(sink: SocketAddr) -> PathBuf {
+    let root = temp_root("drain-pkg");
+    write(
+        &root,
+        "bpmn/grab.bpmn",
+        &definitions(
+            "grab",
+            "1.0.0",
+            "grab",
+            &started_process("grab", "grab-in", sink),
+        ),
+    );
+    write(
+        &root,
+        "channels.yaml",
+        &format!(
+            "channels:\n  - name: grab-in\n    transport: http\n    bind: \"POST /o/extra-release\"\n    codec: json\n{AUTH}"
+        ),
+    );
+    write(&root, "package.yaml", &labels("t2", "grab", "1.0.0"));
+    root
+}
+
+/// Another owner is refused the endpoint v1 keeps, with v1 named and its instances counted.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "docker"]
+async fn another_owner_is_refused_a_retained_endpoint_naming_v1_and_its_count() {
+    let (run, _) = v1_parked_on_its_own_channel(&["K1", "K2"]).await;
+    let addr = run.engine.local_addr;
+    let grab = package(&grabbing_package(SocketAddr::from(([127, 0, 0, 1], 9))));
+    let (status, body) = post(addr, "/admin/deployments", &grab).await;
+    assert_eq!(status, 409, "{body}");
+    for part in [
+        "SUTRA.DEPLOY.ENDPOINT.COLLISION",
+        "POST /o/extra-release",
+        "stays with draining deployment t1--omit--1.0.0",
+        "(2 running instances)",
+        "until it retires",
+    ] {
+        assert!(body.contains(part), "{part}: {body}");
+    }
+    let stored: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM deployment_archive WHERE module = 'grab'")
+            .fetch_one(&run.pool)
+            .await
+            .unwrap();
+    assert_eq!(stored, 0);
+    run.engine.shutdown().await;
+}
+
+/// Once v1 retires the endpoint is free, and the same deploy lands.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "docker"]
+async fn it_is_released_when_v1_retires() {
+    let (run, _) = v1_parked_on_its_own_channel(&["K"]).await;
+    let addr = run.engine.local_addr;
+    let (sink, grabbed) = capture_server().await;
+    let grab = package(&grabbing_package(sink));
+    let (status, body) = post(addr, "/admin/deployments", &grab).await;
+    assert_eq!(status, 409, "while v1 drains: {body}");
+    let (status, body) = release_on_v1s_channel(addr, "K").await;
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        wait_until(30, || async { draining_count(addr).await == 0 }).await,
+        "v1 retires"
+    );
+    let (status, body) = post(addr, "/admin/deployments", &grab).await;
+    assert_eq!(status, 200, "after v1 retired: {body}");
+    let (status, body) = post(addr, "/o/extra-release", br#"{"key":"K"}"#).await;
+    assert_eq!(status, 200, "now the other owner's: {body}");
+    assert!(
+        wait_until(30, || async {
+            grabbed.delivered("/grab-grab-in-started") == 1
+        })
+        .await
+    );
+    run.engine.shutdown().await;
+}
+
+/// The check endpoint gives the deploy's answer, with the count the sweep read.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "docker"]
+async fn the_check_endpoint_reports_it() {
+    let (run, _) = v1_parked_on_its_own_channel(&["K1", "K2"]).await;
+    let addr = run.engine.local_addr;
+    let grab = package(&grabbing_package(SocketAddr::from(([127, 0, 0, 1], 9))));
+    assert!(
+        wait_until(10, || async {
+            status_of(addr).await["drainingInstances"]
+                .as_object()
+                .is_some_and(|m| m.values().any(|n| n == 2))
+        })
+        .await,
+        "the sweep counted v1: {}",
+        status_of(addr).await
+    );
+    let (status, body) = post(addr, "/admin/deployments/check", &grab).await;
+    assert_eq!(status, 200, "{body}");
+    let verdict: serde_json::Value = serde_json::from_str(body.trim()).unwrap();
+    assert_eq!(verdict["ok"], false, "{verdict}");
+    let collision = &verdict["collisions"][0];
+    assert_eq!(collision["holder"], "t1--omit--1.0.0", "{verdict}");
+    assert_eq!(collision["holderDraining"], true, "{verdict}");
+    assert_eq!(collision["holderInstances"], 2, "{verdict}");
+    assert!(
+        collision["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("(2 running instances)"),
+        "{verdict}"
+    );
+    run.engine.shutdown().await;
+}
+
+// ---- R7: retirement ----------------------------------------------------------------------------
+
+/// v1 with kept channels retires once its work is done, and its channels stop with it.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "docker"]
+async fn a_version_with_kept_channels_retires_at_zero_and_stops_serving() {
+    let (run, _) = v1_parked_on_its_own_channel(&["K"]).await;
+    let addr = run.engine.local_addr;
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    assert_eq!(draining_count(addr).await, 1, "the parked instance pins v1");
+    let (status, body) = release_on_v1s_channel(addr, "K").await;
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        wait_until(30, || async { draining_count(addr).await == 0 }).await,
+        "v1 retires at zero. outbox: {}",
+        outbox_state(&run.pool).await
+    );
+    let retired: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM deployment_archive WHERE module = 'omit' AND version = '1.0.0' \
+         AND status = 'retired'",
+    )
+    .fetch_one(&run.pool)
+    .await
+    .unwrap();
+    assert_eq!(retired, 1);
+    assert!(
+        wait_until(10, || async {
+            release_on_v1s_channel(addr, "K").await.0 == 404
+                && post_keyed(addr, "/o/only-v1-start", "v1-key", b"{}")
+                    .await
+                    .0
+                    == 404
+        })
+        .await,
+        "its channels stop"
+    );
+    run.engine.shutdown().await;
+}
+
+/// A start can land on v1 between the count that let it retire and the retirement. A later sweep
+/// finds the instance and opens v1 again. The landing is simulated by writing an instance row for
+/// v1 just after it retires.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "docker"]
+async fn a_retired_version_reopens_when_an_instance_landed() {
+    let (run, _) = v1_parked_on_its_own_channel(&["K"]).await;
+    let addr = run.engine.local_addr;
+    // A parked instance on v2, whose row is copied under v1's id.
+    let (status, body) = post(addr, "/o/kept-start", br#"{"key":"ON-V2"}"#).await;
+    assert_eq!(status, 200, "{body}");
+    let v1_id: String = sqlx::query_scalar(
+        "SELECT deployment_id FROM deployment_archive WHERE module = 'omit' AND version = '1.0.0'",
+    )
+    .fetch_one(&run.pool)
+    .await
+    .unwrap();
+    let v2_id: String = sqlx::query_scalar(
+        "SELECT deployment_id FROM deployment_archive WHERE module = 'omit' AND version = '2.0.0'",
+    )
+    .fetch_one(&run.pool)
+    .await
+    .unwrap();
+    let (status, body) = release_on_v1s_channel(addr, "K").await;
+    assert_eq!(status, 200, "{body}");
+    let pool = run.pool.clone();
+    let id = v1_id.clone();
+    assert!(
+        wait_until(30, || {
+            let (pool, id) = (pool.clone(), id.clone());
+            async move {
+                sqlx::query_scalar::<_, String>(
+                    "SELECT status FROM deployment_archive WHERE deployment_id = $1",
+                )
+                .bind(&id)
+                .fetch_one(&pool)
+                .await
+                .is_ok_and(|status| status == "retired")
+            }
+        })
+        .await,
+        "v1 retires"
+    );
+    let mut tx = run.pool.begin().await.unwrap();
+    sqlx::query(
+        "CREATE TEMP TABLE landed ON COMMIT DROP AS SELECT * FROM instance_state \
+         WHERE deployment_id = $1 AND terminal_at IS NULL LIMIT 1",
+    )
+    .bind(&v2_id)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE landed SET deployment_id = $1, instance_id = gen_random_uuid()")
+        .bind(&v1_id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO instance_state SELECT * FROM landed")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    let pool = run.pool.clone();
+    let id = v1_id.clone();
+    assert!(
+        wait_until(15, || {
+            let (pool, id) = (pool.clone(), id.clone());
+            async move {
+                sqlx::query_scalar::<_, String>(
+                    "SELECT status FROM deployment_archive WHERE deployment_id = $1",
+                )
+                .bind(&id)
+                .fetch_one(&pool)
+                .await
+                .is_ok_and(|status| status == "draining")
+            }
+        })
+        .await,
+        "a sweep opens v1 again"
+    );
+    assert!(
+        wait_until(10, || async { draining_count(addr).await == 1 }).await,
+        "and it drains, served again: {}",
+        status_of(addr).await
+    );
+    run.engine.shutdown().await;
+}
+
+// ---- the folder source --------------------------------------------------------------------------
+
+/// A folder engine on `dir` with a database.
+async fn boot_folder(dir: PathBuf, url: String) -> sutra_engine::RunningEngine {
+    std::env::set_var(
+        "SUTRA_DB_MIGRATIONS",
+        crate::outbox_e2e::shipped_migration_roots_env(),
+    );
+    crate::archive_activation_conformance::boot_archive_engine(dir, Some(url)).await
+}
+
+/// v1's file and a parked instance on it, then v2's file beside it, active.
+async fn folder_with_v1_parked(
+    sink: SocketAddr,
+) -> (sutra_engine::RunningEngine, PathBuf, String, sqlx::PgPool) {
+    let (pool, url) = fresh_db().await;
+    let dir = temp_root("drain-dir");
+    let place = crate::archive_activation_conformance::place_archive;
+    place(
+        &dir,
+        "omit-1.sutra",
+        &package(&package_with_or_without_extra("1.0.0", true, sink)),
+    );
+    let engine = boot_folder(dir.clone(), url.clone()).await;
+    let addr = engine.local_addr;
+    let (status, body) = post(addr, "/o/kept-start", br#"{"key":"K"}"#).await;
+    assert_eq!(status, 200, "park on v1: {body}");
+    place(
+        &dir,
+        "omit-2.sutra",
+        &package(&package_with_or_without_extra("2.0.0", false, sink)),
+    );
+    assert!(
+        wait_until(15, || async { draining_count(addr).await == 1 }).await,
+        "v2 takes over: {}",
+        status_of(addr).await
+    );
+    (engine, dir, url, pool)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "docker"]
+async fn a_folder_keeps_a_channel_only_the_old_file_has() {
+    let (sink, capture) = capture_server().await;
+    let (engine, _dir, _url, _pool) = folder_with_v1_parked(sink).await;
+    let addr = engine.local_addr;
+    let (status, body) = post_keyed(addr, "/o/only-v1-start", "v1-key", b"{}").await;
+    assert_eq!(status, 200, "a start on v1's channel: {body}");
+    let (status, body) = release_on_v1s_channel(addr, "K").await;
+    assert_eq!(status, 200, "the resume: {body}");
+    assert!(
+        wait_until(30, || async {
+            capture.delivered("/1.0.0-held-done") == 1
+                && capture.delivered("/1.0.0-extra-done") == 1
+        })
+        .await
     );
     engine.shutdown().await;
+}
+
+/// Removing v1's file is an undeploy: what it kept stops, while its instance stays resumable by
+/// other means.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "docker"]
+async fn removing_the_file_stops_it() {
+    let (sink, _capture) = capture_server().await;
+    let (engine, dir, _url, _pool) = folder_with_v1_parked(sink).await;
+    let addr = engine.local_addr;
+    let (status, _) = post_keyed(addr, "/o/only-v1-start", "v1-key", b"{}").await;
+    assert_eq!(status, 200, "served while the file is there");
+    std::fs::remove_file(dir.join("omit-1.sutra")).unwrap();
+    assert!(
+        wait_until(15, || async {
+            post_keyed(addr, "/o/only-v1-start", "v1-key", b"{}")
+                .await
+                .0
+                == 404
+        })
+        .await,
+        "the file is gone, so is the channel"
+    );
+    assert_eq!(
+        draining_count(addr).await,
+        1,
+        "v1 still drains its instance"
+    );
+    engine.shutdown().await;
+}
+
+/// The folder refuses another owner's archive on v1's kept endpoint until v1 retires, and a restart
+/// gives the same answer.
+async fn folder_refuses_then_releases(restart: bool) {
+    let (sink, capture) = capture_server().await;
+    let (mut engine, dir, url, _pool) = folder_with_v1_parked(sink).await;
+    crate::archive_activation_conformance::place_archive(
+        &dir,
+        "grab.sutra",
+        &package(&grabbing_package(sink)),
+    );
+    let refused = |addr: SocketAddr| async move {
+        status_of(addr).await["failed"].as_array().is_some_and(|f| {
+            f.iter().any(|f| {
+                f["slot"] == "grab.sutra"
+                    && f["error"]
+                        .as_str()
+                        .unwrap_or("")
+                        .contains("stays with draining deployment t1--omit--1.0.0")
+            })
+        })
+    };
+    assert!(
+        wait_until(15, || refused(engine.local_addr)).await,
+        "{}",
+        status_of(engine.local_addr).await
+    );
+    if restart {
+        engine.shutdown().await;
+        engine = boot_folder(dir.clone(), url).await;
+        assert!(
+            wait_until(15, || refused(engine.local_addr)).await,
+            "a restart keeps the answer: {}",
+            status_of(engine.local_addr).await
+        );
+    }
+    let addr = engine.local_addr;
+    let (status, body) = release_on_v1s_channel(addr, "K").await;
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        wait_until(30, || async { capture.delivered("/1.0.0-held-done") == 1 }).await,
+        "v1's instance finishes"
+    );
+    assert!(
+        wait_until(30, || async {
+            status_of(addr).await["active"]
+                .as_array()
+                .is_some_and(|a| a.iter().any(|a| a["slot"] == "grab.sutra"))
+        })
+        .await,
+        "v1 retires, and the other owner's archive deploys: {}",
+        status_of(addr).await
+    );
+    engine.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "docker"]
+async fn a_folder_refuses_another_owner_until_v1_retires() {
+    folder_refuses_then_releases(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "docker"]
+async fn a_restart_keeps_the_answer() {
+    folder_refuses_then_releases(true).await;
 }
 
 // ---- 9: v2 changes a channel it keeps the name of ----------------------------------------------
@@ -827,10 +1407,11 @@ async fn what_decodes_a_resume_on_a_channel_the_new_version_changed() {
     engine.shutdown().await;
 }
 
-/// 9b. Records behaviour: v2 kept the channel's name and moved its route.
+/// 9b. v2 keeps the channel's name and moves its route: v1's old address is gone, the new one
+/// resumes v1, and the deploy warns with the parked count.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "docker"]
-async fn what_happens_to_the_old_address_of_a_channel_the_new_version_moved() {
+async fn a_moved_address_is_gone_and_warned() {
     let (_pool, url) = fresh_db().await;
     let (sink, capture) = capture_server().await;
     let v1 = package(&modified_channel_package("1.0.0", "json", "/m/old", sink));
@@ -843,24 +1424,100 @@ async fn what_happens_to_the_old_address_of_a_channel_the_new_version_moved() {
     assert_eq!(status, 200, "park: {body}");
     let (status, body) = post(addr, "/admin/deployments", &v2).await;
     assert_eq!(status, 200, "v2: {body}");
-    println!("OBSERVED 9b v2 deploy: {body}");
-
+    for part in [
+        "SUTRA.DEPLOY.ENDPOINT.CHANNEL_CHANGED",
+        "channel 'modified-in' changes address from t1--modified--1.0.0",
+        "1 instance of t1--modified--1.0.0 is parked on it",
+    ] {
+        assert!(body.contains(part), "{part}: {body}");
+    }
     let (status, body) = post(addr, "/m/old", br#"{"key":"K"}"#).await;
-    println!("OBSERVED 9b resume at v1's old address: {status} {body}");
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-    println!(
-        "OBSERVED 9b after the old address: v1 done {}",
-        capture.delivered("/1.0.0-modified-done")
-    );
+    assert_eq!(status, 404, "v1's old address is gone: {body}");
     let (status, body) = post(addr, "/m/new", br#"{"key":"K"}"#).await;
-    println!("OBSERVED 9b resume at v2's new address: {status} {body}");
-    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-    println!(
-        "OBSERVED 9b after 5s: v1 done {}, v2 done {}, draining {}",
-        capture.delivered("/1.0.0-modified-done"),
-        capture.delivered("/2.0.0-modified-done"),
-        draining_count(addr).await
+    assert_eq!(status, 200, "the new address resumes v1: {body}");
+    assert!(
+        wait_until(30, || async {
+            capture.delivered("/1.0.0-modified-done") == 1
+        })
+        .await
     );
+    assert_eq!(capture.delivered("/2.0.0-modified-done"), 0);
+    engine.shutdown().await;
+}
+
+/// v2 moves a queue channel to another queue: v1's consumer on the old queue stops, a message there
+/// waits for nobody, the new queue resumes v1, and the deploy warns.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "docker"]
+async fn a_moved_queue_stops_v1s_consumer_and_warns() {
+    let (pool, url) = fresh_db().await;
+    let (sink, capture) = capture_server().await;
+    let port = rabbit_port();
+    let pid = std::process::id();
+    let (old_queue, new_queue) = (format!("drain-old-{pid}"), format!("drain-new-{pid}"));
+    declare_queue(port, &old_queue).await;
+    declare_queue(port, &new_queue).await;
+    std::env::set_var("E3_RABBIT_USER", "guest");
+    std::env::set_var("E3_RABBIT_PASSWORD", "guest");
+    let v1 = package(&queue_catch_package("1.0.0", &old_queue, port, sink));
+    let v2 = package(&queue_catch_package("2.0.0", &new_queue, port, sink));
+    let engine = boot_db_engine(url).await;
+    let addr = engine.local_addr;
+    let (status, body) = post(addr, "/admin/deployments", &v1).await;
+    assert_eq!(status, 200, "v1: {body}");
+    let (status, body) = post(addr, "/q/start", br#"{"key":"Q1"}"#).await;
+    assert_eq!(status, 200, "park: {body}");
+    let (status, body) = post(addr, "/admin/deployments", &v2).await;
+    assert_eq!(status, 200, "v2: {body}");
+    for part in [
+        "SUTRA.DEPLOY.ENDPOINT.CHANNEL_CHANGED",
+        "channel 'q-in' changes address",
+        "1 instance of t1--qapp--1.0.0 is parked on it",
+    ] {
+        assert!(body.contains(part), "{part}: {body}");
+    }
+
+    let connection = raw_connection(port).await;
+    let channel = connection.create_channel().await.expect("channel");
+    let publish = |queue: String, id: &'static str| {
+        let channel = channel.clone();
+        async move {
+            channel
+                .basic_publish(
+                    "",
+                    &queue,
+                    lapin::options::BasicPublishOptions::default(),
+                    br#"{"key":"Q1"}"#,
+                    lapin::BasicProperties::default()
+                        .with_message_id(id.into())
+                        .with_content_type("application/json".into()),
+                )
+                .await
+                .expect("publish")
+                .await
+                .expect("confirm");
+        }
+    };
+    publish(old_queue.clone(), "old-1").await;
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    assert_eq!(
+        capture.delivered("/1.0.0-q-done"),
+        0,
+        "nothing reads the old queue"
+    );
+    let waiting = channel
+        .basic_get(&old_queue, lapin::options::BasicGetOptions { no_ack: true })
+        .await
+        .expect("get");
+    assert!(waiting.is_some(), "the message waits on the old queue");
+    publish(new_queue.clone(), "new-1").await;
+    assert!(
+        wait_until(30, || async { capture.delivered("/1.0.0-q-done") >= 1 }).await,
+        "the new queue resumes v1. outbox: {}",
+        outbox_state(&pool).await
+    );
+    assert_eq!(capture.delivered("/2.0.0-q-done"), 0);
+    connection.close(200, "done").await.ok();
     engine.shutdown().await;
 }
 
@@ -1005,10 +1662,11 @@ fn sender_package(
     root
 }
 
-/// 10. Records behaviour: which version a draining v1's own message starts an instance on.
+/// 10. A draining v1's own message on a channel only it has starts on v1, over a queue and over
+/// HTTP; on a channel v2 has too, it starts on v2 (10b).
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "docker"]
-async fn what_a_draining_versions_own_message_starts() {
+async fn an_old_versions_message_starts_on_it_on_a_channel_only_it_has() {
     let (pool, url) = fresh_db().await;
     let (sink, capture) = capture_server().await;
     let rabbit = rabbit_port();
@@ -1034,48 +1692,34 @@ async fn what_a_draining_versions_own_message_starts() {
     assert_eq!(status, 200, "park: {body}");
     let (status, body) = post(addr, "/admin/deployments", &v2).await;
     assert_eq!(status, 200, "v2: {body}");
-    println!("OBSERVED 10 v2 deploy: {body}");
 
     let (status, body) = post(addr, "/s/s-release", br#"{"key":"S"}"#).await;
-    println!("OBSERVED 10 release: {status} {body}");
-    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-    for path in [
-        "1.0.0-sender-done",
-        "2.0.0-sender-done",
-        "1.0.0-only-queue-started",
-        "2.0.0-only-queue-started",
-        "1.0.0-only-http-started",
-        "2.0.0-only-http-started",
-        "1.0.0-both-queue-started",
-        "2.0.0-both-queue-started",
-        "1.0.0-both-http-started",
-        "2.0.0-both-http-started",
+    assert_eq!(status, 200, "release: {body}");
+    assert!(
+        wait_until(30, || async {
+            capture.delivered("/1.0.0-sender-done") == 1
+                && capture.delivered("/1.0.0-only-queue-started") == 1
+                && capture.delivered("/1.0.0-only-http-started") == 1
+                && capture.delivered("/2.0.0-both-queue-started") == 1
+                && capture.delivered("/2.0.0-both-http-started") == 1
+        })
+        .await,
+        "outbox: {}",
+        outbox_state(&pool).await
+    );
+    for never in [
+        "/2.0.0-only-queue-started",
+        "/2.0.0-only-http-started",
+        "/1.0.0-both-queue-started",
+        "/1.0.0-both-http-started",
     ] {
-        println!(
-            "OBSERVED 10 {path}: {}",
-            capture.delivered(&format!("/{path}"))
-        );
+        assert_eq!(capture.delivered(never), 0, "{never}");
     }
-    println!("OBSERVED 10 outbox: {}", outbox_state(&pool).await);
-    // What the message itself carries: nothing consumes the v1-only queue now, so read it there.
-    let connection = raw_connection(rabbit).await;
-    let channel = connection.create_channel().await.expect("channel");
-    for queue in [&only_queue, &both_queue] {
-        let got = channel
-            .basic_get(queue, lapin::options::BasicGetOptions { no_ack: true })
-            .await
-            .expect("get");
-        match got {
-            Some(message) => println!(
-                "OBSERVED 10 message on {queue}: properties {:?} body {}",
-                message.delivery.properties,
-                String::from_utf8_lossy(&message.delivery.data)
-            ),
-            None => println!("OBSERVED 10 no message waiting on {queue}"),
-        }
-    }
-    connection.close(200, "read").await.ok();
-    println!("OBSERVED 10 status: {}", status_of(addr).await);
+    assert!(
+        wait_until(30, || async { draining_count(addr).await == 0 }).await,
+        "v1 retires once those finish. outbox: {}",
+        outbox_state(&pool).await
+    );
     engine.shutdown().await;
 }
 
@@ -1103,10 +1747,98 @@ fn simple_start_package(module: &str, sink: SocketAddr) -> PathBuf {
     root
 }
 
-/// 11. Records behaviour: one package sends `local://` at another's channel, both ways it can.
+/// A package that starts on `POST /<name>/go` and sends `local://t1/<name>/1.0.0/in-local`, its own
+/// local channel, which lint accepts.
+fn local_sender_package(name: &str, sink: SocketAddr) -> PathBuf {
+    let root = temp_root("drain-pkg");
+    let process = format!(
+        r#"  <bpmn:process id="sender" name="Sender" isExecutable="true">
+    <bpmn:extensionElements><q:variables>
+      <q:variable name="responseBody" type="object"/>
+    </q:variables></bpmn:extensionElements>
+    <bpmn:startEvent id="Start">
+      <bpmn:extensionElements><q:source channel="go"/></bpmn:extensionElements>
+      <bpmn:outgoing>f1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="Start" targetRef="Build"/>
+    <bpmn:serviceTask id="Build" name="Build">
+      <bpmn:incoming>f1</bpmn:incoming><bpmn:outgoing>f2</bpmn:outgoing>
+      <bpmn:dataInputAssociation><bpmn:assignment>
+        <bpmn:from>{{from: "sender"}}</bpmn:from><bpmn:to>responseBody</bpmn:to>
+      </bpmn:assignment></bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="f2" sourceRef="Build" targetRef="Send"/>
+    <bpmn:sendTask id="Send" name="Send">
+      <bpmn:extensionElements><q:send destination="local://t1/{name}/1.0.0/in-local" contentType="application/json"/></bpmn:extensionElements>
+      <bpmn:incoming>f2</bpmn:incoming><bpmn:outgoing>f3</bpmn:outgoing>
+    </bpmn:sendTask>
+    <bpmn:sequenceFlow id="f3" sourceRef="Send" targetRef="End"/>
+    <bpmn:endEvent id="End"><bpmn:incoming>f3</bpmn:incoming></bpmn:endEvent>
+  </bpmn:process>
+{own}"#,
+        own = started_process(name, "in-local", sink),
+    );
+    write(
+        &root,
+        "bpmn/sender.bpmn",
+        &definitions(name, "1.0.0", "sender", &process),
+    );
+    write(
+        &root,
+        "channels.yaml",
+        &format!(
+            "channels:\n  - name: go\n    transport: http\n    bind: \"POST /{name}/go\"\n    codec: json\n{AUTH}  - name: in-local\n    transport: local\n    codec: json\n    cloudevents-mode: none\n"
+        ),
+    );
+    write(&root, "package.yaml", &labels("t1", name, "1.0.0"));
+    root
+}
+
+/// `bytes` with `from` replaced by `to` in its BPMN, sealed again by hand as an earlier CLI would
+/// have: packaging refuses the result now.
+fn resealed_with(bytes: &[u8], from: &str, to: &str) -> Vec<u8> {
+    let mut entries = crate::archive_activation_conformance::entries_of(bytes);
+    let manifest_name = sutra_loader::archive::MANIFEST_FILE_NAME;
+    let manifest = String::from_utf8(entries[manifest_name].clone()).unwrap();
+    let mut manifest = sutra_loader::ArchiveManifest::parse(&manifest).unwrap();
+    let mut replaced = 0;
+    for (name, content) in entries.iter_mut() {
+        if !name.starts_with("bpmn/") {
+            continue;
+        }
+        let text = String::from_utf8(content.clone()).unwrap();
+        if text.contains(from) {
+            *content = text.replace(from, to).into_bytes();
+            let artifact = manifest
+                .artifacts
+                .iter_mut()
+                .find(|artifact| &artifact.path == name)
+                .expect("listed");
+            artifact.sha256 = sutra_loader::archive::sha256_hex(content);
+            replaced += 1;
+        }
+    }
+    assert_eq!(replaced, 1, "one file holds {from}");
+    entries.insert(manifest_name.to_string(), manifest.to_yaml().into_bytes());
+    sutra_loader::write_archive(&entries).expect("re-zip")
+}
+
+const CROSSES: &str = "SUTRA.CONFIG.SEND.LOCAL_DESTINATION_CROSSES_PACKAGE";
+
+/// The sender, sealed by hand to send to the `target` package's local channel.
+fn crossing_sender(sink: SocketAddr) -> Vec<u8> {
+    resealed_with(
+        &package(&local_sender_package("bydest", sink)),
+        "local://t1/bydest/1.0.0/in-local",
+        "local://t1/target/1.0.0/in-local",
+    )
+}
+
+/// 11. A literal `local://` send to another package is refused by packaging, by the deploy API and by
+/// its check, and the other package never starts.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "docker"]
-async fn what_local_to_a_different_package_does() {
+async fn a_local_send_across_packages_is_refused_at_deploy() {
     let (pool, url) = fresh_db().await;
     let (sink, capture) = capture_server().await;
     let engine = boot_db_engine(url).await;
@@ -1119,90 +1851,128 @@ async fn what_local_to_a_different_package_does() {
     .await;
     assert_eq!(status, 200, "target: {body}");
 
-    let sender = |name: &str, channels: String, send: &str| {
-        let root = temp_root("drain-pkg");
-        let process = format!(
-            r#"  <bpmn:process id="sender" name="Sender" isExecutable="true">
-    <bpmn:extensionElements><q:variables>
-      <q:variable name="responseBody" type="object"/>
-    </q:variables></bpmn:extensionElements>
-    <bpmn:startEvent id="Start">
-      <bpmn:extensionElements><q:source channel="go"/></bpmn:extensionElements>
-      <bpmn:outgoing>f1</bpmn:outgoing>
-    </bpmn:startEvent>
-    <bpmn:sequenceFlow id="f1" sourceRef="Start" targetRef="Build"/>
-    <bpmn:serviceTask id="Build" name="Build">
-      <bpmn:incoming>f1</bpmn:incoming><bpmn:outgoing>f2</bpmn:outgoing>
-      <bpmn:dataInputAssociation><bpmn:assignment>
-        <bpmn:from>{{from: "other-package"}}</bpmn:from><bpmn:to>responseBody</bpmn:to>
-      </bpmn:assignment></bpmn:dataInputAssociation>
-    </bpmn:serviceTask>
-    <bpmn:sequenceFlow id="f2" sourceRef="Build" targetRef="Send"/>
-    <bpmn:sendTask id="Send" name="Send">
-      <bpmn:extensionElements>{send}</bpmn:extensionElements>
-      <bpmn:incoming>f2</bpmn:incoming><bpmn:outgoing>f3</bpmn:outgoing>
-    </bpmn:sendTask>
-    <bpmn:sequenceFlow id="f3" sourceRef="Send" targetRef="End"/>
-    <bpmn:endEvent id="End"><bpmn:incoming>f3</bpmn:incoming></bpmn:endEvent>
-  </bpmn:process>"#
-        );
-        write(
-            &root,
-            "bpmn/sender.bpmn",
-            &definitions(name, "1.0.0", "sender", &process),
-        );
-        write(
-            &root,
-            "channels.yaml",
-            &format!(
-                "channels:\n  - name: go\n    transport: http\n    bind: \"POST /{name}/go\"\n    codec: json\n{AUTH}{channels}"
-            ),
-        );
-        write(&root, "package.yaml", &labels("t1", name, "1.0.0"));
-        let out = temp_root("pkg");
-        sutra_loader::assemble_dir(&root, &out, &sutra_loader::PackageOptions::default())
-            .map(|outcome| std::fs::read(&outcome.archives[0].file_path).expect("archive bytes"))
-            .map_err(|e| format!("{e:?}"))
+    // Packaging refuses it.
+    let root = local_sender_package("bydest", sink);
+    let process = std::fs::read_to_string(root.join("bpmn/sender.bpmn")).unwrap();
+    write(
+        &root,
+        "bpmn/sender.bpmn",
+        &process.replace(
+            "local://t1/bydest/1.0.0/in-local",
+            "local://t1/target/1.0.0/in-local",
+        ),
+    );
+    let out = temp_root("pkg");
+    let packaged =
+        sutra_loader::assemble_dir(&root, &out, &sutra_loader::PackageOptions::default());
+    let Err(refused) = packaged else {
+        panic!("packaging refuses it");
     };
-    let by_destination = sender(
+    let refusal = format!("{refused:?}");
+    assert!(refusal.contains(CROSSES), "{refusal}");
+
+    // An archive sealed without that check is refused by the deploy and by its check.
+    let sealed = crossing_sender(sink);
+    let (status, body) = post(addr, "/admin/deployments", &sealed).await;
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains(CROSSES), "{body}");
+    assert!(body.contains("local://t1/target/1.0.0/in-local"), "{body}");
+    let (status, body) = post(addr, "/admin/deployments/check", &sealed).await;
+    assert_eq!(status, 400, "the check gives the deploy's answer: {body}");
+    let stored: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM deployment_archive WHERE module = 'bydest'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(stored, 0, "nothing stored");
+    let (status, _) = post(addr, "/bydest/go", b"{}").await;
+    assert_eq!(status, 404, "it does not serve");
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    assert_eq!(capture.delivered("/target-in-local-started"), 0);
+    engine.shutdown().await;
+}
+
+/// A row an earlier engine stored with such a send keeps running after the upgrade, and the send
+/// reaches the other package as it did then.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "docker"]
+async fn a_stored_row_keeps_running() {
+    let (pool, url) = fresh_db().await;
+    let (sink, capture) = capture_server().await;
+    let engine = boot_db_engine(url.clone()).await;
+    let (status, body) = post(
+        engine.local_addr,
+        "/admin/deployments",
+        &package(&simple_start_package("target", sink)),
+    )
+    .await;
+    assert_eq!(status, 200, "target: {body}");
+    engine.shutdown().await;
+    crate::endpoint_claims_it::insert_active_row(
+        &pool,
         "bydest",
-        String::new(),
-        r#"<q:send destination="local://t1/target/1.0.0/in-local" contentType="application/json"/>"#,
+        "1.0.0",
+        &crossing_sender(sink),
+        "1 day",
+    )
+    .await;
+
+    let engine = boot_db_engine(url).await;
+    let addr = engine.local_addr;
+    let status = status_of(addr).await;
+    assert_eq!(status["active"].as_array().unwrap().len(), 2, "{status}");
+    assert!(
+        crate::endpoint_claims_it::failed_slots(&status).is_empty(),
+        "{status}"
     );
-    let by_bare_bind = sender(
-        "bybind",
-        "  - name: out\n    direction: outbound\n    transport: local\n    bind: local://t1/target/1.0.0/in-local\n    cloudevents-mode: none\n".to_string(),
-        r#"<q:send channel="out" contentType="application/json"/>"#,
+    let (status, body) = post(addr, "/bydest/go", b"{}").await;
+    assert_eq!(status, 200, "it serves: {body}");
+    assert!(
+        wait_until(30, || async {
+            capture.delivered("/target-in-local-started") == 1
+        })
+        .await,
+        "the stored send still runs. outbox: {}",
+        outbox_state(&pool).await
     );
-    for (name, archive) in [("bydest", by_destination), ("bybind", by_bare_bind)] {
-        let archive = match archive {
-            Ok(archive) => archive,
-            Err(refusal) => {
-                println!(
-                    "OBSERVED 11 the {name} sender does not package: {}",
-                    &refusal[..refusal.len().min(400)]
-                );
-                continue;
-            }
-        };
-        let before = capture.delivered("/target-in-local-started");
-        let (status, body) = post(addr, "/admin/deployments", &archive).await;
-        println!("OBSERVED 11 deploy of the {name} sender: {status} {body}");
-        if status != 200 {
-            continue;
-        }
-        let (status, body) = post(addr, &format!("/{name}/go"), b"{}").await;
-        println!(
-            "OBSERVED 11 {name} go: {status} {}",
-            &body[..body.len().min(160)]
-        );
-        tokio::time::sleep(std::time::Duration::from_secs(4)).await;
-        println!(
-            "OBSERVED 11 {name}: the other package started {} time(s). outbox: {}",
-            capture.delivered("/target-in-local-started") - before,
-            outbox_state(&pool).await
-        );
-    }
+    engine.shutdown().await;
+}
+
+/// In a folder a scan is the deploy, so such an archive is `Failed`, at boot as later.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "docker"]
+async fn a_folder_archive_with_a_crossing_send_is_failed() {
+    let (_pool, url) = fresh_db().await;
+    std::env::set_var(
+        "SUTRA_DB_MIGRATIONS",
+        crate::outbox_e2e::shipped_migration_roots_env(),
+    );
+    let (sink, _capture) = capture_server().await;
+    let dir = temp_root("drain-dir");
+    crate::archive_activation_conformance::place_archive(
+        &dir,
+        "bydest.sutra",
+        &crossing_sender(sink),
+    );
+    let engine = crate::archive_activation_conformance::boot_archive_engine(dir, Some(url)).await;
+    let addr = engine.local_addr;
+    assert!(
+        wait_until(10, || async {
+            status_of(addr).await["failed"]
+                .as_array()
+                .is_some_and(|f| f.len() == 1)
+        })
+        .await,
+        "{}",
+        status_of(addr).await
+    );
+    let status = status_of(addr).await;
+    let failed = status["failed"].as_array().cloned().unwrap_or_default();
+    assert!(
+        failed[0]["error"].as_str().unwrap_or("").contains(CROSSES),
+        "{status}"
+    );
+    assert!(status["active"].as_array().unwrap().is_empty(), "{status}");
     engine.shutdown().await;
 }
 
@@ -1543,35 +2313,123 @@ async fn what_a_redelivery_spanning_the_flip_does() {
     }
 }
 
-/// For the parked-count question: what `waiting_event` holds for a wait on a channel, by kind of wait.
+/// v1 parks each instance at a receive task and a message catch on `answer-in` at once (two
+/// message rows) with a timer boundary on the receive task (a timer row). v2 changes that channel's
+/// codec. The deploy's warning counts each parked instance once, timer rows aside.
+fn parked_kinds_package(version: &str, codec: &str) -> PathBuf {
+    let root = temp_root("drain-pkg");
+    let process = r#"  <bpmn:process id="kinds" name="Kinds" isExecutable="true">
+    <bpmn:extensionElements><q:variables>
+      <q:variable name="answer" type="object"/>
+      <q:variable name="other" type="object"/>
+    </q:variables></bpmn:extensionElements>
+    <bpmn:startEvent id="Start">
+      <bpmn:extensionElements><q:source channel="k-start"/></bpmn:extensionElements>
+      <bpmn:outgoing>f1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="Start" targetRef="Arm"/>
+    <bpmn:serviceTask id="Arm" name="Arm">
+      <bpmn:incoming>f1</bpmn:incoming><bpmn:outgoing>f2</bpmn:outgoing>
+      <bpmn:dataInputAssociation><bpmn:assignment>
+        <bpmn:from>{key: payload.key}</bpmn:from><bpmn:to>answer</bpmn:to>
+      </bpmn:assignment></bpmn:dataInputAssociation>
+      <bpmn:dataInputAssociation><bpmn:assignment>
+        <bpmn:from>{key: payload.key}</bpmn:from><bpmn:to>other</bpmn:to>
+      </bpmn:assignment></bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="f2" sourceRef="Arm" targetRef="Fork"/>
+    <bpmn:parallelGateway id="Fork">
+      <bpmn:incoming>f2</bpmn:incoming><bpmn:outgoing>a1</bpmn:outgoing><bpmn:outgoing>b1</bpmn:outgoing>
+    </bpmn:parallelGateway>
+    <bpmn:sequenceFlow id="a1" sourceRef="Fork" targetRef="Receive"/>
+    <bpmn:receiveTask id="Receive" name="Receive">
+      <bpmn:extensionElements>
+        <q:source channel="answer-in" name="answer"/>
+        <q:alias name="receiveKey" expression="answer.key" unique="true"/>
+      </bpmn:extensionElements>
+      <bpmn:incoming>a1</bpmn:incoming><bpmn:outgoing>a2</bpmn:outgoing>
+    </bpmn:receiveTask>
+    <bpmn:boundaryEvent id="ReceiveTimeout" attachedToRef="Receive" cancelActivity="true">
+      <bpmn:outgoing>t1</bpmn:outgoing>
+      <bpmn:timerEventDefinition><bpmn:timeDuration>PT1H</bpmn:timeDuration></bpmn:timerEventDefinition>
+    </bpmn:boundaryEvent>
+    <bpmn:sequenceFlow id="t1" sourceRef="ReceiveTimeout" targetRef="TimedOut"/>
+    <bpmn:endEvent id="TimedOut"><bpmn:incoming>t1</bpmn:incoming></bpmn:endEvent>
+    <bpmn:sequenceFlow id="b1" sourceRef="Fork" targetRef="Catch"/>
+    <bpmn:intermediateCatchEvent id="Catch" name="Catch">
+      <bpmn:extensionElements>
+        <q:source channel="answer-in" name="other"/>
+        <q:alias name="catchKey" expression="other.key" unique="true"/>
+      </bpmn:extensionElements>
+      <bpmn:incoming>b1</bpmn:incoming><bpmn:outgoing>b2</bpmn:outgoing>
+      <bpmn:messageEventDefinition/>
+    </bpmn:intermediateCatchEvent>
+    <bpmn:sequenceFlow id="a2" sourceRef="Receive" targetRef="Join"/>
+    <bpmn:sequenceFlow id="b2" sourceRef="Catch" targetRef="Join"/>
+    <bpmn:parallelGateway id="Join">
+      <bpmn:incoming>a2</bpmn:incoming><bpmn:incoming>b2</bpmn:incoming><bpmn:outgoing>j1</bpmn:outgoing>
+    </bpmn:parallelGateway>
+    <bpmn:sequenceFlow id="j1" sourceRef="Join" targetRef="Done"/>
+    <bpmn:endEvent id="Done"><bpmn:incoming>j1</bpmn:incoming></bpmn:endEvent>
+  </bpmn:process>"#;
+    write(
+        &root,
+        "bpmn/kinds.bpmn",
+        &definitions("kinds", version, "kinds", process),
+    );
+    write(
+        &root,
+        "channels.yaml",
+        &format!(
+            "channels:\n  - name: k-start\n    transport: http\n    bind: \"POST /k/start\"\n    codec: json\n{AUTH}  - name: answer-in\n    transport: http\n    bind: \"POST /k/answer\"\n    codec: {codec}\n{AUTH}"
+        ),
+    );
+    write(&root, "package.yaml", &labels("t1", "kinds", version));
+    root
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "docker"]
-async fn what_the_wait_table_records_for_each_kind_of_wait() {
+async fn the_warning_counts_distinct_parked_instances() {
     let (pool, url) = fresh_db().await;
-    let (sink, capture) = capture_server().await;
     let engine = boot_db_engine(url).await;
     let addr = engine.local_addr;
-    let holding = package(&crate::endpoint_claims_it::versioned_hold_package(
-        "t1", "kinds", "1.0.0", sink,
-    ));
-    let (status, body) = post(addr, "/admin/deployments", &holding).await;
-    assert_eq!(status, 200, "channel-call package: {body}");
-    let (status, body) = post(addr, "/owned/hold-start", br#"{"key":"K1"}"#).await;
-    assert_eq!(status, 200, "park on a channel call: {body}");
-    assert!(wait_until(10, || async { capture.delivered("/callout") >= 1 }).await);
-    let receive = package(&internal_package("1.0.0", sink));
-    let (status, body) = post(addr, "/admin/deployments", &receive).await;
-    assert_eq!(status, 200, "receive-task package: {body}");
-    let (status, body) = post(addr, "/d/gate-start", br#"{"key":"G1"}"#).await;
-    assert_eq!(status, 200, "park on a receive task: {body}");
+    let (status, body) = post(
+        addr,
+        "/admin/deployments",
+        &package(&parked_kinds_package("1.0.0", "json")),
+    )
+    .await;
+    assert_eq!(status, 200, "v1: {body}");
+    for key in ["K1", "K2"] {
+        let start = format!(r#"{{"key":"{key}"}}"#);
+        let (status, body) = post(addr, "/k/start", start.as_bytes()).await;
+        assert_eq!(status, 200, "park {key}: {body}");
+    }
     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-    // The row-level policy hides the rows from a role without the deployment scope, and the fixture
-    // role bypasses it, so this reads them all.
-    let rows: Vec<(String, String, String)> =
-        sqlx::query_as("SELECT process_id, node_id, status FROM waiting_event ORDER BY node_id")
-            .fetch_all(&pool)
-            .await
-            .expect("waiting rows");
-    println!("OBSERVED waiting_event rows: {rows:?}");
+    // The fixture role bypasses the row-level policy, so this reads every row.
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT node_id, kind FROM waiting_event WHERE status = 'WAITING' ORDER BY node_id",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("waiting rows");
+    let message_rows = rows.iter().filter(|(_, kind)| kind == "MESSAGE").count();
+    assert_eq!(message_rows, 4, "two message waits per instance: {rows:?}");
+    assert!(
+        rows.iter().any(|(_, kind)| kind == "TIMER"),
+        "and timer rows: {rows:?}"
+    );
+    let (status, body) = post(
+        addr,
+        "/admin/deployments",
+        &package(&parked_kinds_package("2.0.0", "xml")),
+    )
+    .await;
+    assert_eq!(status, 200, "v2: {body}");
+    assert!(
+        body.contains("channel 'answer-in' changes codec from t1--kinds--1.0.0; 2 instances of t1--kinds--1.0.0 are parked on it"),
+        "{body}"
+    );
     engine.shutdown().await;
 }

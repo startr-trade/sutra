@@ -335,8 +335,9 @@ fn parse_bool(raw: Option<&String>, fallback: bool, channel: &str) -> Result<boo
 }
 
 /// Enforce the 15-factor secret discipline (mirrors the rabbitmq (AMQP 0.9.1) transport): broker
-/// credentials must be references — `${ENV_VAR}` (optionally with `:default`),
-/// `k8s:secret/<name>#<key>`, or the Rust engine's `env:NAME` form — never literals.
+/// credentials must be references — any form the engine's reference resolver resolves
+/// (`env:NAME`, `secret:KEY`, a registered secret-store scheme, `${NAME}`, `${secret:KEY}`, each
+/// placeholder optionally with `:default`), or `k8s:secret/<name>#<key>` — never literals.
 fn require_secret_ref(
     raw: Option<&String>,
     key: &str,
@@ -345,20 +346,16 @@ fn require_secret_ref(
     let Some(value) = non_blank(raw) else {
         return Ok(None);
     };
-    if is_env_placeholder(&value) || is_k8s_secret_ref(&value) || value.starts_with("env:") {
+    if sutra_envref_spi::is_whole_reference(&value) || is_k8s_secret_ref(&value) {
         return Ok(Some(value));
     }
     Err(Diagnostic::error(
         codes::STARTUP_REFUSED_HARDCODED_SECRET,
         format!(
             "amqp channel '{channel}' property '{key}' must be a secret reference \
-             (e.g. ${{ENV_VAR}} or k8s:secret/<name>#<key>); literal credentials are rejected."
+             (e.g. secret:KEY, ${{secret:KEY}} or ${{ENV_VAR}}); literal credentials are rejected."
         ),
     ))
-}
-
-fn is_env_placeholder(value: &str) -> bool {
-    value.starts_with("${") && value.ends_with('}')
 }
 
 fn is_k8s_secret_ref(value: &str) -> bool {
@@ -629,9 +626,31 @@ mod tests {
         let err = AmqpChannelProperties::from_definition(&def).unwrap_err();
         assert_eq!(err.code, codes::STARTUP_REFUSED_HARDCODED_SECRET);
 
-        // A secret reference is accepted.
-        let def = definition(&[("host", "h"), ("queue", "q"), ("username", "${SB_USER}")]);
-        assert!(AmqpChannelProperties::from_definition(&def).is_ok());
+        for literal in ["s3cr3t:pass", "secret:", "pre${SB_USER}"] {
+            let def = definition(&[("host", "h"), ("queue", "q"), ("password", literal)]);
+            let err = AmqpChannelProperties::from_definition(&def).unwrap_err();
+            assert_eq!(
+                err.code,
+                codes::STARTUP_REFUSED_HARDCODED_SECRET,
+                "{literal}"
+            );
+        }
+
+        // Every secret-reference form is accepted.
+        for reference in [
+            "${SB_USER}",
+            "${SB_USER:guest}",
+            "env:SB_USER",
+            "secret:broker-user",
+            "${secret:broker-user}",
+            "k8s:secret/broker-creds#user",
+        ] {
+            let def = definition(&[("host", "h"), ("queue", "q"), ("username", reference)]);
+            assert!(
+                AmqpChannelProperties::from_definition(&def).is_ok(),
+                "{reference}"
+            );
+        }
     }
 
     #[test]

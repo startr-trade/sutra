@@ -30,6 +30,8 @@ mod tc_ai_examples;
 mod tc_approval_hold;
 #[path = "all/tc_audit_sinks.rs"]
 mod tc_audit_sinks;
+#[path = "all/tc_coverage_cycles.rs"]
+mod tc_coverage_cycles;
 #[path = "all/tc_dedup_refusal.rs"]
 mod tc_dedup_refusal;
 #[path = "all/tc_early_reply_refused.rs"]

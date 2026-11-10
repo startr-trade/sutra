@@ -1077,3 +1077,128 @@ async fn on_persist_source_still_settles_at_dispatch_return() {
     wait_for_message_count(port, &queue, 0, Duration::from_secs(5)).await; // acked immediately
     source.stop().await.expect("stop");
 }
+
+// ---- secret-reference credentials -----------------------------------------------------------
+
+/// Broker credentials written as `secret:KEY` and `${secret:KEY}` pass the literal-secret
+/// refusal, resolve through the engine's reference resolver from the mounted secrets directory,
+/// and open an authenticated session that consumes. The broker here has its own non-default
+/// user, so an anonymous or wrongly resolved session would be refused.
+#[ignore = "docker"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn secret_reference_credentials_resolve_and_connect() {
+    const USER: &str = "sutra-it";
+    const PASS: &str = "it-only-password";
+    let (container, port) = std::thread::spawn(|| {
+        let container = rabbit_image()
+            .with_env_var("RABBITMQ_DEFAULT_USER", USER)
+            .with_env_var("RABBITMQ_DEFAULT_PASS", PASS)
+            .start()
+            .expect("start rabbitmq with a non-default user (docker required)");
+        sutra_testkit::reap_on_exit(container.id());
+        let port = container.get_host_port_ipv4(5672).expect("mapped 5672");
+        (container, port)
+    })
+    .join()
+    .expect("broker bootstrap thread");
+
+    let admin = Connection::connect(
+        &format!("amqp://{USER}:{PASS}@127.0.0.1:{port}"),
+        ConnectionProperties::default(),
+    )
+    .await
+    .expect("admin connection");
+    let anonymous = Connection::connect(
+        &format!("amqp://127.0.0.1:{port}"),
+        ConnectionProperties::default(),
+    )
+    .await;
+    assert!(
+        anonymous.is_err(),
+        "the default guest user must not exist here"
+    );
+    let admin_channel = admin.create_channel().await.expect("channel");
+    let queue = format!("secret-ref-{}", uuid_ish());
+    admin_channel
+        .queue_declare(
+            &queue,
+            QueueDeclareOptions::default(),
+            FieldTable::default(),
+        )
+        .await
+        .expect("declare");
+
+    let secrets = std::env::temp_dir().join(format!("sutra-rmq-secrets-{}", uuid_ish()));
+    std::fs::create_dir_all(&secrets).expect("secrets dir");
+    std::fs::write(secrets.join("rmq-user"), format!("{USER}\n")).expect("user secret");
+    std::fs::write(secrets.join("rmq-pass"), format!("{PASS}\n")).expect("password secret");
+    std::env::set_var("SUTRA_SECRETS_DIR", &secrets);
+
+    let namespace = sutra_channels::config::Namespace::new("acme", "orders", "1.0.0");
+    let binding = sutra_channels::config::ChannelBinding::new(
+        "secret-inbound",
+        namespace,
+        sutra_channels::DeploymentId::unresolved(),
+        "",
+    );
+    let definition = sutra_channels::ChannelDefinition {
+        binding,
+        transport: Some("rabbitmq".to_string()),
+        bind_spec: None,
+        codec: None,
+        cloud_events_mode: None,
+        auth_scheme: None,
+        idempotency_key_header: None,
+        payload_cap_bytes: None,
+        properties: [
+            ("host", "127.0.0.1".to_string()),
+            ("port", port.to_string()),
+            ("queue", queue.clone()),
+            ("username", "secret:rmq-user".to_string()),
+            ("password", "${secret:rmq-pass}".to_string()),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect(),
+    };
+    fn resolver(raw: &str) -> Result<String, String> {
+        sutra_envref_spi::resolve_value(raw).map_err(|e| e.to_string())
+    }
+    let properties =
+        RabbitMqChannelProperties::resolved(&definition, resolver).expect("references accepted");
+    let user = resolver(properties.username.as_deref().expect("username")).expect("user");
+    let pass = resolver(properties.password.as_deref().expect("password")).expect("pass");
+    assert_eq!((user.as_str(), pass.as_str()), (USER, PASS));
+    let properties = properties.with_credentials(Some(user), Some(pass));
+
+    let mut config =
+        RabbitMqSourceConfig::new("acme", "acme/orders/1.0.0", "secret-inbound", properties);
+    config.gate_poll = Duration::from_millis(150);
+    let source = RabbitMqTriggerSource::new(config).expect("source");
+    let intake = ScriptedIntake::always(AckDecision::Ack);
+    source
+        .start(intake.clone(), Arc::new(sutra_channels::AlwaysLeading))
+        .await
+        .expect("start with resolved secret credentials");
+    admin_channel
+        .basic_publish(
+            "",
+            &queue,
+            BasicPublishOptions::default(),
+            b"hello",
+            BasicProperties::default(),
+        )
+        .await
+        .expect("publish")
+        .await
+        .expect("confirm");
+    wait_until("delivery", Duration::from_secs(10), || {
+        intake.delivered_count() >= 1
+    })
+    .await;
+    source.stop().await.expect("stop");
+    let _ = std::fs::remove_dir_all(&secrets);
+    std::thread::spawn(move || drop(container))
+        .join()
+        .expect("broker teardown thread");
+}

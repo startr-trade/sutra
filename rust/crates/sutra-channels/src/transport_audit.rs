@@ -159,7 +159,7 @@ pub enum TransportAuditScope {
     Instance(TransportAuditContext),
     /// The deployment-level journal of the deployment that runs `module_key`
     /// (`<tenant>/<module>/<version>`, the module key of the channel the transport serves):
-    /// for an event no instance owns.
+    /// for an event no instance owns. Its SQL audit row has a NULL `instance_id`, not an empty one.
     Deployment { module_key: String },
 }
 

@@ -367,6 +367,162 @@ cross-process reconstruction record is cleared — the clean baseline a new test
 reporting period, starts from. The rows stay seeded; reset is one scoped update that flips the
 flags, so `total` is unchanged and the `cleared` count is exactly how many routes had been covered.
 
+## Requirements and compliance cycles
+
+Since 0.6.20 a package can map its declared paths to requirements, and a deployment can keep named
+**compliance cycles**, so you can ask "how much of release 4.2's requirements has the test campaign covered?"
+
+- **A requirements map.** `coverage/requirements-map.yaml` maps each declared path to requirement ids, a weight
+  (default 1, above zero) and the test cases that walk it. `sutra coverage check` then adds a `compliance` object:
+  per-requirement and weighted percentages, uncovered paths with their cases, the cases to run, and paths with no
+  cases or no mapping. `--threshold` gates the weighted percentage. Every declared path counts; there is no way to
+  exclude one. A package with no map reports as before. Lint: `SUTRA.CONFIG.COVERAGE.MAPPING_ROUTE_UNKNOWN` (error,
+  a key that matches no declared path) and `SUTRA.CONFIG.COVERAGE.MAPPING_ROUTE_UNMAPPED` (warning, a declared path
+  the map leaves out, counted at weight 1).
+- **Cycles.** `sutra coverage cycle declare|activate|deactivate <LABEL>` and `sutra coverage cycle list`, plus `--cycle`
+  on `coverage check` and `coverage reset`. While a cycle is active, every mark for that deployment records to it.
+  A mark belongs to the cycle active when its instance completes. One cycle can be active per deployment: a second
+  activation is refused (`SUTRA.RUNTIME.COVERAGE.CYCLE_ALREADY_ACTIVE`), as is activating an undeclared label
+  (`CYCLE_UNDECLARED`); reactivating a cycle continues it. With none active, coverage records as before, and `check`
+  and `reset` without `--cycle` read the marks recorded outside any cycle. Cycles belong to a deployment id, so a
+  changed package starts with none. The `sutra.coverage.percent` gauge and the path counter are not cycle-aware.
+
+### Walkthrough
+
+The `money-transfer` example package with this `coverage/requirements-map.yaml`:
+
+```yaml
+routes:
+  accept:
+    requirements: [REQ-HAPPY]
+    weight: 3
+    cases: [case-accept]
+  reject:
+    requirements: [REQ-REFUSAL]
+    cases: [case-reject, case-reject-frozen]
+```
+
+`sutra lint` and `sutra package` accept it (no `MAPPING_ROUTE_*` finding: both declared paths are
+mapped). The engine runs from a deployments folder on PostgreSQL; the CLI reaches the same database
+through `SUTRA_DB_URL`. Steps: declare a cycle and activate it; check it (nothing covered, every case
+to run); post an accepted request; check again (weighted 75%: `accept` weighs 3 of 4); the JSON form
+with `--threshold 75` passes, because the threshold gates the weighted percentage; deactivate, so a
+rejected request records outside the cycle; a second active cycle is refused; reactivating
+`release-4.2` continues it, and the rejected request now covers it fully.
+
+```text
+$ sutra coverage cycle declare release-4.2 --archive archives/money-transfer.sutra
+coverage cycle declare — deployment dep-43a59818955d7e27dd83b82d: cycle 'release-4.2' declared, 2 path(s) seeded
+[exit 0]
+
+$ sutra coverage cycle activate release-4.2 --archive archives/money-transfer.sutra
+coverage cycle activate — deployment dep-43a59818955d7e27dd83b82d: cycle 'release-4.2' is active; coverage now records to it
+[exit 0]
+
+$ sutra coverage check --archive archives/money-transfer.sutra --cycle release-4.2
+coverage check (cross-process) — deployment dep-43a59818955d7e27dd83b82d
+  cycle: release-4.2
+  total: 2  covered: 0  coveragePercentage: 0.00%
+  uncovered (2):
+    - accept
+    - reject
+  weighted: 0.00%  (0 of 4 by weight)
+  requirements (2):
+    REQ-HAPPY: 0.00%  (0 of 1 routes)
+    REQ-REFUSAL: 0.00%  (0 of 1 routes)
+  uncovered routes and the cases that cover them:
+    - accept: case-accept
+    - reject: case-reject, case-reject-frozen
+  cases to run: case-accept, case-reject, case-reject-frozen
+  threshold: 100.00%  =>  FAIL
+[exit 1]
+
+POST accept: HTTP 200
+
+$ sutra coverage check --archive archives/money-transfer.sutra --cycle release-4.2
+coverage check (cross-process) — deployment dep-43a59818955d7e27dd83b82d
+  cycle: release-4.2
+  total: 2  covered: 1  coveragePercentage: 50.00%
+  uncovered (1):
+    - reject
+  weighted: 75.00%  (3 of 4 by weight)
+  requirements (2):
+    REQ-HAPPY: 100.00%  (1 of 1 routes)
+    REQ-REFUSAL: 0.00%  (0 of 1 routes)
+  uncovered routes and the cases that cover them:
+    - reject: case-reject, case-reject-frozen
+  cases to run: case-reject, case-reject-frozen
+  threshold: 100.00%  =>  FAIL
+[exit 1]
+
+$ sutra --format json coverage check --archive archives/money-transfer.sutra --cycle release-4.2 --threshold 75
+{"command":"coverage check","form":"cross-process","deploymentId":"dep-43a59818955d7e27dd83b82d","total":2,"covered":1,"coveragePercentage":50.0,"threshold":75.0,"uncovered":["reject"],"newlyCovered":[],"passed":true,"cy …
+[exit 0]
+
+$ sutra coverage cycle deactivate release-4.2 --archive archives/money-transfer.sutra
+coverage cycle deactivate — deployment dep-43a59818955d7e27dd83b82d: cycle 'release-4.2' deactivated; coverage records outside any cycle
+[exit 0]
+
+POST reject: HTTP 200
+
+$ sutra coverage cycle list --archive archives/money-transfer.sutra
+coverage cycle list — deployment dep-43a59818955d7e27dd83b82d: 1 cycle(s), no-cycle coverage 50.00%  (1 of 2)
+    release-4.2: 50.00%  (1 of 2)
+[exit 0]
+
+$ sutra coverage cycle declare release-4.3 --archive archives/money-transfer.sutra
+coverage cycle declare — deployment dep-43a59818955d7e27dd83b82d: cycle 'release-4.3' declared, 2 path(s) seeded
+[exit 0]
+
+$ sutra coverage cycle activate release-4.3 --archive archives/money-transfer.sutra
+coverage cycle activate — deployment dep-43a59818955d7e27dd83b82d: cycle 'release-4.3' is active; coverage now records to it
+[exit 0]
+
+$ sutra coverage cycle activate release-4.2 --archive archives/money-transfer.sutra
+coverage cycle activate — deployment dep-43a59818955d7e27dd83b82d: SUTRA.RUNTIME.COVERAGE.CYCLE_ALREADY_ACTIVE: cycle 'release-4.3' is active, and only one can be. Deactivate it first; 'release-4.2' was not activated
+[exit 1]
+
+$ sutra coverage cycle deactivate release-4.3 --archive archives/money-transfer.sutra
+coverage cycle deactivate — deployment dep-43a59818955d7e27dd83b82d: cycle 'release-4.3' deactivated; coverage records outside any cycle
+[exit 0]
+
+$ sutra coverage cycle activate release-4.2 --archive archives/money-transfer.sutra
+coverage cycle activate — deployment dep-43a59818955d7e27dd83b82d: cycle 'release-4.2' is active; coverage now records to it
+[exit 0]
+
+POST reject: HTTP 200
+
+$ sutra coverage check --archive archives/money-transfer.sutra --cycle release-4.2
+coverage check (cross-process) — deployment dep-43a59818955d7e27dd83b82d
+  cycle: release-4.2
+  total: 2  covered: 2  coveragePercentage: 100.00%
+  uncovered: none
+  weighted: 100.00%  (4 of 4 by weight)
+  requirements (2):
+    REQ-HAPPY: 100.00%  (1 of 1 routes)
+    REQ-REFUSAL: 100.00%  (1 of 1 routes)
+  threshold: 100.00%  =>  PASS
+[exit 0]
+
+$ sutra coverage cycle deactivate release-4.2 --archive archives/money-transfer.sutra
+coverage cycle deactivate — deployment dep-43a59818955d7e27dd83b82d: cycle 'release-4.2' deactivated; coverage records outside any cycle
+[exit 0]
+
+$ sutra coverage cycle list --archive archives/money-transfer.sutra
+coverage cycle list — deployment dep-43a59818955d7e27dd83b82d: 2 cycle(s), no-cycle coverage 50.00%  (1 of 2)
+    release-4.2: 100.00%  (2 of 2)
+    release-4.3: 0.00%  (0 of 2)
+[exit 0]
+```
+
+The `compliance` object of the JSON check above:
+
+```json
+{"weightedPercentage":75.0,"weightedTotal":4.0,"weightedCovered":3.0,"requirements":[{"requirement":"REQ-HAPPY","total":1,"covered":1,"coveragePercentage":100.0,"uncovered":[]},{"requirement":"REQ-REFUSAL","total":1,"covered":0,"coveragePercentage":0.0,"uncovered":["reject"]}],"uncoveredRoutes":[{"path":"reject","requirements":["REQ-REFUSAL"],"weight":1.0,"cases":["case-reject","case-reject-frozen"]}],"casesToRun":["case-reject","case-reject-frozen"],"routesWithoutCases":[],"unmappedRoutes":[]}
+```
+
+To re-run one case, send `<cycle>:<case>:<attempt>` as the idempotency key on a channel that declares `idempotency-key-header`: a repeat of an attempt does nothing, the next attempt runs. This is covered by the tier-2 conformance suite and not walked here.
+
 ## Curation: `init` enumerates, you decide what matters
 
 `init`'s job is mechanical completeness — surface every structurally valid route (or, cross-process,

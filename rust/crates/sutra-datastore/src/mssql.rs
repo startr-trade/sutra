@@ -398,6 +398,8 @@ fn store_inner(
 #[derive(Clone)]
 pub struct MssqlCoverageStore {
     inner: Arc<StoreInner>,
+    /// The compliance cycle whose rows this handle addresses; `None` for the plain rows.
+    cycle: Option<String>,
 }
 
 /// One open coverage transaction. Committing marks it released; dropping it un-committed
@@ -444,7 +446,32 @@ impl MssqlCoverageStore {
                 None,
                 None,
             )?),
+            cycle: None,
         })
+    }
+
+    /// The same store, addressing `cycle`'s rows (or the plain rows for `None`).
+    pub fn in_cycle(&self, cycle: Option<&str>) -> MssqlCoverageStore {
+        MssqlCoverageStore {
+            inner: Arc::clone(&self.inner),
+            cycle: cycle.map(str::to_string),
+        }
+    }
+
+    fn row_scope(&self) -> coverage::CoverageRowScope {
+        match self.cycle {
+            Some(_) => coverage::CoverageRowScope::InCycle,
+            None => coverage::CoverageRowScope::NoCycle,
+        }
+    }
+
+    /// A statement's leading parameters: the deployment id, then the cycle label if any.
+    fn key_params<'a>(&'a self, deployment_id: &'a &'a str) -> Vec<&'a dyn tiberius::ToSql> {
+        let mut params: Vec<&'a dyn tiberius::ToSql> = vec![deployment_id];
+        if let Some(cycle) = &self.cycle {
+            params.push(cycle);
+        }
+        params
     }
 
     /// The declared store name this coverage store was built from.
@@ -485,15 +512,13 @@ impl MssqlCoverageStore {
         if path_urns.is_empty() {
             return Ok(0);
         }
-        let sql = coverage::seed_sql(DIALECT);
+        let sql = coverage::seed_sql(DIALECT, self.row_scope());
         let mut tx = self.begin(false).await?;
         let mut inserted = 0u64;
         for urn in path_urns {
-            match tx
-                .client()
-                .execute(sql.as_str(), &[&deployment_id, &urn.as_str()])
-                .await
-            {
+            let mut params = self.key_params(&deployment_id);
+            params.push(urn);
+            match tx.client().execute(sql.as_str(), &params).await {
                 Ok(done) => inserted += done.total(),
                 Err(e) if is_duplicate_key(&e) => {}
                 Err(e) => return Err(cov_err(&self.inner.name, "seed", e)),
@@ -512,12 +537,14 @@ impl MssqlCoverageStore {
         path_urn: &str,
     ) -> Result<bool, DataStoreError> {
         check_deployment_id(deployment_id)?;
+        let mut mark_params = self.key_params(&deployment_id);
+        mark_params.push(&path_urn);
         let mut tx = self.begin(false).await?;
         let flipped = tx
             .client()
             .execute(
-                coverage::mark_update_sql(DIALECT).as_str(),
-                &[&deployment_id, &path_urn],
+                coverage::mark_update_sql(DIALECT, self.row_scope()).as_str(),
+                &mark_params,
             )
             .await
             .map_err(|e| cov_err(&self.inner.name, "mark", e))?
@@ -528,8 +555,8 @@ impl MssqlCoverageStore {
             match tx
                 .client()
                 .execute(
-                    coverage::mark_insert_sql(DIALECT).as_str(),
-                    &[&deployment_id, &path_urn],
+                    coverage::mark_insert_sql(DIALECT, self.row_scope()).as_str(),
+                    &mark_params,
                 )
                 .await
             {
@@ -556,8 +583,8 @@ impl MssqlCoverageStore {
         let mut tx = self.begin(true).await?;
         let mut covered = BTreeSet::new();
         for chunk in path_urns.chunks(coverage::IN_CHUNK) {
-            let sql = coverage::covered_among_sql(DIALECT, chunk.len());
-            let mut params: Vec<&dyn tiberius::ToSql> = vec![&deployment_id];
+            let sql = coverage::covered_among_sql(DIALECT, self.row_scope(), chunk.len());
+            let mut params = self.key_params(&deployment_id);
             params.extend(chunk.iter().map(|u| u as &dyn tiberius::ToSql));
             let rows = tx
                 .client()
@@ -588,8 +615,8 @@ impl MssqlCoverageStore {
         let mut tx = self.begin(false).await?;
         let mut cleared = 0u64;
         for chunk in path_urns.chunks(coverage::IN_CHUNK) {
-            let sql = coverage::clear_paths_sql(DIALECT, chunk.len());
-            let mut params: Vec<&dyn tiberius::ToSql> = vec![&deployment_id];
+            let sql = coverage::clear_paths_sql(DIALECT, self.row_scope(), chunk.len());
+            let mut params = self.key_params(&deployment_id);
             params.extend(chunk.iter().map(|u| u as &dyn tiberius::ToSql));
             cleared += tx
                 .client()
@@ -609,7 +636,13 @@ impl MssqlCoverageStore {
     ) -> Result<CoverageCounts, DataStoreError> {
         check_deployment_id(deployment_id)?;
         let mut tx = self.begin(false).await?;
-        let counts = read_counts(&mut tx, &self.inner.name, deployment_id).await?;
+        let counts = read_counts(
+            &mut tx,
+            &self.inner.name,
+            self.row_scope(),
+            &self.key_params(&deployment_id),
+        )
+        .await?;
         tx.commit(&self.inner.name).await?;
         Ok(counts)
     }
@@ -621,10 +654,19 @@ impl MssqlCoverageStore {
     ) -> Result<CoverageMetrics, DataStoreError> {
         check_deployment_id(deployment_id)?;
         let mut tx = self.begin(true).await?;
-        let counts = read_counts(&mut tx, &self.inner.name, deployment_id).await?;
+        let counts = read_counts(
+            &mut tx,
+            &self.inner.name,
+            self.row_scope(),
+            &self.key_params(&deployment_id),
+        )
+        .await?;
         let rows = tx
             .client()
-            .query(coverage::uncovered_sql(DIALECT).as_str(), &[&deployment_id])
+            .query(
+                coverage::uncovered_sql(DIALECT, self.row_scope()).as_str(),
+                &self.key_params(&deployment_id),
+            )
             .await
             .map_err(|e| cov_err(&self.inner.name, "uncovered", e))?
             .into_first_result()
@@ -651,17 +693,21 @@ impl MssqlCoverageStore {
         let mut tx = self.begin(false).await?;
         let business_key = row.business_key.as_deref();
         let trace_id = row.trace_id.as_deref();
+        let route_urn = row.route_urn.as_str();
+        let segment_process = row.segment_process.as_str();
+        let instance_id = row.instance_id.as_str();
+        let mut params = self.key_params(&deployment_id);
+        params.extend([
+            &route_urn as &dyn tiberius::ToSql,
+            &segment_process,
+            &instance_id,
+            &business_key,
+            &trace_id,
+        ]);
         tx.client()
             .execute(
-                coverage::write_fragment_sql(DIALECT).as_str(),
-                &[
-                    &deployment_id,
-                    &row.route_urn.as_str(),
-                    &row.segment_process.as_str(),
-                    &row.instance_id.as_str(),
-                    &business_key,
-                    &trace_id,
-                ],
+                coverage::write_fragment_sql(DIALECT, self.row_scope()).as_str(),
+                &params,
             )
             .await
             .map_err(|e| cov_err(&self.inner.name, "fragment insert", e))?;
@@ -679,8 +725,8 @@ impl MssqlCoverageStore {
         let rows = tx
             .client()
             .query(
-                coverage::read_fragments_sql(DIALECT).as_str(),
-                &[&deployment_id],
+                coverage::read_fragments_sql(DIALECT, self.row_scope()).as_str(),
+                &self.key_params(&deployment_id),
             )
             .await
             .map_err(|e| cov_err(&self.inner.name, "fragment read", e))?
@@ -715,20 +761,64 @@ impl MssqlCoverageStore {
         let mut tx = self.begin(false).await?;
         tx.client()
             .execute(
-                coverage::reset_metrics_sql(DIALECT).as_str(),
-                &[&deployment_id],
+                coverage::reset_metrics_sql(DIALECT, self.row_scope()).as_str(),
+                &self.key_params(&deployment_id),
             )
             .await
             .map_err(|e| cov_err(&self.inner.name, "reset", e))?;
         tx.client()
             .execute(
-                coverage::delete_fragments_sql(DIALECT).as_str(),
-                &[&deployment_id],
+                coverage::delete_fragments_sql(DIALECT, self.row_scope()).as_str(),
+                &self.key_params(&deployment_id),
             )
             .await
             .map_err(|e| cov_err(&self.inner.name, "fragment reset", e))?;
         tx.commit(&self.inner.name).await?;
         Ok(())
+    }
+
+    /// Run a cycle-registry write; the affected-row count, with a duplicate key counting as zero.
+    pub(crate) async fn cycle_write(
+        &self,
+        sql: &str,
+        binds: &[&str],
+        op: &'static str,
+    ) -> Result<u64, DataStoreError> {
+        let params: Vec<&dyn tiberius::ToSql> =
+            binds.iter().map(|b| b as &dyn tiberius::ToSql).collect();
+        let mut tx = self.begin(false).await?;
+        let affected = match tx.client().execute(sql, &params).await {
+            Ok(done) => done.total(),
+            Err(e) if is_duplicate_key(&e) => 0,
+            Err(e) => return Err(cov_err(&self.inner.name, op, e)),
+        };
+        tx.commit(&self.inner.name).await?;
+        Ok(affected)
+    }
+
+    /// Run a cycle-registry read; the labels of its single text column.
+    pub(crate) async fn cycle_labels(
+        &self,
+        sql: &str,
+        binds: &[&str],
+        op: &'static str,
+    ) -> Result<Vec<String>, DataStoreError> {
+        let params: Vec<&dyn tiberius::ToSql> =
+            binds.iter().map(|b| b as &dyn tiberius::ToSql).collect();
+        let mut tx = self.begin(false).await?;
+        let rows = tx
+            .client()
+            .query(sql, &params)
+            .await
+            .map_err(|e| cov_err(&self.inner.name, op, e))?
+            .into_first_result()
+            .await
+            .map_err(|e| cov_err(&self.inner.name, op, e))?;
+        tx.commit(&self.inner.name).await?;
+        Ok(rows
+            .iter()
+            .map(|r| r.get::<&str, _>(0).unwrap_or_default().to_string())
+            .collect())
     }
 }
 
@@ -736,11 +826,12 @@ impl MssqlCoverageStore {
 async fn read_counts(
     tx: &mut CoverageTx,
     store: &str,
-    deployment_id: &str,
+    scope: coverage::CoverageRowScope,
+    key_params: &[&dyn tiberius::ToSql],
 ) -> Result<CoverageCounts, DataStoreError> {
     let rows = tx
         .client()
-        .query(coverage::counts_sql(DIALECT).as_str(), &[&deployment_id])
+        .query(coverage::counts_sql(DIALECT, scope).as_str(), key_params)
         .await
         .map_err(|e| cov_err(store, "count", e))?
         .into_first_result()

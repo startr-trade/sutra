@@ -17,6 +17,8 @@ mod lint_broadcast_dedup_test;
 mod lint_channel_call_alias_test;
 #[path = "all/lint_feel_assignment_and_loop_test.rs"]
 mod lint_feel_assignment_and_loop_test;
+#[path = "all/lint_local_send_test.rs"]
+mod lint_local_send_test;
 #[path = "all/lint_navigation_test.rs"]
 mod lint_navigation_test;
 #[path = "all/lint_never_init_test.rs"]
@@ -31,6 +33,8 @@ mod lint_receipt_attribute_test;
 mod lint_relay_channel_test;
 #[path = "all/lint_selector_test.rs"]
 mod lint_selector_test;
+#[path = "all/lint_start_and_wait_test.rs"]
+mod lint_start_and_wait_test;
 #[path = "all/lint_store_structure_test.rs"]
 mod lint_store_structure_test;
 #[path = "all/lint_stream_test.rs"]

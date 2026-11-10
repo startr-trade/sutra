@@ -959,3 +959,26 @@ async fn raw_message_text_column_round_trips_exactly() {
         assert_eq!(read["body"].as_str(), Some(body), "{key}");
     }
 }
+
+/// Declaring, activating, the single-active rule, row isolation and continuing an earlier cycle.
+#[ignore = "docker"]
+#[tokio::test(flavor = "multi_thread")]
+async fn coverage_cycles_keep_to_their_own_rows() {
+    let db = fixture::fresh_db().await;
+    let store = fixture::coverage_store(&db);
+    crate::coverage_cycle_contract::run(&store).await;
+}
+
+/// A database from before cycles: its rows read as "no cycle", and cycles work beside them.
+#[ignore = "docker"]
+#[tokio::test(flavor = "multi_thread")]
+async fn coverage_cycles_upgrade_a_database_that_predates_them() {
+    let db = fixture::fresh_db().await;
+    let ddl = crate::coverage_cycle_contract::pre_cycle_ddl(sutra_datastore::SqlDialect::Mssql);
+    // Any store's first use applies its scripts; the lookup fails only on its own absent table.
+    let _ = fixture::store_with_ddl(&db, "pre-cycle", &ddl)
+        .get("x")
+        .await;
+    let store = fixture::coverage_store(&db);
+    crate::coverage_cycle_contract::assert_upgraded(&store).await;
+}

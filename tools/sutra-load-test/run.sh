@@ -32,9 +32,15 @@
 #   ERROR_RATE_THRESHOLD   default 0.005   (= 0.5%)
 #   P99_MS_THRESHOLD       default 500
 #
+# Resource metrics (optional): name where the engine and PostgreSQL run and each load step also
+# reports engine CPU and RSS, PostgreSQL CPU, IOPS and WAL. Unreadable ones print "unavailable".
+#   ENGINE_PID | ENGINE_CONTAINER, PG_PID | PG_CONTAINER, PG_PSQL, PG_USER, PG_DB
+# See step-metrics.sh for what each is read from.
+#
 # Output (per run):
 #   tools/sutra-load-test/results/<timestamp>-<profile>-<target>.json
 #   tools/sutra-load-test/results/<timestamp>-<profile>-<target>.md
+#   tools/sutra-load-test/results/<timestamp>-<profile>-<target>.metrics.json   (the resource metrics)
 #
 # Both are .gitignore'd locally; CI uploads them as artifacts with 90-day retention.
 
@@ -54,7 +60,7 @@ for arg in "$@"; do
         --profile=*)  PROFILE="${arg#--profile=}" ;;
         --url=*)      EXTERNAL_URL="${arg#--url=}" ;;
         -h|--help)
-            sed -n '3,33p' "$0"
+            sed -n '3,38p' "$0"
             exit 0
             ;;
         *)
@@ -109,6 +115,11 @@ fi
 TS="$(date -u +%Y%m%dT%H%M%SZ)"
 JSON_OUT="$RESULTS_DIR/${TS}-${PROFILE}-${TARGET}.json"
 SUMMARY_OUT="$RESULTS_DIR/${TS}-${PROFILE}-${TARGET}.md"
+METRICS_OUT="$RESULTS_DIR/${TS}-${PROFILE}-${TARGET}.metrics.json"
+# shellcheck source=step-metrics.sh
+. "$(dirname "${BASH_SOURCE[0]}")/step-metrics.sh"
+SM_DIR="$(mktemp -d)"
+trap 'rm -rf "$SM_DIR"' EXIT
 
 # --- prerequisites ------------------------------------------------------------
 
@@ -140,6 +151,7 @@ API_KEY="${SUTRA_API_KEY:-hello-demo-key}"
 # emits the aggregated metrics k6 prints at end-of-run as machine-readable JSON,
 # which is what we summarise below. --out json=... emits per-request samples
 # (large; useful for post-hoc analysis but not parsed here).
+sm_snapshot "$SM_DIR/before"
 set +e
 BASE_URL="$BASE_URL" \
 API_KEY="$API_KEY" \
@@ -149,6 +161,8 @@ PAYLOAD="$PAYLOAD_PATH" \
         "$PROFILE_SCRIPT"
 K6_EXIT=$?
 set -e
+sm_snapshot "$SM_DIR/after"
+sm_report_json "$SM_DIR/before" "$SM_DIR/after" "$PROFILE" >"$METRICS_OUT"
 
 if [ ! -f "$JSON_OUT" ]; then
     echo "[load-test] k6 produced no JSON output (exit=$K6_EXIT)" >&2
@@ -212,6 +226,8 @@ k6_version="$(k6 version 2>/dev/null | head -1 || echo unknown)"
     printf '| Latency p99 | %.2f ms |\n'            "$p99"
     printf '| Checks passed | %s |\n'               "$chk_pass"
     printf '| Checks failed | %s |\n'               "$chk_fail"
+    echo
+    sm_report "$SM_DIR/before" "$SM_DIR/after" "$PROFILE"
     echo
     echo "## Load-generator host metadata"
     echo

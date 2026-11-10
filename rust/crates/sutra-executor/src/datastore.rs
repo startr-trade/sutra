@@ -27,17 +27,34 @@ use crate::deployment::DeploymentId;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoreError {
     message: String,
+    code: Option<String>,
 }
 
 impl StoreError {
     pub fn new(message: impl Into<String>) -> StoreError {
         StoreError {
             message: message.into(),
+            code: None,
+        }
+    }
+
+    /// A failure the backend names with a stable `SUTRA.*` code (an edited, already-applied
+    /// migration, a projected-store contract refusal). The executor fails the step with this code
+    /// instead of the generic `SUTRA.RUNTIME.UNEXPECTED`.
+    pub fn with_code(code: impl Into<String>, message: impl Into<String>) -> StoreError {
+        StoreError {
+            message: message.into(),
+            code: Some(code.into()),
         }
     }
 
     pub fn message(&self) -> &str {
         &self.message
+    }
+
+    /// The backend's stable diagnostic code, when the failure has one.
+    pub fn code(&self) -> Option<&str> {
+        self.code.as_deref()
     }
 }
 

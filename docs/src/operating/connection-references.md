@@ -27,10 +27,9 @@ You need the engine, PostgreSQL and a broker. This was run on PostgreSQL 16 and 
 
 Other properties of these channels, such as `prefetch-count`, stay literal.
 
-**Credentials follow their own rule.** On `rabbitmq` and `amqp`, `username` and `password` must be `${NAME}`,
-`env:NAME` or `k8s:secret/<name>#<key>`. A `secret:KEY` or `${secret:KEY}` there is refused with
-`SUTRA.STARTUP.REFUSED.HARDCODED_SECRET`. To use a mounted secret as a broker password, expose it to the
-engine as an environment variable.
+**Credentials** (`username`, `password` on `rabbitmq` and `amqp`) take the whole-value forms above, `${secret:KEY}`
+included since 0.6.20, and `k8s:secret/<name>#<key>`. A literal, or text with a reference inside it such as `pre${X}`,
+is refused with `SUTRA.STARTUP.REFUSED.HARDCODED_SECRET`. See [section 5](#5-broker-credentials-from-a-secret-and-a-blank-reference).
 
 ## 1. The channel
 
@@ -139,12 +138,87 @@ because the deploy's own answer won't show it.
 If the channel with the bad reference already had a running consumer, that consumer stops. The next activation
 in which the reference resolves starts it again.
 
+## 5. Broker credentials from a secret, and a blank reference
+
+Since 0.6.20, `username` and `password` on `rabbitmq` and `amqp` take `secret:KEY` and `${secret:KEY}`, besides
+`${NAME}`, `env:NAME` and `k8s:secret/<name>#<key>`. A literal is still refused with
+`SUTRA.STARTUP.REFUSED.HARDCODED_SECRET`.
+
+A reference that resolves to blank now warns `SUTRA.CONFIG.PROPERTY.BLANK_REFERENCE`, naming the channel, the property
+and the reference as written, never a value. Write `${NAME:}` for an optional setting: it does not warn.
+
+A RabbitMQ channel whose credentials come from secret files (`/etc/sutra/secrets/broker-user`,
+`/etc/sutra/secrets/broker-password`), and whose `exchange` is `${H}` with `H` set but empty. The
+broker has only the user in that file, so the consumer connects only if the credentials resolved.
+Run B is the same package with `exchange: ${H:}`.
+
+```text
+using sutra 0.6.20
+$ cat refnotes/channels.yaml
+channels:
+  - name: note-in
+    transport: rabbitmq
+    host: ${BROKER_HOST}
+    virtual-host: env:BROKER_VHOST
+    queue: secret:notes-queue
+    exchange: ${H}
+    username: secret:broker-user
+    password: ${secret:broker-password}
+    ack-mode: on-persist
+    cloudevents-mode: none
+$ sutra lint refnotes
+[WARN] SUTRA.CHANNEL.NO_SCHEMA — deployment default/refnotes/1.0.0 (dep-ffffffffffffffffffffffff): channel 'note-in' has 1 subscriber(s) but its codec (none) declares no message types — no type can be derived, so only a catch-all <q:source> can match. Schema-less ingress is legitimate; this warns so
+[WARN] SUTRA.DEPLOY.DATASTORE.SHARED_CONNECTION — the connection of data store(s) notes names neither this package's tenant nor its module, so a copy co-hosted on one engine resolves the same connection and shares those stores' rows. If that is not intended, give each variant its own reference in it
+0 error(s), 2 warning(s)
+[exit 0]
+$ sutra package refnotes -o out-a
+[WARN] SUTRA.CHANNEL.NO_SCHEMA — deployment default/refnotes/1.0.0 (dep-ffffffffffffffffffffffff): channel 'note-in' has 1 subscriber(s) but its codec (none) declares no message types — no type can be derived, so only a catch-all <q:source> can match. Schema-less ingress is legitimate; this warns so it is explicit.
+packaged out-a/refnotes.sutra (deploymentId dep-11d6a5f464d563879221824f)
+[exit 0]
+package refnotes-b exit=0
+broker up: 1
+
+== Run A: secret: credentials, exchange: ${H} with H set but empty
+ready: {"status":"UP","checks":[{"name":"sutra-loader","status":"UP","data":{"deploymen
+queue, consumers: notes-from-a-secret	1
+Message published
+ store_key |                    body                    
+-----------+--------------------------------------------
+ s-1       | {"title":"credentials from a secret file"}
+(1 row)
+
+BLANK_REFERENCE lines:
+{"code":"SUTRA.CONFIG.PROPERTY.BLANK_REFERENCE","channel":"note-in","property":"exchange","timestamp":"2026-11-10T05:26:09.248+00:00","sequence":6,"level":"WARN","loggerName":"sutra_transport_spi","message":"channel 'note-in' property 'exchange' reference '${H}' resolved to blank, so the property is unset: the transport's built-in default applies, or a required property is refused. Write the refer
+HARDCODED_SECRET lines: 0
+broker password in the log: 0
+
+== Run B: exchange: ${H:} with H set but empty
+ready: {"status":"UP","checks":[{"name":"sutra-loader","status":"UP","data":{"deploymen
+queue, consumers: notes-from-a-secret	1
+Message published
+ store_key |              body               
+-----------+---------------------------------
+ s-2       | {"title":"an optional setting"}
+(1 row)
+
+BLANK_REFERENCE lines: 0
+broker password in the log: 0
+removed, left: 0
+```
+
+The full warning text, one line in the log:
+
+```text
+channel 'note-in' property 'exchange' reference '${H}' resolved to blank, so the property is unset: the transport's built-in default applies, or a required property is refused. Write the reference with an empty default, such as ${NAME:}, to leave it blank on purpose
+```
+
 ## What to watch for
 
 - **A reference that resolves to blank is the property left unset,** so `${NAME:}` writes an optional setting. A
   variable that is set but empty counts too. A required property is then refused: Kafka `bootstrap.servers` and
   `topic`, RabbitMQ `queue`, AMQP `host`, Pub/Sub `project-id`, the file spool directory. One with a default takes
-  it with no warning: RabbitMQ `host` becomes `localhost`, and Kafka `group.id` becomes `sutra-<channel>`.
+  it: RabbitMQ `host` becomes `localhost`, and Kafka `group.id` becomes `sutra-<channel>`. Since 0.6.20 the engine logs
+  `SUTRA.CONFIG.PROPERTY.BLANK_REFERENCE` first (0.6.19 was silent); `${NAME:}` is the explicit form and does not warn.
 - **A value that starts with a secret scheme and a colon is a reference.** A Kafka broker called `vault`, written
   `bootstrap.servers: vault:9092`, fails to resolve. Write it `${BROKER:vault:9092}`. `kafka:9092` is fine.
 - **A changed value restarts the consumer at the next activation.** An activation is what reads it again; nothing

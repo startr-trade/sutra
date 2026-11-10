@@ -119,7 +119,8 @@ mod tests {
         let versions: Vec<i64> = scripts.iter().map(|s| s.version).collect();
         // The reference set minus the four row-security scripts (V403/V602/V702/V802 —
         // enforced-bind posture) plus the V605 external-task (pull) table, the V803 timer
-        // addendum and the deployment-archive store (V1001 — DB-backed deployment source). No
+        // addendum and the deployment-archive store (V1001 — DB-backed deployment source, V1003 its retained-channels
+        // flag). No
         // V9xx: coverage is not an engine-database
         // subsystem — its DDL ships with `sutra-datastore`
         // and is applied to the `coverage` store the deployment declares.
@@ -127,7 +128,7 @@ mod tests {
             versions,
             vec![
                 101, 201, 301, 302, 304, 401, 402, 501, 601, 603, 604, 605, 606, 701, 801, 803,
-                804, 1001
+                804, 1001, 1003
             ]
         );
     }

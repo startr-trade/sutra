@@ -601,10 +601,13 @@ fn read_archive_internal(
     let mut diagnostics: Vec<LintDiagnostic> = Vec::new();
     validate_deployment(&deployment, &mut diagnostics);
     // A sealed archive may come from an earlier CLI, which accepted any `dedupKey`. Whoever reads it
-    // decides: what is already deployed keeps running, and a new deploy is refused.
+    // decides: what is already deployed keeps running, and a new deploy is refused. The same goes for
+    // a literal `local://` send to another package and an unknown called element
+    // ([`crate::lint::deployment_send_faults`]).
     let refuses = |d: &&LintDiagnostic| {
         d.severity == LintSeverity::Error
             && d.code != sutra_bpmn::codes::PARSE_Q_SOURCE_DEDUP_KEY_UNRECOGNISED
+            && !crate::lint::DEPLOY_PATH_ONLY_CODES.contains(&d.code.as_str())
     };
     if let Some(first) = diagnostics.iter().find(refuses) {
         let error_count = diagnostics.iter().filter(refuses).count();

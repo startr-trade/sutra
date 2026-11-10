@@ -26,7 +26,7 @@ status, and the file transport moves the file to `.failed/`. Every other transpo
   channel and the dedup key. It never carries the body.
 - When an audit sink is on, a record `inbound.DELIVERY_DROPPED` in the deployment's journal. Its
   `diagnostic_code` is the refusal's, and its `diagnostic_json` names the channel. No instance owns it, so its
-  `instance_id` is empty.
+  `instance_id` is NULL, not empty: select it with `instance_id IS NULL`.
 
 Two limits of this release:
 

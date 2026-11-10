@@ -14,6 +14,8 @@ pub mod catalog;
 pub mod codecs;
 pub mod compat_baseline;
 pub mod coverage;
+mod coverage_compliance;
+pub mod coverage_cycle;
 pub mod create;
 pub mod crypto;
 pub mod deploy;

@@ -31,8 +31,10 @@ pub struct MySqlDeploymentArchiveStore {
 const SQL_NEXT_REVISION: &str =
     "SELECT CAST(COALESCE(MAX(revision), 0) + 1 AS SIGNED) FROM deployment_archive WHERE slot = ?";
 
+/// A replace in place supersedes the prior row, which keeps the channels nothing newer declares.
 const SQL_DEMOTE: &str =
-    "UPDATE deployment_archive SET status = 'draining' WHERE slot = ? AND status = 'active'";
+    "UPDATE deployment_archive SET status = 'draining', retains_channels = TRUE \
+     WHERE slot = ? AND status = 'active'";
 
 /// Keyed on the `deployment_id` PRIMARY KEY: an identical content-hash re-deploy (a
 /// rollback) re-activates the existing row — flipped to `draining` by the demote above —
@@ -43,7 +45,8 @@ const SQL_INSERT: &str = "INSERT INTO deployment_archive \
      VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?) \
      ON DUPLICATE KEY UPDATE \
        status = 'active', slot = VALUES(slot), revision = VALUES(revision), \
-       bytes = VALUES(bytes), checksum = VALUES(checksum), activated_at = VALUES(activated_at)";
+       bytes = VALUES(bytes), checksum = VALUES(checksum), activated_at = VALUES(activated_at), \
+       retains_channels = FALSE";
 
 const SQL_LIST_ACTIVE: &str =
     "SELECT deployment_id, slot, tenant, module, version, revision, bytes \
@@ -52,7 +55,7 @@ const SQL_LIST_ACTIVE: &str =
 /// The SERVED set (active + the draining tail), newest revision first within a slot — the
 /// reference's `list_active_and_draining` select, verbatim apart from the placeholder dialect.
 const SQL_LIST_SERVED: &str =
-    "SELECT deployment_id, slot, tenant, module, version, revision, bytes, status \
+    "SELECT deployment_id, slot, tenant, module, version, revision, bytes, status, retains_channels \
      FROM deployment_archive WHERE status IN ('active', 'draining') \
      ORDER BY slot, revision DESC";
 
@@ -161,6 +164,7 @@ impl MySqlDeploymentArchiveStore {
                         bytes: r.try_get("bytes").map_err(map_row)?,
                     },
                     status: ArchiveStatus::parse(&str_col(r, "status")?)?,
+                    retains_channels: r.try_get("retains_channels").map_err(map_row)?,
                 })
             })
             .collect()

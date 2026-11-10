@@ -423,6 +423,25 @@ pub async fn serve(config: EngineConfig) -> Result<RunningEngine, Box<dyn std::e
         .collect();
     let boot_facts: Vec<crate::deployment_facts::DeploymentFacts> =
         boot_plans.iter().map(|p| p.facts.clone()).collect();
+    let boot_draining_facts: Vec<crate::deployment_facts::DeploymentFacts> = boot_draining_plans
+        .iter()
+        .map(|p| p.facts.clone())
+        .collect();
+    let boot_draining_ids: Vec<String> = boot_draining_plans
+        .iter()
+        .map(|p| p.dep.value().to_string())
+        .collect();
+    let boot_holds = crate::deploy::draining_holds(
+        &boot_plans
+            .iter()
+            .map(crate::deploy::ServedChannels::of)
+            .collect::<Vec<_>>(),
+        &boot_draining_plans
+            .iter()
+            .map(crate::deploy::ServedChannels::of)
+            .collect::<Vec<_>>(),
+        &Default::default(),
+    );
     // Crypto key provider — HkdfKeyProvider from the master key, or the envelope
     // EnvelopeKeyProvider loading sealed DEKs from the `data_key` store (async, so built here in
     // serve() before the runtime-less actor thread). The one provider is shared by the persistence
@@ -587,6 +606,9 @@ pub async fn serve(config: EngineConfig) -> Result<RunningEngine, Box<dyn std::e
                     .collect();
                 s.facts = boot_facts;
                 s.failed = refused;
+                s.draining = boot_draining_ids;
+                s.holds = boot_holds;
+                s.draining_facts = boot_draining_facts;
             }
             let controller = Arc::new(crate::deploy::DeployController::new(store, hooks));
             (None, Some(controller))
@@ -1121,7 +1143,7 @@ fn deploy_refusal_response(error: String) -> axum::response::Response {
 
 /// `POST /admin/deployments/check` body — judge an archive against the ACTIVE set, changing
 /// nothing. A verdict is always `200`; only an archive that does not verify is a `400`.
-pub(crate) fn deployment_check_response(
+pub(crate) async fn deployment_check_response(
     state: &AppState,
     slot: Option<&str>,
     body: &[u8],
@@ -1130,6 +1152,7 @@ pub(crate) fn deployment_check_response(
         .map_err(|e| format!("{e}"))
         .and_then(|archive| {
             crate::deploy::refuse_unrecognised_dedup_keys(&archive.deployment)?;
+            crate::deploy::refuse_send_faults(&archive.deployment)?;
             crate::deployment_facts::DeploymentFacts::of_loaded(
                 &archive.deployment,
                 crate::deployment_facts::ConnectionView::Resolved,
@@ -1148,22 +1171,55 @@ pub(crate) fn deployment_check_response(
                 .into_response();
         }
     };
-    // Judging against nothing would answer `ok: true` for a set this engine cannot read.
-    let Ok(status) = state.deploy_status.read() else {
+    // Judging against nothing would answer `ok: true` for a set this engine cannot read. The guard
+    // stays inside this block: nothing below may hold it across an await.
+    let read = {
+        let guard = state.deploy_status.read();
+        guard.ok().map(|status| {
+            let others: Vec<crate::deployment_facts::DeploymentFacts> = status
+                .facts
+                .iter()
+                .filter(|f| f.slot != candidate.slot)
+                .cloned()
+                .collect();
+            // What draining versions keep, with the instance counts the last sweep read.
+            let holds: Vec<crate::deployment_facts::DrainingHold> = status
+                .holds
+                .iter()
+                .cloned()
+                .map(|mut hold| {
+                    hold.instances = status
+                        .draining_instances
+                        .get(&hold.facts.deployment_id)
+                        .copied();
+                    hold
+                })
+                .collect();
+            // The older versions of its owner, active and draining: what an upgrade warns about.
+            let older_facts: Vec<crate::deployment_facts::DeploymentFacts> = others
+                .iter()
+                .chain(status.draining_facts.iter())
+                .filter(|f| f.owner == candidate.owner)
+                .cloned()
+                .collect();
+            (others, holds, older_facts)
+        })
+    };
+    let Some((others, holds, older_facts)) = read else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({ "error": "deployment status is unavailable" })),
         )
             .into_response();
     };
-    let others: Vec<crate::deployment_facts::DeploymentFacts> = status
-        .facts
-        .iter()
-        .filter(|f| f.slot != candidate.slot)
-        .cloned()
-        .collect();
-    drop(status);
-    let mut verdict = crate::deployment_facts::evaluate_candidate(&candidate, &others);
+    let mut verdict =
+        crate::deployment_facts::evaluate_candidate_with_holds(&candidate, &others, &holds);
+    let older: Vec<&crate::deployment_facts::DeploymentFacts> = older_facts.iter().collect();
+    for finding in crate::deploy::UpgradeFinding::of(&candidate, &older) {
+        verdict
+            .warnings
+            .push(finding.counted(state.pool.as_ref()).await);
+    }
     // With no deploy controller this engine serves a folder.
     if state.deploy.is_none() {
         verdict.warn_for_folder_target(&candidate);
@@ -1173,7 +1229,7 @@ pub(crate) fn deployment_check_response(
         Json(serde_json::json!({
             "deploymentId": candidate.deployment_id,
             "slot": candidate.slot,
-            "ok": verdict.collisions.is_empty(),
+            "ok": verdict.is_ok(),
             "collisions": verdict.collisions.iter().map(|c| serde_json::json!({
                 "code": sutra_channels::codes::DEPLOY_ENDPOINT_COLLISION,
                 "transport": c.transport,
@@ -1183,7 +1239,16 @@ pub(crate) fn deployment_check_response(
                 "claimant": c.claimant_label,
                 "claimantChannel": c.claimant_channel,
                 "message": c.describe(),
-            })).collect::<Vec<_>>(),
+            })).chain(verdict.retained_collisions.iter().map(|c| serde_json::json!({
+                "code": sutra_channels::codes::DEPLOY_ENDPOINT_COLLISION,
+                "transport": c.transport,
+                "endpoint": c.identity,
+                "holder": c.holder_label,
+                "holderDraining": true,
+                "holderInstances": c.instances,
+                "claimant": candidate.label,
+                "message": c.describe(),
+            }))).collect::<Vec<_>>(),
             "warnings": verdict.warnings.iter()
                 .map(crate::deployment_facts::DeployWarning::to_json)
                 .collect::<Vec<_>>(),

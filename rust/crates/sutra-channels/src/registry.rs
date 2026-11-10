@@ -362,6 +362,91 @@ pub struct RelayTarget {
     pub wait_node_id: String,
 }
 
+/// One wait of a process and a channel it subscribes to: a user task, a message catch event or a
+/// receive task on its channel, or a channel-call task on the channel its response arrives on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WaitSubscription {
+    pub process_id: String,
+    pub node_id: String,
+    pub channel: String,
+    /// The `<q:source messageTypeValue>` the wait is pinned to, if any.
+    pub message_type: Option<String>,
+    /// The `<q:source messageTypePattern>` it accepts, if any.
+    pub message_type_pattern: Option<String>,
+}
+
+/// Every wait of `process` and the channels it subscribes to, in node order: what a relay message
+/// on a channel can resume. Only the process's own nodes, as the relay resolves them.
+pub fn wait_subscriptions(process: &ProcessDefinition) -> Vec<WaitSubscription> {
+    let mut out: Vec<WaitSubscription> = Vec::new();
+    for node in process.nodes() {
+        let bindings = process.bindings_for(node.id());
+        for_each_wait_channel(process, node, |channel| {
+            if out
+                .iter()
+                .any(|w| w.node_id == node.id() && w.channel == channel)
+            {
+                return;
+            }
+            let source = bindings.sources.iter().find(|s| s.channel == channel);
+            out.push(WaitSubscription {
+                process_id: process.id.clone(),
+                node_id: node.id().to_string(),
+                channel: channel.to_string(),
+                message_type: source.and_then(|s| s.message_type_value.clone()),
+                message_type_pattern: source.and_then(|s| s.message_type_pattern.clone()),
+            });
+        });
+    }
+    out
+}
+
+/// Whether a subscription typed `(a_type, a_pattern)` and one typed `(b_type, b_pattern)` can both
+/// accept one message: either declares no type, or both pin the same type, or a pattern is
+/// involved (two patterns, or a pattern and a type, are taken to overlap: proving otherwise would
+/// mean comparing regular languages).
+pub fn message_types_can_overlap(
+    a_type: Option<&str>,
+    a_pattern: Option<&str>,
+    b_type: Option<&str>,
+    b_pattern: Option<&str>,
+) -> bool {
+    let untyped = |t: Option<&str>, p: Option<&str>| t.is_none() && p.is_none();
+    if untyped(a_type, a_pattern) || untyped(b_type, b_pattern) {
+        return true;
+    }
+    match (a_type, b_type) {
+        (Some(a), Some(b)) => a == b,
+        _ => true,
+    }
+}
+
+/// Call `visit` with each channel `node` waits on. The one definition of a wait the relay and
+/// [`wait_subscriptions`] share; it allocates nothing.
+fn for_each_wait_channel(
+    process: &ProcessDefinition,
+    node: &sutra_bpmn::model::Node,
+    mut visit: impl FnMut(&str),
+) {
+    match node {
+        sutra_bpmn::model::Node::UserTask { channels, .. }
+        | sutra_bpmn::model::Node::MessageCatchEvent { channels, .. }
+        | sutra_bpmn::model::Node::ReceiveTask { channels, .. } => {
+            channels.iter().for_each(|c| visit(c));
+        }
+        // A channel-call task's <q:source channel> names the inbound channel its correlated
+        // RESPONSE arrives on.
+        sutra_bpmn::model::Node::ServiceTask {
+            id, implementation, ..
+        } if implementation.starts_with(sutra_bpmn::model::CHANNEL_CALL_PREFIX) => process
+            .bindings_for(id)
+            .sources
+            .iter()
+            .for_each(|s| visit(&s.channel)),
+        _ => {}
+    }
+}
+
 /// Deployment-scoped module registry with cross-process message-type dispatch — the
 /// handler-resolution / module-lookup slice of the process registry. A
 /// deployment (module version) may span several BPMN files; registering each loaded
@@ -623,26 +708,10 @@ impl ProcessModuleRegistry {
         let mut out: Vec<(u8, RelayTarget)> = Vec::new();
         for process in processes {
             for node in process.nodes() {
-                let subscribed = match node {
-                    sutra_bpmn::model::Node::UserTask { channels, .. }
-                    | sutra_bpmn::model::Node::MessageCatchEvent { channels, .. }
-                    | sutra_bpmn::model::Node::ReceiveTask { channels, .. } => {
-                        channels.iter().any(|c| c == channel)
-                    }
-                    // A channel-call task's <q:source channel> names the inbound
-                    // channel its correlated RESPONSE arrives on.
-                    sutra_bpmn::model::Node::ServiceTask {
-                        id, implementation, ..
-                    } if implementation.starts_with(sutra_bpmn::model::CHANNEL_CALL_PREFIX) => {
-                        process
-                            .bindings_for(id)
-                            .sources
-                            .iter()
-                            .any(|s| s.channel == channel)
-                    }
-                    _ => false,
-                };
+                let mut subscribed = false;
+                for_each_wait_channel(process, node, |c| subscribed |= c == channel);
                 if subscribed {
+                    let node_id = node.id();
                     let predicates = CompiledPredicates {
                         selectors: table,
                         process_id: &process.id,
@@ -653,16 +722,16 @@ impl ProcessModuleRegistry {
                     // Only consult the predicate when the node's source declares one, matching
                     // the start-event rule: no predicate means no opinion.
                     let declares_predicate = process
-                        .bindings_for(node.id())
+                        .bindings_for(node_id)
                         .sources
                         .iter()
                         .any(|s| s.channel == channel && s.filter_expression.is_some());
                     if declares_predicate
-                        && !sutra_bpmn::SourcePredicate::holds(&predicates, node.id())
+                        && !sutra_bpmn::SourcePredicate::holds(&predicates, node_id)
                     {
                         continue;
                     }
-                    let Some(tier) = relay_type_tier(process, node.id(), channel, message_type)
+                    let Some(tier) = relay_type_tier(process, node_id, channel, message_type)
                     else {
                         continue;
                     };
@@ -670,7 +739,7 @@ impl ProcessModuleRegistry {
                         tier,
                         RelayTarget {
                             process: Arc::clone(process),
-                            wait_node_id: node.id().to_string(),
+                            wait_node_id: node_id.to_string(),
                         },
                     ));
                 }

@@ -23,6 +23,9 @@ use sutra_datastore::{
     StructureRef,
 };
 
+#[path = "coverage_cycle_contract/contract.rs"]
+mod coverage_cycle_contract;
+
 // ---- dockerised PostgreSQL (dynamic port) ---------------------------------
 
 struct PgContainer {
@@ -1726,4 +1729,26 @@ async fn a_failed_migration_records_nothing() {
     let fixed = PostgresDataStore::from_definition(&def, ledger_scripts("broken", &good)).unwrap();
     assert_eq!(fixed.get("k").await.unwrap(), None);
     assert_eq!(ledger_rows(&url, "broken").await.len(), 2);
+}
+
+/// Declaring, activating, the single-active rule, row isolation and continuing an earlier cycle.
+#[ignore = "docker"]
+#[tokio::test(flavor = "multi_thread")]
+async fn coverage_cycles_keep_to_their_own_rows() {
+    let pg = PgContainer::start();
+    coverage_cycle_contract::run(&coverage_store(&pg.url())).await;
+}
+
+/// A database from before cycles: its rows read as "no cycle", and cycles work beside them.
+#[ignore = "docker"]
+#[tokio::test(flavor = "multi_thread")]
+async fn coverage_cycles_upgrade_a_database_that_predates_them() {
+    let pg = PgContainer::start();
+    let ddl = coverage_cycle_contract::pre_cycle_ddl(sutra_datastore::SqlDialect::Postgres);
+    // Any store's first use applies its scripts; the lookup fails only on its own absent table.
+    let pre_cycle =
+        PostgresDataStore::from_definition(&literal_def("pre-cycle", &pg.url()), vec![ddl])
+            .unwrap();
+    let _ = pre_cycle.get("x").await;
+    coverage_cycle_contract::assert_upgraded(&coverage_store(&pg.url())).await;
 }

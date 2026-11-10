@@ -40,14 +40,18 @@ pub use archive::{
     deployment_from_entries, deployment_id_of_manifest, read_archive, read_archive_expecting,
     read_archive_file, write_archive, ArchiveManifest, ArtifactEntry, LoadedArchive,
 };
-pub use coverage::{BusinessCorrelation, CoverageFile, CoverageRoute, Hop};
+pub use coverage::{
+    parse_requirements_map, BusinessCorrelation, CoverageFile, CoverageRoute, Hop, RequirementsMap,
+    RouteRequirements, DEFAULT_ROUTE_WEIGHT, REQUIREMENTS_MAP_FILE,
+};
 pub use error::LoaderError;
 pub use layer_stack::{
     assemble_stack, compose_stack, lint_stack, LayerStack, StackLayer, StackOverride, StackRemoval,
     StackResolution,
 };
 pub use lint::{
-    unrecognised_dedup_keys, LintDiagnostic, LintReport, LintSeverity, UnrecognisedDedupKey,
+    deployment_send_faults, unrecognised_dedup_keys, LintDiagnostic, LintReport, LintSeverity,
+    UnrecognisedDedupKey,
 };
 pub use overlay::{
     assemble_dir_with_overlays, compose_overlays, lint_dir_with_overlays, ComposedPackage,

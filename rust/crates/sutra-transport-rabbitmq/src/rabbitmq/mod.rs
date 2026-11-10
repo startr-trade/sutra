@@ -241,9 +241,10 @@ fn parse_u16(
 }
 
 /// Enforce the 15-factor secret discipline (the secret-reference validation):
-/// broker credentials must be references —
-/// `${ENV_VAR}` (optionally with `:default`), `k8s:secret/<name>#<key>`, or the Rust
-/// engine's `env:NAME` form — never literals.
+/// broker credentials must be references — any form the engine's reference resolver
+/// resolves (`env:NAME`, `secret:KEY`, a registered secret-store scheme, `${NAME}`,
+/// `${secret:KEY}`, each placeholder optionally with `:default`), or
+/// `k8s:secret/<name>#<key>` — never literals.
 fn require_secret_ref(
     raw: Option<&String>,
     key: &str,
@@ -252,30 +253,16 @@ fn require_secret_ref(
     let Some(value) = non_blank(raw) else {
         return Ok(None);
     };
-    if is_env_placeholder(&value) || is_k8s_secret_ref(&value) || value.starts_with("env:") {
+    if sutra_envref_spi::is_whole_reference(&value) || is_k8s_secret_ref(&value) {
         return Ok(Some(value));
     }
     Err(Diagnostic::error(
         codes::STARTUP_REFUSED_HARDCODED_SECRET,
         format!(
             "rabbitmq channel '{channel}' property '{key}' must be a secret reference \
-             (e.g. ${{ENV_VAR}} or k8s:secret/<name>#<key>); literal credentials are rejected."
+             (e.g. secret:KEY, ${{secret:KEY}} or ${{ENV_VAR}}); literal credentials are rejected."
         ),
     ))
-}
-
-/// `^\$\{[A-Z_][A-Z0-9_]*(:.*)?}$` without a regex dependency.
-fn is_env_placeholder(value: &str) -> bool {
-    let Some(inner) = value.strip_prefix("${").and_then(|v| v.strip_suffix('}')) else {
-        return false;
-    };
-    let name = inner.split_once(':').map_or(inner, |(n, _)| n);
-    let mut chars = name.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    (first.is_ascii_uppercase() || first == '_')
-        && chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
 }
 
 /// `^k8s:secret/[^#]+#.+$` without a regex dependency.
@@ -570,6 +557,16 @@ mod tests {
         let def = definition(&[("queue", "q"), ("username", "admin")]);
         let err = RabbitMqChannelProperties::from_definition(&def).unwrap_err();
         assert_eq!(err.code, codes::STARTUP_REFUSED_HARDCODED_SECRET);
+        // A literal that merely contains a colon is not a reference either.
+        for literal in ["s3cr3t:pass", "secret:", "pre${RABBITMQ_PASSWORD}"] {
+            let def = definition(&[("queue", "q"), ("password", literal)]);
+            let err = RabbitMqChannelProperties::from_definition(&def).unwrap_err();
+            assert_eq!(
+                err.code,
+                codes::STARTUP_REFUSED_HARDCODED_SECRET,
+                "{literal}"
+            );
+        }
 
         // Reference forms all pass.
         for reference in [
@@ -577,6 +574,8 @@ mod tests {
             "${RABBITMQ_PASSWORD:guest}",
             "k8s:secret/broker-creds#password",
             "env:RABBITMQ_PASSWORD",
+            "secret:broker-password",
+            "${secret:broker-password}",
         ] {
             let def = definition(&[("queue", "q"), ("password", reference)]);
             assert!(
@@ -584,9 +583,10 @@ mod tests {
                 "reference form '{reference}' must be accepted"
             );
         }
-        // Lowercase env names are NOT the `${ENV}` form (the regex only matches uppercase).
+        // A lowercase environment-variable name is a reference too: the resolver reads it, and
+        // the AMQP 1.0 transport accepts it alike.
         let def = definition(&[("queue", "q"), ("password", "${lowercase}")]);
-        assert!(RabbitMqChannelProperties::from_definition(&def).is_err());
+        assert!(RabbitMqChannelProperties::from_definition(&def).is_ok());
     }
 
     #[test]

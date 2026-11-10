@@ -109,6 +109,54 @@ pub fn resolve_env_only(value: &str) -> Result<String, EnvRefError> {
     resolve_value_with(value, &env_only)
 }
 
+/// `true` when `value`, as a whole, is a reference rather than literal text: a `<scheme>:<body>`
+/// secret-ref whose scheme is registered (`env:NAME`, `secret:KEY`, `vault:…`, …), or one `${…}`
+/// placeholder naming an environment variable (`${NAME}`) or a registered scheme
+/// (`${secret:KEY}`), with or without a `:default`. A credential that must never be written
+/// literally is checked with this, so it accepts exactly the forms [`resolve_value`] resolves.
+/// `user:pass` is not a reference: `user` is no registered scheme.
+pub fn is_whole_reference(value: &str) -> bool {
+    let value = value.trim();
+    let registry = default_registry();
+    if let Some((scheme, body)) = split_scheme(value) {
+        return !body.is_empty() && registry.get(scheme).is_some();
+    }
+    let Some(inner) = value.strip_prefix("${").and_then(|v| v.strip_suffix('}')) else {
+        return false;
+    };
+    if inner.contains(['{', '}']) {
+        return false;
+    }
+    if let Some((scheme, body)) = split_scheme(inner) {
+        if registry.get(scheme).is_some() {
+            return !split_default(body).0.is_empty();
+        }
+    }
+    let name = split_default(inner).0;
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// `true` when `value` is one `${…}` placeholder with an explicitly empty default — `${NAME:}`,
+/// `${secret:KEY:}` — the form an author writes to say a blank result is intended.
+pub fn is_explicit_empty_default(value: &str) -> bool {
+    let value = value.trim();
+    let Some(inner) = value.strip_prefix("${").and_then(|v| v.strip_suffix('}')) else {
+        return false;
+    };
+    if inner.contains(['{', '}']) {
+        return false;
+    }
+    let body = match split_scheme(inner) {
+        Some((scheme, rest)) if default_registry().get(scheme).is_some() => rest,
+        _ => inner,
+    };
+    matches!(split_default(body), (key, Some("")) if !key.is_empty())
+}
+
 /// `true` when `value` contains at least one `${…}` placeholder token — the
 /// `SecretRefs.hasEnvToken` detector (a value with no token needs no substitution).
 pub fn has_env_token(value: &str) -> bool {
@@ -375,6 +423,44 @@ mod tests {
         assert!(resolve_value("env:SUTRA_ENVREF_TEST_UNSET").is_err());
         assert!(resolve_value("${SUTRA_ENVREF_TEST_UNSET}").is_err());
         assert_eq!(resolve_value("plain").unwrap(), "plain");
+    }
+
+    #[test]
+    fn whole_reference_accepts_every_resolvable_form_and_no_literal() {
+        for reference in [
+            "env:BROKER_USER",
+            "secret:broker-user",
+            "${BROKER_USER}",
+            "${BROKER_USER:guest}",
+            "${secret:broker-user}",
+            "${secret:broker-user:}",
+            "  secret:broker-user  ",
+        ] {
+            assert!(is_whole_reference(reference), "{reference}");
+        }
+        for literal in [
+            "guest",
+            "user:pass",
+            "secret:",
+            "${}",
+            "${secret:}",
+            "x${BROKER_USER}",
+            "${A}${B}",
+            "k8s-ish:value",
+        ] {
+            assert!(!is_whole_reference(literal), "{literal}");
+        }
+    }
+
+    #[test]
+    fn explicit_empty_default_is_only_the_colon_brace_form() {
+        assert!(is_explicit_empty_default("${H:}"));
+        assert!(is_explicit_empty_default(" ${secret:host-key:} "));
+        assert!(!is_explicit_empty_default("${H}"));
+        assert!(!is_explicit_empty_default("${H:x}"));
+        assert!(!is_explicit_empty_default("env:H"));
+        assert!(!is_explicit_empty_default("${secret:host-key}"));
+        assert!(!is_explicit_empty_default("a${H:}"));
     }
 
     // ===== secret-ref edge cases =====

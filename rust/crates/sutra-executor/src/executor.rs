@@ -42,7 +42,7 @@ use crate::registry::{
     AuthRef, AuthRefResolverRegistry, DecisionEngineRegistry, DecisionRegistry, ScriptRegistry,
     TaskContextView, TaskError, TaskRegistry, TemplateEngineRegistry, TemplateRegistry,
 };
-use crate::variables::{feel_to_json, json_to_feel, Variables};
+use crate::variables::{feel_to_json, feel_to_json_without_nulls, json_to_feel, Variables};
 
 /// Path coverage — the conventional store name a coverage-tracking module declares.
 const COVERAGE_OP_PREFIX: &str = "coverage:";
@@ -60,7 +60,7 @@ type DeploymentConfigResolver = dyn Fn(&DeploymentId) -> Option<Arc<BTreeMap<Str
 /// A FEEL condition evaluator backed by `sutra-feel`'s boolean evaluation.
 pub fn feel_condition_evaluator() -> impl Fn(&str, &Variables) -> Result<bool, ExecError> {
     |expr: &str, vars: &Variables| {
-        sutra_feel::expressions::eval_boolean(expr, &vars.to_feel_context())
+        sutra_feel::expressions::eval_boolean(expr, vars.as_feel_context())
             .map_err(|e| ExecError::Diagnostic(SutraError::new(&e.code, e.message)))
     }
 }
@@ -68,7 +68,7 @@ pub fn feel_condition_evaluator() -> impl Fn(&str, &Variables) -> Result<bool, E
 /// A FEEL value evaluator backed by `sutra-feel`'s value evaluation.
 pub fn feel_value_evaluator() -> impl Fn(&str, &Variables) -> Result<FeelValue, ExecError> {
     |expr: &str, vars: &Variables| {
-        sutra_feel::expressions::eval(expr, &vars.to_feel_context())
+        sutra_feel::expressions::eval(expr, vars.as_feel_context())
             .map_err(|e| ExecError::Diagnostic(SutraError::new(&e.code, e.message)))
     }
 }
@@ -2606,11 +2606,11 @@ impl TokenExecutor {
         if params.is_empty() {
             return Ok(out);
         }
-        let vars = state.ctx.borrow().variables.clone();
+        let ctx = state.ctx.borrow();
         for p in params {
             out.insert(
                 p.name.clone(),
-                (self.value_evaluator)(&p.expression, &vars)?,
+                (self.value_evaluator)(&p.expression, &ctx.variables)?,
             );
         }
         Ok(out)
@@ -2690,7 +2690,7 @@ impl TokenExecutor {
             task.name = %file_name,
         )
         .entered();
-        let model = self.render_model(vars, param_values);
+        let model = self.render_model(vars, param_values, engine.drops_null_model_entries());
         engine
             .render(&key, bytes, &model)
             .map_err(TaskFailure::Uncaught)
@@ -2733,15 +2733,43 @@ impl TokenExecutor {
     /// scoped input view), plus a `vars` handle for dotted-key bracket access, the
     /// caller-injected `uuid` / `now` suppliers, and `sourceXml` (raw inbound body) for
     /// XML-transform engines.
-    fn render_model(&self, vars: &Variables, param_values: &Variables) -> serde_json::Value {
+    ///
+    /// With `drop_nulls` (the engine treats a null entry as absent) every null-valued object entry
+    /// is left out, at any depth, while converting: the same model, key order included, as
+    /// building it with its nulls and then dropping them, without the second copy.
+    fn render_model(
+        &self,
+        vars: &Variables,
+        param_values: &Variables,
+        drop_nulls: bool,
+    ) -> serde_json::Value {
         // The variables, converted once: they are the model's top level and, again, `vars`.
-        let vars_json = vars.to_json();
+        let vars_json = if drop_nulls {
+            vars.to_json_without_nulls()
+        } else {
+            vars.to_json()
+        };
         let mut model = match &vars_json {
+            serde_json::Value::Object(m) if drop_nulls => {
+                // A null variable keeps its slot until the end, so a later entry of the same
+                // name (a param, `vars`, `uuid`, ...) lands where it always did.
+                let mut top = serde_json::Map::new();
+                for (k, _) in vars.iter() {
+                    let value = m.get(k).cloned().unwrap_or(serde_json::Value::Null);
+                    top.insert(k.to_string(), value);
+                }
+                top
+            }
             serde_json::Value::Object(m) => m.clone(),
             _ => serde_json::Map::new(),
         };
         for (k, v) in param_values.iter() {
-            model.insert(k.to_string(), feel_to_json(v));
+            let value = if drop_nulls {
+                feel_to_json_without_nulls(v)
+            } else {
+                feel_to_json(v)
+            };
+            model.insert(k.to_string(), value);
         }
         model.insert("vars".to_string(), vars_json);
         model.insert(
@@ -2759,6 +2787,9 @@ impl TokenExecutor {
                     serde_json::Value::String(body.clone()),
                 );
             }
+        }
+        if drop_nulls {
+            model.retain(|_, v| !v.is_null());
         }
         serde_json::Value::Object(model)
     }
@@ -2814,7 +2845,7 @@ impl TokenExecutor {
         )
         .entered();
         let vars = state.ctx.borrow().variables.clone();
-        let model = self.render_model(&vars, &Variables::new());
+        let model = self.render_model(&vars, &Variables::new(), engine.drops_null_model_entries());
         let rendered = engine
             .render(&key, bytes, &model)
             .map_err(|e| fatal_diag(codes::RUNTIME_UNEXPECTED, e))?;
@@ -2902,10 +2933,11 @@ impl TokenExecutor {
         dm: &DataMapping,
         state: &mut ExecutionState<'_>,
     ) -> Result<(), Signal> {
+        // Every expression below evaluates against the live variables under a short borrow that
+        // ends before the next await, so each operation sees what the previous one bound.
         for read in &dm.store_reads {
-            let vars = state.ctx.borrow().variables.clone();
             if let Some(query) = &read.query {
-                let result = self.run_store_query(id, read, query, &vars, state).await?;
+                let result = self.run_store_query(id, read, query, state).await?;
                 state
                     .ctx
                     .borrow_mut()
@@ -2913,30 +2945,34 @@ impl TokenExecutor {
                     .insert(read.target_var.clone(), result);
                 continue;
             }
-            let key_value =
-                (self.value_evaluator)(&read.key_expression, &vars).map_err(Signal::Fatal)?;
+            let key_value = {
+                let ctx = state.ctx.borrow();
+                (self.value_evaluator)(&read.key_expression, &ctx.variables)
+            }
+            .map_err(Signal::Fatal)?;
             let key = as_store_key(&key_value, &read.key_expression, id)?;
             // Store ops are async + typed. A backend `Err` fails the instance CLOSED at
             // this step boundary (the old `last_error()` poison check, now `?` on Result).
-            let (value, rev) =
-                if state.store_tx.is_some() {
-                    let tx = self.tx_for(&read.store, id, state).await?;
-                    let value = if read.for_update {
-                        tx.get_for_update(&key).await
-                    } else {
-                        tx.get(&key).await
-                    }
-                    .map_err(|e| store_op_failed(&read.store, &key, id, "read", &e.to_string()))?;
-                    let rev = tx.revision(&key).await.map_err(|e| {
-                        store_op_failed(&read.store, &key, id, "read", &e.to_string())
-                    })?;
-                    (value, rev)
+            let (value, rev) = if state.store_tx.is_some() {
+                let tx = self.tx_for(&read.store, id, state).await?;
+                let value = if read.for_update {
+                    tx.get_for_update(&key).await
                 } else {
-                    let store = self.resolve_store(&read.store, id, state)?;
-                    store.get_with_revision(&key).await.map_err(|e| {
-                        store_op_failed(&read.store, &key, id, "read", &e.to_string())
-                    })?
-                };
+                    tx.get(&key).await
+                }
+                .map_err(|e| store_op_failed(&read.store, &key, id, "read", &e))?;
+                let rev = tx
+                    .revision(&key)
+                    .await
+                    .map_err(|e| store_op_failed(&read.store, &key, id, "read", &e))?;
+                (value, rev)
+            } else {
+                let store = self.resolve_store(&read.store, id, state)?;
+                store
+                    .get_with_revision(&key)
+                    .await
+                    .map_err(|e| store_op_failed(&read.store, &key, id, "read", &e))?
+            };
             state
                 .store_revs
                 .insert(format!("{}#{key}", read.store), rev);
@@ -2950,8 +2986,11 @@ impl TokenExecutor {
             self.run_message_decode(id, decode, state)?;
         }
         for assign in &dm.assignments {
-            let vars = state.ctx.borrow().variables.clone();
-            let value = (self.value_evaluator)(&assign.expression, &vars).map_err(Signal::Fatal)?;
+            let value = {
+                let ctx = state.ctx.borrow();
+                (self.value_evaluator)(&assign.expression, &ctx.variables)
+            }
+            .map_err(Signal::Fatal)?;
             state
                 .ctx
                 .borrow_mut()
@@ -2959,42 +2998,46 @@ impl TokenExecutor {
                 .insert(assign.target_var.clone(), value);
         }
         for write in &dm.store_writes {
-            let vars = state.ctx.borrow().variables.clone();
-            let key_value =
-                (self.value_evaluator)(&write.key_expression, &vars).map_err(Signal::Fatal)?;
+            let (key_value, value) = {
+                let ctx = state.ctx.borrow();
+                let key_value = (self.value_evaluator)(&write.key_expression, &ctx.variables)
+                    .map_err(Signal::Fatal)?;
+                let value = ctx
+                    .variables
+                    .get(&write.value_var)
+                    .cloned()
+                    .unwrap_or(FeelValue::Null);
+                (key_value, value)
+            };
             let key = as_store_key(&key_value, &write.key_expression, id)?;
-            let value = vars
-                .get(&write.value_var)
-                .cloned()
-                .unwrap_or(FeelValue::Null);
             if state.store_tx.is_some() {
                 let tx = self.tx_for(&write.store, id, state).await?;
-                let current = tx.get(&key).await.map_err(|e| {
-                    store_op_failed(&write.store, &key, id, "write", &e.to_string())
-                })?;
+                let current = tx
+                    .get(&key)
+                    .await
+                    .map_err(|e| store_op_failed(&write.store, &key, id, "write", &e))?;
                 let to_store = merge_field(write, value, current);
                 if write.expect_unchanged || write.expect_absent {
                     let expected = expected_revision(write, &key, state);
-                    let applied =
-                        tx.put_if_revision(&key, to_store, expected)
-                            .await
-                            .map_err(|e| {
-                                store_op_failed(&write.store, &key, id, "write", &e.to_string())
-                            })?;
+                    let applied = tx
+                        .put_if_revision(&key, to_store, expected)
+                        .await
+                        .map_err(|e| store_op_failed(&write.store, &key, id, "write", &e))?;
                     if !applied {
                         return Err(store_conflict(write, &key, expected, id, state.process));
                     }
                 } else {
-                    tx.put(&key, to_store).await.map_err(|e| {
-                        store_op_failed(&write.store, &key, id, "write", &e.to_string())
-                    })?;
+                    tx.put(&key, to_store)
+                        .await
+                        .map_err(|e| store_op_failed(&write.store, &key, id, "write", &e))?;
                 }
             } else {
                 let store = self.resolve_store(&write.store, id, state)?;
                 let current = if write.field.is_some() {
-                    store.get(&key).await.map_err(|e| {
-                        store_op_failed(&write.store, &key, id, "write", &e.to_string())
-                    })?
+                    store
+                        .get(&key)
+                        .await
+                        .map_err(|e| store_op_failed(&write.store, &key, id, "write", &e))?
                 } else {
                     None
                 };
@@ -3004,16 +3047,15 @@ impl TokenExecutor {
                     let applied = store
                         .put_if_revision(&key, to_store, expected)
                         .await
-                        .map_err(|e| {
-                            store_op_failed(&write.store, &key, id, "write", &e.to_string())
-                        })?;
+                        .map_err(|e| store_op_failed(&write.store, &key, id, "write", &e))?;
                     if !applied {
                         return Err(store_conflict(write, &key, expected, id, state.process));
                     }
                 } else {
-                    store.put(&key, to_store).await.map_err(|e| {
-                        store_op_failed(&write.store, &key, id, "write", &e.to_string())
-                    })?;
+                    store
+                        .put(&key, to_store)
+                        .await
+                        .map_err(|e| store_op_failed(&write.store, &key, id, "write", &e))?;
                 }
             }
         }
@@ -3095,59 +3137,65 @@ impl TokenExecutor {
         id: &str,
         read: &sutra_bpmn::model::StoreRead,
         query: &sutra_bpmn::StoreQuery,
-        vars: &Variables,
         state: &ExecutionState<'_>,
     ) -> Result<FeelValue, Signal> {
-        let bound = |expr: &str, what: &str| -> Result<String, Signal> {
-            match (self.value_evaluator)(expr, vars).map_err(Signal::Fatal)? {
-                FeelValue::String(s) => Ok(s),
-                other => Err(fatal_diag(
-                    codes::RUNTIME_DATASTORE_QUERY_INVALID,
-                    format!(
-                        "Data task '{id}' key query on store '{}': {what} expression '{expr}' \
-                         evaluated to {} — a key bound must be a string.",
-                        read.store,
-                        sutra_feel::value::canonical_string_of(&other)
-                    ),
-                )),
-            }
-        };
-        let lower = bound(&read.key_expression, "the key")?;
-        let upper = match &query.mode {
-            sutra_bpmn::StoreQueryMode::Prefix => {
-                if lower.is_empty() {
-                    return Err(fatal_diag(
+        // The bounds evaluate against the live variables. The borrow lives only in this block,
+        // so it ends before the query awaits.
+        let (lower, upper, after) = {
+            let ctx = state.ctx.borrow();
+            let vars = &ctx.variables;
+            let bound = |expr: &str, what: &str| -> Result<String, Signal> {
+                match (self.value_evaluator)(expr, vars).map_err(Signal::Fatal)? {
+                    FeelValue::String(s) => Ok(s),
+                    other => Err(fatal_diag(
                         codes::RUNTIME_DATASTORE_QUERY_INVALID,
                         format!(
+                            "Data task '{id}' key query on store '{}': {what} expression '{expr}' \
+                         evaluated to {} — a key bound must be a string.",
+                            read.store,
+                            sutra_feel::value::canonical_string_of(&other)
+                        ),
+                    )),
+                }
+            };
+            let lower = bound(&read.key_expression, "the key")?;
+            let upper = match &query.mode {
+                sutra_bpmn::StoreQueryMode::Prefix => {
+                    if lower.is_empty() {
+                        return Err(fatal_diag(
+                            codes::RUNTIME_DATASTORE_QUERY_INVALID,
+                            format!(
                             "Data task '{id}' key query on store '{}': the prefix evaluated to \
                              the empty string, which would read the whole store.",
                             read.store
                         ),
-                    ));
+                        ));
+                    }
+                    prefix_upper_bound(&lower)
                 }
-                prefix_upper_bound(&lower)
-            }
-            sutra_bpmn::StoreQueryMode::Range { to_expression } => {
-                Some(bound(to_expression, "the @to")?)
-            }
-        };
-        let after = match &query.after_expression {
-            None => None,
-            Some(expr) => match (self.value_evaluator)(expr, vars).map_err(Signal::Fatal)? {
-                FeelValue::Null => None,
-                FeelValue::String(s) => Some(s),
-                other => {
-                    return Err(fatal_diag(
-                        codes::RUNTIME_DATASTORE_QUERY_INVALID,
-                        format!(
-                            "Data task '{id}' key query on store '{}': @after expression \
+                sutra_bpmn::StoreQueryMode::Range { to_expression } => {
+                    Some(bound(to_expression, "the @to")?)
+                }
+            };
+            let after = match &query.after_expression {
+                None => None,
+                Some(expr) => match (self.value_evaluator)(expr, vars).map_err(Signal::Fatal)? {
+                    FeelValue::Null => None,
+                    FeelValue::String(s) => Some(s),
+                    other => {
+                        return Err(fatal_diag(
+                            codes::RUNTIME_DATASTORE_QUERY_INVALID,
+                            format!(
+                                "Data task '{id}' key query on store '{}': @after expression \
                              '{expr}' evaluated to {} — it must be a key (string) or null.",
-                            read.store,
-                            sutra_feel::value::canonical_string_of(&other)
-                        ),
-                    ))
-                }
-            },
+                                read.store,
+                                sutra_feel::value::canonical_string_of(&other)
+                            ),
+                        ))
+                    }
+                },
+            };
+            (lower, upper, after)
         };
         let split = |p: &String| p.split('.').map(str::to_string).collect::<Vec<_>>();
         let spec = crate::datastore::StoreKeyQuery {
@@ -3165,9 +3213,10 @@ impl TokenExecutor {
                 .collect(),
         };
         let store = self.resolve_store(&read.store, id, state)?;
-        let result = store.query(&spec).await.map_err(|e| {
-            store_op_failed(&read.store, &spec.lower, id, "key query", &e.to_string())
-        })?;
+        let result = store
+            .query(&spec)
+            .await
+            .map_err(|e| store_op_failed(&read.store, &spec.lower, id, "key query", &e))?;
         for (agg, value) in query.aggregates.iter().zip(&result.aggregates) {
             let bad: i64 = match value {
                 crate::datastore::StoreAggregateValue::Total(cell) => cell.non_numeric,
@@ -3237,7 +3286,7 @@ impl TokenExecutor {
         let tx = store
             .begin()
             .await
-            .map_err(|e| store_op_failed(store_name, "", node_id, "begin", &e.to_string()))?
+            .map_err(|e| store_op_failed(store_name, "", node_id, "begin", &e))?
             .ok_or_else(|| {
                 fatal_diag(
                     codes::RUNTIME_UNEXPECTED,
@@ -3265,19 +3314,23 @@ impl TokenExecutor {
     ) -> Result<(), Signal> {
         let process = state.process;
         let outgoing = process.outgoing(id);
-        let vars = state.ctx.borrow().variables.clone();
         let mut chosen: Option<&SequenceFlow> = None;
-        for flow in &outgoing {
-            if default_flow_id == Some(flow.id.as_str()) {
-                continue;
-            }
-            let satisfied = match &flow.condition {
-                None => true,
-                Some(cond) => (self.condition_evaluator)(cond, &vars).map_err(Signal::Fatal)?,
-            };
-            if satisfied {
-                chosen = Some(flow);
-                break;
+        {
+            let ctx = state.ctx.borrow();
+            for flow in &outgoing {
+                if default_flow_id == Some(flow.id.as_str()) {
+                    continue;
+                }
+                let satisfied = match &flow.condition {
+                    None => true,
+                    Some(cond) => {
+                        (self.condition_evaluator)(cond, &ctx.variables).map_err(Signal::Fatal)?
+                    }
+                };
+                if satisfied {
+                    chosen = Some(flow);
+                    break;
+                }
             }
         }
         if chosen.is_none() {
@@ -6176,9 +6229,24 @@ async fn commit_store_tx(state: &mut ExecutionState<'_>) -> Option<String> {
 
 /// A durable-store backend failure surfaced as a fatal diagnostic (fail-closed — never
 /// reply success on a lost read/write).
-fn store_op_failed(store: &str, key: &str, node_id: &str, op: &str, err: &str) -> Signal {
+/// A store operation failed: the instance fails closed with the backend's own code when it has
+/// one (an edited, already-applied migration is `SUTRA.RUNTIME.DATASTORE.MIGRATION_CHECKSUM`),
+/// otherwise `SUTRA.RUNTIME.UNEXPECTED`. A coded failure is also logged, without the key, because
+/// a dead-lettered message's log line carries only the code.
+fn store_op_failed(store: &str, key: &str, node_id: &str, op: &str, err: &StoreError) -> Signal {
+    let code = err.code().unwrap_or(codes::RUNTIME_UNEXPECTED);
+    if err.code().is_some() {
+        tracing::error!(
+            code = %code,
+            store = %store,
+            node = %node_id,
+            op = %op,
+            "data store refused the operation: {}",
+            err.message()
+        );
+    }
     fatal_diag(
-        codes::RUNTIME_UNEXPECTED,
+        code,
         format!("Data task '{node_id}' {op} on store '{store}'[{key}] failed: {err}"),
     )
 }

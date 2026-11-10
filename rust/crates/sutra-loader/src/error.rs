@@ -67,6 +67,14 @@ pub mod codes {
     // distinct code: the cross-process routes desugar-inject into the referenced processes'
     // `coverage_paths` at load, so the existing `COVERAGE.STORE_MISSING` check already fires for
     // them.
+    /// `coverage/requirements-map.yaml` names a path this deployment does not declare, so its
+    /// requirement ids and weight would never reach a report.
+    pub const CONFIG_COVERAGE_MAPPING_ROUTE_UNKNOWN: &str =
+        "SUTRA.CONFIG.COVERAGE.MAPPING_ROUTE_UNKNOWN";
+    /// A declared path is missing from `coverage/requirements-map.yaml`. It still counts, at the
+    /// default weight and against no requirement.
+    pub const CONFIG_COVERAGE_MAPPING_ROUTE_UNMAPPED: &str =
+        "SUTRA.CONFIG.COVERAGE.MAPPING_ROUTE_UNMAPPED";
     /// A coverage route's `segments` key, or a `links` hop's `<process>:<node>` reference, names
     /// a processId the deployment does not declare.
     pub const CONFIG_CORRELATION_PROCESS_UNKNOWN: &str = "SUTRA.CONFIG.CORRELATION.PROCESS_UNKNOWN";
@@ -264,6 +272,20 @@ pub mod codes {
     /// hop would dispatch to a channel that cannot receive it. Fail-closed at load.
     pub const CONFIG_CHANNEL_LOCAL_TARGET_UNKNOWN: &str =
         "SUTRA.CONFIG.CHANNEL.LOCAL_TARGET_UNKNOWN";
+    /// A `<q:send destination>` literal `local://` address that is not one of this package's own
+    /// `transport: local` inbound channels: another package, another version of this one, or a
+    /// bare `local://<name>` the runtime cannot address. A package reaches another through a
+    /// channel that package listens on, not through its in-process address.
+    pub const CONFIG_SEND_LOCAL_DESTINATION_CROSSES_PACKAGE: &str =
+        "SUTRA.CONFIG.SEND.LOCAL_DESTINATION_CROSSES_PACKAGE";
+    /// A call activity's `calledElement`, or a `<q:dispatch>` case or default, names no process of
+    /// this package. It would fail only when an instance reached it.
+    pub const CONFIG_CALL_ACTIVITY_UNKNOWN_CALLED_ELEMENT: &str =
+        "SUTRA.CONFIG.CALL_ACTIVITY.UNKNOWN_CALLED_ELEMENT";
+    /// One package has a start event and a wait on the same channel with message types that can
+    /// overlap. A message meant for the wait also matches the start, and start events are tried
+    /// first, so it starts a new instance and the parked one keeps waiting.
+    pub const CONFIG_CHANNEL_START_AND_WAIT: &str = "SUTRA.CONFIG.CHANNEL.START_AND_WAIT";
 
     // ---- the reserved SUTRA.DEPLOY.* family — the sealed-archive load checks ----
     /// The archive container is not a readable `.sutra` ZIP (open failure, non-UTF-8 or

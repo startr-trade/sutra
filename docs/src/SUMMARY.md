@@ -22,6 +22,7 @@
 - [Recordings and media references](building/recordings-and-media.md)
 - [Wait states and human tasks](building/wait-states.md)
 - [One endpoint, one deployment](building/endpoint-claims.md)
+- [Upgrading a deployment in place](building/upgrading-in-place.md)
 - [Acceptance receipts](building/acceptance-receipts.md)
 - [External tasks: the pull worker surface](building/external-tasks.md)
 - [Retries, history, and schedules](building/retries-history-schedules.md)
@@ -64,6 +65,7 @@
 - [Troubleshooting BPMN solutions](operating/troubleshooting.md)
 - [Upgrading to 0.6.18](operating/upgrading-0-6-18.md)
 - [Upgrading to 0.6.19](operating/upgrading-0-6-19.md)
+- [Upgrading to 0.6.20](operating/upgrading-0-6-20.md)
 
 # Reference
 

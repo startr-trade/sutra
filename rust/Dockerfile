@@ -53,6 +53,11 @@ FROM chef AS builder
 # or `release-it` (fast IT/dev image: no LTO, parallel codegen — see rust/Cargo.toml). Both emit
 # `target/<profile>/sutra-engine`. The shipped image build is unchanged (default `release`).
 ARG CARGO_PROFILE=release
+# jemalloc fixes its page size when it is built, and a binary built for 4 KiB pages aborts on a
+# kernel with larger ones. Many arm64 hosts run 16 or 64 KiB pages, so an arm64 build assumes
+# 64 KiB (2^16), which also runs on smaller-page kernels. amd64 is 4 KiB everywhere. Both cargo
+# steps set it alike, so the dependency layer the cook step builds is the one the build reuses.
+ARG TARGETARCH
 COPY --from=planner /build/recipe.json recipe.json
 # cargo-chef keys the dependency build on recipe.json (a source-only change reuses this layer).
 # The BuildKit cache mounts (crate registry + git + the target dir) go further: a DEPENDENCY
@@ -61,6 +66,7 @@ COPY --from=planner /build/recipe.json recipe.json
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/build/target \
+    if [ "$TARGETARCH" = arm64 ]; then export JEMALLOC_SYS_WITH_LG_PAGE=16; fi && \
     cargo chef cook --profile ${CARGO_PROFILE} --recipe-path recipe.json
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
@@ -74,6 +80,7 @@ COPY crates ./crates
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/build/target \
+    if [ "$TARGETARCH" = arm64 ]; then export JEMALLOC_SYS_WITH_LG_PAGE=16; fi && \
     cargo build --profile ${CARGO_PROFILE} -p sutra-dist \
     && cp target/${CARGO_PROFILE}/sutra-engine /build/sutra-engine
 

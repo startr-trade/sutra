@@ -527,11 +527,15 @@ pub fn validate_deployment_with_manifests(
     check_channel_uniqueness(deployment, &definitions, &dep_label, out);
     check_coverage_store(deployment, &stores, &dep_label, out);
     check_coverage_correlations(deployment, &definitions, &dep_label, out);
+    check_requirements_map(deployment, &dep_label, out);
     check_store_references(deployment, &stores, &dep_label, out);
     check_literal_credentials(&stores, &definitions, &dep_label, out);
     check_migrations(deployment, &stores, &dep_label, out);
     check_store_structures(deployment, &stores, &dep_label, out);
     check_node_references(deployment, &definitions, &dep_label, out);
+    check_local_send_destinations(deployment, &dep_label, out);
+    check_called_elements(deployment, &dep_label, out);
+    check_start_and_wait(deployment, &dep_label, out);
     check_feel_sites(deployment, &dep_label, out);
     check_receipt_attributes(deployment, &dep_label, out);
     check_timer_config_keys(deployment, &dep_label, out);
@@ -2151,6 +2155,51 @@ fn check_coverage_store(
 // route desugar-injects into the referenced processes' `coverage_paths` at load, so the
 // existing `check_coverage_store` above already fires `COVERAGE.STORE_MISSING` for them.
 // ==================================================================================
+
+/// The requirements map against what the deployment declares. A key that matches nothing is an
+/// error, because a typo would silently leave its requirement ids and weight out of every report.
+/// A declared path the map omits is only a warning: it still counts, at the default weight.
+fn check_requirements_map(
+    deployment: &LoadedDeployment,
+    dep_label: &str,
+    out: &mut Vec<LintDiagnostic>,
+) {
+    // A malformed map already failed the load.
+    let Ok(Some(map)) = deployment.requirements_map() else {
+        return;
+    };
+    let declared = deployment.declared_coverage_urns();
+    let file_ref = format!("coverage/{}", crate::coverage::REQUIREMENTS_MAP_FILE);
+    for route in map.routes.keys() {
+        if !declared.iter().any(|urn| urn == route) {
+            out.push(
+                LintDiagnostic::error(
+                    codes::CONFIG_COVERAGE_MAPPING_ROUTE_UNKNOWN,
+                    format!(
+                        "deployment {dep_label}: {file_ref} maps route '{route}', which this \
+                         deployment does not declare."
+                    ),
+                )
+                .at_named(&file_ref, route),
+            );
+        }
+    }
+    for urn in &declared {
+        if !map.routes.contains_key(urn) {
+            out.push(
+                LintDiagnostic::warning(
+                    codes::CONFIG_COVERAGE_MAPPING_ROUTE_UNMAPPED,
+                    format!(
+                        "deployment {dep_label}: declared path '{urn}' is not in {file_ref}. It \
+                         still counts, at weight {} and against no requirement.",
+                        crate::coverage::DEFAULT_ROUTE_WEIGHT
+                    ),
+                )
+                .at_named(&file_ref, urn),
+            );
+        }
+    }
+}
 
 /// The effective [`ProcessDefinition`] for `pid` (looked up in its owning module — the
 /// desugar-inject keeps `processes` coherent). `None` when the deployment declares no such
@@ -4412,6 +4461,230 @@ fn callees_of(process: &ProcessDefinition, module_pids: &BTreeSet<String>) -> BT
         }
     });
     callees
+}
+
+/// The refusals a deploy adds for a package that reads, and that a stored package keeps running
+/// with: a literal `local://` send to another package, and a called element no process of the
+/// package answers to. The archive reader lets both through, so what an earlier engine accepted
+/// still loads; each deploy path asks this, and refuses a new deploy on an error.
+pub fn deployment_send_faults(deployment: &LoadedDeployment) -> Vec<LintDiagnostic> {
+    let dep_label = format!(
+        "{}/{}/{} ({})",
+        deployment.tenant,
+        deployment.module,
+        deployment.version,
+        deployment.id.value()
+    );
+    let mut out = Vec::new();
+    check_local_send_destinations(deployment, &dep_label, &mut out);
+    check_called_elements(deployment, &dep_label, &mut out);
+    out
+}
+
+/// The codes [`deployment_send_faults`] raises, which the archive reader does not refuse on.
+pub(crate) const DEPLOY_PATH_ONLY_CODES: [&str; 2] = [
+    codes::CONFIG_SEND_LOCAL_DESTINATION_CROSSES_PACKAGE,
+    codes::CONFIG_CALL_ACTIVITY_UNKNOWN_CALLED_ELEMENT,
+];
+
+/// A literal `<q:send destination="local://…">` must address one of this package's own
+/// `transport: local` inbound channels, as `local://<tenant>/<module>/<version>/<channel>`. Any
+/// other is another package (another version of this one included) or an address the runtime
+/// cannot read. A destination with `${` is built at run time and is not judged.
+fn check_local_send_destinations(
+    deployment: &LoadedDeployment,
+    dep_label: &str,
+    out: &mut Vec<LintDiagnostic>,
+) {
+    let local_inbound: BTreeSet<String> = deployment
+        .channels_yaml
+        .as_ref()
+        .and_then(|yaml| {
+            load_channel_definitions(
+                yaml.as_bytes(),
+                &deployment.tenant,
+                &deployment.module,
+                &deployment.version,
+                "channels.yaml",
+            )
+            .ok()
+        })
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|d| !d.is_outbound() && d.transport.as_deref() == Some("local"))
+        .map(|d| d.binding.channel_name)
+        .collect();
+    let own_prefix = format!(
+        "local://{}/{}/{}/",
+        deployment.tenant, deployment.module, deployment.version
+    );
+    let mut seen = BTreeSet::new();
+    for module in deployment.processes.values() {
+        for process in module.processes() {
+            if !seen.insert(process.id.clone()) {
+                continue;
+            }
+            visit_nodes(process, &mut |owner, node| {
+                let Some(send) = &owner.bindings_for(node.id()).send else {
+                    return;
+                };
+                let Some(destination) = send.destination.as_deref().map(str::trim) else {
+                    return;
+                };
+                if !destination.starts_with("local://") || destination.contains("${") {
+                    return;
+                }
+                let own = destination
+                    .strip_prefix(&own_prefix)
+                    .is_some_and(|channel| local_inbound.contains(channel));
+                if own {
+                    return;
+                }
+                out.push(
+                    LintDiagnostic::error(
+                        codes::CONFIG_SEND_LOCAL_DESTINATION_CROSSES_PACKAGE,
+                        format!(
+                            "deployment {dep_label}: process '{}' node '{}' sends to \
+                             '{destination}', which is not a 'transport: local' inbound channel \
+                             of this package ({own_prefix}<channel>). A local address does not \
+                             cross packages, versions of one package included: send on an \
+                             outbound channel the other package listens on",
+                            process.id,
+                            node.id()
+                        ),
+                    )
+                    .at_node(&process.id, node.id()),
+                );
+            });
+        }
+    }
+}
+
+/// Every call activity's `calledElement` (unless a `<q:dispatch>` replaces it), and every
+/// `<q:dispatch>` case and default, must name a process of this package: by id, or by the part
+/// after its last `:`, as a call resolves it.
+fn check_called_elements(
+    deployment: &LoadedDeployment,
+    dep_label: &str,
+    out: &mut Vec<LintDiagnostic>,
+) {
+    let module_pids: BTreeSet<String> = deployment.processes.keys().cloned().collect();
+    let resolves = |called: &str| {
+        module_pids.contains(called)
+            || called
+                .rsplit_once(':')
+                .is_some_and(|(_, local)| module_pids.contains(local))
+    };
+    let mut seen = BTreeSet::new();
+    for module in deployment.processes.values() {
+        for process in module.processes() {
+            if !seen.insert(process.id.clone()) {
+                continue;
+            }
+            visit_nodes(process, &mut |owner, node| {
+                let mut named: Vec<(&str, &str)> = Vec::new();
+                let dispatch = &owner.bindings_for(node.id()).dispatch;
+                // With a `<q:dispatch>` the static `calledElement` is never used.
+                if let (Node::CallActivity { called_element, .. }, None) = (node, dispatch) {
+                    named.push(("calledElement", called_element.as_str()));
+                }
+                if let Some(dispatch) = dispatch {
+                    if let Some(default) = &dispatch.default_called_element {
+                        named.push(("<q:dispatch> default", default.as_str()));
+                    }
+                    for case in &dispatch.cases {
+                        named.push(("<q:dispatch> case", case.called_element.as_str()));
+                    }
+                }
+                for (what, called) in named {
+                    let called = called.trim();
+                    if called.is_empty() || resolves(called) {
+                        continue;
+                    }
+                    out.push(
+                        LintDiagnostic::error(
+                            codes::CONFIG_CALL_ACTIVITY_UNKNOWN_CALLED_ELEMENT,
+                            format!(
+                                "deployment {dep_label}: process '{}' node '{}' {what} \
+                                 '{called}' names no process of this package",
+                                process.id,
+                                node.id()
+                            ),
+                        )
+                        .at_node(&process.id, node.id()),
+                    );
+                }
+            });
+        }
+    }
+}
+
+/// A start event and a wait on one channel, with message types that can overlap: a message meant
+/// for the wait also matches the start, and start events are tried first. A warning, at the start.
+fn check_start_and_wait(
+    deployment: &LoadedDeployment,
+    dep_label: &str,
+    out: &mut Vec<LintDiagnostic>,
+) {
+    let mut processes: Vec<&ProcessDefinition> = Vec::new();
+    let mut seen = BTreeSet::new();
+    for module in deployment.processes.values() {
+        for process in module.processes() {
+            if seen.insert(process.id.clone()) {
+                processes.push(process);
+            }
+        }
+    }
+    let waits: Vec<sutra_channels::WaitSubscription> = processes
+        .iter()
+        .flat_map(|p| sutra_channels::wait_subscriptions(p))
+        .collect();
+    for process in &processes {
+        for start in process.start_events() {
+            let Node::StartEvent { channels, .. } = start else {
+                continue;
+            };
+            let source = process.bindings_for(start.id()).source();
+            let (start_type, start_pattern) = (
+                source.and_then(|s| s.message_type_value.as_deref()),
+                source.and_then(|s| s.message_type_pattern.as_deref()),
+            );
+            for channel in channels {
+                let overlapping: Vec<String> = waits
+                    .iter()
+                    .filter(|w| {
+                        w.channel == *channel
+                            && sutra_channels::message_types_can_overlap(
+                                w.message_type.as_deref(),
+                                w.message_type_pattern.as_deref(),
+                                start_type,
+                                start_pattern,
+                            )
+                    })
+                    .map(|w| format!("{}/{}", w.process_id, w.node_id))
+                    .collect();
+                if overlapping.is_empty() {
+                    continue;
+                }
+                out.push(
+                    LintDiagnostic::warning(
+                        codes::CONFIG_CHANNEL_START_AND_WAIT,
+                        format!(
+                            "deployment {dep_label}: process '{}' start event '{}' and the wait at \
+                             {} are both on channel '{channel}' with message types that can \
+                             overlap. Start events are tried first, so a message meant for a \
+                             parked instance starts a new one; give them disjoint message types or \
+                             separate channels",
+                            process.id,
+                            start.id(),
+                            overlapping.join(", ")
+                        ),
+                    )
+                    .at_node(&process.id, start.id()),
+                );
+            }
+        }
+    }
 }
 
 /// reachable(P) = own(P) ∪ ⋃ own(Q) over every transitive caller Q (a dispatched
@@ -7664,6 +7937,49 @@ mod tests {
 
     /// The all-good baseline: one linked hop `p1:send1 → p2:start2` on channel `chA`, key `txnId`
     /// (payload-sourced), one contiguous route over both processes.
+    #[test]
+    fn the_requirements_map_is_checked_against_what_is_declared() {
+        let with_map = |content: String| {
+            let mut dep = positive_dep();
+            dep.coverage_files.insert(
+                crate::coverage::REQUIREMENTS_MAP_FILE.to_string(),
+                crate::LoadedArtifact {
+                    path: PathBuf::from("coverage/requirements-map.yaml"),
+                    content,
+                },
+            );
+            let mut out = Vec::new();
+            check_requirements_map(&dep, "t/m/1.0.0 (id)", &mut out);
+            out
+        };
+        let declared = positive_dep().declared_coverage_urns();
+        assert!(!declared.is_empty());
+
+        // A key that matches nothing is an error, naming the key.
+        let mapped_all: String = declared
+            .iter()
+            .map(|urn| format!("  {urn}: {{ weight: 2 }}\n"))
+            .collect();
+        let out = with_map(format!(
+            "routes:\n{mapped_all}  typo-route: {{ weight: 1 }}\n"
+        ));
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(out[0].code, codes::CONFIG_COVERAGE_MAPPING_ROUTE_UNKNOWN);
+        assert!(out[0].message.contains("typo-route"));
+
+        // A declared path the map omits still counts, and the author hears that it is unmapped.
+        let out = with_map("routes: {}\n".to_string());
+        assert_eq!(out.len(), declared.len(), "{out:?}");
+        assert!(out
+            .iter()
+            .all(|d| d.code == codes::CONFIG_COVERAGE_MAPPING_ROUTE_UNMAPPED));
+
+        // No map, no findings: a package without one lints as it always has.
+        let mut out = Vec::new();
+        check_requirements_map(&positive_dep(), "t/m/1.0.0 (id)", &mut out);
+        assert!(out.is_empty(), "{out:?}");
+    }
+
     fn positive_dep() -> LoadedDeployment {
         corr_dep(
             Some(cc_send(Some("chA"), &[])),

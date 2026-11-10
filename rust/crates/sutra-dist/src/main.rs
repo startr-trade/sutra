@@ -113,6 +113,15 @@ async fn health_check() -> ! {
     std::process::exit(code);
 }
 
+// The engine evaluates many short-lived values per message (decoded messages, FEEL results,
+// template models), so allocation speed shows directly in CPU per message: measured under a
+// 200/s load, jemalloc cut engine CPU by about a quarter against glibc malloc, with no
+// latency cost. Builds without the `jemalloc` feature, and MSVC builds, use the system
+// allocator.
+#[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 #[tokio::main]
 async fn main() {
     // The health probe runs BEFORE any telemetry or config work: it is a short-lived

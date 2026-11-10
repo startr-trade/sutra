@@ -28,8 +28,13 @@ use sutra_executor::{
 use sutra_feel::FeelValue;
 
 /// Map a durable-store backend failure to the executor SPI's typed error (fail-closed).
+/// A coded backend failure keeps its code, so the instance (or the dead letter) is attributed to
+/// it rather than to an unexpected error.
 fn to_store_err(e: DataStoreError) -> StoreError {
-    StoreError::new(e.to_string())
+    match e.code() {
+        Some(code) => StoreError::with_code(code, e.to_string()),
+        None => StoreError::new(e.to_string()),
+    }
 }
 
 /// The executor's key query in the dialect stores' terms.
@@ -334,6 +339,22 @@ impl DeclaredCoverageStores {
     }
 }
 
+impl DeclaredCoverageStores {
+    /// The store for `deployment_id`, addressing whichever rows coverage goes to right now: the
+    /// active cycle's, or the plain rows when none is active. Read on every call rather than
+    /// cached, so an operator's activation reaches every replica with nothing to signal. A failed
+    /// read is an error, not a fall back to the plain rows, because a mark recorded outside the
+    /// cycle it was meant for would be a wrong number rather than a missing one.
+    async fn active_scope(&self, deployment_id: &str) -> Result<CoverageStore, StoreError> {
+        let store = self.resolve(deployment_id)?;
+        let cycle = store
+            .active_cycle(deployment_id)
+            .await
+            .map_err(to_metric_err)?;
+        Ok(store.in_cycle(cycle.as_deref()))
+    }
+}
+
 impl Default for DeclaredCoverageStores {
     fn default() -> Self {
         Self::new()
@@ -347,7 +368,8 @@ impl CoverageMetricStore for DeclaredCoverageStores {
         deployment_id: &str,
         path_urns: &[String],
     ) -> Result<(), StoreError> {
-        self.resolve(deployment_id)?
+        self.active_scope(deployment_id)
+            .await?
             .seed_declared(deployment_id, path_urns)
             .await
             .map(|_| ())
@@ -359,7 +381,8 @@ impl CoverageMetricStore for DeclaredCoverageStores {
         deployment_id: &str,
         path_urn: &str,
     ) -> Result<bool, StoreError> {
-        self.resolve(deployment_id)?
+        self.active_scope(deployment_id)
+            .await?
             .mark_path_covered(deployment_id, path_urn)
             .await
             .map_err(to_metric_err)
@@ -370,7 +393,8 @@ impl CoverageMetricStore for DeclaredCoverageStores {
         deployment_id: &str,
         path_urns: &[String],
     ) -> Result<std::collections::BTreeSet<String>, StoreError> {
-        self.resolve(deployment_id)?
+        self.active_scope(deployment_id)
+            .await?
             .covered_among(deployment_id, path_urns)
             .await
             .map_err(to_metric_err)
@@ -381,7 +405,8 @@ impl CoverageMetricStore for DeclaredCoverageStores {
         deployment_id: &str,
         path_urns: &[String],
     ) -> Result<u64, StoreError> {
-        self.resolve(deployment_id)?
+        self.active_scope(deployment_id)
+            .await?
             .clear_paths(deployment_id, path_urns)
             .await
             .map_err(to_metric_err)
@@ -399,7 +424,8 @@ impl CoverageMetricStore for DeclaredCoverageStores {
             business_key: fragment.business_key.clone(),
             trace_id: fragment.trace_id.clone(),
         };
-        self.resolve(deployment_id)?
+        self.active_scope(deployment_id)
+            .await?
             .write_fragment(deployment_id, &row)
             .await
             .map_err(to_metric_err)
@@ -407,7 +433,8 @@ impl CoverageMetricStore for DeclaredCoverageStores {
 
     async fn read_metrics(&self, deployment_id: &str) -> Result<CoverageMetrics, StoreError> {
         let m = self
-            .resolve(deployment_id)?
+            .active_scope(deployment_id)
+            .await?
             .read_metrics(deployment_id)
             .await
             .map_err(to_metric_err)?;
@@ -419,7 +446,8 @@ impl CoverageMetricStore for DeclaredCoverageStores {
     }
 
     async fn reset(&self, deployment_id: &str) -> Result<(), StoreError> {
-        self.resolve(deployment_id)?
+        self.active_scope(deployment_id)
+            .await?
             .reset(deployment_id)
             .await
             .map_err(to_metric_err)
@@ -430,7 +458,8 @@ impl CoverageMetricStore for DeclaredCoverageStores {
         deployment_id: &str,
     ) -> Result<Vec<CoverageFragment>, StoreError> {
         let rows = self
-            .resolve(deployment_id)?
+            .active_scope(deployment_id)
+            .await?
             .read_fragments(deployment_id)
             .await
             .map_err(to_metric_err)?;
@@ -859,5 +888,24 @@ mod cache_tests {
             store.get(key).await.unwrap();
         }
         assert!(store.cache.len() <= 2);
+    }
+}
+
+#[cfg(test)]
+mod store_error_tests {
+    use super::*;
+
+    #[test]
+    fn a_coded_backend_failure_keeps_its_code() {
+        let coded = to_store_err(DataStoreError::with_code(
+            sutra_datastore::migration::codes::MIGRATION_CHECKSUM,
+            "data store 'notes': migration 'V1__init.sql' changed",
+        ));
+        assert_eq!(
+            coded.code(),
+            Some(sutra_datastore::migration::codes::MIGRATION_CHECKSUM)
+        );
+        assert!(coded.message().contains("V1__init.sql"));
+        assert_eq!(to_store_err(DataStoreError::new("reset")).code(), None);
     }
 }

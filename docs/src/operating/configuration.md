@@ -75,7 +75,10 @@ to it in-process as soon as the step's commit is durable, so the tick (`tick-int
 `sutra.outbox.batch-size` (default `50`) is how many due rows one claim takes per deployment.
 Delivered rows are deleted in batches. See [Tuning for throughput](throughput-tuning.md).
 
-Outbound deliveries retry with backoff forever by default. `sutra.outbox.retry.max-attempts`
+Outbound deliveries retry with backoff forever by default. `sutra.outbox.retry.base-delay` defaults to `PT1S`:
+retry *n* waits about `base-delay × 2ⁿ`, so the first retry comes about 2 s after the failure. Since 0.6.20 each
+failed attempt that will be retried logs a WARN with the destination, the cause's code and message, the attempt number
+and `next_attempt_at`. `sutra.outbox.retry.max-attempts`
 is the opt-in ceiling: a delivery that exhausts it is marked terminally poisoned — retained
 with its last error, never retried again, one incident recorded for a `required` delivery,
 and no longer counted by the draining-deployment retirement gate. "We gave up" is a durable,

@@ -161,7 +161,7 @@ pub fn receipt_attribute_snapshot(
         .map(|d| d.name.as_str())
         .collect();
     let any_redactor = variables
-        .to_feel_context()
+        .as_feel_context()
         .keys()
         .any(|k| k.ends_with(sutra_bpmn::REDACTION_COMPANION_SUFFIX));
     for attribute in &process.receipt_attributes {

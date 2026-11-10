@@ -293,6 +293,21 @@ impl PgInstanceStore {
         Self { pool }
     }
 
+    /// [`InstanceStore::count_active`] on the caller's connection, inside the caller's
+    /// transaction: the deployment scope is set for the rest of it, so a caller counting several
+    /// deployments sets each in turn. For a caller that holds a lock on that connection.
+    pub async fn count_active_in(
+        conn: &mut PgConnection,
+        deployment: &DeploymentId,
+    ) -> Result<i64> {
+        crate::scope::set_deployment_guc(conn, deployment).await?;
+        sqlx::query_scalar(SQL_COUNT_ACTIVE)
+            .bind(deployment.as_str())
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(PersistenceError::db("instance countActive"))
+    }
+
     /// UPSERT on a caller-supplied connection (the transactional-step building block).
     pub async fn persist_in(
         conn: &mut PgConnection,

@@ -103,6 +103,10 @@ pub struct ServedArchiveRow {
     /// When the row last became active. What decides between rows an older engine let share an
     /// endpoint: the earliest holds.
     pub activated_at: Option<OffsetDateTime>,
+    /// A draining row a newer version of its owner superseded: it keeps serving the inbound
+    /// channels no newer version declares until it retires. `false` for an undeploy, for a row
+    /// that lost an endpoint to another owner, and for rows drained before the column existed.
+    pub retains_channels: bool,
 }
 
 /// One status row (the CRD-mirror / status-endpoint projection — no bytes).
@@ -184,8 +188,10 @@ impl PgDeploymentArchiveStore {
         ))?;
 
         // Demote the prior active row (if any) so the one-active-per-slot index stays satisfied.
+        // Both demotions are supersessions: the row keeps the channels nothing newer declares.
         sqlx::query(
-            "UPDATE deployment_archive SET status = 'draining' WHERE slot = $1 AND status = 'active'",
+            "UPDATE deployment_archive SET status = 'draining', retains_channels = TRUE \
+             WHERE slot = $1 AND status = 'active'",
         )
         .bind(&new.slot)
         .execute(&mut *tx)
@@ -193,7 +199,8 @@ impl PgDeploymentArchiveStore {
         .map_err(PersistenceError::db("deployment_archive demote"))?;
         for slot in superseded {
             sqlx::query(
-                "UPDATE deployment_archive SET status = 'draining' WHERE slot = $1 AND status = 'active'",
+                "UPDATE deployment_archive SET status = 'draining', retains_channels = TRUE \
+                 WHERE slot = $1 AND status = 'active'",
             )
             .bind(slot)
             .execute(&mut *tx)
@@ -208,7 +215,8 @@ impl PgDeploymentArchiveStore {
              VALUES ($1, $2, $3, $4, $5, 'active', $6, $7, $8, $9) \
              ON CONFLICT (deployment_id) DO UPDATE SET \
                status = 'active', slot = EXCLUDED.slot, revision = EXCLUDED.revision, \
-               bytes = EXCLUDED.bytes, checksum = EXCLUDED.checksum, activated_at = EXCLUDED.activated_at",
+               bytes = EXCLUDED.bytes, checksum = EXCLUDED.checksum, activated_at = EXCLUDED.activated_at, \
+               retains_channels = FALSE",
         )
         .bind(&new.deployment_id)
         .bind(&new.slot)
@@ -282,8 +290,8 @@ impl PgDeploymentArchiveStore {
     ) -> Result<Vec<ServedArchiveRow>> {
         let rows = sqlx::query(
             "SELECT deployment_id, slot, tenant, module, version, revision, bytes, status, \
-             activated_at FROM deployment_archive WHERE status IN ('active', 'draining') \
-             ORDER BY slot, revision DESC",
+             activated_at, retains_channels FROM deployment_archive \
+             WHERE status IN ('active', 'draining') ORDER BY slot, revision DESC",
         )
         .fetch_all(&mut *conn)
         .await
@@ -306,19 +314,23 @@ impl PgDeploymentArchiveStore {
                     },
                     status: ArchiveStatus::parse(&status)?,
                     activated_at: r.try_get("activated_at").map_err(map_row)?,
+                    retains_channels: r.try_get("retains_channels").map_err(map_row)?,
                 })
             })
             .collect()
     }
 
     /// Stop an ACTIVE row serving intake, leaving it to drain: a row that lost an endpoint to one
-    /// another row holds. Returns `true` when a row flipped. Safe for every replica to repeat.
-    pub async fn demote_active(&self, deployment_id: &str) -> Result<bool> {
+    /// another row holds. `retains_channels` when a higher version of its owner superseded it,
+    /// rather than another owner. Returns `true` when a row flipped. Safe for every replica to
+    /// repeat.
+    pub async fn demote_active(&self, deployment_id: &str, retains_channels: bool) -> Result<bool> {
         let affected = sqlx::query(
-            "UPDATE deployment_archive SET status = 'draining' \
+            "UPDATE deployment_archive SET status = 'draining', retains_channels = $2 \
              WHERE deployment_id = $1 AND status = 'active'",
         )
         .bind(deployment_id)
+        .bind(retains_channels)
         .execute(&self.pool)
         .await
         .map_err(PersistenceError::db("deployment_archive demote_active"))?
@@ -407,6 +419,32 @@ impl PgDeploymentArchiveStore {
             return Ok(false);
         };
         // Convergence notify (pg) — best-effort, so peers deregister the retired definition too.
+        let slot: String = row.try_get("slot").map_err(map_row)?;
+        let _ = sqlx::query("SELECT pg_notify('sutra_deployments', $1)")
+            .bind(&slot)
+            .execute(&self.pool)
+            .await;
+        Ok(true)
+    }
+}
+
+impl PgDeploymentArchiveStore {
+    /// Undo a retirement that raced a start: a row the sweep retired at zero instances, on which an
+    /// instance landed after all. `retired` → `draining`, keeping its `retains_channels`, so the
+    /// next activation registers it again and the instance can finish there. Returns `true` when a
+    /// row flipped; notifies peers like every other flip.
+    pub async fn reopen_retired(&self, deployment_id: &str) -> Result<bool> {
+        let row = sqlx::query(
+            "UPDATE deployment_archive SET status = 'draining' \
+             WHERE deployment_id = $1 AND status = 'retired' RETURNING slot",
+        )
+        .bind(deployment_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(PersistenceError::db("deployment_archive reopen_retired"))?;
+        let Some(row) = row else {
+            return Ok(false);
+        };
         let slot: String = row.try_get("slot").map_err(map_row)?;
         let _ = sqlx::query("SELECT pg_notify('sutra_deployments', $1)")
             .bind(&slot)

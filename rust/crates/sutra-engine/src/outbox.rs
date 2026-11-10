@@ -115,6 +115,52 @@ pub(crate) fn to_claimed(entry: OutboxEntry) -> ClaimedOutboxRow {
     }
 }
 
+/// Hand rows just committed for an in-process hand-off to the dispatcher. Those rows were
+/// inserted due only after the hand-off grace, so that no claim competes with the hand-off. If
+/// the hand-off has closed since (the dispatcher stopped between the reservation and the
+/// commit), the rows it could not take are made due now and the dispatcher is woken, so the next
+/// claim delivers them instead of waiting out the grace. Rows claimed in the meantime keep their
+/// lease. If making them due fails, they are still delivered once the grace has passed: delivery
+/// stays at-least-once either way.
+pub async fn hand_off_or_make_due(
+    signal: &sutra_channels::OutboxSignal,
+    pool: &PgPool,
+    deployment: &sutra_executor::DeploymentId,
+    entries: Vec<OutboxEntry>,
+) {
+    let inserted: Vec<(Uuid, OffsetDateTime)> = entries
+        .iter()
+        .map(|e| (e.entry_id, e.next_attempt_at))
+        .collect();
+    let unsent = signal.hand_off(deployment, entries.into_iter().map(to_claimed).collect());
+    if unsent.is_empty() {
+        return;
+    }
+    let due: Vec<(Uuid, OffsetDateTime)> = inserted
+        .into_iter()
+        .filter(|(id, _)| unsent.contains(&id.to_string()))
+        .collect();
+    let dep = match persist_dep(deployment) {
+        Ok(dep) => dep,
+        Err(e) => {
+            warn!(deployment = deployment.value(), error = %e, "outbox hand-off fallback: rows stay due after the hand-off grace");
+            return;
+        }
+    };
+    match PgOutboxStore::new(pool.clone())
+        .make_due_if_unclaimed(&dep, &due, OffsetDateTime::now_utc())
+        .await
+    {
+        Ok(_) => signal.wake(),
+        Err(e) => warn!(
+            deployment = deployment.value(),
+            rows = due.len(),
+            error = %e,
+            "outbox hand-off fallback could not make rows due now: they are delivered once the hand-off grace has passed"
+        ),
+    }
+}
+
 impl OutboxRowStore for PgOutboxRows {
     fn claim_due_excluding<'a>(
         &'a self,

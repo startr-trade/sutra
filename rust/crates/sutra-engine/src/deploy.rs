@@ -57,9 +57,10 @@ use uuid::Uuid;
 
 use crate::assembly::{build_engine, plan_deployment, DeploymentPlan};
 use crate::deployment_facts::{
-    already_shared_endpoints, deployment_slot, evaluate_candidate, holder_record_refusal,
-    settle_claims, ConnectionView, DeployWarning, DeploymentFacts, EndpointHolding, EndpointKey,
-    SettledClaim,
+    already_shared_endpoints, compare_deployment_versions, deployment_slot,
+    evaluate_candidate_with_holds, holder_record_refusal, settle_claims, ConnectionView,
+    DeployWarning, DeploymentFacts, DrainingHold, EndpointHolding, EndpointKey, SettledClaim,
+    CHANNEL_NAME_ENDPOINT,
 };
 
 // ---- Activation diagnostics (the SUTRA.DEPLOY.* runtime-activation slice; the
@@ -250,6 +251,14 @@ pub(crate) struct DeploymentStatusSnapshot {
     /// What each ACTIVE deployment claims — what `POST /admin/deployments/check` judges a
     /// candidate against. Never serialized.
     pub(crate) facts: Vec<DeploymentFacts>,
+    /// What draining versions keep until they retire: another owner's candidate claiming any of it
+    /// is refused. Never serialized.
+    pub(crate) holds: Vec<DrainingHold>,
+    /// Running instances of each draining deployment, by id, as last counted.
+    pub(crate) draining_instances: BTreeMap<String, u64>,
+    /// What each DRAINING deployment claims and subscribes to: the older versions a candidate's
+    /// upgrade warnings compare with. Never serialized.
+    pub(crate) draining_facts: Vec<DeploymentFacts>,
 }
 
 /// Shared, watcher-published deployment status read by the HTTP endpoints.
@@ -276,6 +285,8 @@ impl DeploymentStatusSnapshot {
         self.active = last_applied.active.clone();
         self.draining = last_applied.draining.clone();
         self.facts = last_applied.facts.clone();
+        self.holds = last_applied.holds.clone();
+        self.draining_facts = last_applied.draining_facts.clone();
     }
 
     /// The whole snapshot as the `/sutra/deployments` JSON body.
@@ -288,6 +299,10 @@ impl DeploymentStatusSnapshot {
                 .map(|(id, slot)| serde_json::json!({"deploymentId": id, "slot": slot, "phase": "Pending", "ready": false}))
                 .collect::<Vec<_>>(),
             "draining": self.draining,
+            // A version that keeps feeding itself never retires: this is how an operator sees it.
+            "drainingInstances": self.draining.iter()
+                .filter_map(|id| self.draining_instances.get(id).map(|n| (id.clone(), serde_json::json!(n))))
+                .collect::<serde_json::Map<String, serde_json::Value>>(),
             "failed": self.failed.iter()
                 .map(|(slot, err)| serde_json::json!({"slot": slot, "phase": "Failed", "error": err}))
                 .collect::<Vec<_>>(),
@@ -308,9 +323,13 @@ impl DeploymentStatusSnapshot {
             }));
         }
         if self.draining.iter().any(|dep| dep == id) {
-            return Some(serde_json::json!({
+            let mut found = serde_json::json!({
                 "deploymentId": id, "phase": "Draining", "ready": false
-            }));
+            });
+            if let Some(n) = self.draining_instances.get(id) {
+                found["instances"] = serde_json::json!(n);
+            }
+            return Some(found);
         }
         None
     }
@@ -345,6 +364,12 @@ pub(crate) struct DeploymentDirectory {
     booting: bool,
     /// What was last said about deployments sharing such an endpoint, so it is said once.
     already_shared_reported: Vec<String>,
+    /// Running instances of each DRAINING deployment, by id, as the last sweep counted them. What a
+    /// refusal naming a draining version says, and what the status endpoint shows.
+    draining_instances: BTreeMap<String, u64>,
+    /// Retired here lately: their plans stay prepared until a sweep lets them go, so one an
+    /// instance landed on after all can be opened again.
+    recently_retired: RecentlyRetired,
 }
 
 impl DeploymentDirectory {
@@ -396,6 +421,8 @@ impl DeploymentDirectory {
             persistence,
             booting: true,
             already_shared_reported: Vec::new(),
+            draining_instances: BTreeMap::new(),
+            recently_retired: RecentlyRetired::default(),
         };
         directory.scan();
         if directory.unsettled {
@@ -545,8 +572,8 @@ impl DeploymentDirectory {
             return;
         }
         for _ in 0..3 {
-            let (judged, outcomes) = self.judge();
-            let claims = active_claims(&judged, &outcomes);
+            let (judged, outcomes, holds) = self.judge();
+            let claims = active_claims(&judged, &outcomes, &holds);
             match self.ledger.record(claims) {
                 Ok(true) => {
                     self.apply_settlement(judged, outcomes);
@@ -575,7 +602,11 @@ impl DeploymentDirectory {
     /// What each path offers, and what becomes of it. A path whose latest bytes are refused, or do
     /// not verify, falls back on the content it already serves, and that content is judged again in
     /// the same light: it may be all that path has left.
-    fn judge(&mut self) -> (Vec<JudgedArchive>, Vec<SettledClaim>) {
+    ///
+    /// A superseded version keeps the endpoints of channels nothing newer of its owner declares, so
+    /// another owner claiming one is refused until it retires. Which versions are superseded is
+    /// settled first, without those holds, since a hold never decides between versions of one owner.
+    fn judge(&mut self) -> (Vec<JudgedArchive>, Vec<SettledClaim>, Vec<DrainingHold>) {
         let mut fell_back: BTreeMap<PathBuf, String> = BTreeMap::new();
         loop {
             let judged = self.judged_archives(&fell_back);
@@ -594,7 +625,10 @@ impl DeploymentDirectory {
             // get applied are the archives' alone.
             let mut facts = facts;
             facts.extend(self.unjudged_claims(&judged, &facts));
-            let outcomes = settle_claims(&facts, &self.holders_for(&facts));
+            let holders = self.holders_for(&facts);
+            let unheld = settle_claims(&facts, &holders, &[]);
+            let holds = self.holds_for(&judged, &unheld);
+            let outcomes = settle_claims(&facts, &holders, &holds);
             let mut more = false;
             for (archive, outcome) in judged.iter().zip(&outcomes) {
                 let SettledClaim::Refused { reason } = outcome else {
@@ -614,7 +648,7 @@ impl DeploymentDirectory {
             }
             if !more {
                 self.held_back = fell_back;
-                return (judged, outcomes);
+                return (judged, outcomes, holds);
             }
         }
     }
@@ -723,6 +757,41 @@ impl DeploymentDirectory {
             });
         }
         claims
+    }
+
+    /// The holds of the versions that would drain if `outcomes` were applied: the judged archives
+    /// they supersede that serve or drain now (at boot, every one: a boot drains them all), and
+    /// what else drains here keeping its channels. A superseded archive that has retired holds
+    /// nothing, though its file stays.
+    fn holds_for(&self, judged: &[JudgedArchive], outcomes: &[SettledClaim]) -> Vec<DrainingHold> {
+        let judged_ids: HashSet<&str> = judged.iter().map(|a| a.plan.dep.value()).collect();
+        let current = self.draining_plans();
+        let mut active: Vec<ServedChannels<'_>> = Vec::new();
+        let mut draining: Vec<ServedChannels<'_>> = Vec::new();
+        for (archive, outcome) in judged.iter().zip(outcomes) {
+            match outcome {
+                SettledClaim::Active => active.push(ServedChannels::of(&archive.plan)),
+                SettledClaim::Superseded { .. }
+                    if self.booting
+                        || self.draining.contains(&archive.plan.dep)
+                        || self.active.contains(&archive.plan.dep) =>
+                {
+                    draining.push(ServedChannels {
+                        retains_channels: true,
+                        ..ServedChannels::of(&archive.plan)
+                    })
+                }
+                SettledClaim::Superseded { .. } => {}
+                SettledClaim::Refused { .. } => {}
+            }
+        }
+        for plan in current
+            .iter()
+            .filter(|p| p.retains_channels && !judged_ids.contains(p.dep.value()))
+        {
+            draining.push(ServedChannels::of(plan));
+        }
+        draining_holds(&active, &draining, &self.draining_instances)
     }
 
     /// Who holds each endpoint these candidates claim. The record says, when the owner it names
@@ -984,10 +1053,33 @@ impl DeploymentDirectory {
 
     /// The DRAINING plans (most recently drained first) — registered for pinned resume,
     /// no routes, no newly-claimed bindings.
+    ///
+    /// A plan keeps the channels nothing newer declares while a file still holds it as superseded:
+    /// removing the file is an undeploy, and stops them.
     pub(crate) fn draining_plans(&self) -> Vec<DeploymentPlan> {
         self.draining
             .iter()
             .filter_map(|id| self.prepared.get(id.value()).cloned())
+            .map(|mut plan| {
+                plan.retains_channels = self.files.iter().any(|(path, file)| {
+                    !file.superseded_by.is_empty()
+                        && self
+                            .verified
+                            .get(path)
+                            .is_some_and(|verified| verified.dep == plan.dep)
+                });
+                plan
+            })
+            .collect()
+    }
+
+    /// The draining ids that keep channels, for noticing that the served set changed without the
+    /// active set changing: a superseded file removed, say.
+    fn retaining_ids(&self) -> Vec<String> {
+        self.draining_plans()
+            .iter()
+            .filter(|plan| plan.retains_channels)
+            .map(|plan| plan.dep.value().to_string())
             .collect()
     }
 
@@ -1026,17 +1118,33 @@ impl DeploymentDirectory {
                 })
             })
             .collect();
-        let facts = self
-            .active_plans()
+        let active_plans = self.active_plans();
+        let facts = active_plans
             .iter()
             .map(|p| p.facts.clone().in_slot(&slot_of(&p.dep)))
             .collect();
+        let draining_plans = self.draining_plans();
+        let holds = draining_holds(
+            &active_plans
+                .iter()
+                .map(ServedChannels::of)
+                .collect::<Vec<_>>(),
+            &draining_plans
+                .iter()
+                .map(ServedChannels::of)
+                .collect::<Vec<_>>(),
+            &self.draining_instances,
+        );
+        let draining_facts = draining_plans.iter().map(|p| p.facts.clone()).collect();
         DeploymentStatusSnapshot {
             active,
             pending: Vec::new(),
             draining,
             failed,
             facts,
+            holds,
+            draining_instances: self.draining_instances.clone(),
+            draining_facts,
         }
     }
 
@@ -1057,11 +1165,8 @@ impl DeploymentDirectory {
         }
         self.draining.retain(|id| !retired.contains(id));
         for id in retired {
-            let still_contributed = self.files.values().any(|f| f.current.as_ref() == Some(id))
-                || self.active.contains(id);
-            if !still_contributed {
-                self.prepared.remove(id.value());
-            }
+            // Kept prepared until the recheck lets it go.
+            self.recently_retired.push(id.clone());
             info!(
                 deployment = id.value(),
                 "deployment retired (quiescent — zero instances, zero pending outbox)"
@@ -1069,14 +1174,52 @@ impl DeploymentDirectory {
         }
         true
     }
+
+    /// Recheck what retired lately against this sweep's findings. One with work on it after all
+    /// drains again; one quiet long enough is let go, its plan dropped unless something still
+    /// contributes it. Returns `true` when anything drains again.
+    fn recheck_retired(&mut self, found: &[(DeploymentId, bool)]) -> bool {
+        let (reopen, let_go) = self.recently_retired.recheck(found);
+        for id in let_go {
+            let still_used = self.files.values().any(|f| f.current.as_ref() == Some(&id))
+                || self.active.contains(&id)
+                || self.draining.contains(&id);
+            if !still_used {
+                self.prepared.remove(id.value());
+            }
+        }
+        let mut reopened = false;
+        for id in reopen {
+            if self.prepared.contains_key(id.value()) && !self.draining.contains(&id) {
+                warn!(
+                    deployment = id.value(),
+                    "a retired deployment has work on it after all (an instance started as it \
+                     retired): it drains again"
+                );
+                self.draining.push(id);
+                reopened = true;
+            }
+        }
+        reopened
+    }
 }
 
-/// The exclusive endpoints of the deployments that came out active, as the record should hold them.
+/// The exclusive endpoints of the deployments that came out active, as the record should hold them,
+/// and those a draining version keeps: the record stays with it until it retires, and the hold that
+/// ended is released then. What came out active is recorded last, so it wins an endpoint a hold
+/// could not keep from it.
 fn active_claims(
     judged: &[JudgedArchive],
     outcomes: &[SettledClaim],
+    holds: &[DrainingHold],
 ) -> BTreeMap<EndpointKey, EndpointHolding> {
     let mut claims = BTreeMap::new();
+    for hold in holds {
+        for endpoint in &hold.facts.endpoints {
+            let key = (endpoint.transport.clone(), endpoint.claim.identity.clone());
+            add_holder(&mut claims, key, endpoint, &hold.facts);
+        }
+    }
     for (archive, outcome) in judged.iter().zip(outcomes) {
         if *outcome != SettledClaim::Active {
             continue;
@@ -1177,6 +1320,8 @@ fn prepare_archive(
                 .unwrap_or(UnjudgedClaim::Unreadable),
         ),
     };
+    // A scan is a folder's deploy, so what a new deploy is refused for fails the archive here.
+    refuse_send_faults(&archive.deployment).map_err(known)?;
     let plan = plan_deployment(&archive.deployment).map_err(|e| known(format!("{e}")))?;
     if let Some(reason) = holder_record_refusal(&plan.facts) {
         return Err(ArchiveRejection {
@@ -1199,6 +1344,7 @@ fn prepare_archive(
 pub(crate) fn prepare_archive_bytes(bytes: &[u8]) -> Result<DeploymentPlan, String> {
     let archive = sutra_loader::read_archive(bytes).map_err(|e| format!("{e}"))?;
     report_unrecognised_dedup_keys(&archive.deployment);
+    report_send_faults(&archive.deployment);
     plan_deployment(&archive.deployment).map_err(|e| format!("{e}"))
 }
 
@@ -1213,6 +1359,36 @@ fn report_unrecognised_dedup_keys(deployment: &sutra_loader::LoadedDeployment) {
             code = sutra_bpmn::codes::PARSE_Q_SOURCE_DEDUP_KEY_UNRECOGNISED,
             "{}",
             found.describe_running(&package)
+        );
+    }
+}
+
+/// Why a NEW deploy of this package is refused, if it sends a literal `local://` address outside
+/// itself or calls a process it does not have. A stored row keeps running with these
+/// ([`report_send_faults`]); only a new deploy is refused.
+pub(crate) fn refuse_send_faults(
+    deployment: &sutra_loader::LoadedDeployment,
+) -> Result<(), String> {
+    match sutra_loader::deployment_send_faults(deployment)
+        .into_iter()
+        .find(|d| d.severity == sutra_loader::LintSeverity::Error)
+    {
+        Some(first) => Err(format!("[{}] {}", first.code, first.message)),
+        None => Ok(()),
+    }
+}
+
+/// A stored package with a fault a new deploy would be refused for keeps running, and each load
+/// says so.
+fn report_send_faults(deployment: &sutra_loader::LoadedDeployment) {
+    for fault in sutra_loader::deployment_send_faults(deployment)
+        .into_iter()
+        .filter(|d| d.severity == sutra_loader::LintSeverity::Error)
+    {
+        error!(
+            code = %fault.code,
+            "stored deployment keeps running, though a new deploy of it would be refused: {}",
+            fault.message
         );
     }
 }
@@ -1298,6 +1474,11 @@ pub(crate) async fn settled_store_set(
             .map(|(_, slot)| slot.clone())
             .unwrap_or_default()
     };
+    let retaining: HashSet<String> = draining_rows
+        .iter()
+        .filter(|row| row.retains_channels)
+        .map(|row| row.archive.deployment_id.clone())
+        .collect();
     let bytes_of = |rows: Vec<sutra_persistence::stores::ServedArchiveRow>| {
         rows.into_iter()
             .map(|row| (row.archive.deployment_id, row.archive.bytes))
@@ -1305,6 +1486,9 @@ pub(crate) async fn settled_store_set(
     };
     let mut plans = plans_from_store(bytes_of(active_rows));
     let mut draining = plans_from_store(bytes_of(draining_rows));
+    for plan in &mut draining {
+        plan.retains_channels = retaining.contains(plan.dep.value());
+    }
 
     // The earliest activated first, so the first claimant of an endpoint is its holder.
     let mut order: Vec<usize> = (0..plans.len()).collect();
@@ -1336,7 +1520,8 @@ pub(crate) async fn settled_store_set(
         .iter()
         .map(|p| p.facts.clone().in_slot(&slot_of(&id_slots, p.dep.value())))
         .collect();
-    let outcomes = settle_claims(&facts, &holders);
+    // Rows that already share an endpoint: the deploy path holds the gate, so no hold applies here.
+    let outcomes = settle_claims(&facts, &holders, &[]);
     let mut refused = Vec::new();
     let mut kept = Vec::new();
     for message in already_shared_endpoints(&facts) {
@@ -1345,22 +1530,31 @@ pub(crate) async fn settled_store_set(
             "{message}"
         );
     }
-    for (plan, outcome) in plans.drain(..).zip(outcomes) {
-        let reason = match outcome {
+    for (mut plan, outcome) in plans.drain(..).zip(outcomes) {
+        let (reason, superseded) = match outcome {
             SettledClaim::Active => {
                 kept.push(plan);
                 continue;
             }
-            SettledClaim::Superseded { by } => format!(
-                "[{}] {} is an older version than {}, on an endpoint they share",
-                sutra_channels::codes::DEPLOY_ENDPOINT_SUPERSEDED,
-                plan.facts.label,
-                by.join(", ")
+            SettledClaim::Superseded { by } => (
+                format!(
+                    "[{}] {} is an older version than {}, on an endpoint they share",
+                    sutra_channels::codes::DEPLOY_ENDPOINT_SUPERSEDED,
+                    plan.facts.label,
+                    by.join(", ")
+                ),
+                true,
             ),
-            SettledClaim::Refused { reason } => reason,
+            SettledClaim::Refused { reason } => (reason, false),
         };
         let id = plan.dep.value().to_string();
-        store.demote_active(&id).await.map_err(|e| e.to_string())?;
+        // Superseded by a higher version of its owner, it keeps what nothing newer declares; a row
+        // that lost to another owner keeps nothing.
+        store
+            .demote_active(&id, superseded)
+            .await
+            .map_err(|e| e.to_string())?;
+        plan.retains_channels = superseded;
         error!(
             deployment = %id,
             error = %reason,
@@ -1376,6 +1570,202 @@ pub(crate) async fn settled_store_set(
         id_slots,
         refused,
     })
+}
+
+// ---- Channels a superseded version keeps ----------------------------------------------------
+
+/// One deployment's channels as the serving set sees them: what it claims, what it declares, and
+/// whether, draining, it keeps what nothing newer declares.
+#[derive(Clone, Copy)]
+pub(crate) struct ServedChannels<'a> {
+    pub(crate) facts: &'a DeploymentFacts,
+    pub(crate) definitions: &'a [ChannelDefinition],
+    pub(crate) retains_channels: bool,
+}
+
+impl<'a> ServedChannels<'a> {
+    pub(crate) fn of(plan: &'a DeploymentPlan) -> ServedChannels<'a> {
+        ServedChannels {
+            facts: &plan.facts,
+            definitions: &plan.definitions,
+            retains_channels: plan.retains_channels,
+        }
+    }
+}
+
+/// An inbound channel a draining deployment goes on serving.
+#[derive(Clone)]
+pub(crate) struct RetainedChannel {
+    pub(crate) deployment: String,
+    pub(crate) definition: ChannelDefinition,
+    /// Its endpoints, the channel-name endpoint left out.
+    pub(crate) endpoints: Vec<DeclaredEndpoint>,
+}
+
+/// The inbound channels draining deployments keep serving. A draining deployment keeps a channel
+/// when it was superseded rather than undeployed (`retains_channels`), no version of its owner
+/// that serves declares a channel of that name, and nothing that serves is on any of its
+/// endpoints: on a topic too, or both versions would process every event. Another owner on a topic
+/// does not take it. An owner with no active version keeps what it had until it retires.
+///
+/// What serves is the active set, then what this keeps: of two draining versions with one channel,
+/// the higher version keeps it, and of two contents of one version, the first listed.
+pub(crate) fn retained_channels(
+    active: &[ServedChannels<'_>],
+    draining: &[ServedChannels<'_>],
+) -> Vec<RetainedChannel> {
+    let mut names: HashSet<(String, String)> = HashSet::new();
+    let mut identities: Vec<(String, String, String, EndpointSharing)> = Vec::new();
+    let take = |names: &mut HashSet<(String, String)>,
+                identities: &mut Vec<(String, String, String, EndpointSharing)>,
+                owner: &str,
+                name: &str,
+                endpoints: &[DeclaredEndpoint]| {
+        names.insert((owner.to_string(), name.to_string()));
+        for e in endpoints {
+            identities.push((
+                owner.to_string(),
+                e.transport.clone(),
+                e.claim.identity.clone(),
+                e.claim.sharing,
+            ));
+        }
+    };
+    let endpoints_of = |facts: &DeploymentFacts, channel: &str| -> Vec<DeclaredEndpoint> {
+        facts
+            .endpoints
+            .iter()
+            .filter(|e| e.channel == channel && e.transport != CHANNEL_NAME_ENDPOINT)
+            .cloned()
+            .collect()
+    };
+    for served in active {
+        for def in served.definitions {
+            let name = &def.binding.channel_name;
+            let endpoints = endpoints_of(served.facts, name);
+            take(
+                &mut names,
+                &mut identities,
+                &served.facts.owner,
+                name,
+                &endpoints,
+            );
+        }
+    }
+    let mut order: Vec<usize> = (0..draining.len()).collect();
+    order.sort_by(|a, b| {
+        compare_deployment_versions(&draining[*b].facts.version, &draining[*a].facts.version)
+    });
+    let mut kept = Vec::new();
+    for i in order {
+        let served = &draining[i];
+        if !served.retains_channels {
+            continue;
+        }
+        let owner = &served.facts.owner;
+        for def in served.definitions.iter().filter(|d| !d.is_outbound()) {
+            let name = &def.binding.channel_name;
+            if names.contains(&(owner.clone(), name.clone())) {
+                continue;
+            }
+            let endpoints = endpoints_of(served.facts, name);
+            let taken = endpoints.iter().any(|e| {
+                identities
+                    .iter()
+                    .any(|(holder, transport, identity, sharing)| {
+                        *transport == e.transport
+                            && *identity == e.claim.identity
+                            && (holder == owner
+                                || *sharing != EndpointSharing::Broadcast
+                                || e.claim.sharing != EndpointSharing::Broadcast)
+                    })
+            });
+            if taken {
+                continue;
+            }
+            take(&mut names, &mut identities, owner, name, &endpoints);
+            kept.push(RetainedChannel {
+                deployment: served.facts.deployment_id.clone(),
+                definition: def.clone(),
+                endpoints,
+            });
+        }
+    }
+    kept
+}
+
+/// What each retaining draining version keeps, as far as its own owner is concerned: the endpoints
+/// of the channels no serving version of its owner declares or is on. That is what another owner is
+/// refused, whatever it would take of it. `instances` counts each version's running instances, by
+/// deployment id, where they were counted.
+pub(crate) fn draining_holds(
+    active: &[ServedChannels<'_>],
+    draining: &[ServedChannels<'_>],
+    instances: &BTreeMap<String, u64>,
+) -> Vec<DrainingHold> {
+    let owners: BTreeSet<&str> = draining
+        .iter()
+        .filter(|d| d.retains_channels)
+        .map(|d| d.facts.owner.as_str())
+        .collect();
+    let mut holds = Vec::new();
+    for owner in owners {
+        let own_active: Vec<ServedChannels<'_>> = active
+            .iter()
+            .filter(|s| s.facts.owner == owner)
+            .copied()
+            .collect();
+        let own_draining: Vec<ServedChannels<'_>> = draining
+            .iter()
+            .filter(|s| s.facts.owner == owner)
+            .copied()
+            .collect();
+        let kept = retained_channels(&own_active, &own_draining);
+        for served in draining.iter().filter(|d| d.facts.owner == owner) {
+            let endpoints: Vec<DeclaredEndpoint> = kept
+                .iter()
+                .filter(|k| k.deployment == served.facts.deployment_id)
+                .flat_map(|k| k.endpoints.iter().cloned())
+                .collect();
+            if endpoints.is_empty() {
+                continue;
+            }
+            holds.push(DrainingHold {
+                facts: DeploymentFacts {
+                    endpoints,
+                    ..served.facts.clone()
+                },
+                instances: instances.get(&served.facts.deployment_id).copied(),
+            });
+        }
+    }
+    holds
+}
+
+/// [`retained_channels`] over planned deployments.
+pub(crate) fn retained_definitions(
+    active: &[DeploymentPlan],
+    draining: &[DeploymentPlan],
+) -> Vec<RetainedChannel> {
+    let active: Vec<ServedChannels<'_>> = active.iter().map(ServedChannels::of).collect();
+    let draining: Vec<ServedChannels<'_>> = draining.iter().map(ServedChannels::of).collect();
+    retained_channels(&active, &draining)
+}
+
+/// Every channel definition the transports serve: the active set's, then the retained ones.
+pub(crate) fn served_definitions(
+    active: &[DeploymentPlan],
+    draining: &[DeploymentPlan],
+) -> Vec<ChannelDefinition> {
+    active
+        .iter()
+        .flat_map(|plan| plan.definitions.iter().cloned())
+        .chain(
+            retained_definitions(active, draining)
+                .into_iter()
+                .map(|kept| kept.definition),
+        )
+        .collect()
 }
 
 /// Everything the watcher needs to drive a flip.
@@ -1453,9 +1843,11 @@ pub(crate) async fn activate_plans(
     // The new active channel definitions the flip rewires every transport to (collected
     // before `active` is moved into the actor rebuild below). Each transport — HTTP included —
     // filters this set by its own `transport:` in `rewire`.
+    let retained = retained_definitions(&active, &draining);
     let active_definitions: Vec<ChannelDefinition> = active
         .iter()
         .flat_map(|plan| plan.definitions.iter().cloned())
+        .chain(retained.iter().map(|kept| kept.definition.clone()))
         .collect();
 
     // The last gate before anything changes. A deploy path has already judged its candidate; this
@@ -1465,6 +1857,11 @@ pub(crate) async fn activate_plans(
     let endpoints: Vec<DeclaredEndpoint> = active
         .iter()
         .flat_map(|plan| plan.facts.endpoints.iter().cloned())
+        .chain(
+            retained
+                .iter()
+                .flat_map(|kept| kept.endpoints.iter().cloned()),
+        )
         // Refused to anything new, and allowed to go on for what already runs on it: a deploy path
         // has judged those, and a set can only hold what those let through.
         .filter(|endpoint| {
@@ -1741,6 +2138,138 @@ pub(crate) struct DeployAccepted {
     pub(crate) warnings: Vec<DeployWarning>,
 }
 
+/// A warning an upgrade owes about an older version of the candidate's owner, before its parked
+/// instances are counted.
+pub(crate) enum UpgradeFinding {
+    Changed(crate::deployment_facts::ChangedChannel),
+    StartOnWait(crate::deployment_facts::NewStartOnWait),
+}
+
+impl UpgradeFinding {
+    /// What `candidate` changes for each of `older` (versions of its owner only).
+    pub(crate) fn of(
+        candidate: &DeploymentFacts,
+        older: &[&DeploymentFacts],
+    ) -> Vec<UpgradeFinding> {
+        let mut found = Vec::new();
+        for old in older
+            .iter()
+            .filter(|o| o.owner == candidate.owner && o.deployment_id != candidate.deployment_id)
+        {
+            let (changed, starts) = crate::deployment_facts::compare_with_older(candidate, old);
+            found.extend(changed.into_iter().map(UpgradeFinding::Changed));
+            found.extend(starts.into_iter().map(UpgradeFinding::StartOnWait));
+        }
+        found
+    }
+
+    fn older_and_nodes(&self) -> (&str, &[String]) {
+        match self {
+            UpgradeFinding::Changed(c) => (&c.older_deployment_id, &c.wait_nodes),
+            UpgradeFinding::StartOnWait(s) => (&s.older_deployment_id, &s.wait_nodes),
+        }
+    }
+
+    fn warning(&self, parked: Option<u64>) -> DeployWarning {
+        match self {
+            UpgradeFinding::Changed(c) => c.warning(parked),
+            UpgradeFinding::StartOnWait(s) => s.warning(parked),
+        }
+    }
+
+    /// The warning, with the older version's parked instances counted on `conn`.
+    pub(crate) async fn counted_on(&self, conn: &mut sqlx::PgConnection) -> DeployWarning {
+        let (older, nodes) = self.older_and_nodes();
+        let parked = match PersistDeploymentId::new(older) {
+            Ok(dep) => sutra_persistence::stores::PgWaitStateStore::count_parked_on_nodes_in(
+                conn, &dep, nodes,
+            )
+            .await
+            .ok(),
+            Err(_) => None,
+        };
+        self.warning(parked)
+    }
+
+    /// The warning, counted in a transaction of its own on `pool`, or uncounted without one.
+    pub(crate) async fn counted(&self, pool: Option<&PgPool>) -> DeployWarning {
+        let Some(pool) = pool else {
+            return self.warning(None);
+        };
+        match pool.begin().await {
+            Ok(mut tx) => {
+                let warning = self.counted_on(&mut tx).await;
+                let _ = tx.rollback().await;
+                warning
+            }
+            Err(_) => self.warning(None),
+        }
+    }
+}
+
+/// What [`DeployController::admit`] decided about a candidate it did not refuse outright.
+struct Admission {
+    warnings: Vec<DeployWarning>,
+    superseded_slots: Vec<String>,
+    retained_collisions: Vec<crate::deployment_facts::RetainedCollision>,
+    /// Counted and added to the warnings once nothing refuses the candidate.
+    upgrade: Vec<UpgradeFinding>,
+}
+
+/// A stored row's channels, read without planning it: only what the deploy check needs.
+struct StoredChannels {
+    facts: DeploymentFacts,
+    definitions: Vec<ChannelDefinition>,
+    retains_channels: bool,
+}
+
+impl StoredChannels {
+    fn of_row(row: &sutra_persistence::stores::ServedArchiveRow) -> Option<StoredChannels> {
+        let slot = &row.archive.slot;
+        let loaded = match sutra_loader::read_archive(&row.archive.bytes) {
+            Ok(archive) => archive.deployment,
+            Err(e) => {
+                warn!(slot = %slot, error = %e, "stored archive skipped by the endpoint check");
+                return None;
+            }
+        };
+        let facts = match DeploymentFacts::of_loaded(&loaded, ConnectionView::Resolved) {
+            Ok(facts) => facts.in_slot(slot),
+            Err(e) => {
+                warn!(slot = %slot, error = %e, "stored archive skipped by the endpoint check");
+                return None;
+            }
+        };
+        let definitions = loaded
+            .channels_yaml
+            .as_ref()
+            .and_then(|yaml| {
+                sutra_channels::load_channel_definitions(
+                    yaml.as_bytes(),
+                    &loaded.tenant,
+                    &loaded.module,
+                    &loaded.version,
+                    "channels.yaml",
+                )
+                .ok()
+            })
+            .unwrap_or_default();
+        Some(StoredChannels {
+            facts,
+            definitions,
+            retains_channels: row.retains_channels,
+        })
+    }
+
+    fn served(&self) -> ServedChannels<'_> {
+        ServedChannels {
+            facts: &self.facts,
+            definitions: &self.definitions,
+            retains_channels: self.retains_channels,
+        }
+    }
+}
+
 /// The synchronous deploy path for the `db` deployment source: validate the archive bytes →
 /// store the row ACTIVE (replace-in-place) → run the activation flip → refresh the
 /// deploy-status + OpenAPI-spec projections. Held in the admin `AppState`; the
@@ -1750,6 +2279,10 @@ pub(crate) struct DeployAccepted {
 pub(crate) struct DeployController {
     store: sutra_persistence::stores::PgDeploymentArchiveStore,
     hooks: ActivationHooks,
+    /// Running instances of each draining row, by id, as the last sweep counted them.
+    draining_instances: std::sync::Mutex<BTreeMap<String, u64>>,
+    /// Rows this replica's sweep retired lately, rechecked until quiet twice in a row.
+    recently_retired: std::sync::Mutex<RecentlyRetired>,
 }
 
 impl DeployController {
@@ -1757,7 +2290,62 @@ impl DeployController {
         store: sutra_persistence::stores::PgDeploymentArchiveStore,
         hooks: ActivationHooks,
     ) -> DeployController {
-        DeployController { store, hooks }
+        DeployController {
+            store,
+            hooks,
+            draining_instances: std::sync::Mutex::new(BTreeMap::new()),
+            recently_retired: std::sync::Mutex::new(RecentlyRetired::default()),
+        }
+    }
+
+    /// Recheck the rows this sweep retired lately: one an instance landed on after all is opened
+    /// again, and the flip that follows serves it. Returns how many opened.
+    async fn recheck_retired(&self) -> Result<usize, String> {
+        let recent = self
+            .recently_retired
+            .lock()
+            .map(|r| r.ids())
+            .unwrap_or_default();
+        if recent.is_empty() {
+            return Ok(0);
+        }
+        let found: Vec<(DeploymentId, bool)> = quiescence(&recent, &self.hooks.pool)
+            .await
+            .into_iter()
+            .map(|(id, _, quiescent)| (id, quiescent))
+            .collect();
+        let (reopen, _) = match self.recently_retired.lock() {
+            Ok(mut r) => r.recheck(&found),
+            Err(_) => return Ok(0),
+        };
+        let mut reopened = 0usize;
+        for id in reopen {
+            match self.store.reopen_retired(id.value()).await {
+                Ok(true) => {
+                    reopened += 1;
+                    warn!(
+                        deployment = id.value(),
+                        "a retired deployment has work on it after all (an instance started as \
+                         it retired): it drains again"
+                    );
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    warn!(deployment = id.value(), error = %e, "reopen of a retired deployment failed")
+                }
+            }
+        }
+        if reopened > 0 {
+            self.reactivate_from_store().await?;
+        }
+        Ok(reopened)
+    }
+
+    fn draining_counts(&self) -> BTreeMap<String, u64> {
+        self.draining_instances
+            .lock()
+            .map(|counts| counts.clone())
+            .unwrap_or_default()
     }
 
     /// Deploy (or hot-deploy replace-in-place) a sealed `.sutra` archive: validate the bytes
@@ -1790,6 +2378,7 @@ impl DeployController {
     ) -> Result<(String, String, i64, Vec<DeployWarning>), String> {
         let archive = sutra_loader::read_archive(&bytes).map_err(|e| format!("{e}"))?;
         refuse_unrecognised_dedup_keys(&archive.deployment)?;
+        refuse_send_faults(&archive.deployment)?;
         // A bad candidate is refused here rather than stored and then dropped from every flip.
         let plan = prepare_archive_bytes(&bytes)?;
         let dep = &archive.deployment;
@@ -1812,7 +2401,32 @@ impl DeployController {
             )
             .await
             .map_err(|e| e.to_string())?;
-        let (warnings, superseded_slots) = self.admit(&plan, &slot, served)?;
+        let Admission {
+            mut warnings,
+            superseded_slots,
+            retained_collisions,
+            upgrade,
+        } = self.admit(&plan, &slot, served)?;
+        if !retained_collisions.is_empty() {
+            // Counted only on a refusal, on the lock's own connection.
+            let mut described = Vec::new();
+            for mut collision in retained_collisions {
+                if let Ok(dep) = PersistDeploymentId::new(&collision.holder_deployment_id) {
+                    collision.instances =
+                        sutra_persistence::stores::PgInstanceStore::count_active_in(&mut tx, &dep)
+                            .await
+                            .ok()
+                            .map(|n| u64::try_from(n).unwrap_or(0));
+                }
+                described.push(collision.describe());
+            }
+            return Err(described.join("; "));
+        }
+        for finding in &upgrade {
+            let warning = finding.counted_on(&mut tx).await;
+            warn!(code = %warning.code, slot = %slot, "{}", warning.message);
+            warnings.push(warning);
+        }
         let new = sutra_persistence::stores::NewArchive {
             deployment_id: deployment_id.clone(),
             slot: slot.clone(),
@@ -1836,65 +2450,90 @@ impl DeployController {
         Ok((deployment_id, slot, revision, warnings))
     }
 
-    /// Judge a planned candidate against the store's other active rows: refuse an endpoint
-    /// collision, and refuse a set some transport could not rewire to. Returns the warnings and
-    /// the slots of the same tenant and module this candidate supersedes.
+    /// Judge a planned candidate against the store's other rows: refuse an endpoint collision, and
+    /// refuse a set some transport could not rewire to. An endpoint a draining version of another
+    /// owner keeps comes back in [`Admission::retained_collisions`], for the caller to count that
+    /// version's instances on its own connection before refusing. Returns the warnings and the
+    /// slots of the same tenant and module this candidate supersedes.
     fn admit(
         &self,
         plan: &DeploymentPlan,
         slot: &str,
         served: Vec<sutra_persistence::stores::ServedArchiveRow>,
-    ) -> Result<(Vec<DeployWarning>, Vec<String>), String> {
-        let (active, _) = split_served_archives(served);
-        let mut others = Vec::new();
-        let mut other_definitions: Vec<(String, Vec<ChannelDefinition>)> = Vec::new();
-        for row in active.into_iter().filter(|row| row.slot != slot) {
-            // Only what the check reads: a full plan of every row belongs to the flip.
-            let loaded = match sutra_loader::read_archive(&row.bytes) {
-                Ok(archive) => archive.deployment,
-                Err(e) => {
-                    warn!(slot = %row.slot, error = %e, "stored archive skipped by the endpoint check");
-                    continue;
-                }
-            };
-            let facts = match DeploymentFacts::of_loaded(&loaded, ConnectionView::Resolved) {
-                Ok(facts) => facts.in_slot(&row.slot),
-                Err(e) => {
-                    warn!(slot = %row.slot, error = %e, "stored archive skipped by the endpoint check");
-                    continue;
-                }
-            };
-            if let Some(yaml) = &loaded.channels_yaml {
-                if let Ok(defs) = sutra_channels::load_channel_definitions(
-                    yaml.as_bytes(),
-                    &loaded.tenant,
-                    &loaded.module,
-                    &loaded.version,
-                    "channels.yaml",
-                ) {
-                    other_definitions.push((row.slot.clone(), defs));
-                }
+    ) -> Result<Admission, String> {
+        let mut active: Vec<StoredChannels> = Vec::new();
+        let mut draining: Vec<StoredChannels> = Vec::new();
+        for row in served {
+            let is_draining = row.status == sutra_persistence::stores::ArchiveStatus::Draining;
+            if !is_draining && row.archive.slot == slot {
+                continue;
             }
-            others.push(facts);
+            let Some(stored) = StoredChannels::of_row(&row) else {
+                continue;
+            };
+            if is_draining {
+                draining.push(stored);
+            } else {
+                active.push(stored);
+            }
         }
-        let verdict = evaluate_candidate(&plan.facts.clone().in_slot(slot), &others);
+        let active_view: Vec<ServedChannels<'_>> =
+            active.iter().map(StoredChannels::served).collect();
+        let draining_view: Vec<ServedChannels<'_>> =
+            draining.iter().map(StoredChannels::served).collect();
+        // What draining versions keep now, as the serving set stands.
+        let holds = draining_holds(&active_view, &draining_view, &BTreeMap::new());
+        let others: Vec<DeploymentFacts> = active.iter().map(|s| s.facts.clone()).collect();
+        let candidate = plan.facts.clone().in_slot(slot);
+        let verdict = evaluate_candidate_with_holds(&candidate, &others, &holds);
         if !verdict.collisions.is_empty() {
             return Err(describe_endpoint_refusal(&verdict.collisions));
         }
         let superseded_slots: Vec<String> =
             verdict.superseded.iter().map(|s| s.slot.clone()).collect();
-        // The set the flip will really serve: a superseded deployment is no part of it.
-        let mut definitions = plan.definitions.clone();
-        for (other_slot, defs) in other_definitions {
-            if !superseded_slots.contains(&other_slot) {
-                definitions.extend(defs);
+        if verdict.retained_collisions.is_empty() {
+            // The set the flip will really serve: a superseded deployment is no part of it, beyond
+            // the channels it keeps.
+            let mut after_active: Vec<ServedChannels<'_>> = vec![ServedChannels::of(plan)];
+            let mut after_draining: Vec<ServedChannels<'_>> = Vec::new();
+            for stored in &active {
+                if superseded_slots.contains(&stored.facts.slot) {
+                    after_draining.push(ServedChannels {
+                        retains_channels: true,
+                        ..stored.served()
+                    });
+                } else {
+                    after_active.push(stored.served());
+                }
+            }
+            after_draining.extend(draining.iter().map(StoredChannels::served));
+            let mut definitions: Vec<ChannelDefinition> = after_active
+                .iter()
+                .flat_map(|s| s.definitions.iter().cloned())
+                .collect();
+            definitions.extend(
+                retained_channels(&after_active, &after_draining)
+                    .into_iter()
+                    .map(|kept| kept.definition),
+            );
+            prepare_transports(&self.hooks.transports, &definitions)?;
+            for warning in &verdict.warnings {
+                warn!(code = %warning.code, slot = %slot, "{}", warning.message);
             }
         }
-        prepare_transports(&self.hooks.transports, &definitions)?;
-        for warning in &verdict.warnings {
-            warn!(code = %warning.code, slot = %slot, "{}", warning.message);
-        }
-        Ok((verdict.warnings, superseded_slots))
+        // What the candidate changes for the versions it supersedes and those already draining.
+        let older: Vec<&DeploymentFacts> = active
+            .iter()
+            .filter(|s| superseded_slots.contains(&s.facts.slot))
+            .chain(draining.iter())
+            .map(|s| &s.facts)
+            .collect();
+        Ok(Admission {
+            warnings: verdict.warnings,
+            superseded_slots,
+            retained_collisions: verdict.retained_collisions,
+            upgrade: UpgradeFinding::of(&candidate, &older),
+        })
     }
 
     /// Undeploy a slot (retire its active row) + re-activate the remaining set. `Ok(false)` when
@@ -2141,6 +2780,17 @@ impl DeployController {
                 )
             })
             .collect();
+        let draining_instances = self.draining_counts();
+        let draining_facts: Vec<DeploymentFacts> =
+            draining_plans.iter().map(|p| p.facts.clone()).collect();
+        let holds = draining_holds(
+            &plans.iter().map(ServedChannels::of).collect::<Vec<_>>(),
+            &draining_plans
+                .iter()
+                .map(ServedChannels::of)
+                .collect::<Vec<_>>(),
+            &draining_instances,
+        );
         activate_plans(plans, draining_plans, live_ids, &self.hooks).await?;
         // Status reflects only the successfully-served ids (a stored row that failed re-prepare is
         // dropped from the projection, not reported Active).
@@ -2164,6 +2814,9 @@ impl DeployController {
                 draining: draining_ids,
                 failed: refused,
                 facts,
+                holds,
+                draining_instances,
+                draining_facts,
             };
         }
         if let Ok(mut m) = self.hooks.specs.write() {
@@ -2190,6 +2843,7 @@ impl DeployController {
     /// (the warning comes from the gate), and a retire that loses a race with a concurrent
     /// rollback re-deploy flips nothing — the guard is `status = 'draining'`.
     pub(crate) async fn sweep_quiescent_draining(&self) -> Result<usize, String> {
+        self.recheck_retired().await?;
         let served = self
             .store
             .list_active_and_draining()
@@ -2203,12 +2857,30 @@ impl DeployController {
         if candidates.is_empty() {
             return Ok(0);
         }
-        let quiescent = quiescent_ids(&candidates, &self.hooks.pool).await;
+        let found = quiescence(&candidates, &self.hooks.pool).await;
+        let counts: BTreeMap<String, u64> = found
+            .iter()
+            .filter_map(|(id, n, _)| n.map(|n| (id.value().to_string(), n)))
+            .collect();
+        if let Ok(mut held) = self.draining_instances.lock() {
+            *held = counts.clone();
+        }
+        if let Ok(mut s) = self.hooks.status.write() {
+            s.draining_instances = counts;
+        }
+        let quiescent: Vec<DeploymentId> = found
+            .into_iter()
+            .filter(|(_, _, quiescent)| *quiescent)
+            .map(|(id, _, _)| id)
+            .collect();
         let mut retired = 0usize;
         for id in &quiescent {
             match self.store.retire_deployment(id.value()).await {
                 Ok(true) => {
                     retired += 1;
+                    if let Ok(mut recent) = self.recently_retired.lock() {
+                        recent.push(id.clone());
+                    }
                     info!(
                         deployment = id.value(),
                         "deployment retired (quiescent — zero instances, zero pending outbox)"
@@ -2322,20 +2994,89 @@ pub(crate) async fn spawn_deploy_listen(pool: PgPool, controller: Arc<DeployCont
     }
 }
 
+/// Deployments retired lately, each with how many sweeps in a row have found it still quiescent.
+/// A draining version's channels take starts, so an instance can land between the count that let
+/// it retire and the retirement: a later sweep that finds work there opens it again.
+#[derive(Default)]
+pub(crate) struct RecentlyRetired {
+    entries: Vec<(DeploymentId, u8)>,
+}
+
+/// How many sweeps in a row must find a retired deployment quiescent before it is let go.
+const RETIRED_RECHECKS: u8 = 2;
+
+impl RecentlyRetired {
+    fn push(&mut self, id: DeploymentId) {
+        if !self.entries.iter().any(|(known, _)| *known == id) {
+            self.entries.push((id, 0));
+        }
+    }
+
+    fn ids(&self) -> Vec<DeploymentId> {
+        self.entries.iter().map(|(id, _)| id.clone()).collect()
+    }
+
+    /// Apply one sweep's findings: `(id, quiescent)`. Returns `(to_reopen, let_go)`. An id this
+    /// sweep could not judge stays as it was.
+    fn recheck(
+        &mut self,
+        found: &[(DeploymentId, bool)],
+    ) -> (Vec<DeploymentId>, Vec<DeploymentId>) {
+        let (mut reopen, mut let_go) = (Vec::new(), Vec::new());
+        self.entries
+            .retain_mut(|(id, quiet)| match found.iter().find(|(f, _)| f == id) {
+                Some((_, false)) => {
+                    reopen.push(id.clone());
+                    false
+                }
+                Some((_, true)) => {
+                    *quiet += 1;
+                    if *quiet >= RETIRED_RECHECKS {
+                        let_go.push(id.clone());
+                        false
+                    } else {
+                        true
+                    }
+                }
+                None => true,
+            });
+        (reopen, let_go)
+    }
+}
+
 /// The DRAINING ids that are now quiescent: zero active instances AND zero pending
 /// outbox rows. Persistence-less engines have nothing pinned — everything drains
 /// immediately.
+#[cfg(test)]
 pub(crate) async fn quiescent_ids(
     draining: &[DeploymentId],
     pool: &Option<PgPool>,
 ) -> Vec<DeploymentId> {
+    quiescence(draining, pool)
+        .await
+        .into_iter()
+        .filter(|(_, _, quiescent)| *quiescent)
+        .map(|(id, _, _)| id)
+        .collect()
+}
+
+/// Each DRAINING id with its running instances, where they could be counted, and whether it is
+/// quiescent: zero active instances, zero pending outbox rows and zero live external tasks. Without
+/// a database nothing is pinned: everything is quiescent at once, with no instances.
+pub(crate) async fn quiescence(
+    draining: &[DeploymentId],
+    pool: &Option<PgPool>,
+) -> Vec<(DeploymentId, Option<u64>, bool)> {
     let Some(pool) = pool else {
-        return draining.to_vec();
+        return draining
+            .iter()
+            .map(|id| (id.clone(), Some(0), true))
+            .collect();
     };
     let mut out = Vec::new();
     for id in draining {
         let Ok(dep) = sutra_persistence::DeploymentId::new(id.value()) else {
-            out.push(id.clone());
+            out.push((id.clone(), None, true));
             continue;
         };
         let instances = sutra_persistence::stores::InstanceStore::count_active(
@@ -2359,9 +3100,10 @@ pub(crate) async fn quiescent_ids(
             &dep,
         )
         .await;
+        let counted = instances.as_ref().ok().map(|n| (*n).max(0) as u64);
         match (instances, outbox, external) {
-            (Ok(0), Ok(0), Ok(0)) => out.push(id.clone()),
-            (Ok(_), Ok(_), Ok(_)) => {}
+            (Ok(0), Ok(0), Ok(0)) => out.push((id.clone(), counted, true)),
+            (Ok(_), Ok(_), Ok(_)) => out.push((id.clone(), counted, false)),
             (i, o, x) => {
                 if let Err(e) = i {
                     warn!(deployment = id.value(), error = %e, "quiescence instance check failed");
@@ -2372,6 +3114,7 @@ pub(crate) async fn quiescent_ids(
                 if let Err(e) = x {
                     warn!(deployment = id.value(), error = %e, "quiescence external-task check failed");
                 }
+                out.push((id.clone(), counted, false));
             }
         }
     }
@@ -2410,6 +3153,8 @@ pub(crate) fn spawn_deployments_watch(
         let mut pending_apply = false;
         let mut apply_error: Option<String> = None;
         let mut last_applied = directory.status_snapshot();
+        let mut last_retaining = directory.retaining_ids();
+        let mut last_active: Vec<DeploymentId> = directory.active.clone();
         loop {
             interval.tick().await;
             // Scan on a blocking thread (fs walk + archive verification + BPMN parse).
@@ -2438,20 +3183,72 @@ pub(crate) fn spawn_deployments_watch(
                 }
             }
 
-            // Retirement sweep: quiescent DRAINING deployments deregister.
-            if !directory.draining.is_empty() {
-                let retired = quiescent_ids(&directory.draining, &hooks.pool).await;
-                if directory.retire(&retired) {
+            // Retirement sweep: quiescent DRAINING deployments deregister. The counts it reads are
+            // what a refusal naming a draining version and the status endpoint say.
+            let recent = directory.recently_retired.ids();
+            if !recent.is_empty() {
+                let rechecked: Vec<(DeploymentId, bool)> = quiescence(&recent, &hooks.pool)
+                    .await
+                    .into_iter()
+                    .map(|(id, _, quiescent)| (id, quiescent))
+                    .collect();
+                if directory.recheck_retired(&rechecked) {
                     needs_apply = true;
+                    directory.unsettled = true;
                 }
             }
+            if !directory.draining.is_empty() {
+                let found = quiescence(&directory.draining, &hooks.pool).await;
+                directory.draining_instances = found
+                    .iter()
+                    .filter_map(|(id, n, _)| n.map(|n| (id.value().to_string(), n)))
+                    .collect();
+                let retired: Vec<DeploymentId> = found
+                    .into_iter()
+                    .filter(|(_, _, quiescent)| *quiescent)
+                    .map(|(id, _, _)| id)
+                    .collect();
+                if directory.retire(&retired) {
+                    needs_apply = true;
+                    // What they held is free now: judge again, so the record lets it go.
+                    directory.unsettled = true;
+                }
+            } else {
+                directory.draining_instances.clear();
+            }
 
+            // What draining versions keep can change while the active set does not.
+            let retaining = directory.retaining_ids();
+            if retaining != last_retaining {
+                needs_apply = true;
+            }
             if needs_apply || pending_apply {
                 match apply_activation(&directory, &hooks).await {
                     Ok(()) => {
                         pending_apply = false;
                         apply_error = None;
                         last_applied = directory.status_snapshot();
+                        last_retaining = retaining;
+                        // A folder has no caller to answer: what an upgrade changes for the
+                        // versions draining under it is logged, with their parked instances.
+                        let draining = directory.draining_plans();
+                        let older: Vec<&DeploymentFacts> =
+                            draining.iter().map(|p| &p.facts).collect();
+                        for plan in directory.active_plans() {
+                            if last_active.contains(&plan.dep) {
+                                continue;
+                            }
+                            for finding in UpgradeFinding::of(&plan.facts, &older) {
+                                let warning = finding.counted(hooks.pool.as_ref()).await;
+                                warn!(
+                                    code = %warning.code,
+                                    deployment = plan.dep.value(),
+                                    "{}",
+                                    warning.message
+                                );
+                            }
+                        }
+                        last_active = directory.active.clone();
                     }
                     Err(e) => {
                         // The flip aborted — old state stays live; next tick retries.
@@ -2578,6 +3375,9 @@ mod status_snapshot_tests {
             draining: vec!["id-draining".into()],
             failed: vec![("t--m--v3".into(), "boom".into())],
             facts: Vec::new(),
+            holds: Vec::new(),
+            draining_instances: [("id-draining".to_string(), 3)].into_iter().collect(),
+            draining_facts: Vec::new(),
         }
     }
 
@@ -2609,6 +3409,9 @@ mod status_snapshot_tests {
         // The other buckets are unaffected.
         assert_eq!(json["active"].as_array().unwrap().len(), 1);
         assert_eq!(json["failed"].as_array().unwrap().len(), 1);
+        // A draining version shows its running instances.
+        assert_eq!(json["drainingInstances"]["id-draining"], 3);
+        assert_eq!(snapshot().lookup("id-draining").unwrap()["instances"], 3);
     }
 
     #[test]
@@ -2625,5 +3428,233 @@ mod status_snapshot_tests {
         assert_eq!(snap.lookup("id-draining").unwrap()["phase"], "Draining");
         // An unknown id is still None (caller keeps polling).
         assert!(snap.lookup("id-nope").is_none());
+    }
+}
+
+#[cfg(test)]
+mod retained_tests {
+    use super::*;
+    use sutra_channels::EndpointClaim;
+
+    /// One version of `owner`: inbound http channels `(name, identity)`.
+    struct Version {
+        facts: DeploymentFacts,
+        definitions: Vec<ChannelDefinition>,
+    }
+
+    fn version(owner: &str, id: &str, version: &str, channels: &[(&str, &str)]) -> Version {
+        let (tenant, module) = owner.split_once('/').unwrap();
+        let head = if channels.is_empty() {
+            "channels: []\n"
+        } else {
+            "channels:\n"
+        };
+        let yaml: String = std::iter::once(head.to_string())
+            .chain(channels.iter().map(|(name, path)| {
+                format!("  - name: {name}\n    transport: http\n    bind: \"{path}\"\n    codec: json\n")
+            }))
+            .collect();
+        let definitions = sutra_channels::load_channel_definitions(
+            yaml.as_bytes(),
+            tenant,
+            module,
+            version,
+            "channels.yaml",
+        )
+        .unwrap();
+        let label = format!("{tenant}--{module}--{version}");
+        let endpoints = channels
+            .iter()
+            .map(|(name, path)| DeclaredEndpoint {
+                deployment_id: id.to_string(),
+                deployment_label: label.clone(),
+                owner: owner.to_string(),
+                channel: name.to_string(),
+                transport: "http".to_string(),
+                claim: EndpointClaim::exclusive(*path),
+            })
+            .collect();
+        Version {
+            facts: DeploymentFacts {
+                deployment_id: id.to_string(),
+                label,
+                owner: owner.to_string(),
+                version: version.to_string(),
+                slot: format!("slot-{id}"),
+                endpoints,
+                ..DeploymentFacts::default()
+            },
+            definitions,
+        }
+    }
+
+    fn served(v: &Version, retains: bool) -> ServedChannels<'_> {
+        ServedChannels {
+            facts: &v.facts,
+            definitions: &v.definitions,
+            retains_channels: retains,
+        }
+    }
+
+    fn kept(
+        active: &[ServedChannels<'_>],
+        draining: &[ServedChannels<'_>],
+    ) -> Vec<(String, String)> {
+        retained_channels(active, draining)
+            .into_iter()
+            .map(|k| (k.deployment, k.definition.binding.channel_name))
+            .collect()
+    }
+
+    #[test]
+    fn retained_definitions_keep_only_what_no_newer_version_declares() {
+        let v1 = version(
+            "t/m",
+            "v1",
+            "1.0.0",
+            &[("a", "POST /a"), ("only", "POST /only")],
+        );
+        let v2 = version("t/m", "v2", "2.0.0", &[("a", "POST /a2")]);
+        assert_eq!(
+            kept(&[served(&v2, false)], &[served(&v1, true)]),
+            vec![("v1".to_string(), "only".to_string())],
+            "'a' is taken by name, though v2 moved it"
+        );
+    }
+
+    #[test]
+    fn retained_definitions_drop_an_identity_taken_under_another_name() {
+        let v1 = version(
+            "t/m",
+            "v1",
+            "1.0.0",
+            &[("old", "POST /x"), ("only", "POST /only")],
+        );
+        let v2 = version("t/m", "v2", "2.0.0", &[("renamed", "POST /x")]);
+        assert_eq!(
+            kept(&[served(&v2, false)], &[served(&v1, true)]),
+            vec![("v1".to_string(), "only".to_string())]
+        );
+    }
+
+    #[test]
+    fn retained_definitions_drop_a_topic_the_successor_subscribes() {
+        let mut v1 = version("t/m", "v1", "1.0.0", &[("events", "topic-x")]);
+        let mut v2 = version("t/m", "v2", "2.0.0", &[("events-2", "topic-x")]);
+        for v in [&mut v1, &mut v2] {
+            for e in &mut v.facts.endpoints {
+                e.claim = EndpointClaim::broadcast(e.claim.identity.clone());
+            }
+        }
+        assert!(kept(&[served(&v2, false)], &[served(&v1, true)]).is_empty());
+        // Another owner on the same topic does not take it.
+        let mut other = version("t/other", "o1", "1.0.0", &[("events", "topic-x")]);
+        other.facts.endpoints[0].claim = EndpointClaim::broadcast("topic-x");
+        let v2_elsewhere = version("t/m", "v2", "2.0.0", &[("x", "POST /x")]);
+        assert_eq!(
+            kept(
+                &[served(&v2_elsewhere, false), served(&other, false)],
+                &[served(&v1, true)]
+            ),
+            vec![("v1".to_string(), "events".to_string())]
+        );
+    }
+
+    #[test]
+    fn retained_definitions_give_a_channel_two_draining_versions_have_to_the_newest() {
+        let v1 = version("t/m", "v1", "1.9.0", &[("only", "POST /only")]);
+        let v15 = version("t/m", "v15", "1.10.0", &[("only", "POST /only")]);
+        let v2 = version("t/m", "v2", "2.0.0", &[("a", "POST /a")]);
+        for draining in [
+            [served(&v1, true), served(&v15, true)],
+            [served(&v15, true), served(&v1, true)],
+        ] {
+            assert_eq!(
+                kept(&[served(&v2, false)], &draining),
+                vec![("v15".to_string(), "only".to_string())]
+            );
+        }
+    }
+
+    #[test]
+    fn retained_definitions_hold_with_no_active_successor() {
+        // Undeploying the successor does not stop what the older version keeps: it serves until it
+        // retires.
+        let v1 = version("t/m", "v1", "1.0.0", &[("only", "POST /only")]);
+        assert_eq!(
+            kept(&[], &[served(&v1, true)]),
+            vec![("v1".to_string(), "only".to_string())]
+        );
+    }
+
+    #[test]
+    fn retained_definitions_need_the_flag() {
+        let v1 = version("t/m", "v1", "1.0.0", &[("only", "POST /only")]);
+        let v2 = version("t/m", "v2", "2.0.0", &[("a", "POST /a")]);
+        assert!(kept(&[served(&v2, false)], &[served(&v1, false)]).is_empty());
+    }
+
+    #[test]
+    fn retained_definitions_leave_out_outbound_channels() {
+        let mut v1 = version("t/m", "v1", "1.0.0", &[]);
+        v1.definitions = sutra_channels::load_channel_definitions(
+            b"channels:\n  - name: out\n    direction: outbound\n    transport: http\n    bind: \"http://127.0.0.1:9/x\"\n",
+            "t",
+            "m",
+            "1.0.0",
+            "channels.yaml",
+        )
+        .unwrap();
+        assert!(kept(&[], &[served(&v1, true)]).is_empty());
+    }
+
+    #[test]
+    fn draining_holds_name_what_another_owner_would_be_refused() {
+        let v1 = version(
+            "t/m",
+            "v1",
+            "1.0.0",
+            &[("a", "POST /a"), ("only", "POST /only")],
+        );
+        let v2 = version("t/m", "v2", "2.0.0", &[("a", "POST /a")]);
+        // Another owner on the endpoint does not shrink the hold: the hold is what it is refused.
+        let other = version("t/x", "x1", "1.0.0", &[("grab", "POST /only")]);
+        let counts: BTreeMap<String, u64> = [("v1".to_string(), 4)].into_iter().collect();
+        let holds = draining_holds(
+            &[served(&v2, false), served(&other, false)],
+            &[served(&v1, true)],
+            &counts,
+        );
+        assert_eq!(holds.len(), 1);
+        assert_eq!(holds[0].facts.deployment_id, "v1");
+        assert_eq!(holds[0].instances, Some(4));
+        let ids: Vec<&str> = holds[0]
+            .facts
+            .endpoints
+            .iter()
+            .map(|e| e.claim.identity.as_str())
+            .collect();
+        assert_eq!(ids, vec!["POST /only"]);
+    }
+
+    #[test]
+    fn a_retired_deployment_is_let_go_after_two_quiet_sweeps_or_reopened() {
+        let quiet = DeploymentId::of("dep-0000000000000000000000a1").unwrap();
+        let busy = DeploymentId::of("dep-0000000000000000000000b2").unwrap();
+        let mut recent = RecentlyRetired::default();
+        recent.push(quiet.clone());
+        recent.push(busy.clone());
+        recent.push(busy.clone());
+        assert_eq!(recent.ids().len(), 2, "one entry per id");
+        let (reopen, let_go) = recent.recheck(&[(quiet.clone(), true), (busy.clone(), false)]);
+        assert_eq!(reopen, vec![busy.clone()]);
+        assert!(let_go.is_empty());
+        // Not judged this sweep: it stays as it was.
+        let (reopen, let_go) = recent.recheck(&[]);
+        assert!(reopen.is_empty() && let_go.is_empty());
+        let (reopen, let_go) = recent.recheck(&[(quiet.clone(), true)]);
+        assert!(reopen.is_empty());
+        assert_eq!(let_go, vec![quiet]);
+        assert!(recent.ids().is_empty());
     }
 }

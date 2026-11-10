@@ -24,6 +24,8 @@ sutra-formats = { path = "../sutra-formats" }
 sutra-testkit = { path = "../sutra-testkit", features = ["conformance"] }
 # `assemble_dir` — one deployment-package directory sealed into one `.sutra` archive on the host.
 sutra-loader = { path = "../sutra-loader" }
+# `sutra coverage ...` driven in-process, as a CI client on the host would run it.
+sutra-cli = { path = "../sutra-cli" }
 
 # Fixtures the SUITES construct directly (the harness owns its own copies of these):
 # testcontainers for the per-suite ad-hoc containers, lapin for the broker round trips.

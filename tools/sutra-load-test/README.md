@@ -59,12 +59,53 @@ RATE=500 DURATION=60s \
 profile and flamegraphs of the engine and the database (needs `perf` and `inferno`). Read the
 header of `relay-bench.sh` for every knob.
 
+## Resource metrics per load step (for a cost model)
+
+Every load step reports the resources it cost, not only its latency: engine CPU and RSS,
+PostgreSQL CPU, PostgreSQL IOPS and WAL volume. `relay-bench.sh` prints the table for its measured
+step; `run.sh` appends it to the `.md` summary and writes `<run>.metrics.json` next to it. Both use
+[`step-metrics.sh`](step-metrics.sh), which reads only `/proc`, `docker inspect`, the container's
+cgroup and two PostgreSQL views, so there is nothing to install.
+
+```bash
+# engine and database in containers on this host
+ENGINE_CONTAINER=sutra-engine PG_CONTAINER=sutra-db PG_USER=sutra PG_DB=sutra \
+  tools/sutra-load-test/run.sh --target=external --url=http://127.0.0.1:8081 --profile=smoke
+# engine on this host by pid, a remote or managed PostgreSQL reached over the network
+ENGINE_PID=$(pgrep -f sutra-engine) PG_PSQL="psql -h db.internal -U meter -d app" \
+  tools/sutra-load-test/run.sh --target=external --url=http://127.0.0.1:8081 --profile=sustained
+```
+
+| Metric | Source | Needs |
+|---|---|---|
+| Engine CPU (cores) | `/proc/<pid>/stat` utime+stime delta; a container uses its cgroup `cpu.stat` | `ENGINE_PID` or `ENGINE_CONTAINER`, on this host |
+| Engine RSS, end and peak (MB) | `VmRSS` and `VmHWM` in `/proc/<pid>/status` (peak is the process's lifetime peak) | same |
+| PostgreSQL CPU (cores) | postmaster and backends, or the container cgroup | `PG_PID` or `PG_CONTAINER`, on this host |
+| PostgreSQL IOPS | reads+writes+extends from `pg_stat_io`, per second. PostgreSQL's own I/O operations, not device IOPS | PostgreSQL 16+, `PG_PSQL` or `PG_CONTAINER` |
+| WAL (bytes, bytes/s) | `pg_stat_wal.wal_bytes` delta | PostgreSQL 14+, `PG_PSQL` or `PG_CONTAINER` |
+
+A metric that cannot be read in the deployment shape (a remote engine, a managed database, an older
+PostgreSQL, an unreadable pid) is reported as `unavailable` in the table and `null` in the JSON.
+It is never reported as 0.
+
+**Guidance for downstream harnesses.** The functions are small enough to copy or source: call
+`sm_snapshot <file>` at the start and end of each step, then `sm_report` (markdown) or
+`sm_report_json` (one object per step, with `null` for unavailable). Take one snapshot pair per
+step, so a ramp or soak yields a row per stage. For a cost model use CPU cores and RSS to size
+compute, `pg_iops` and `wal_bytes_per_s` to size the database volume and its provisioned IOPS, and
+divide by the step's completed work (settles, requests) for a per-unit cost. Where the database is
+managed, take its CPU and device IOPS from the provider's metrics for the same time window and keep
+`PG_PSQL` for WAL. CPU from `/proc` on a native PostgreSQL does not include backends that exit
+during the step; the engine keeps pooled connections, so this is small, and a container's cgroup
+reading has no such gap. Read the numbers at steady state: discard the warm-up step.
+
 ## Layout
 
 ```
 tools/sutra-load-test/
 ├── README.md          (this file)
 ├── run.sh             (harness: run k6 against a URL, capture results, exit code)
+├── step-metrics.sh    (sourced: per-step engine/PostgreSQL CPU, RSS, IOPS, WAL)
 ├── relay-bench.sh     (the relay workload: own PG + sink + engine, per-settle DB cost)
 ├── sink/              (the relay workload's callback sink — standalone crate, own Cargo.lock)
 ├── profiles/

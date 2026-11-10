@@ -107,6 +107,14 @@ pub trait TemplateEngine {
         template: &[u8],
         model: &serde_json::Value,
     ) -> Result<String, String>;
+
+    /// Whether this engine treats a null-valued model entry exactly like an absent one, at any
+    /// depth (it drops them before rendering). When it does, the executor builds the model
+    /// without those entries in the first place, which renders the same and saves the engine a
+    /// second copy of the model. Defaults to `false`: the model then carries its nulls.
+    fn drops_null_model_entries(&self) -> bool {
+        false
+    }
 }
 
 /// The strict Handlebars engine adapter (R6 — the `.hbs` normative engine).
@@ -141,6 +149,11 @@ impl TemplateEngine for HbsTemplateEngine {
         self.inner
             .render(template_id, template, model)
             .map_err(|e| e.message)
+    }
+
+    /// The strict Handlebars engine strips null-valued entries so a null fails like a missing key.
+    fn drops_null_model_entries(&self) -> bool {
+        true
     }
 }
 
@@ -233,7 +246,7 @@ impl DecisionEngine for DmnEngine {
         input: &Variables,
     ) -> Result<Variables, String> {
         self.inner
-            .evaluate(decision_id, decision, &input.to_feel_context())
+            .evaluate(decision_id, decision, input.as_feel_context())
             .map(|m| m.into_iter().collect())
             .map_err(|e| e.to_string())
     }
@@ -271,7 +284,7 @@ impl DecisionEngine for SrlEngine {
         input: &Variables,
     ) -> Result<Variables, String> {
         self.inner
-            .evaluate(decision_id, decision, &input.to_feel_context())
+            .evaluate(decision_id, decision, input.as_feel_context())
             .map(|m| m.into_iter().collect())
             .map_err(|e| e.to_string())
     }

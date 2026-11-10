@@ -30,8 +30,9 @@ const SQL_NEXT_REVISION: &str =
     "SELECT CAST(COALESCE(MAX(revision), 0) + 1 AS BIGINT) AS next_rev \
      FROM deployment_archive WHERE slot = @P1";
 
-const SQL_DEMOTE: &str =
-    "UPDATE deployment_archive SET status = 'draining' WHERE slot = @P1 AND status = 'active'";
+/// A replace in place supersedes the prior row, which keeps the channels nothing newer declares.
+const SQL_DEMOTE: &str = "UPDATE deployment_archive SET status = 'draining', retains_channels = 1 \
+     WHERE slot = @P1 AND status = 'active'";
 
 /// Keyed on the `deployment_id` PRIMARY KEY: an identical content-hash re-deploy (a
 /// rollback) re-activates the existing row — flipped to `draining` by the demote above —
@@ -42,7 +43,7 @@ const SQL_MERGE: &str = "MERGE deployment_archive WITH (HOLDLOCK) AS t \
      USING (SELECT @P1 AS deployment_id) AS s ON t.deployment_id = s.deployment_id \
      WHEN MATCHED THEN UPDATE SET \
        status = 'active', slot = @P2, revision = @P6, bytes = @P7, checksum = @P8, \
-       activated_at = @P9 \
+       activated_at = @P9, retains_channels = 0 \
      WHEN NOT MATCHED THEN INSERT \
        (deployment_id, slot, tenant, module, version, status, revision, bytes, checksum, activated_at) \
        VALUES (@P1, @P2, @P3, @P4, @P5, 'active', @P6, @P7, @P8, @P9);";
@@ -58,7 +59,7 @@ const SQL_LIST_STATUS: &str =
 /// The SERVED set (active + the draining tail), newest revision first within a slot — the
 /// reference's `list_active_and_draining` select, verbatim apart from the placeholder dialect.
 const SQL_LIST_SERVED: &str =
-    "SELECT deployment_id, slot, tenant, module, version, revision, bytes, status \
+    "SELECT deployment_id, slot, tenant, module, version, revision, bytes, status, retains_channels \
      FROM deployment_archive WHERE status IN ('active', 'draining') \
      ORDER BY slot, revision DESC";
 
@@ -235,6 +236,7 @@ fn served_of(row: &tiberius::Row) -> Result<ServedArchiveRow> {
         activated_at: None,
         archive: active_of(row)?,
         status: ArchiveStatus::parse(status)?,
+        retains_channels: req::<bool>(row, "retains_channels")?,
     })
 }
 
