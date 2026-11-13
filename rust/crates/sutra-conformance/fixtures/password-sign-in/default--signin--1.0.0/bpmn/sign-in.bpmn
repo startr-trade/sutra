@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Read the user's row and check the password against its hash. The credentials are @transient
+     (never persisted) and @sensitive (redacted in logs and audit). -->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0"
+                  id="Definitions_sign_in"
+                  targetNamespace="urn:sutra:module:signin:1.0.0">
+  <bpmn:dataStore id="usersStore" name="users"/>
+  <bpmn:process id="sign-in" isExecutable="true">
+    <bpmn:extensionElements>
+      <q:audit sink="jsonl" capture="payload"/>
+      <q:variables>
+        <q:variable name="creds" type="object" transient="true" sensitive="true"/>
+        <q:variable name="user" type="object"/>
+        <q:variable name="signedIn" type="boolean"/>
+      </q:variables>
+    </bpmn:extensionElements>
+    <bpmn:dataStoreReference id="refUser" dataStoreRef="usersStore">
+      <bpmn:extensionElements><q:store key="creds.user"/></bpmn:extensionElements>
+    </bpmn:dataStoreReference>
+    <bpmn:startEvent id="Start">
+      <bpmn:extensionElements><q:source channel="sign-in" name="creds"/></bpmn:extensionElements>
+    </bpmn:startEvent>
+    <bpmn:serviceTask id="Load" name="Read the user">
+      <bpmn:dataInputAssociation>
+        <bpmn:sourceRef>refUser</bpmn:sourceRef><bpmn:targetRef>user</bpmn:targetRef>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:serviceTask id="Check" name="Check the password">
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment>
+          <bpmn:from>password verify(creds.password, user.passwordHash) = true</bpmn:from>
+          <bpmn:to>signedIn</bpmn:to>
+        </bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:serviceTask id="Answer" implementation="signed-in.hbs">
+      <bpmn:extensionElements><q:reply mode="native" contentType="application/json"/></bpmn:extensionElements>
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="Done"/>
+    <bpmn:sequenceFlow id="F1" sourceRef="Start" targetRef="Load"/>
+    <bpmn:sequenceFlow id="F2" sourceRef="Load" targetRef="Check"/>
+    <bpmn:sequenceFlow id="F3" sourceRef="Check" targetRef="Answer"/>
+    <bpmn:sequenceFlow id="F4" sourceRef="Answer" targetRef="Done"/>
+  </bpmn:process>
+</bpmn:definitions>

@@ -23,6 +23,7 @@ pub mod expressions;
 mod lexer;
 pub mod numeric;
 mod parser;
+mod password;
 pub mod paths;
 pub mod positions;
 mod random;

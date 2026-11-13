@@ -21,9 +21,11 @@
 //! - the reply `content-type` rides the **`content-type`** record header, defaulting to
 //!   `application/octet-stream`.
 
+pub mod security;
 pub mod sink;
 pub mod source;
 
+pub use security::{KafkaBrokerSecurity, KafkaSinkSecurity};
 pub use sink::KafkaMessageSink;
 pub use source::{KafkaSourceConfig, KafkaTriggerSource};
 
@@ -31,6 +33,9 @@ use std::collections::BTreeMap;
 
 use sutra_channels::config::ChannelDefinition;
 use sutra_channels::diag::Diagnostic;
+use sutra_transport_spi::is_secret_reference;
+
+use security::{passthrough_security_key, SECURITY_PROTOCOLS};
 
 /// Stable diagnostic-code strings — the exact Kafka diagnostic codes
 /// this module raises.
@@ -45,10 +50,21 @@ pub mod codes {
     /// `inbound-auth.scheme=mtls` is per-message UNSUPPORTED; a one-time boot WARN,
     /// then allow-through (broker-level SASL/SSL still applies).
     pub const INBOUND_MTLS_UNSUPPORTED: &str = "SUTRA.INBOUND.KAFKA.MTLS_UNSUPPORTED";
+    /// The consumer's TLS handshake failed (an untrusted CA or a host-name mismatch, typically).
+    pub const INBOUND_BROKER_TLS_FAILED: &str = "SUTRA.INBOUND.KAFKA.BROKER_TLS_FAILED";
+    /// The broker refused the consumer's SASL credentials.
+    pub const INBOUND_BROKER_AUTH_FAILED: &str = "SUTRA.INBOUND.KAFKA.BROKER_AUTH_FAILED";
 
     pub const OUTBOUND_PRODUCE_FAILED: &str = "SUTRA.OUTBOUND.KAFKA.PRODUCE_FAILED";
     pub const OUTBOUND_TOPIC_MISSING: &str = "SUTRA.OUTBOUND.KAFKA.TOPIC_MISSING";
     pub const OUTBOUND_CONFIG_INVALID: &str = "SUTRA.OUTBOUND.KAFKA.CONFIG_INVALID";
+    /// The sink's TLS handshake failed.
+    pub const OUTBOUND_BROKER_TLS_FAILED: &str = "SUTRA.OUTBOUND.KAFKA.BROKER_TLS_FAILED";
+    /// The broker refused the sink's SASL credentials.
+    pub const OUTBOUND_BROKER_AUTH_FAILED: &str = "SUTRA.OUTBOUND.KAFKA.BROKER_AUTH_FAILED";
+    /// `SUTRA.STARTUP.REFUSED.HARDCODED_SECRET` — literal broker credentials in channel YAML are
+    /// refused (the shared engine-wide code).
+    pub const STARTUP_REFUSED_HARDCODED_SECRET: &str = "SUTRA.STARTUP.REFUSED.HARDCODED_SECRET";
 
     /// `SUTRA.OUTBOUND.SEND.FAILED` — malformed destination (permanent posture).
     pub const OUTBOUND_SEND_FAILED: &str = "SUTRA.OUTBOUND.SEND.FAILED";
@@ -74,12 +90,6 @@ const OWNED_CLIENT_KEYS: [&str; 4] = [
     "security.protocol",
 ];
 
-/// The Kafka `security.protocol` values librdkafka accepts (the allow-list). This
-/// build is PLAINTEXT-only (no ssl/sasl features); a non-PLAINTEXT protocol parses here
-/// but fails closed at client construction — the operator's config error, never a literal
-/// this transport silently downgrades.
-const SECURITY_PROTOCOLS: [&str; 4] = ["PLAINTEXT", "SSL", "SASL_PLAINTEXT", "SASL_SSL"];
-
 /// Effective ack modes of a broker channel — parsed leniently:
 /// `on-complete` (ASCII case-insensitive) opts in, anything else is `on-persist`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,9 +110,9 @@ impl AckMode {
 }
 
 /// Typed view over the transport-specific channel properties — the Kafka
-/// channel-properties shape (same keys, same defaults). Kafka authenticates via
-/// broker-level SASL/TLS (this build is PLAINTEXT-only), so there are no channel-YAML
-/// credentials and no secret-reference discipline here (contrast the RabbitMQ properties).
+/// channel-properties shape (same keys, same defaults). SASL credentials and a `tls-ca-pem` are
+/// authored as secret references and resolved just before connect, see
+/// [`KafkaChannelProperties::with_resolved_security`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KafkaChannelProperties {
     /// `bootstrap.servers` (required inbound).
@@ -117,6 +127,8 @@ pub struct KafkaChannelProperties {
     pub auto_offset_reset: String,
     /// `security.protocol` (default `PLAINTEXT`, upper-cased, validated to the allow-list).
     pub security_protocol: String,
+    /// The TLS and SASL settings behind `security_protocol`.
+    pub security: KafkaBrokerSecurity,
     /// Verbatim `kafka.*` / `kafka.consumer.*` passthrough (prefix stripped) — extra
     /// librdkafka client config the author is responsible for keeping valid.
     pub client_config: BTreeMap<String, String>,
@@ -126,9 +138,11 @@ pub struct KafkaChannelProperties {
     pub singleton: bool,
 }
 
-/// The connection properties that may be an environment or secret reference. Credentials and
-/// `inbound-auth` resolve separately, later in the wiring.
-const REFERENCE_PROPERTIES: [&str; 3] = ["bootstrap.servers", "topic", "group.id"];
+/// The connection properties that may be an environment or secret reference, including the TLS
+/// CA path, which differs between environments the way a broker address does. The SASL
+/// credentials, `tls-ca-pem` and `inbound-auth` are secrets: they must be written as a whole
+/// reference and resolve separately, later in the wiring.
+const REFERENCE_PROPERTIES: [&str; 4] = ["bootstrap.servers", "topic", "group.id", "tls-ca-file"];
 
 impl KafkaChannelProperties {
     /// [`Self::from_definition`] with `${NAME}`, `${NAME:default}`, `env:NAME` and `secret:` style
@@ -151,8 +165,9 @@ impl KafkaChannelProperties {
     pub const DEFAULT_SECURITY_PROTOCOL: &'static str = "PLAINTEXT";
 
     /// Read the typed properties off a channel definition. Mirrors
-    /// `KafkaChannelProperties.from(ChannelConfig)`: defaults applied, `security.protocol`
-    /// validated (`SUTRA.INBOUND.KAFKA.CONFIG_INVALID` otherwise).
+    /// `KafkaChannelProperties.from(ChannelConfig)`: defaults applied, `security.protocol` and its
+    /// settings validated (`SUTRA.INBOUND.KAFKA.CONFIG_INVALID` otherwise), literal credentials
+    /// refused (`SUTRA.STARTUP.REFUSED.HARDCODED_SECRET`).
     pub fn from_definition(def: &ChannelDefinition) -> Result<KafkaChannelProperties, Diagnostic> {
         let props = &def.properties;
         let channel = &def.binding.channel_name;
@@ -178,6 +193,30 @@ impl KafkaChannelProperties {
                 upper
             }
         };
+        let security = read_broker_security(props, channel)?;
+        security.validate(&security_protocol).map_err(|detail| {
+            Diagnostic::error(
+                codes::INBOUND_CONFIG_INVALID,
+                format!("kafka channel '{channel}': {detail}"),
+            )
+        })?;
+        if let Some(key) = props
+            .keys()
+            .filter_map(|key| {
+                key.strip_prefix("kafka.consumer.")
+                    .or_else(|| key.strip_prefix("kafka.producer."))
+                    .or_else(|| key.strip_prefix("kafka."))
+            })
+            .find_map(passthrough_security_key)
+        {
+            return Err(Diagnostic::error(
+                codes::INBOUND_CONFIG_INVALID,
+                format!(
+                    "kafka channel '{channel}' passes '{key}' through to the client; TLS and SASL \
+                     are set with the 'sasl.*' and 'tls-*' channel properties"
+                ),
+            ));
+        }
         let client_config = passthrough_config(props);
         // The startup-orchestrator resolution (`ChannelDefinition::effective_ack_mode`):
         // a declared `ack-mode:` wins, the broker default is `on-persist`.
@@ -188,10 +227,26 @@ impl KafkaChannelProperties {
             group_id,
             auto_offset_reset,
             security_protocol,
+            security,
             client_config,
             ack_mode,
             singleton: def.singleton(),
         })
+    }
+
+    /// Returns a copy with the SASL credentials and the `tls-ca-pem` reference replaced by their
+    /// RESOLVED values, which the wiring does just before a client is built.
+    pub fn with_resolved_security(
+        &self,
+        resolved_user: Option<String>,
+        resolved_pass: Option<String>,
+        resolved_ca_pem: Option<String>,
+    ) -> KafkaChannelProperties {
+        let mut resolved = self.clone();
+        resolved.security.sasl_username = resolved_user;
+        resolved.security.sasl_password = resolved_pass;
+        resolved.security.tls_ca_pem = resolved_ca_pem;
+        resolved
     }
 
     /// True when an inbound topic is declared.
@@ -225,6 +280,58 @@ fn passthrough_config(props: &BTreeMap<String, String>) -> BTreeMap<String, Stri
         out.insert(stripped.to_string(), value.clone());
     }
     out
+}
+
+/// Read the `sasl.*` and `tls-*` channel properties. Credentials and a PEM must be references.
+fn read_broker_security(
+    props: &BTreeMap<String, String>,
+    channel: &str,
+) -> Result<KafkaBrokerSecurity, Diagnostic> {
+    let insecure = non_blank(props.get("tls-insecure-skip-verify")).unwrap_or_default();
+    let tls_insecure_skip_verify = if insecure.is_empty() || insecure.eq_ignore_ascii_case("false")
+    {
+        false
+    } else if insecure.eq_ignore_ascii_case("true") {
+        true
+    } else {
+        return Err(Diagnostic::error(
+            codes::INBOUND_CONFIG_INVALID,
+            format!(
+                "kafka channel '{channel}' property 'tls-insecure-skip-verify' has an invalid \
+                 boolean value: '{insecure}'"
+            ),
+        ));
+    };
+    Ok(KafkaBrokerSecurity {
+        sasl_mechanism: non_blank(props.get("sasl.mechanism")).map(|m| m.to_ascii_uppercase()),
+        sasl_username: require_secret_ref(props.get("sasl.username"), "sasl.username", channel)?,
+        sasl_password: require_secret_ref(props.get("sasl.password"), "sasl.password", channel)?,
+        tls_ca_file: non_blank(props.get("tls-ca-file")),
+        tls_ca_pem: require_secret_ref(props.get("tls-ca-pem"), "tls-ca-pem", channel)?,
+        tls_insecure_skip_verify,
+    })
+}
+
+/// Enforce the secret discipline: a credential must be a reference (see [`is_secret_reference`]),
+/// never a literal. The refusal names the property and never echoes the value.
+fn require_secret_ref(
+    raw: Option<&String>,
+    key: &str,
+    channel: &str,
+) -> Result<Option<String>, Diagnostic> {
+    let Some(value) = non_blank(raw) else {
+        return Ok(None);
+    };
+    if is_secret_reference(&value) {
+        return Ok(Some(value));
+    }
+    Err(Diagnostic::error(
+        codes::STARTUP_REFUSED_HARDCODED_SECRET,
+        format!(
+            "kafka channel '{channel}' property '{key}' must be a secret reference (e.g. \
+             ${{ENV_VAR}}, env:NAME or secret:NAME); literal credentials are rejected."
+        ),
+    ))
 }
 
 fn non_blank(value: Option<&String>) -> Option<String> {
@@ -385,6 +492,93 @@ mod tests {
         ]);
         let err = KafkaChannelProperties::from_definition(&def).unwrap_err();
         assert_eq!(err.code, codes::INBOUND_CONFIG_INVALID);
+    }
+
+    fn sasl_definition(extra: &[(&'static str, &'static str)]) -> ChannelDefinition {
+        let mut props = vec![
+            ("bootstrap.servers", "kafka:9092"),
+            ("topic", "t"),
+            ("security.protocol", "sasl_ssl"),
+            ("sasl.mechanism", "scram-sha-256"),
+            ("sasl.username", "env:KAFKA_USER"),
+            ("sasl.password", "secret:KAFKA_PASS"),
+        ];
+        props.extend_from_slice(extra);
+        definition(&props)
+    }
+
+    #[test]
+    fn sasl_properties_are_read_as_references_and_resolved_on_request() {
+        let props = KafkaChannelProperties::from_definition(&sasl_definition(&[])).expect("props");
+        assert_eq!(props.security_protocol, "SASL_SSL");
+        assert_eq!(
+            props.security.sasl_mechanism.as_deref(),
+            Some("SCRAM-SHA-256")
+        );
+        assert_eq!(
+            props.security.sasl_password.as_deref(),
+            Some("secret:KAFKA_PASS")
+        );
+        assert!(
+            !props.security.tls_insecure_skip_verify,
+            "verified by default"
+        );
+
+        let resolved = props.with_resolved_security(
+            Some("svc-user".to_string()),
+            Some("hunter2".to_string()),
+            None,
+        );
+        assert_eq!(resolved.security.sasl_password.as_deref(), Some("hunter2"));
+        assert!(!format!("{resolved:?}").contains("hunter2"));
+    }
+
+    #[test]
+    fn a_literal_credential_is_refused_without_echoing_it() {
+        let def = definition(&[
+            ("bootstrap.servers", "kafka:9092"),
+            ("topic", "t"),
+            ("security.protocol", "SASL_SSL"),
+            ("sasl.mechanism", "PLAIN"),
+            ("sasl.username", "env:KAFKA_USER"),
+            ("sasl.password", "hunter2"),
+        ]);
+        let err = KafkaChannelProperties::from_definition(&def).unwrap_err();
+        assert_eq!(err.code, codes::STARTUP_REFUSED_HARDCODED_SECRET);
+        assert!(!err.message.contains("hunter2"), "{}", err.message);
+    }
+
+    #[test]
+    fn settings_that_cannot_take_effect_fail_closed() {
+        for bad in [
+            definition(&[("topic", "t"), ("tls-ca-file", "/etc/ca.pem")]),
+            definition(&[("topic", "t"), ("sasl.mechanism", "PLAIN")]),
+            definition(&[
+                ("topic", "t"),
+                ("security.protocol", "SSL"),
+                ("tls-insecure-skip-verify", "maybe"),
+            ]),
+            definition(&[("topic", "t"), ("security.protocol", "SASL_SSL")]),
+            sasl_definition(&[("sasl.mechanism", "GSSAPI")]),
+        ] {
+            let err = KafkaChannelProperties::from_definition(&bad).unwrap_err();
+            assert_eq!(err.code, codes::INBOUND_CONFIG_INVALID, "{}", err.message);
+        }
+    }
+
+    #[test]
+    fn the_passthrough_cannot_set_a_secret_or_weaken_verification() {
+        for key in [
+            "kafka.sasl.password",
+            "kafka.consumer.ssl.ca.location",
+            "kafka.enable.ssl.certificate.verification",
+            "kafka.producer.ssl.key.password",
+        ] {
+            let def = definition(&[("topic", "t"), (key, "hunter2")]);
+            let err = KafkaChannelProperties::from_definition(&def).unwrap_err();
+            assert_eq!(err.code, codes::INBOUND_CONFIG_INVALID, "{key}");
+            assert!(!err.message.contains("hunter2"), "{}", err.message);
+        }
     }
 
     #[test]

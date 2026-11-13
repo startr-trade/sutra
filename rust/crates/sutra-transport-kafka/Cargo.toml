@@ -17,10 +17,11 @@ inventory = "0.3.24"
 async-trait = { workspace = true }
 time = { workspace = true }
 # Kafka transport (source + sink): librdkafka binding — consumer-group + offset-commit
-# semantics the pure-Rust clients lack. PLAINTEXT-only vendored build (see workspace dep).
+# semantics the pure-Rust clients lack. Vendored build with vendored OpenSSL for TLS and SASL (see
+# the workspace dep).
 rdkafka = { workspace = true }
 
 [dev-dependencies]
-sutra-testkit = { path = "../sutra-testkit" }
+sutra-testkit = { path = "../sutra-testkit", features = ["broker-tls"] }
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true, features = ["kafka"] }

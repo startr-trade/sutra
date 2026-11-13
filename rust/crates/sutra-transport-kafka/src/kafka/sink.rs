@@ -15,8 +15,9 @@
 //! - the producer runs `acks=all` + `enable.idempotence=true`.
 //!
 //! Bootstrap servers do NOT ride the URI — the sink is engine-wide-configured, wired
-//! from `SUTRA_SINK_KAFKA_BOOTSTRAP_SERVERS`. One [`FutureProducer`] is cached for the
-//! sink's lifetime (created lazily on first publish).
+//! from `SUTRA_SINK_KAFKA_BOOTSTRAP_SERVERS` and, for TLS and SASL, the other
+//! `SUTRA_SINK_KAFKA_*` variables (see [`super::security`]). One [`FutureProducer`] is cached for
+//! the sink's lifetime (created lazily on first publish).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -30,6 +31,7 @@ use sutra_channels::diag::Diagnostic;
 use sutra_channels::sink::{BoxFuture, MessageSink, OutboundMessage, SendOutcome};
 use sutra_channels::telemetry::TRACEPARENT_HEADER;
 
+use super::security::{BrokerFailureRecorder, ClientRole, KafkaSinkSecurity};
 use super::{codes, parse_destination, HEADER_CONTENT_TYPE, HEADER_OUTBOX_KEY};
 
 /// Producer delivery timeout (the sink's `PT30S` request timeout).
@@ -40,8 +42,20 @@ const SEND_TIMEOUT: Duration = Duration::from_secs(30);
 /// producer is created lazily and cached.
 pub struct KafkaMessageSink {
     bootstrap_servers: String,
-    producer: tokio::sync::Mutex<Option<Arc<FutureProducer>>>,
+    /// The TLS and SASL settings, or why they could not be read (then every send fails closed
+    /// rather than connect with less protection than the deployment asked for).
+    security: Result<KafkaSinkSecurity, String>,
+    producer: tokio::sync::Mutex<Option<SinkClient>>,
 }
+
+/// The cached producer and a handle on the failures its context records.
+#[derive(Clone)]
+struct SinkClient {
+    producer: Arc<SinkProducer>,
+    failures: BrokerFailureRecorder,
+}
+
+type SinkProducer = FutureProducer<BrokerFailureRecorder>;
 
 impl KafkaMessageSink {
     /// A sink targeting `bootstrap_servers` (comma-separated `host:port` list; may be empty
@@ -49,12 +63,23 @@ impl KafkaMessageSink {
     pub fn new(bootstrap_servers: impl Into<String>) -> KafkaMessageSink {
         KafkaMessageSink {
             bootstrap_servers: bootstrap_servers.into(),
+            security: Ok(KafkaSinkSecurity::default()),
             producer: tokio::sync::Mutex::new(None),
         }
     }
 
+    /// Set the TLS and SASL settings. `Err` holds why the engine-wide settings are unusable;
+    /// every send then reports it.
+    pub fn with_security(
+        mut self,
+        security: Result<KafkaSinkSecurity, String>,
+    ) -> KafkaMessageSink {
+        self.security = security;
+        self
+    }
+
     /// The cached-or-fresh idempotent producer.
-    async fn producer(&self) -> Result<Arc<FutureProducer>, Diagnostic> {
+    async fn producer(&self) -> Result<SinkClient, Diagnostic> {
         if self.bootstrap_servers.trim().is_empty() {
             return Err(Diagnostic::error(
                 codes::OUTBOUND_CONFIG_INVALID,
@@ -62,28 +87,39 @@ impl KafkaMessageSink {
                  (SUTRA_SINK_KAFKA_BOOTSTRAP_SERVERS) — cannot publish",
             ));
         }
+        let security = self.security.as_ref().map_err(|e| {
+            Diagnostic::error(
+                codes::OUTBOUND_CONFIG_INVALID,
+                format!("kafka sink security settings are invalid: {e}"),
+            )
+        })?;
         let mut cache = self.producer.lock().await;
         if let Some(existing) = cache.as_ref() {
-            return Ok(Arc::clone(existing));
+            return Ok(existing.clone());
         }
-        let producer: FutureProducer = ClientConfig::new()
+        let mut client = ClientConfig::new();
+        client
             .set("bootstrap.servers", &self.bootstrap_servers)
             .set("acks", "all")
             .set("enable.idempotence", "true")
-            .set("message.timeout.ms", SEND_TIMEOUT.as_millis().to_string())
-            .create()
-            .map_err(|e| {
-                Diagnostic::error(
-                    codes::OUTBOUND_CONFIG_INVALID,
-                    format!(
-                        "kafka sink could not build a producer for '{}': {e}",
-                        self.bootstrap_servers
-                    ),
-                )
-            })?;
-        let producer = Arc::new(producer);
-        *cache = Some(Arc::clone(&producer));
-        Ok(producer)
+            .set("message.timeout.ms", SEND_TIMEOUT.as_millis().to_string());
+        security.security.apply_to(&security.protocol, &mut client);
+        let failures = BrokerFailureRecorder::new(ClientRole::Outbound, "sink");
+        let producer: SinkProducer = client.create_with_context(failures.clone()).map_err(|e| {
+            Diagnostic::error(
+                codes::OUTBOUND_CONFIG_INVALID,
+                format!(
+                    "kafka sink could not build a producer for '{}': {e}",
+                    self.bootstrap_servers
+                ),
+            )
+        })?;
+        let sink_client = SinkClient {
+            producer: Arc::new(producer),
+            failures,
+        };
+        *cache = Some(sink_client.clone());
+        Ok(sink_client)
     }
 
     /// Drain posture: drop the cached producer (best-effort; librdkafka flushes on drop).
@@ -106,8 +142,8 @@ impl MessageSink for KafkaMessageSink {
                 Ok(d) => d,
                 Err(diagnostic) => return SendOutcome::PermanentFailure(diagnostic),
             };
-            let producer = match self.producer().await {
-                Ok(p) => p,
+            let SinkClient { producer, failures } = match self.producer().await {
+                Ok(client) => client,
                 Err(diagnostic) => return SendOutcome::RetryableFailure(diagnostic),
             };
             let headers = build_headers(message);
@@ -131,11 +167,25 @@ impl MessageSink for KafkaMessageSink {
                 }
             };
             match result {
-                Ok(_) => SendOutcome::Delivered,
-                Err((error, _)) => SendOutcome::RetryableFailure(Diagnostic::error(
-                    codes::OUTBOUND_PRODUCE_FAILED,
-                    format!("kafka publish to {} failed: {error}", message.destination),
-                )),
+                Ok(_) => {
+                    failures.clear();
+                    SendOutcome::Delivered
+                }
+                // A record that could never reach a broker reports only a delivery timeout. The
+                // recorded TLS or SASL failure is the reason an operator can act on.
+                Err((error, _)) => match failures.last_failure() {
+                    Some(failure) => SendOutcome::RetryableFailure(Diagnostic::error(
+                        &failure.code,
+                        format!(
+                            "kafka publish to {} failed: {}",
+                            message.destination, failure.message
+                        ),
+                    )),
+                    None => SendOutcome::RetryableFailure(Diagnostic::error(
+                        codes::OUTBOUND_PRODUCE_FAILED,
+                        format!("kafka publish to {} failed: {error}", message.destination),
+                    )),
+                },
             }
         })
     }
@@ -333,6 +383,19 @@ mod tests {
         match sink.send(&message("kafka://replies")).await {
             SendOutcome::RetryableFailure(d) => {
                 assert_eq!(d.code, codes::OUTBOUND_CONFIG_INVALID)
+            }
+            other => panic!("expected RetryableFailure, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn unusable_security_settings_fail_every_send_closed() {
+        let sink = KafkaMessageSink::new("localhost:9092")
+            .with_security(Err("SUTRA_SINK_KAFKA_SECURITY_PROTOCOL".to_string()));
+        match sink.send(&message("kafka://replies")).await {
+            SendOutcome::RetryableFailure(d) => {
+                assert_eq!(d.code, codes::OUTBOUND_CONFIG_INVALID);
+                assert!(d.message.contains("SUTRA_SINK_KAFKA_SECURITY_PROTOCOL"));
             }
             other => panic!("expected RetryableFailure, got {other:?}"),
         }

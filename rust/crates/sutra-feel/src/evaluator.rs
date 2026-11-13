@@ -30,6 +30,7 @@ use time_tz::PrimitiveDateTimeExt;
 use crate::ast::{ArithOp, CompareOp, FeelExpr, LogicalOp};
 use crate::codes;
 use crate::error::FeelError;
+use crate::password;
 use crate::positions::FeelSourcePositions;
 use crate::random;
 use crate::value::{canonical_string_of, FeelContext, FeelDuration, FeelValue, TimeQualifier};
@@ -75,6 +76,8 @@ pub(crate) const SPACED_BUILTIN_ALIASES: &[(&str, &str)] = &[
     ("overlaps after", "overlapsAfter"),
     ("finished by", "finishedBy"),
     ("started by", "startedBy"),
+    ("password hash", "passwordHash"),
+    ("password verify", "passwordVerify"),
 ];
 
 /// FEEL property names that contain a space (temporal/range accessors after a `.`). The
@@ -1157,6 +1160,26 @@ impl Evaluator<'_> {
             }
             "uuid" => Ok(FeelValue::String(random::uuid_v4())),
             "random" => Ok(FeelValue::from(random::random_unit_f64())),
+            // argon2id password hashing. A non-string or empty argument, a malformed or
+            // over-cost hash, is `null`. Errors name the function only, never an argument.
+            "passwordHash" => {
+                self.require_args("password hash", &args, 1, site)?;
+                Ok(match &args[0] {
+                    FeelValue::String(pw) => {
+                        password::hash(pw).map_or(FeelValue::Null, FeelValue::String)
+                    }
+                    _ => FeelValue::Null,
+                })
+            }
+            "passwordVerify" => {
+                self.require_args("password verify", &args, 2, site)?;
+                Ok(match (&args[0], &args[1]) {
+                    (FeelValue::String(pw), FeelValue::String(phc)) => {
+                        password::verify(pw, phc).map_or(FeelValue::Null, FeelValue::Boolean)
+                    }
+                    _ => FeelValue::Null,
+                })
+            }
 
             // ---- numeric (unary / binary) ----
             "abs" => {

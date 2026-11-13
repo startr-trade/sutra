@@ -46,6 +46,24 @@ fn uuid_and_random_are_rejected() {
 }
 
 #[test]
+fn password_hash_is_denied_at_replay_bound_sites() {
+    let ast = expressions::parse("password hash(payload.pw)").unwrap();
+    let err = determinism::require_pure(&ast, "alias 'pw-hash'").unwrap_err();
+    assert_eq!(err.code, codes::FEEL_DETERMINISM_UNSAFE_BUILTIN);
+    assert!(err.message.contains("password hash"), "{}", err.message);
+    // The camelCase spelling is denied too.
+    assert!(!determinism::is_pure(
+        &expressions::parse("passwordHash(payload.pw)").unwrap()
+    ));
+    // `password verify` is a pure function of its arguments.
+    determinism::require_pure(
+        &expressions::parse("password verify(payload.pw, user.hash)").unwrap(),
+        "alias 'signed-in'",
+    )
+    .unwrap();
+}
+
+#[test]
 fn temporal_builtins_are_pure_with_injected_now_variable() {
     // secondsBetween()/isBlank() are pure functions of their arguments; `now` here is a
     // bare PATH (the engine-injected context variable at DMN evaluation sites), not the

@@ -217,6 +217,81 @@ pub fn scan_crate_src(crate_name: &str) -> Vec<Violation> {
     violations
 }
 
+/// The `channel` of a `rust-toolchain.toml`: the toolchain every build of the workspace uses.
+pub fn toolchain_channel(toml: &str) -> Option<String> {
+    toml.lines().find_map(|line| {
+        let (key, value) = line.split_once('=')?;
+        (key.trim() == "channel").then(|| unquote(value.trim()).to_string())
+    })
+}
+
+fn unquote(value: &str) -> &str {
+    let value = value.split(" #").next().unwrap_or(value).trim();
+    value
+        .strip_prefix('"')
+        .and_then(|v| v.strip_suffix('"'))
+        .or_else(|| value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
+        .unwrap_or(value)
+}
+
+/// Every place a GitHub Actions workflow disagrees with the pinned toolchain `channel`: a
+/// `toolchain:` input naming another toolchain, or a `dtolnay/rust-toolchain` step with no
+/// `toolchain:` input at all, which would install whatever the action's default is. Each entry is
+/// `<line>: <what>`. A workflow that installs a second toolchain beside the pin compiles nothing
+/// with it, because every step runs inside `rust/` where the pin wins, so the only cost of a
+/// mismatch is a slower job; but a CI job that says 1.95 while the build uses 1.96 misleads anyone
+/// reading it, so the two must agree.
+pub fn workflow_toolchain_mismatches(workflow: &str, channel: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let lines: Vec<&str> = workflow.lines().collect();
+    for (index, line) in lines.iter().enumerate() {
+        let trimmed = line.trim_start().trim_start_matches("- ").trim_start();
+        if let Some(value) = trimmed.strip_prefix("toolchain:") {
+            let value = unquote(value.trim());
+            if value != channel {
+                out.push(format!(
+                    "{}: toolchain '{value}', but rust-toolchain.toml pins '{channel}'",
+                    index + 1
+                ));
+            }
+        }
+        if let Some(action) = trimmed.strip_prefix("uses:") {
+            if !action.trim().starts_with("dtolnay/rust-toolchain@") {
+                continue;
+            }
+            let indent = line.len() - line.trim_start().len();
+            let step_has_toolchain = lines[index + 1..]
+                .iter()
+                .take_while(|next| {
+                    let next_indent = next.len() - next.trim_start().len();
+                    next.trim().is_empty() || next_indent > indent || {
+                        // A key of the same step at the same indent as `uses:`.
+                        next_indent == indent && !next.trim_start().starts_with('-')
+                    }
+                })
+                .any(|next| next.trim_start().starts_with("toolchain:"));
+            if !step_has_toolchain {
+                out.push(format!(
+                    "{}: dtolnay/rust-toolchain without a `toolchain:` input; pass \
+                     `toolchain: {channel}`",
+                    index + 1
+                ));
+            }
+        }
+    }
+    out
+}
+
+/// The repository root: `rust/crates/<this crate>` is three levels down.
+#[cfg(test)]
+fn repo_root() -> PathBuf {
+    crates_dir()
+        .parent()
+        .and_then(Path::parent)
+        .expect("rust/crates sits two levels below the repository root")
+        .to_path_buf()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -331,6 +406,67 @@ mod tests {
         assert!(
             scan_code(&strip_comments(code)).is_empty(),
             "a domain word in a comment after a lifetime must still be stripped"
+        );
+    }
+
+    /// Every workflow installs the toolchain `rust/rust-toolchain.toml` pins. The workflows exist only
+    /// in a checkout that carries `.github/workflows`; anywhere else there is nothing to check.
+    #[test]
+    fn workflows_use_the_pinned_toolchain() {
+        let root = repo_root();
+        let workflows = root.join(".github").join("workflows");
+        let Ok(entries) = fs::read_dir(&workflows) else {
+            eprintln!("no {} here: nothing to check", workflows.display());
+            return;
+        };
+        let pin = fs::read_to_string(root.join("rust").join("rust-toolchain.toml"))
+            .expect("rust/rust-toolchain.toml");
+        let channel = toolchain_channel(&pin).expect("rust-toolchain.toml names a channel");
+        let mut files: Vec<PathBuf> = entries
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x == "yml" || x == "yaml"))
+            .collect();
+        files.sort();
+        assert!(
+            !files.is_empty(),
+            "{} has no workflows",
+            workflows.display()
+        );
+        let mismatches: Vec<String> = files
+            .iter()
+            .flat_map(|file| {
+                let text = fs::read_to_string(file).expect("workflow readable");
+                let name = file.file_name().unwrap().to_string_lossy().into_owned();
+                workflow_toolchain_mismatches(&text, &channel)
+                    .into_iter()
+                    .map(move |m| format!("{name}:{m}"))
+            })
+            .collect();
+        assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+    }
+
+    #[test]
+    fn the_toolchain_check_reads_the_pin_and_flags_a_drift() {
+        assert_eq!(
+            toolchain_channel("[toolchain]\nchannel = \"1.96.0\"\ncomponents = [\"clippy\"]\n")
+                .as_deref(),
+            Some("1.96.0")
+        );
+        let pinned =
+            "steps:\n  - uses: dtolnay/rust-toolchain@0123abcd # master\n    with:\n      \
+                      toolchain: 1.96.0\n      components: clippy\n  - run: make lint\n";
+        assert!(workflow_toolchain_mismatches(pinned, "1.96.0").is_empty());
+        let drifted = pinned.replace("toolchain: 1.96.0", "toolchain: \"1.95.0\"");
+        let found = workflow_toolchain_mismatches(&drifted, "1.96.0");
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].starts_with("4: toolchain '1.95.0'"), "{found:?}");
+        let missing = "steps:\n  - uses: dtolnay/rust-toolchain@stable\n  - name: next\n    \
+                       with:\n      toolchain: 1.96.0\n";
+        let found = workflow_toolchain_mismatches(missing, "1.96.0");
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(
+            found[0].starts_with("2: dtolnay/rust-toolchain without"),
+            "{found:?}"
         );
     }
 }

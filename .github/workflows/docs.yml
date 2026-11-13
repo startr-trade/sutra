@@ -43,12 +43,12 @@ env:
 jobs:
   build:
     name: mdBook build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     outputs:
       has_book: ${{ steps.detect.outputs.has_book }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Detect the book
         id: detect
@@ -77,12 +77,12 @@ jobs:
 
       - name: Configure Pages
         if: steps.detect.outputs.has_book == 'true' && github.event_name != 'pull_request'
-        uses: actions/configure-pages@v6
+        uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
 
       # `build-dir` defaults to `book` relative to book.toml → docs/book.
       - name: Upload Pages artifact
         if: steps.detect.outputs.has_book == 'true' && github.event_name != 'pull_request'
-        uses: actions/upload-pages-artifact@v5
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
         with:
           path: docs/book
 
@@ -91,7 +91,7 @@ jobs:
     needs: build
     # PRs build the book (a broken book fails the PR) but never deploy.
     if: ${{ needs.build.outputs.has_book == 'true' && github.event_name != 'pull_request' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
       contents: read
@@ -103,4 +103,4 @@ jobs:
     steps:
       - name: Deploy
         id: deployment
-        uses: actions/deploy-pages@v5
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1

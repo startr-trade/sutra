@@ -26,6 +26,9 @@ pub fn looks_like_git_ref(value: &str) -> bool {
             .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
 }
 
+/// The file `git archive` writes into the extraction directory before it is unpacked.
+const BASELINE_TAR: &str = ".baseline.tar";
+
 /// Extracts `git_ref` (restricted to the default pathspecs that exist in that ref) into a
 /// fresh temporary directory. The caller must [`cleanup`] the returned directory.
 pub fn extract(repo_root: &Path, git_ref: &str) -> Result<PathBuf, String> {
@@ -39,7 +42,7 @@ pub fn extract(repo_root: &Path, git_ref: &str) -> Result<PathBuf, String> {
     std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create temp dir: {e}"))?;
 
     let result = (|| {
-        let tar_path = dir.join(".baseline.tar");
+        let tar_path = dir.join(BASELINE_TAR);
         let mut archive = Command::new("git");
         archive
             .current_dir(repo_root)
@@ -52,8 +55,10 @@ pub fn extract(repo_root: &Path, git_ref: &str) -> Result<PathBuf, String> {
         }
         run_checked(archive, "git archive")?;
 
+        // The archive is named relative to the folder it unpacks into: GNU tar, which a Windows
+        // PATH may put first, reads an absolute `C:\…` file name as a remote host.
         let mut untar = Command::new("tar");
-        untar.arg("-x").arg("-f").arg(&tar_path).arg("-C").arg(&dir);
+        untar.current_dir(&dir).args(["-x", "-f", BASELINE_TAR]);
         run_checked(untar, "tar -x")?;
         std::fs::remove_file(&tar_path).ok();
         Ok(())

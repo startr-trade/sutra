@@ -21,7 +21,7 @@ sutra-formats = { path = "../sutra-formats" }
 # The atexit container reaper (testcontainers-rs 0.25 has no ryuk) AND — via the `conformance`
 # feature — the promoted harness: `sutra_testkit::conformance::{util, engine, broker, callback,
 # compose, k8s}`, re-exported by `tests/all/support.rs`.
-sutra-testkit = { path = "../sutra-testkit", features = ["conformance"] }
+sutra-testkit = { path = "../sutra-testkit", features = ["conformance", "broker-tls"] }
 # `assemble_dir` — one deployment-package directory sealed into one `.sutra` archive on the host.
 sutra-loader = { path = "../sutra-loader" }
 # `sutra coverage ...` driven in-process, as a CI client on the host would run it.
@@ -32,9 +32,10 @@ sutra-cli = { path = "../sutra-cli" }
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true, features = ["rabbitmq"] }
 lapin = { workspace = true }
-# rdkafka is carried for the kafka-transport channels the examples declare (no suite asserts a
-# kafka round trip yet).
+# The test-side broker clients of `tc_broker_tls`. They drive the plaintext listeners, so the only
+# TLS under test is the engine's.
 rdkafka = { workspace = true }
+fe2o3-amqp = { workspace = true }
 # Raw archive inspection for the deployment-source assembly.
 zip = { workspace = true }
 serde_json = { workspace = true }

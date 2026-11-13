@@ -654,8 +654,7 @@ fn package_dir_deployment(
 /// Shared with [`crate::overlay`], whose composed temp directory must carry exactly this
 /// name so a layered run and a hand-merged run emit the same archive file name.
 pub(crate) fn package_dir_name(package_dir: &Path) -> String {
-    package_dir
-        .canonicalize()
+    dunce::canonicalize(package_dir)
         .ok()
         .as_deref()
         .unwrap_or(package_dir)
@@ -839,6 +838,25 @@ fn entry_processes(deployment: &LoadedDeployment) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A relative `.` and a trailing `..` name the folder they resolve to, and the resolved path
+    /// carries no Windows `\\?\` verbatim prefix (that half only means something on Windows,
+    /// where the cli-portability CI job runs it).
+    #[test]
+    fn the_archive_name_is_the_resolved_folder_name_without_a_verbatim_prefix() {
+        let parent = tempfile::tempdir().expect("tempdir");
+        let pkg = parent.path().join("orders-pkg");
+        std::fs::create_dir_all(pkg.join("bpmn")).expect("mkdir");
+        assert_eq!(package_dir_name(&pkg), "orders-pkg");
+        assert_eq!(package_dir_name(&pkg.join("bpmn").join("..")), "orders-pkg");
+        let resolved = dunce::canonicalize(&pkg).expect("resolves");
+        assert!(
+            !resolved.to_string_lossy().starts_with(r"\\?\"),
+            "{}",
+            resolved.display()
+        );
+        assert_eq!(package_dir_name(Path::new("/")), "package");
+    }
 
     const PLAIN_BPMN: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"

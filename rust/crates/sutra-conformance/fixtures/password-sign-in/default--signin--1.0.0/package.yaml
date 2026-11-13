@@ -1,0 +1,9 @@
+# Deployment package for the password sign-in conformance suite: a typed `users` store holding
+# argon2id hashes, an enrol flow that hashes with `password hash`, and a sign-in flow that checks
+# with `password verify`. Labels are opaque selectors.
+labels:
+  "tenant": "default"
+  "module": "signin"
+  "version": "1.0.0"
+engine:
+  minContract: 1

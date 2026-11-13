@@ -1,6 +1,7 @@
 //! A binary that is not libtest cannot make the suite guard respawn. This file is such a binary
 //! (`harness = false`), which is why it is its own test target and not a module of a `tests/all.rs`:
-//! like a doc-test, it ignores `--list` and runs its code again.
+//! its probe, like a doc-test, ignores `--list` and runs its code again. The top-level process does
+//! answer `--list`, so a runner that lists first, such as cargo-nextest, can find the test.
 //!
 //! The check cannot itself run away. Every process appends a line to a counter file before doing
 //! anything else, and past [`PROCESS_LIMIT`] lines it exits at once, without taking a guard.
@@ -15,8 +16,22 @@ const PROCESS_LIMIT: usize = 5;
 
 fn main() {
     match std::env::var_os(COUNTER_ENV) {
+        None if listing_requested() => list(),
         None => check(),
         Some(counter) => probe(PathBuf::from(counter)),
+    }
+}
+
+/// A test runner that lists before it runs, such as cargo-nextest, asks with `--list`: answer the
+/// way libtest's terse listing does, naming the one test, and none when only ignored tests are
+/// wanted.
+fn listing_requested() -> bool {
+    std::env::args().skip(1).any(|arg| arg == "--list")
+}
+
+fn list() {
+    if !std::env::args().skip(1).any(|arg| arg == "--ignored") {
+        println!("suite_listing_no_respawn: test");
     }
 }
 

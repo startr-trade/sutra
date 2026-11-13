@@ -35,6 +35,29 @@ gateway condition or a `q:alias` expression without deploying anything. See
 [Crates: sutra-feel and sutra-dmn](../reference/crates.md) if you want FEEL evaluation embedded in
 your own Rust project, independent of the engine.
 
+### Password hashing
+
+Two builtins let a flow check a password against a stored hash without ever storing the password
+(new in 0.6.21):
+
+| Function | Returns |
+|---|---|
+| `password hash(password)` | An argon2id hash in PHC string form, `$argon2id$v=19$m=19456,t=2,p=1$<salt>$<hash>`, with a fresh 16-byte salt from the operating system. `null` if the argument is not a string or is empty. |
+| `password verify(password, hash)` | `true` if the password matches the hash, `false` if it does not. `null` if either argument is not a string, or if the hash is malformed, is not argon2id, or asks for more than m = 65 536 KiB, t = 10 or p = 4. The comparison is constant-time. |
+
+- **The parameters are fixed** in code: argon2id, m = 19 456 KiB, t = 2, p = 1, the OWASP minimum.
+  A package can't change them. `password verify` reads the parameters from the stored hash, so the
+  cap keeps a planted hash from tying up a worker and its memory.
+- **`password hash` is denied at replay-bound sites,** like `uuid()`, because it draws a random
+  salt. Use it in a task, not in a `q:alias` or a `when`; `sutra lint` refuses it there with
+  `SUTRA.FEEL.DETERMINISM.UNSAFE_BUILTIN`. `password verify` is deterministic and works anywhere.
+- **Cost.** One verify takes about 22 ms (criterion median 22.3 ms on an Intel i7-10750H laptop,
+  release build), and holds its executor worker for that time. That suits a sign-in; don't call
+  these functions for every message.
+
+[Signing a user in against a store](signing-in-against-a-store.md) builds a sign-in flow with them
+and checks that the password reaches no table, audit record or log line.
+
 ## DMN decision tables
 
 A `.dmn` file under `rules/` is a standard DMN 1.5 decision table; the engine's evaluator supports

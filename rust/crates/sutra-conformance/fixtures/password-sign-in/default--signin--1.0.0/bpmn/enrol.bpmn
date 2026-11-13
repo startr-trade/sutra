@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Hash the password and write the user's row. The credentials are @transient (never persisted)
+     and @sensitive (redacted in logs and audit). -->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0"
+                  id="Definitions_enrol"
+                  targetNamespace="urn:sutra:module:signin:1.0.0">
+  <bpmn:dataStore id="usersStore" name="users"/>
+  <bpmn:process id="enrol" isExecutable="true">
+    <bpmn:extensionElements>
+      <q:audit sink="jsonl" capture="payload"/>
+      <q:variables>
+        <q:variable name="creds" type="object" transient="true" sensitive="true"/>
+        <q:variable name="row" type="object"/>
+      </q:variables>
+    </bpmn:extensionElements>
+    <bpmn:dataStoreReference id="refUser" dataStoreRef="usersStore">
+      <bpmn:extensionElements><q:store key="creds.user"/></bpmn:extensionElements>
+    </bpmn:dataStoreReference>
+    <bpmn:startEvent id="Start">
+      <bpmn:extensionElements><q:source channel="enrol" name="creds"/></bpmn:extensionElements>
+    </bpmn:startEvent>
+    <bpmn:serviceTask id="Hash" name="Hash and store">
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment>
+          <bpmn:from>{userId: creds.user, passwordHash: password hash(creds.password)}</bpmn:from>
+          <bpmn:to>row</bpmn:to>
+        </bpmn:assignment>
+      </bpmn:dataInputAssociation>
+      <bpmn:dataOutputAssociation>
+        <bpmn:sourceRef>row</bpmn:sourceRef><bpmn:targetRef>refUser</bpmn:targetRef>
+      </bpmn:dataOutputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="Done"/>
+    <bpmn:sequenceFlow id="F1" sourceRef="Start" targetRef="Hash"/>
+    <bpmn:sequenceFlow id="F2" sourceRef="Hash" targetRef="Done"/>
+  </bpmn:process>
+</bpmn:definitions>

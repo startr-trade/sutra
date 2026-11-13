@@ -13,6 +13,80 @@ This is the changelog for the **Rust-native** engine (`rust/` workspace). It beg
 
 Nothing yet.
 
+## [0.6.21] — 2026-11-13
+
+**2026-11-13.** **The `kafka` and `amqp` (AMQP 1.0) transports connect to TLS brokers natively, with no sidecar,** and authenticate with SASL: Kafka with PLAIN, SCRAM-SHA-256 or SCRAM-SHA-512, AMQP 1.0 with PLAIN. Brokers are verified by default. **FEEL gains `password hash` and `password verify`** (argon2id), so a flow can sign a user in against a password hash in a typed store without storing or logging the password. **The CLI's `self-update` works on macOS,** and paths printed on Windows no longer carry a `\\?\` prefix. There is no migration, and no archive format, deploymentId or snapshot format change.
+
+## Before you upgrade
+
+**Check these against what you run:**
+
+- **Kafka's `kafka.*` passthrough now refuses `sasl.*`, `ssl.*` and `enable.ssl.certificate.verification`.** A channel that sets one of them stops at startup. Use the typed properties below instead. They could not have secured a connection before, because the engine's Kafka client was built without TLS.
+- **A Kafka `sasl.username`, `sasl.password` or `tls-ca-pem` written as a literal is refused** with `SUTRA.STARTUP.REFUSED.HARDCODED_SECRET`, like the AMQP and RabbitMQ credentials. Write a reference.
+- **A plaintext AMQP sink whose credentials the broker refuses now reports `SUTRA.OUTBOUND.AMQP.BROKER_AUTH_FAILED`,** where it reported `SEND_FAILED`. Update an alert that matches the old code.
+- **The engine binary now includes its own OpenSSL 3.6.3, for the Kafka client** (librdkafka has no other TLS backend). The engine still loads no system libssl: `readelf -d` lists only libgcc_s, libm, libc and the loader. **An image scanner cannot see this copy;** it is tracked through `rust/Cargo.lock`, so `cargo audit` reports an advisory filed against the `openssl-src` crate. The image is about 8 MB larger. **Building from source now needs `perl`**, for OpenSSL's build.
+
+## TLS and SASL on Kafka and AMQP 1.0
+
+For an inbound channel:
+
+| Property | Transport | Meaning |
+|---|---|---|
+| `security.protocol` | kafka | `PLAINTEXT` (default), `SSL`, `SASL_PLAINTEXT` or `SASL_SSL` |
+| `sasl.mechanism` | kafka | `PLAIN`, `SCRAM-SHA-256` or `SCRAM-SHA-512` |
+| `sasl.username`, `sasl.password` | kafka | References, never literals |
+| `tls: true` | amqp | Use TLS. The default port becomes 5671 |
+| `username`, `password` | amqp | References. SASL PLAIN is used when both are set |
+| `tls-ca-file` | both | A PEM bundle used in place of the system CAs. Takes references, like an address |
+| `tls-ca-pem` | both | A reference to PEM text, used in place of the system CAs |
+| `tls-insecure-skip-verify` | both | `true` turns off the certificate and host-name checks |
+
+- **Verification is on by default,** against the system CAs (`SSL_CERT_FILE` and `SSL_CERT_DIR` are honoured), unless a CA setting replaces them. `tls-insecure-skip-verify: true` is the only way to turn it off, and the engine logs a warning whenever it applies.
+- **A setting that could not take effect stops the channel at startup** instead of being ignored: a CA setting without TLS, `sasl.*` without a SASL protocol, both CA settings at once, or SASL GSSAPI or OAUTHBEARER.
+- **The protocol switches stay literal.** `tls`, `security.protocol`, `sasl.mechanism` and `tls-insecure-skip-verify` do not expand references; addresses, credentials and `tls-ca-file` do.
+- **Outbound sends** use one engine-wide setting per transport, from the environment: `SUTRA_SINK_KAFKA_SECURITY_PROTOCOL`, `SUTRA_SINK_KAFKA_SASL_MECHANISM`, `SUTRA_SINK_KAFKA_SASL_USERNAME`, `SUTRA_SINK_KAFKA_SASL_PASSWORD`, `SUTRA_SINK_KAFKA_TLS_CA_FILE`, `SUTRA_SINK_KAFKA_TLS_INSECURE_SKIP_VERIFY`; and for `amqp10s://` destinations `SUTRA_SINK_AMQP_TLS_CA_FILE` and `SUTRA_SINK_AMQP_TLS_INSECURE_SKIP_VERIFY`, with the existing `SUTRA_SINK_AMQP_USERNAME` and `SUTRA_SINK_AMQP_PASSWORD`.
+- **New diagnostics:** `SUTRA.INBOUND.KAFKA.BROKER_TLS_FAILED`, `SUTRA.INBOUND.KAFKA.BROKER_AUTH_FAILED`, the same two under `OUTBOUND.KAFKA`, `INBOUND.AMQP` and `OUTBOUND.AMQP`. `BROKER_TLS_FAILED` means the broker's certificate is not trusted or does not name the host, or the trust settings could not be read; `BROKER_AUTH_FAILED` means the broker refused the credentials. Neither prints a password or anything the broker sent back during SASL. A consumer keeps retrying and an outbound message stays in the outbox, so both recover once the setting is corrected. The AMQP consumer backs off between attempts; the Kafka client retries quickly and logs each attempt, so a wrong CA gives dozens of lines a second: alert on the code, not the line count.
+- **What it was tested against:** Apache Kafka 3.8 and Apache ActiveMQ Artemis, in local containers. Managed Kafka services and Azure Service Bus have not been tested and are not claimed to work; Azure Service Bus's CBS token flow is not implemented. Client certificates (mTLS) are not supported.
+
+The book page "Connecting to a TLS and SASL broker" walks a message through both brokers, with a refused login and an untrusted CA.
+
+## Password hashing in FEEL
+
+- **`password hash(password)`** returns an argon2id hash in PHC string form (`$argon2id$v=19$m=19456,t=2,p=1$…`), with a fresh 16-byte salt from the operating system. The parameters are fixed in code. An empty or non-string password gives `null`.
+- **`password verify(password, hash)`** returns `true` or `false`, comparing in constant time. It returns `null` for a malformed hash, one that is not argon2id, or one that asks for more than m = 65 536 KiB, t = 10 or p = 4, so a stored hash cannot make a verify arbitrarily expensive.
+- **`password hash` is denied where an expression must give the same answer on replay,** like `uuid()`: `sutra lint` refuses it there with `SUTRA.FEEL.DETERMINISM.UNSAFE_BUILTIN`. `password verify` is deterministic and allowed everywhere.
+- **Cost:** one verify takes about 22 ms (criterion median 22.3 ms, range 21.1 to 23.8 ms, on an Intel i7-10750H laptop, release build).
+- **Keep the plaintext out of every surface** by reading the sign-in message into a variable marked `transient` and `sensitive`: it is then neither persisted nor written to the audit log or the engine log. The book page "Signing a user in against a store" builds such a flow, and checks the database dump, the audit file and the engine log for the password.
+- New dependency: `argon2` 0.5 (with `password-hash` and `blake2`), with default features off.
+
+## CLI on macOS and Windows
+
+- **`sutra self-update` works on macOS.** It passed GNU tar's `--wildcards`, which macOS's bsdtar refuses. It now unpacks the archive into a scratch folder and takes the binary from there.
+- **Windows paths are printed without the `\\?\` prefix.** Package loading, `sutra lint`, `sutra create` and the documentation generators resolve paths without it, so a printed path or a path comparison matches what you typed. The catalog's JSON `repoRoot` showed it.
+- **`sutra compat-baseline` against a git reference** gives `tar` a relative archive name, because GNU tar, which Git for Windows puts first on `PATH`, reads `C:\…` as a remote host.
+- These were tested on Linux, which exercises the Linux-visible half of each. A new hosted job, `cli-portability`, runs the CLI and package-loader tests and clippy on macOS 15 and Windows Server 2025 for every change; its first run is this release's.
+
+## Building and CI
+
+- **`make ci`** runs the hosted pipeline's checks locally, cheapest first: `make fmt-check`, `make lint`, `make cross`, `make test`, `make audit` and `make scan-deps`.
+- **`make test` runs cargo-nextest** when it is installed, plus the doctests, and otherwise `cargo test`; both run every test before reporting. The hosted pipeline installs nextest.
+- **`make cross`** runs clippy for the CLI and its workspace crates against Windows (MSVC) and both macOS targets, skipping a target whose C toolchain the host lacks.
+- **The workflows pin every action by commit and every runner by version,** and are checked with actionlint. A new architecture test fails the build when a workflow's Rust toolchain differs from `rust-toolchain.toml`.
+- **`.gitattributes`** makes text files LF in every checkout. The BPMN and DMN schemas published by the OMG are kept byte for byte as published.
+
+## Security
+
+- **The image scan configuration's justifications for the base image's libssl3** now say why: the engine links no libssl, and its Kafka client's OpenSSL is compiled in (see "Before you upgrade").
+- **Seven new base-image findings are ignored, time-boxed,** with their reasons in `.trivyignore.yaml`: five in libssl3 (CMS, QUIC and AES-GCM-SIV), which the engine never loads and whose code paths its compiled-in OpenSSL does not use for TLS over TCP, and two in glibc (regex and the wide `scanf` family). Debian ships no fix for any of them.
+- **`quinn-proto` 0.11.19 and `quinn-udp` 0.5.16** in `Cargo.lock`, for RUSTSEC-2026-0523, RUSTSEC-2026-0524 and RUSTSEC-2026-0538. Neither crate is compiled into the engine or the CLI; they are in the lockfile only as an optional dependency of `reqwest` that no crate enables (`cargo tree -i quinn-proto -e all --target all` is empty).
+
+## For extension authors
+
+- `sutra_transport_spi::is_secret_reference` is new: whether a value is a whole secret reference (any registered scheme, `${…}`, or `k8s:secret/<name>#<key>`).
+- `sutra-transport-amqp` gains `AmqpTlsProperties`, `register_amqp_sink_with_tls`, `sink_tls_settings_from_env` and `AmqpMessageSink::with_tls_settings`, and `AmqpChannelProperties` a `tls_settings` field.
+- `sutra-transport-kafka` gains `KafkaBrokerSecurity`, `KafkaSinkSecurity`, `register_kafka_sink_with_security` and `KafkaMessageSink::with_security`, and `KafkaChannelProperties` a `security` field.
+- `BrokerFailureRecorder` is new. Code that builds `AmqpChannelProperties` or `KafkaChannelProperties` with a struct literal must add the new field.
+
 ## [0.6.20] — 2026-11-10
 
 **2026-11-10.** **A superseded version now keeps serving the channels only it declares, until it retires,** where 0.6.18 and 0.6.19 drained it whole. **Another owner is refused such an endpoint until then.** **A literal `local://` send to another package, or to another version of the same package, is refused at lint and deploy.** **The engine uses about half the CPU it did under load**: evaluation no longer copies the variables, and jemalloc is the allocator. **Coverage can be checked against requirements, in named compliance cycles.** RabbitMQ and AMQP broker credentials accept `secret:` references. Two additive migrations run at boot: V1003 (deployments) and V904 (coverage, at the store's next first use). There is no archive format, deploymentId or snapshot format change.

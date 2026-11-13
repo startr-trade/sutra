@@ -29,6 +29,7 @@ sutra-loader = { path = "../sutra-loader", optional = true }
 sutra-envref-spi = { path = "../sutra-envref-spi", optional = true }
 # Database + broker fixtures. `rabbitmq` adds on top of the workspace `postgres`/`kafka`.
 testcontainers = { workspace = true, optional = true }
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"], optional = true }
 testcontainers-modules = { workspace = true, features = ["rabbitmq"], optional = true }
 # AMQP 0.9.1 client for the broker fixture's publish / passive-declare / recorder helpers.
 lapin = { workspace = true, optional = true }
@@ -42,6 +43,9 @@ serde_json = { workspace = true, optional = true }
 
 [features]
 default = []
+# TLS and SASL broker fixtures (`broker_tls`): test certificates generated at run time, and an
+# Artemis and a Kafka container that require them. Dev-only, like the rest of this crate.
+broker-tls = ["dep:testcontainers", "dep:rcgen"]
 conformance = [
     "dep:sutra-loader",
     "dep:sutra-envref-spi",

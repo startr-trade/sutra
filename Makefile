@@ -20,7 +20,7 @@ CATALOG_OUTPUT := $(if $(wildcard docs/design/artifact-documentation),docs/desig
 
 .PHONY: catalog catalog-rust catalog-check catalog-rust-check install-hooks verify-workflows verify-docs \
 	print-catalog-output \
-	help test test-docker test-all test-k8s lint docker-clean audit scan-deps scan-image codeql \
+	help ci fmt-check cross test test-docker test-all test-k8s lint docker-clean audit scan-deps scan-image codeql \
 	image image-it
 
 ## Regenerate the catalog. Only the rust/ pages are written; anything else in the
@@ -81,8 +81,19 @@ install-hooks: ## Install the optional catalog-regen pre-commit hook (opt-in loc
 # vendored anywhere in this repository — see THIRD-PARTY-NOTICES.md). Whatever a distribution
 # generates, and the cost of compiling it, is that distribution's business.
 
-test: ## Tier-1: the no-docker Rust suite.
-	cd rust && cargo test --workspace
+## Tier-1 runs under cargo-nextest when it is installed: each test is its own process and test
+## binaries run side by side. nextest cannot run doctests, so `cargo test --doc` follows it. Without
+## nextest it is plain `cargo test`. Both use `--no-fail-fast`, so one run reports every failure.
+## Install nextest with `cargo install cargo-nextest --locked`.
+test: ## Tier-1: the no-docker Rust suite (cargo-nextest + doctests when installed, else cargo test).
+	@cd rust && if cargo nextest --version >/dev/null 2>&1; then \
+		echo "make test: cargo nextest run, then cargo test --doc"; \
+		cargo nextest run --workspace --no-fail-fast && \
+		cargo test --workspace --doc --no-fail-fast; \
+	else \
+		echo "make test: cargo-nextest is not installed, so cargo test"; \
+		cargo test --workspace --no-fail-fast; \
+	fi
 
 ## Tier-2: the docker (testcontainers) suites. `make test-docker P=sutra-persistence`
 ## narrows it to one crate; bare `make test-docker` runs the whole workspace's ignored set.
@@ -121,6 +132,29 @@ verify-docs: ## Run the commands the getting-started docs document (SUTRA_BIN=<p
 
 verify-workflows: ## Verify workflow YAML + that every action reference resolves upstream.
 	bash scripts/verify-workflow-actions.sh
+
+## The local CI gate: what the CI workflow's jobs run, cheapest first, stopping at the first
+## failure. Run it before every push. Tier-2, the image scan and CodeQL are not in it: they run
+## nightly or once per release.
+ci: ## Local CI, cheapest first: fmt-check, lint, cross, test, audit, scan-deps.
+	$(MAKE) --no-print-directory fmt-check
+	$(MAKE) --no-print-directory lint
+	$(MAKE) --no-print-directory cross
+	$(MAKE) --no-print-directory test
+	$(MAKE) --no-print-directory audit
+	$(MAKE) --no-print-directory scan-deps
+
+fmt-check: ## rustfmt check over the workspace (fails on any unformatted file).
+	cd rust && cargo fmt --all --check
+
+## Clippy -D warnings over sutra-cli and the workspace crates it depends on, for the systems the CLI
+## ships to (windows-msvc and both darwin targets). `ring` and `aws-lc-sys` compile C for the target,
+## so a target is checked only on a host with its C toolchain (darwin on macOS, windows-msvc on
+## Windows) and skipped with a message elsewhere; the hosted cli-portability job covers the rest.
+## CROSS_TARGETS= narrows it; see scripts/cross-clippy.sh.
+CROSS_TARGETS ?=
+cross: ## Clippy for sutra-cli on windows-msvc + darwin (skips a target with no C toolchain here).
+	bash scripts/cross-clippy.sh $(CROSS_TARGETS)
 
 lint: ## Routine clippy -D warnings (workspace) + the domain-neutrality gate.
 	cd rust && cargo clippy --workspace --all-targets -- -D warnings

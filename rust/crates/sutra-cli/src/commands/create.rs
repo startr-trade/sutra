@@ -384,8 +384,7 @@ fn create_ci(args: CiArgs, format: ReportFormat, io: &mut Io<'_>) -> i32 {
         return exit::USAGE;
     }
     // The workspace name is its directory name — the same thing `create app` used.
-    let app = root
-        .canonicalize()
+    let app = dunce::canonicalize(&root)
         .ok()
         .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
         .unwrap_or_else(|| "app".to_string());
@@ -687,9 +686,7 @@ fn create_bpmn(args: BpmnArgs, format: ReportFormat, io: &mut Io<'_>) -> i32 {
         .clone()
         .unwrap_or_else(|| format!("{}Request", pascal_case(&args.process)));
     let namespace = args.namespace.clone().unwrap_or_else(|| {
-        let pkg = args
-            .package
-            .canonicalize()
+        let pkg = dunce::canonicalize(&args.package)
             .ok()
             .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
             .unwrap_or_else(|| "package".to_string());

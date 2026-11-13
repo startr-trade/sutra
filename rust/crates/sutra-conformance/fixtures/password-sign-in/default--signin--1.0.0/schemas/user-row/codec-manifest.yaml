@@ -1,0 +1,3 @@
+# The `users` store's row type. No channel binds it.
+schemaKind: xsd
+formats: [xml]

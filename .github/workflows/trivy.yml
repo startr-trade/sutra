@@ -16,14 +16,14 @@ jobs:
   # secrets, and IaC misconfig (Dockerfile / OpenTofu). Runs on every push + PR.
   fs:
     name: filesystem (deps · secrets · IaC)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       security-events: write
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - name: Trivy filesystem scan
-        uses: aquasecurity/trivy-action@v0.36.0 # pin (v-prefixed tags); bump as needed
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           scan-type: fs
           scanners: vuln,secret,misconfig
@@ -38,7 +38,7 @@ jobs:
           # even though a local `trivy fs` picks it up from the working directory.
           trivyignores: .trivyignore.yaml
       - name: Upload SARIF to code scanning
-        uses: github/codeql-action/upload-sarif@v4
+        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
         if: always()
         with:
           sarif_file: trivy-fs.sarif
@@ -51,20 +51,20 @@ jobs:
   image:
     name: engine image
     if: github.event_name != 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       security-events: write
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - name: Set up Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       # GHA-backed layer cache, same pattern as release.yml/nightly.yml: the chef-cook
       # dependency layer dominates this build and only changes with the lockfile. Its own
       # `scope=` because tag-ref caches (release's) are not readable from main/scheduled
       # runs — this cache is saved on main pushes and read back by the weekly schedule.
       - name: Build engine image
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: ./rust
           file: ./rust/Dockerfile
@@ -74,7 +74,7 @@ jobs:
           cache-from: type=gha,scope=trivy-image
           cache-to: type=gha,mode=max,scope=trivy-image
       - name: Trivy image scan
-        uses: aquasecurity/trivy-action@v0.36.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           scan-type: image
           image-ref: sutra-engine:ci
@@ -83,7 +83,7 @@ jobs:
           severity: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
           trivyignores: .trivyignore.yaml
       - name: Upload SARIF to code scanning
-        uses: github/codeql-action/upload-sarif@v4
+        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
         if: always()
         with:
           sarif_file: trivy-image.sarif

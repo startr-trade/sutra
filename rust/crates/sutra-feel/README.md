@@ -47,6 +47,21 @@ This crate powers [`sutra-dmn`](https://crates.io/crates/sutra-dmn)'s decision-t
 but has no dependency on it — it can be used on its own wherever FEEL expression evaluation is
 needed.
 
+## Password hashing
+
+Two builtins hash and check passwords with argon2id:
+
+| Function | Returns |
+|---|---|
+| `password hash(password)` | An argon2id hash in PHC string form, `$argon2id$v=19$m=19456,t=2,p=1$<salt>$<hash>`, with a fresh 16-byte salt from the OS. `null` if the argument is not a string or is empty. |
+| `password verify(password, hash)` | `true` if the password matches the hash, `false` if not. `null` if either argument is not a string, or if the hash is malformed, is not argon2id, or asks for more than m = 65 536 KiB, t = 10 or p = 4. The comparison is constant-time. |
+
+The parameters (m = 19 456 KiB, t = 2, p = 1) are fixed in code. `password hash` reads OS
+randomness, so it is on the determinism denylist; `password verify` is pure. Evaluation is
+synchronous, so one verify blocks the caller for one hash time (about 22 ms on a 2020 laptop
+CPU): these are for sign-in rates, not per-message use. Errors name the function, never its
+arguments.
+
 ## License
 
 Licensed under either of

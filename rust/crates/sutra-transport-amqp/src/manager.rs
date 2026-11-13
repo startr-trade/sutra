@@ -9,14 +9,14 @@
 //! once and moves on; consumers detach onto the runtime (broker absence is NON-FATAL), and
 //! the shared, rewireable [`AmqpChannels`] rides the activation flip via
 //! [`AmqpChannels::rewire`] with the same semantics (stop changed/removed, start added, keep
-//! unchanged; idempotent; non-fatal on a bad new def; drain on shutdown). Like RabbitMQ (and
-//! unlike Kafka) AMQP 1.0 carries channel-YAML `username`/`password` secret references, so the
-//! credential-resolution step is present (an unresolvable reference ⇒ WARN + skip, the
-//! broker-absent deployment shape).
+//! unchanged; idempotent; non-fatal on a bad new def; drain on shutdown). Like RabbitMQ, AMQP 1.0
+//! carries channel-YAML `username`/`password` secret references, so the credential-resolution
+//! step is present (an unresolvable reference ⇒ WARN + skip, the broker-absent deployment shape).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use crate::amqp::AmqpTlsProperties;
 use crate::amqp::{
     AmqpChannelProperties, AmqpMessageSink, AmqpSourceConfig, AmqpTriggerSource, TRANSPORT,
 };
@@ -37,6 +37,11 @@ use sutra_transport_spi::{EngineIntake, EnvRefResolver, TransportChannels, Trans
 pub const SINK_USERNAME_ENV: &str = "SUTRA_SINK_AMQP_USERNAME";
 /// The env var naming the engine-wide default AMQP sink password.
 pub const SINK_PASSWORD_ENV: &str = "SUTRA_SINK_AMQP_PASSWORD";
+/// The env var naming a PEM bundle that replaces the native root store for `amqp10s://` sends.
+pub const SINK_TLS_CA_FILE_ENV: &str = "SUTRA_SINK_AMQP_TLS_CA_FILE";
+/// The env var that, set to `true`, disables broker certificate and host-name verification for
+/// `amqp10s://` sends.
+pub const SINK_TLS_INSECURE_SKIP_VERIFY_ENV: &str = "SUTRA_SINK_AMQP_TLS_INSECURE_SKIP_VERIFY";
 
 /// Register the AMQP 1.0 sink into an outbox [`SinkRegistry`] under its claimed schemes
 /// (`amqp10` / `amqp10s`), carrying the engine-wide default credentials.
@@ -46,6 +51,54 @@ pub fn register_amqp_sink(
     password: Option<String>,
 ) {
     registry.register(Arc::new(AmqpMessageSink::new(username, password)));
+}
+
+/// [`register_amqp_sink`] with the trust settings for `amqp10s://` destinations. `Err` holds why
+/// the engine-wide settings are unusable; every TLS send then fails closed and reports it.
+pub fn register_amqp_sink_with_tls(
+    registry: &mut SinkRegistry,
+    username: Option<String>,
+    password: Option<String>,
+    tls_settings: Result<AmqpTlsProperties, String>,
+) {
+    registry.register(Arc::new(
+        AmqpMessageSink::new(username, password).with_tls_settings(tls_settings),
+    ));
+}
+
+/// The engine-wide sink trust settings from the environment. An unset environment yields the
+/// defaults: the native root store, with verification on.
+pub fn sink_tls_settings_from_env() -> Result<AmqpTlsProperties, String> {
+    sink_tls_settings_from(
+        std::env::var(SINK_TLS_CA_FILE_ENV).ok().as_deref(),
+        std::env::var(SINK_TLS_INSECURE_SKIP_VERIFY_ENV)
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn sink_tls_settings_from(
+    ca_file: Option<&str>,
+    insecure_skip_verify: Option<&str>,
+) -> Result<AmqpTlsProperties, String> {
+    let insecure_skip_verify = match insecure_skip_verify.map(str::trim).unwrap_or("") {
+        "" => false,
+        v if v.eq_ignore_ascii_case("false") => false,
+        v if v.eq_ignore_ascii_case("true") => true,
+        v => {
+            return Err(format!(
+                "{SINK_TLS_INSECURE_SKIP_VERIFY_ENV} must be 'true' or 'false', got '{v}'"
+            ))
+        }
+    };
+    Ok(AmqpTlsProperties {
+        ca_file: ca_file
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string),
+        ca_pem: None,
+        insecure_skip_verify,
+    })
 }
 
 /// The engine-wide default AMQP sink credentials from the environment (both `None` ⇒
@@ -301,7 +354,29 @@ fn build_and_start_consumer(
             return Ok(None);
         }
     };
-    let resolved = properties.with_credentials(username, password);
+    // A CA reference that cannot resolve here is the same deployment shape: skip, never boot on
+    // a weaker trust decision.
+    let ca_pem = match resolve_credential(
+        properties.tls_settings.ca_pem.as_deref(),
+        "tls-ca-pem",
+        &channel,
+        ctx.resolver,
+    ) {
+        Ok(ca_pem) => ca_pem,
+        Err(diagnostic) => {
+            warn!(
+                channel = %channel,
+                code = %diagnostic.code,
+                "amqp consumer NOT started — TLS CA reference unresolvable in this \
+                 environment: {}",
+                diagnostic.message
+            );
+            return Ok(None);
+        }
+    };
+    let resolved = properties
+        .with_credentials(username, password)
+        .with_resolved_ca_pem(ca_pem);
 
     let singleton = resolved.singleton;
     if singleton && ctx.pool.is_none() {
@@ -479,11 +554,11 @@ fn spawn_boxed(
     )?))
 }
 
-/// Factory `register_sink` adapter — reads the `SUTRA_SINK_AMQP_{USERNAME,PASSWORD}` env
-/// defaults itself (the broker host rides the `amqp10://` URI).
+/// Factory `register_sink` adapter — reads the `SUTRA_SINK_AMQP_*` env defaults itself (the
+/// broker host rides the `amqp10://` URI).
 fn register_sink(registry: &mut SinkRegistry) {
     let (username, password) = sink_credentials_from_env();
-    register_amqp_sink(registry, username, password);
+    register_amqp_sink_with_tls(registry, username, password, sink_tls_settings_from_env());
 }
 
 inventory::submit! {
@@ -546,6 +621,33 @@ inventory::submit! {
 }
 
 #[cfg(test)]
+mod sink_tls_env_tests {
+    use super::sink_tls_settings_from;
+
+    #[test]
+    fn unset_environment_means_native_roots_with_verification_on() {
+        let settings = sink_tls_settings_from(None, None).expect("defaults");
+        assert_eq!(settings.ca_file, None);
+        assert!(!settings.insecure_skip_verify);
+    }
+
+    #[test]
+    fn the_opt_out_is_explicit_and_a_typo_never_disables_verification() {
+        assert!(
+            sink_tls_settings_from(None, Some("true"))
+                .expect("explicit")
+                .insecure_skip_verify
+        );
+        assert!(
+            !sink_tls_settings_from(None, Some("FALSE"))
+                .expect("explicit")
+                .insecure_skip_verify
+        );
+        assert!(sink_tls_settings_from(None, Some("yes")).is_err());
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -592,6 +694,7 @@ mod connection_references {
             "${BAD_PORT}" => Ok("s3cret-value".to_string()),
             "env:QUEUE" => Ok("resolved-queue".to_string()),
             "secret:topic" => Ok("resolved-topic".to_string()),
+            "${CA_FILE}" => Ok("/etc/sutra/ca.pem".to_string()),
             r if r.contains("${") || r.starts_with("env:") || r.starts_with("secret:") => {
                 Err(format!("{r} is not set"))
             }
@@ -694,6 +797,51 @@ mod connection_references {
             .expect("literal values wire");
         let plain = AmqpChannelProperties::from_definition(&definition(&[])).expect("plain parse");
         assert_eq!(literal, plain);
+    }
+
+    #[test]
+    fn a_tls_ca_file_reference_resolves_and_an_unresolved_one_fails_wiring() {
+        let props = AmqpChannelProperties::resolved(
+            &definition(&[("tls", "true"), ("tls-ca-file", "${CA_FILE}")]),
+            resolver,
+        )
+        .expect("resolves");
+        assert_eq!(
+            props.tls_settings.ca_file.as_deref(),
+            Some("/etc/sutra/ca.pem")
+        );
+        let err = AmqpChannelProperties::resolved(
+            &definition(&[("tls", "true"), ("tls-ca-file", "${UNSET_CA}")]),
+            resolver,
+        )
+        .expect_err("unresolved");
+        assert_eq!(err.code, "SUTRA.INBOUND.AMQP.CONFIG_INVALID");
+        assert!(err.message.contains("'tls-ca-file'"), "{}", err.message);
+    }
+
+    #[test]
+    fn a_tls_ca_pem_must_still_be_a_whole_reference() {
+        for literal in ["-----BEGIN CERTIFICATE-----", "pre${CA_PEM}"] {
+            let err = AmqpChannelProperties::resolved(
+                &definition(&[("tls", "true"), ("tls-ca-pem", literal)]),
+                resolver,
+            )
+            .expect_err("literal");
+            assert_eq!(
+                err.code, "SUTRA.STARTUP.REFUSED.HARDCODED_SECRET",
+                "{literal}"
+            );
+        }
+        for reference in ["${CA_PEM}", "${secret:ca-pem}", "secret:ca-pem"] {
+            assert!(
+                AmqpChannelProperties::resolved(
+                    &definition(&[("tls", "true"), ("tls-ca-pem", reference)]),
+                    resolver,
+                )
+                .is_ok(),
+                "{reference}"
+            );
+        }
     }
 
     #[test]

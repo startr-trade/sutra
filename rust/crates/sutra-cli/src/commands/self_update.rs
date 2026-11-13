@@ -615,28 +615,52 @@ fn unpack(archive: &[u8], binary: &str, target: &str, dest: &PathBuf) -> Result<
         Err(format!("the release zip contained no {binary}.exe"))
     } else {
         // The tarball is small (one stripped binary + licenses) and already in memory; shelling
-        // out to `tar` keeps the dependency surface of an updater minimal.
-        let tmp = dest.with_extension("tar.gz");
-        std::fs::write(&tmp, archive).map_err(|e| format!("staging the archive: {e}"))?;
-        let dir = dest.parent().ok_or("no staging dir")?;
-        let status = std::process::Command::new("tar")
-            .arg("-xzf")
-            .arg(&tmp)
-            .arg("-C")
-            .arg(dir)
-            .arg("--strip-components=1")
-            .arg("--wildcards")
-            .arg(format!("*/{binary}"))
-            .status();
-        let _ = std::fs::remove_file(&tmp);
-        match status {
-            Ok(s) if s.success() => {}
-            Ok(s) => return Err(format!("tar exited {s}")),
-            Err(e) => return Err(format!("running tar: {e} (is tar on PATH?)")),
-        }
-        let extracted = dir.join(binary);
-        std::fs::rename(&extracted, dest).map_err(|e| format!("staging the new binary: {e}"))
+        // out to `tar` keeps the dependency surface of an updater minimal. Only the options GNU
+        // tar and the bsdtar macOS ships share are used: bsdtar has no `--wildcards`, so the whole
+        // archive is extracted into a scratch folder and the binary picked out of it. The archive
+        // is named relative to that folder, because GNU tar reads `C:\…` as a remote host.
+        let scratch = dest.with_extension("unpack");
+        let _ = std::fs::remove_dir_all(&scratch);
+        std::fs::create_dir_all(&scratch)
+            .map_err(|e| format!("creating {}: {e}", scratch.display()))?;
+        let result = (|| {
+            std::fs::write(scratch.join("release.tar.gz"), archive)
+                .map_err(|e| format!("staging the archive: {e}"))?;
+            let status = std::process::Command::new("tar")
+                .current_dir(&scratch)
+                .args(["-xzf", "release.tar.gz"])
+                .status();
+            match status {
+                Ok(s) if s.success() => {}
+                Ok(s) => return Err(format!("tar exited {s}")),
+                Err(e) => return Err(format!("running tar: {e} (is tar on PATH?)")),
+            }
+            let extracted = find_unpacked_binary(&scratch, binary)
+                .ok_or_else(|| format!("the release archive contained no {binary}"))?;
+            std::fs::rename(&extracted, dest).map_err(|e| format!("staging the new binary: {e}"))
+        })();
+        let _ = std::fs::remove_dir_all(&scratch);
+        result
     }
+}
+
+/// The release binary in an unpacked tarball: `<top-folder>/<binary>`, the layout the release
+/// workflow packages, or `<binary>` at the top.
+fn find_unpacked_binary(scratch: &Path, binary: &str) -> Option<PathBuf> {
+    let top = scratch.join(binary);
+    if top.is_file() {
+        return Some(top);
+    }
+    let mut folders: Vec<PathBuf> = std::fs::read_dir(scratch)
+        .ok()?
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .filter(|path| path.is_dir())
+        .collect();
+    folders.sort();
+    folders
+        .into_iter()
+        .map(|folder| folder.join(binary))
+        .find(|candidate| candidate.is_file())
 }
 
 #[cfg(test)]
@@ -654,6 +678,39 @@ mod tests {
             image: Some("ghcr.io/startr-trade/sutra".to_string()),
             token_command: None,
         }
+    }
+
+    /// The tarball branch uses only options GNU tar and macOS bsdtar share, and finds the binary
+    /// under the archive's top folder.
+    #[cfg(unix)]
+    #[test]
+    fn a_release_tarball_unpacks_with_portable_tar_options() {
+        let work = std::env::temp_dir().join(format!("sutra-unpack-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&work);
+        let top = work.join("src/sutra-v9.9.9-x86_64-unknown-linux-gnu");
+        std::fs::create_dir_all(&top).unwrap();
+        std::fs::write(top.join("sutra"), b"new-binary").unwrap();
+        std::fs::write(top.join("LICENSE-MIT"), b"license").unwrap();
+        let tarball = work.join("release.tar.gz");
+        let status = std::process::Command::new("tar")
+            .current_dir(work.join("src"))
+            .arg("-czf")
+            .arg(&tarball)
+            .arg("sutra-v9.9.9-x86_64-unknown-linux-gnu")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let bytes = std::fs::read(&tarball).unwrap();
+        let dest = work.join(".sutra-update-v9.9.9");
+        unpack(&bytes, "sutra", "x86_64-unknown-linux-gnu", &dest).expect("unpacks");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"new-binary");
+        assert!(
+            !dest.with_extension("unpack").exists(),
+            "scratch folder removed"
+        );
+        let err = unpack(&bytes, "absent", "x86_64-unknown-linux-gnu", &dest).unwrap_err();
+        assert!(err.contains("no absent"), "{err}");
+        let _ = std::fs::remove_dir_all(&work);
     }
 
     #[test]

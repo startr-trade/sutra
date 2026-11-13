@@ -129,6 +129,17 @@ pub fn require_resolved_port(
     Ok(())
 }
 
+/// True when a channel property value is a secret REFERENCE rather than a literal: any whole
+/// reference the engine's resolver resolves (see [`sutra_envref_spi::is_whole_reference`]:
+/// `env:NAME`, `secret:KEY`, a registered secret-store scheme, `${NAME}`, `${secret:KEY}`, each
+/// placeholder optionally with `:default`), or a `k8s:secret/<name>#<key>` reference. Transports
+/// use this to refuse a literal credential at startup.
+pub fn is_secret_reference(value: &str) -> bool {
+    let value = value.trim();
+    sutra_envref_spi::is_whole_reference(value)
+        || (value.starts_with("k8s:secret/") && value.contains('#'))
+}
+
 /// The uniform inbound-consumer spawner signature every vendor's [`TransportFactory`]
 /// exposes: `(defs, engine, pool, envref-resolver, runtime) -> the live manager`.
 pub type TransportSpawn = fn(

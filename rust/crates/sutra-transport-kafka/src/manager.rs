@@ -9,9 +9,9 @@
 //! consumers detach onto the runtime (broker absence is NON-FATAL), and the shared,
 //! rewireable [`KafkaChannels`] rides the activation flip via [`KafkaChannels::rewire`]
 //! with the same semantics (stop changed/removed, start added, keep unchanged; idempotent;
-//! non-fatal on a bad new def; drain on shutdown). Unlike RabbitMQ there are no channel-YAML
-//! credentials (Kafka authenticates at the broker layer; this build is PLAINTEXT), so the
-//! credential-resolution step is absent.
+//! non-fatal on a bad new def; drain on shutdown). Like RabbitMQ, the `sasl.*` credentials and a
+//! `tls-ca-pem` are channel-YAML secret references, resolved here (an unresolvable reference ⇒
+//! WARN + skip, the broker-absent deployment shape).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -28,13 +28,26 @@ use tokio::runtime::Handle;
 use tracing::{info, warn};
 
 use crate::kafka::{
-    KafkaChannelProperties, KafkaMessageSink, KafkaSourceConfig, KafkaTriggerSource, TRANSPORT,
+    KafkaChannelProperties, KafkaMessageSink, KafkaSinkSecurity, KafkaSourceConfig,
+    KafkaTriggerSource, TRANSPORT,
 };
 
 /// The env var naming the engine-wide Kafka sink bootstrap servers.
 /// Empty/unset ⇒ the sink still registers
 /// (so `kafka://` destinations resolve) but publishes fail-closed retryable until set.
 pub const SINK_BOOTSTRAP_ENV: &str = "SUTRA_SINK_KAFKA_BOOTSTRAP_SERVERS";
+
+/// [`register_kafka_sink`] with TLS and SASL settings. `Err` holds why the engine-wide settings are
+/// unusable; every send then fails closed and reports it.
+pub fn register_kafka_sink_with_security(
+    registry: &mut SinkRegistry,
+    bootstrap_servers: &str,
+    security: Result<KafkaSinkSecurity, String>,
+) {
+    registry.register(Arc::new(
+        KafkaMessageSink::new(bootstrap_servers).with_security(security),
+    ));
+}
 
 /// Register the Kafka sink into an outbox [`SinkRegistry`] (the outbox dispatcher's
 /// resolution surface) under its claimed scheme (`kafka`), targeting `bootstrap_servers`.
@@ -209,8 +222,7 @@ impl KafkaChannels {
                         .expect("broker registry")
                         .insert(key, consumer);
                 }
-                // Kafka has no credential-skip path (no channel-YAML secrets); the Option
-                // mirrors rabbitmq's signature so a future SASL case slots in here.
+                // A broker secret that does not resolve here: already WARNed, consumer skipped.
                 Ok(None) => {}
                 Err(d) => warn!(
                     code = %d.code,
@@ -263,6 +275,41 @@ fn build_and_start_consumer(
     let properties = KafkaChannelProperties::resolved(definition, ctx.resolver)?;
     let fingerprint = properties.clone();
 
+    let security = &properties.security;
+    let (username, password, ca_pem) = match (
+        resolve_security_reference(
+            security.sasl_username.as_deref(),
+            "sasl.username",
+            &channel,
+            ctx.resolver,
+        ),
+        resolve_security_reference(
+            security.sasl_password.as_deref(),
+            "sasl.password",
+            &channel,
+            ctx.resolver,
+        ),
+        resolve_security_reference(
+            security.tls_ca_pem.as_deref(),
+            "tls-ca-pem",
+            &channel,
+            ctx.resolver,
+        ),
+    ) {
+        (Ok(u), Ok(p), Ok(c)) => (u, p, c),
+        (Err(diagnostic), _, _) | (_, Err(diagnostic), _) | (_, _, Err(diagnostic)) => {
+            warn!(
+                channel = %channel,
+                code = %diagnostic.code,
+                "kafka consumer NOT started — a broker secret is unresolvable in this \
+                 environment: {}",
+                diagnostic.message
+            );
+            return Ok(None);
+        }
+    };
+    let properties = properties.with_resolved_security(username, password, ca_pem);
+
     let singleton = properties.singleton;
     if singleton && ctx.pool.is_none() {
         warn!(
@@ -313,6 +360,24 @@ fn build_and_start_consumer(
             fingerprint,
         },
     )))
+}
+
+/// Resolve one authored secret reference. The resolver's error names the reference, not its value.
+fn resolve_security_reference(
+    reference: Option<&str>,
+    key: &str,
+    channel: &str,
+    resolver: EnvRefResolver,
+) -> Result<Option<String>, Diagnostic> {
+    let Some(reference) = reference else {
+        return Ok(None);
+    };
+    resolver(reference).map(Some).map_err(|e| {
+        Diagnostic::error(
+            crate::kafka::codes::INBOUND_CONFIG_INVALID,
+            format!("kafka channel '{channel}' could not resolve the reference for '{key}': {e}"),
+        )
+    })
 }
 
 /// Construct + start one consumer per inbound `transport: kafka` definition, fail-closed on
@@ -419,9 +484,13 @@ fn spawn_boxed(
     )?))
 }
 
-/// Factory `register_sink` adapter — reads `SUTRA_SINK_KAFKA_BOOTSTRAP_SERVERS` itself.
+/// Factory `register_sink` adapter — reads the `SUTRA_SINK_KAFKA_*` environment itself.
 fn register_sink(registry: &mut SinkRegistry) {
-    register_kafka_sink(registry, &sink_bootstrap_from_env());
+    register_kafka_sink_with_security(
+        registry,
+        &sink_bootstrap_from_env(),
+        KafkaSinkSecurity::from_env(),
+    );
 }
 
 inventory::submit! {
@@ -529,6 +598,7 @@ mod connection_references {
             "${BOOTSTRAP}" => Ok("broker.test:9093".to_string()),
             "env:TOPIC" => Ok("resolved-topic".to_string()),
             "secret:group" => Ok("resolved-group".to_string()),
+            "${CA_FILE}" => Ok("/etc/sutra/ca.pem".to_string()),
             r if r.contains("${") || r.starts_with("env:") || r.starts_with("secret:") => {
                 Err(format!("{r} is not set"))
             }
@@ -617,6 +687,59 @@ mod connection_references {
                 assert!(err.message.contains("orders-in"), "{}", err.message);
                 assert!(err.message.contains(&format!("'{key}'")), "{}", err.message);
             }
+        }
+    }
+
+    #[test]
+    fn a_tls_ca_file_reference_resolves_and_an_unresolved_one_fails_wiring() {
+        let props = KafkaChannelProperties::resolved(
+            &definition(&[("security.protocol", "SSL"), ("tls-ca-file", "${CA_FILE}")]),
+            resolver,
+        )
+        .expect("resolves");
+        assert_eq!(
+            props.security.tls_ca_file.as_deref(),
+            Some("/etc/sutra/ca.pem")
+        );
+        let err = KafkaChannelProperties::resolved(
+            &definition(&[("security.protocol", "SSL"), ("tls-ca-file", "${UNSET_CA}")]),
+            resolver,
+        )
+        .expect_err("unresolved");
+        assert_eq!(err.code, "SUTRA.INBOUND.KAFKA.CONFIG_INVALID");
+        assert!(err.message.contains("'tls-ca-file'"), "{}", err.message);
+    }
+
+    #[test]
+    fn sasl_credentials_accept_every_whole_reference_and_refuse_a_literal() {
+        let sasl = |password: &str| {
+            definition(&[
+                ("security.protocol", "SASL_SSL"),
+                ("sasl.mechanism", "PLAIN"),
+                ("sasl.username", "${KAFKA_USER}"),
+                ("sasl.password", password),
+            ])
+        };
+        for reference in [
+            "${KAFKA_PASS}",
+            "${KAFKA_PASS:fallback}",
+            "env:KAFKA_PASS",
+            "secret:kafka-pass",
+            "${secret:kafka-pass}",
+            "k8s:secret/kafka#pass",
+        ] {
+            assert!(
+                KafkaChannelProperties::resolved(&sasl(reference), resolver).is_ok(),
+                "{reference}"
+            );
+        }
+        for literal in ["hunter2", "pre${KAFKA_PASS}", "secret:"] {
+            let err = KafkaChannelProperties::resolved(&sasl(literal), resolver)
+                .expect_err("literal refused");
+            assert_eq!(
+                err.code, "SUTRA.STARTUP.REFUSED.HARDCODED_SECRET",
+                "{literal}"
+            );
         }
     }
 

@@ -14,8 +14,7 @@ use crate::model::{DocTree, Package};
 /// Scan `input_root` and build the full [`DocTree`].
 pub fn discover(input_root: &Path) -> Result<DocTree> {
     let input_display = input_root.to_string_lossy().replace('\\', "/");
-    let input_root = input_root
-        .canonicalize()
+    let input_root = dunce::canonicalize(input_root)
         .with_context(|| format!("--input folder not found: {}", input_root.display()))?;
     if !input_root.is_dir() {
         anyhow::bail!("--input must be a directory: {}", input_root.display());

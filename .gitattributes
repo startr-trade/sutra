@@ -1,0 +1,21 @@
+# Every text file is stored and checked out with LF, on every system. Fixtures, schemas and
+# `include_str!` contents are compared byte for byte, so a Windows checkout that turned them into
+# CRLF would fail tests that pass on Linux.
+* text=auto eol=lf
+
+# The vendored OMG schemas are kept byte for byte as published, which is CRLF.
+xsd/bpmn/*.xsd -text
+xsd/dmn/*.xsd -text
+
+# Binary files: never converted, never diffed as text.
+*.png binary
+*.jpg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.pptx binary
+*.wav binary
+*.mp4 binary
+*.wasm binary
+*.zip binary
+*.gz binary

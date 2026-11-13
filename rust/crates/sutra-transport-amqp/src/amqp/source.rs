@@ -53,6 +53,7 @@ use sutra_channels::source::{
     LeaderGate, TriggerSource,
 };
 
+use super::tls::{classify_open_error, open_tls_connection, AmqpBrokerTarget, AmqpConnectFailure};
 use super::{
     codes, AckMode, AmqpChannelProperties, PROPERTY_CONTENT_TYPE, PROPERTY_OUTBOX_KEY, TRANSPORT,
 };
@@ -392,16 +393,6 @@ async fn supervise(
 /// that is down fails here (NON-FATAL — the supervisor retries).
 async fn open_session(config: &AmqpSourceConfig) -> Result<BrokerSession, Diagnostic> {
     let props = &config.properties;
-    if props.tls {
-        return Err(Diagnostic::error(
-            codes::INBOUND_CONFIG_INVALID,
-            format!(
-                "amqp channel '{}' requested tls but TLS is not compiled into this build \
-                 (PLAINTEXT only); use broker-level TLS via a sidecar/mesh",
-                config.channel
-            ),
-        ));
-    }
     let address = props.source_address().ok_or_else(|| {
         Diagnostic::error(
             codes::INBOUND_QUEUE_MISSING,
@@ -412,18 +403,42 @@ async fn open_session(config: &AmqpSourceConfig) -> Result<BrokerSession, Diagno
         )
     })?;
     let container = format!("sutra-amqp-source-{}", config.channel);
-    let uri = props.connection_uri();
-    let mut connection = Connection::open(container.clone(), uri.as_str())
-        .await
-        .map_err(|e| {
-            Diagnostic::error(
-                codes::INBOUND_CONNECTION_FAILED,
-                format!(
-                    "amqp channel '{}' could not connect to {}:{}: {e}",
-                    config.channel, props.host, props.port
-                ),
-            )
-        })?;
+    let opened = if props.tls {
+        match props.tls_settings.client_config() {
+            Ok(tls_config) => {
+                let target = AmqpBrokerTarget {
+                    host: &props.host,
+                    port: props.port,
+                    username: props
+                        .username
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|user| !user.is_empty()),
+                    password: props.password.as_deref().map(str::trim),
+                };
+                open_tls_connection(&container, &target, std::sync::Arc::new(tls_config)).await
+            }
+            Err(detail) => Err(AmqpConnectFailure::Tls(detail)),
+        }
+    } else {
+        Connection::open(container.clone(), props.connection_uri().as_str())
+            .await
+            .map_err(classify_open_error)
+    };
+    let mut connection = opened.map_err(|failure| {
+        let (code, detail) = match failure {
+            AmqpConnectFailure::Tls(detail) => (codes::INBOUND_BROKER_TLS_FAILED, detail),
+            AmqpConnectFailure::Auth(detail) => (codes::INBOUND_BROKER_AUTH_FAILED, detail),
+            AmqpConnectFailure::Connection(detail) => (codes::INBOUND_CONNECTION_FAILED, detail),
+        };
+        Diagnostic::error(
+            code,
+            format!(
+                "amqp channel '{}' could not connect to {}:{}: {detail}",
+                config.channel, props.host, props.port
+            ),
+        )
+    })?;
     let mut session = Session::begin(&mut connection).await.map_err(|e| {
         Diagnostic::error(
             codes::INBOUND_CONNECTION_FAILED,
@@ -814,6 +829,7 @@ mod tests {
             host: "localhost".to_string(),
             port: 5672,
             tls: false,
+            tls_settings: Default::default(),
             username: None,
             password: None,
             queue: Some("in-q".to_string()),

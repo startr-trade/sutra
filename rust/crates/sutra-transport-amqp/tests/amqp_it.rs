@@ -171,6 +171,7 @@ fn source_with_mode(port: u16, queue: &str, channel: &str, ack_mode: AckMode) ->
         host: "127.0.0.1".to_string(),
         port,
         tls: false,
+        tls_settings: Default::default(),
         username: None, // ANONYMOUS_LOGIN — the image allows anonymous sessions
         password: None,
         queue: Some(queue.to_string()),

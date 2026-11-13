@@ -19,6 +19,12 @@
 //! not a hot path) and closes it after the disposition settles — no shared mutable state,
 //! trivially `Send`. Engine-wide default credentials (from `SUTRA_SINK_AMQP_{USERNAME,
 //! PASSWORD}`) apply when the URI carries no userinfo (anonymous when both are empty).
+//!
+//! An `amqp10s://` destination is secured natively (see [`super::tls`]) under the engine-wide
+//! trust settings (`SUTRA_SINK_AMQP_TLS_CA_FILE`, `SUTRA_SINK_AMQP_TLS_INSECURE_SKIP_VERIFY`). A
+//! destination URI can hold a password, so every diagnostic here names it redacted.
+
+use std::sync::{Arc, Mutex};
 
 use fe2o3_amqp::types::messaging::{ApplicationProperties, Message};
 use fe2o3_amqp::{Connection, Sender, Session};
@@ -27,8 +33,13 @@ use sutra_channels::diag::Diagnostic;
 use sutra_channels::sink::{BoxFuture, MessageSink, OutboundMessage, SendOutcome};
 use sutra_channels::telemetry::TRACEPARENT_HEADER;
 
+use super::tls::{
+    classify_open_error, open_tls_connection, AmqpBrokerTarget, AmqpConnectFailure,
+    AmqpTlsProperties,
+};
 use super::{
-    codes, parse_destination, AmqpDestination, PROPERTY_CONTENT_TYPE, PROPERTY_OUTBOX_KEY,
+    codes, parse_destination, redact_destination, AmqpDestination, PROPERTY_CONTENT_TYPE,
+    PROPERTY_OUTBOX_KEY,
 };
 use super::{SCHEME, SCHEME_TLS};
 
@@ -40,6 +51,12 @@ const CONTAINER_ID: &str = "sutra-amqp-sink";
 pub struct AmqpMessageSink {
     default_username: Option<String>,
     default_password: Option<String>,
+    /// The trust settings for `amqp10s://` destinations, or why they could not be read (then
+    /// those sends fail closed rather than fall back to a weaker trust decision).
+    tls_settings: Result<AmqpTlsProperties, String>,
+    /// The loaded client configuration, so the CA bundle is read once rather than per send. A
+    /// failed load is not cached.
+    tls_config: Mutex<Option<Arc<rustls::ClientConfig>>>,
 }
 
 impl AmqpMessageSink {
@@ -53,7 +70,44 @@ impl AmqpMessageSink {
         AmqpMessageSink {
             default_username: default_username.filter(|s| !s.is_empty()),
             default_password: default_password.filter(|s| !s.is_empty()),
+            tls_settings: Ok(AmqpTlsProperties::default()),
+            tls_config: Mutex::new(None),
         }
+    }
+
+    /// Set the trust settings for `amqp10s://` destinations. `Err` holds why the engine-wide
+    /// settings are unusable; every TLS send then reports it.
+    pub fn with_tls_settings(
+        mut self,
+        tls_settings: Result<AmqpTlsProperties, String>,
+    ) -> AmqpMessageSink {
+        self.tls_settings = tls_settings;
+        self
+    }
+
+    /// The cached-or-fresh TLS client configuration.
+    fn tls_client_config(&self) -> Result<Arc<rustls::ClientConfig>, Diagnostic> {
+        let settings = self.tls_settings.as_ref().map_err(|e| {
+            Diagnostic::error(
+                codes::OUTBOUND_CONFIG_INVALID,
+                format!("amqp sink TLS settings are invalid: {e}"),
+            )
+        })?;
+        let mut cache = self
+            .tls_config
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(config) = cache.as_ref() {
+            return Ok(Arc::clone(config));
+        }
+        let config = settings.client_config().map(Arc::new).map_err(|e| {
+            Diagnostic::error(
+                codes::OUTBOUND_BROKER_TLS_FAILED,
+                format!("amqp sink could not load its TLS trust settings: {e}"),
+            )
+        })?;
+        *cache = Some(Arc::clone(&config));
+        Ok(config)
     }
 
     /// Drain posture: connection-per-send holds no long-lived resources, so drain is a no-op
@@ -83,19 +137,15 @@ impl MessageSink for AmqpMessageSink {
                 Ok(d) => self.apply_default_credentials(d),
                 Err(diagnostic) => return SendOutcome::PermanentFailure(diagnostic),
             };
-            if destination.tls {
-                // This build compiles no TLS; an amqp10s:// send fails closed retryable
-                // (mirrors the Kafka non-PLAINTEXT posture — broker-level TLS is external).
-                return SendOutcome::RetryableFailure(Diagnostic::error(
-                    codes::OUTBOUND_CONFIG_INVALID,
-                    format!(
-                        "amqp sink cannot publish to {} — TLS (amqp10s) is not compiled into \
-                         this build; use amqp10:// with broker-level TLS via a sidecar/mesh",
-                        message.destination
-                    ),
-                ));
-            }
-            deliver(&destination, message).await
+            let tls_config = if destination.tls {
+                match self.tls_client_config() {
+                    Ok(config) => Some(config),
+                    Err(diagnostic) => return SendOutcome::RetryableFailure(diagnostic),
+                }
+            } else {
+                None
+            };
+            deliver(&destination, message, tls_config).await
         })
     }
 }
@@ -103,21 +153,41 @@ impl MessageSink for AmqpMessageSink {
 /// Open a connection → session → sender, send the projected message, settle the outcome,
 /// then close. Connection/session/send failures are RETRYABLE (the outbox loop re-attempts);
 /// a broker that rejects the disposition is likewise retryable.
-async fn deliver(destination: &AmqpDestination, message: &OutboundMessage) -> SendOutcome {
-    let uri = destination.connection_uri();
-    let mut connection = match Connection::open(CONTAINER_ID, uri.as_str()).await {
+async fn deliver(
+    destination: &AmqpDestination,
+    message: &OutboundMessage,
+    tls_config: Option<Arc<rustls::ClientConfig>>,
+) -> SendOutcome {
+    let opened = match tls_config {
+        Some(config) => {
+            let target = AmqpBrokerTarget {
+                host: &destination.host,
+                port: destination.port,
+                username: destination.username.as_deref(),
+                password: destination.password.as_deref(),
+            };
+            open_tls_connection(CONTAINER_ID, &target, config).await
+        }
+        None => Connection::open(CONTAINER_ID, destination.connection_uri().as_str())
+            .await
+            .map_err(classify_open_error),
+    };
+    let redacted = redact_destination(&message.destination);
+    let mut connection = match opened {
         Ok(c) => c,
-        Err(e) => {
+        Err(failure) => {
+            let (code, detail) = match failure {
+                AmqpConnectFailure::Tls(detail) => (codes::OUTBOUND_BROKER_TLS_FAILED, detail),
+                AmqpConnectFailure::Auth(detail) => (codes::OUTBOUND_BROKER_AUTH_FAILED, detail),
+                AmqpConnectFailure::Connection(detail) => (codes::OUTBOUND_SEND_FAILED, detail),
+            };
             return SendOutcome::RetryableFailure(Diagnostic::error(
-                codes::OUTBOUND_SEND_FAILED,
-                format!(
-                    "amqp sink could not connect to {}: {e}",
-                    message.destination
-                ),
+                code,
+                format!("amqp sink could not connect to {redacted}: {detail}"),
             ));
         }
     };
-    let outcome = deliver_on_connection(&mut connection, destination, message).await;
+    let outcome = deliver_on_connection(&mut connection, destination, message, &redacted).await;
     // Best-effort close (the disposition already settled).
     let _ = connection.close().await;
     outcome
@@ -127,16 +197,14 @@ async fn deliver_on_connection(
     connection: &mut fe2o3_amqp::connection::ConnectionHandle<()>,
     destination: &AmqpDestination,
     message: &OutboundMessage,
+    redacted: &str,
 ) -> SendOutcome {
     let mut session = match Session::begin(connection).await {
         Ok(s) => s,
         Err(e) => {
             return SendOutcome::RetryableFailure(Diagnostic::error(
                 codes::OUTBOUND_SEND_FAILED,
-                format!(
-                    "amqp sink could not begin a session to {}: {e}",
-                    message.destination
-                ),
+                format!("amqp sink could not begin a session to {redacted}: {e}"),
             ));
         }
     };
@@ -152,10 +220,7 @@ async fn deliver_on_connection(
             let _ = session.end().await;
             return SendOutcome::RetryableFailure(Diagnostic::error(
                 codes::OUTBOUND_SEND_FAILED,
-                format!(
-                    "amqp sink could not attach a sender to {}: {e}",
-                    message.destination
-                ),
+                format!("amqp sink could not attach a sender to {redacted}: {e}"),
             ));
         }
     };
@@ -168,15 +233,14 @@ async fn deliver_on_connection(
                 SendOutcome::RetryableFailure(Diagnostic::error(
                     codes::OUTBOUND_SEND_FAILED,
                     format!(
-                        "amqp publish to {} was not accepted (disposition: {outcome:?})",
-                        message.destination
+                        "amqp publish to {redacted} was not accepted (disposition: {outcome:?})"
                     ),
                 ))
             }
         }
         Err(e) => SendOutcome::RetryableFailure(Diagnostic::error(
             codes::OUTBOUND_SEND_FAILED,
-            format!("amqp publish to {} failed: {e}", message.destination),
+            format!("amqp publish to {redacted} failed: {e}"),
         )),
     };
 
@@ -370,10 +434,48 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tls_destination_is_a_retryable_config_failure() {
-        let sink = AmqpMessageSink::new(None, None);
+    async fn unusable_tls_settings_fail_tls_sends_closed_and_name_the_setting() {
+        let sink = AmqpMessageSink::new(None, None)
+            .with_tls_settings(Err("SUTRA_SINK_AMQP_TLS_INSECURE_SKIP_VERIFY".to_string()));
         match sink.send(&message("amqp10s://broker:5671/q")).await {
-            SendOutcome::RetryableFailure(d) => assert_eq!(d.code, codes::OUTBOUND_CONFIG_INVALID),
+            SendOutcome::RetryableFailure(d) => {
+                assert_eq!(d.code, codes::OUTBOUND_CONFIG_INVALID);
+                assert!(d
+                    .message
+                    .contains("SUTRA_SINK_AMQP_TLS_INSECURE_SKIP_VERIFY"));
+            }
+            other => panic!("expected RetryableFailure, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unloadable_ca_bundle_is_a_retryable_tls_failure() {
+        let sink = AmqpMessageSink::new(None, None).with_tls_settings(Ok(AmqpTlsProperties {
+            ca_file: Some("/nonexistent/ca.pem".to_string()),
+            ..AmqpTlsProperties::default()
+        }));
+        match sink.send(&message("amqp10s://broker:5671/q")).await {
+            SendOutcome::RetryableFailure(d) => {
+                assert_eq!(d.code, codes::OUTBOUND_BROKER_TLS_FAILED)
+            }
+            other => panic!("expected RetryableFailure, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_connect_failure_never_names_the_uri_password() {
+        // Port 1 on loopback refuses at once, and the send reports it with the userinfo removed.
+        let sink = AmqpMessageSink::new(None, None);
+        match sink
+            .send(&message("amqp10://svc-user:hunter2@127.0.0.1:1/q"))
+            .await
+        {
+            SendOutcome::RetryableFailure(d) => {
+                assert_eq!(d.code, codes::OUTBOUND_SEND_FAILED);
+                assert!(!d.message.contains("hunter2"), "{}", d.message);
+                assert!(!d.message.contains("svc-user"), "{}", d.message);
+                assert!(d.message.contains("127.0.0.1:1"), "{}", d.message);
+            }
             other => panic!("expected RetryableFailure, got {other:?}"),
         }
     }

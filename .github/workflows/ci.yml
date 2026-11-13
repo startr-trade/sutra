@@ -4,13 +4,19 @@ name: CI
 # repo-root `make` targets (one source of truth — `make help` lists them), so a contributor
 # who is green locally is green here:
 #
-#   make lint   → cargo clippy --workspace --all-targets -- -D warnings
-#                 + cargo test -p sutra-archtest   (the domain-neutrality gate)
-#   make test   → cargo test --workspace                                 (tier-1, no Docker)
-#   make audit  → cargo audit + cargo deny check   (rust/deny.toml, rust/.cargo/audit.toml)
+#   make fmt-check → cargo fmt --all --check
+#   make lint      → cargo clippy --workspace --all-targets -- -D warnings
+#                    + cargo test -p sutra-archtest   (the domain-neutrality gate)
+#   make test      → cargo nextest run --workspace --no-fail-fast + cargo test --doc
+#                    (tier-1, no Docker; plain `cargo test` where nextest is not installed)
+#   make audit     → cargo audit + cargo deny check   (rust/deny.toml, rust/.cargo/audit.toml)
+#   make cross     → clippy for sutra-cli on windows-msvc and both darwin targets, run by the
+#                    cli-portability job on the systems that have their C toolchains
 #
-# `cargo fmt --all --check` is run directly: the Makefile has no `fmt` target (formatting is
-# not part of the local `lint` chain), and adding one is a source-repo decision, not a CI one.
+# `make ci` runs them all locally, cheapest first, plus `make scan-deps`.
+#
+# Every `uses:` is pinned to a full commit SHA, with the release it is in a comment; actionlint
+# (the first job) checks every workflow.
 #
 # WHY THERE ARE NO DOCKER JOBS HERE
 # --------------------------------
@@ -61,33 +67,49 @@ env:
   CARGO_PROFILE_TEST_DEBUG: "0"
 
 jobs:
-  fmt:
-    name: rustfmt
-    runs-on: ubuntu-latest
+  actionlint:
+    name: actionlint
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      # The official image, pinned by digest. It checks every workflow under .github/workflows,
+      # shell scripts included (the image bundles shellcheck).
+      - name: actionlint
+        uses: docker://rhysd/actionlint@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667 # 1.7.12
         with:
+          args: -color
+
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master, 2026-10-16
+        with:
+          toolchain: 1.96.0
           components: rustfmt
       # No build cache: rustfmt compiles nothing.
-      - name: cargo fmt --check
-        working-directory: rust
-        run: cargo fmt --all --check
+      - name: make fmt-check
+        run: make fmt-check
 
   lint:
     name: clippy + domain-neutrality (make lint)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master, 2026-10-16
         with:
+          toolchain: 1.96.0
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: rust
           key: lint
+          # Only main saves: a pull request restores main's cache and never writes its own.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # Hosted runners ship ~25 GB of preinstalled toolchains we never use (dotnet, android
       # SDK, GHC, CodeQL bundles). Reclaiming them up front is what keeps the link step from
       # running the disk to zero on a cold cache; cheap (~20 s) next to a 10-minute build.
@@ -100,7 +122,7 @@ jobs:
           df -h / | tail -1
       # librdkafka (Kafka transport) vendors its C sources and builds them via mklove;
       # `make` + a C++ compiler are the only extra tools it needs (see rust/Dockerfile).
-      # ubuntu-latest ships both — this is an assertion, not an install.
+      # ubuntu-24.04 ships both — this is an assertion, not an install.
       - name: Verify C/C++ build tooling (librdkafka vendored build)
         run: |
           command -v make >/dev/null || { echo "::error::make is missing"; exit 1; }
@@ -110,19 +132,22 @@ jobs:
 
   test:
     name: tier-1 tests (make test)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master, 2026-10-16
+        with:
+          toolchain: 1.96.0
       # `shared-key`, not `key`: a plain `key` is combined with the job identity, so no other
       # workflow can ever restore it. This cache is deliberately restorable from elsewhere —
       # release.yml's verify job reads it, which is what keeps a release from recompiling a
       # workspace main already compiled. Saved on main, so a tag ref can restore it.
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: rust
           shared-key: verify
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # Hosted runners ship ~25 GB of preinstalled toolchains we never use (dotnet, android
       # SDK, GHC, CodeQL bundles). Reclaiming them up front is what keeps the link step from
       # running the disk to zero on a cold cache; cheap (~20 s) next to a 10-minute build.
@@ -133,20 +158,63 @@ jobs:
                       /usr/local/share/boost /opt/hostedtoolcache/CodeQL || true
           sudo docker image prune -af >/dev/null 2>&1 || true
           df -h / | tail -1
+      # cargo-nextest, so `make test` runs the same way it does locally.
+      - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
+        with:
+          tool: cargo-nextest
       - name: make test
         run: make test
 
   audit:
     name: supply chain (make audit)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master, 2026-10-16
+        with:
+          toolchain: 1.96.0
       # cargo-audit + cargo-deny read the resolved lockfile only (no rustc), so this job
       # needs no build cache — just the two prebuilt binaries.
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
         with:
           tool: cargo-audit,cargo-deny
       - name: make audit
         run: make audit
+
+  # The CLI ships as a release binary for macOS and Windows, so its tests and the loader's run
+  # there too. The engine ships only as a Linux image, so the rest of the workspace does not.
+  # `scripts/cross-clippy.sh` (`make cross`) checks the targets this system has a C toolchain
+  # for: both darwin targets on macOS, windows-msvc on Windows.
+  cli-portability:
+    name: CLI on ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            targets: aarch64-apple-darwin,x86_64-apple-darwin
+          - os: windows-2025
+            targets: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master, 2026-10-16
+        with:
+          toolchain: 1.96.0
+          components: clippy
+          targets: ${{ matrix.targets }}
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: rust
+          key: cli-portability
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: sutra-cli and sutra-loader tests
+        working-directory: rust
+        run: cargo test -p sutra-cli -p sutra-loader --no-fail-fast
+      - name: make cross (clippy for this system's targets)
+        run: bash scripts/cross-clippy.sh

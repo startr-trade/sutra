@@ -275,10 +275,7 @@ fn replaced_file_names(
 ) -> Vec<String> {
     let extension = sutra_loader::archive::ARCHIVE_EXTENSION;
     let mut names = vec![format!("{}.{extension}", candidate.slot)];
-    let dir = args
-        .package_dir
-        .canonicalize()
-        .unwrap_or_else(|_| args.package_dir.clone());
+    let dir = dunce::canonicalize(&args.package_dir).unwrap_or_else(|_| args.package_dir.clone());
     if let Some(name) = dir.file_name() {
         names.push(format!("{}.{extension}", name.to_string_lossy()));
     }

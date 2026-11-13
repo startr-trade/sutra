@@ -77,6 +77,8 @@ use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
 use rdkafka::message::{BorrowedMessage, Headers};
 use rdkafka::util::Timeout;
 use rdkafka::{ClientConfig, Message, Offset, TopicPartitionList};
+
+use super::security::{BrokerFailureRecorder, ClientRole};
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::{info, warn};
 
@@ -349,6 +351,9 @@ async fn supervise(
     }
 }
 
+/// A consumer whose context reports TLS and SASL failures, which never reach `recv` on their own.
+type ChannelConsumer = StreamConsumer<BrokerFailureRecorder>;
+
 /// The librdkafka configuration a channel's consumer is built from.
 pub(crate) fn consumer_client_config(props: &KafkaChannelProperties) -> ClientConfig {
     let mut client = ClientConfig::new();
@@ -356,8 +361,10 @@ pub(crate) fn consumer_client_config(props: &KafkaChannelProperties) -> ClientCo
         .set("bootstrap.servers", &props.bootstrap_servers)
         .set("group.id", &props.group_id)
         .set("enable.auto.commit", "false")
-        .set("auto.offset.reset", &props.auto_offset_reset)
-        .set("security.protocol", &props.security_protocol);
+        .set("auto.offset.reset", &props.auto_offset_reset);
+    props
+        .security
+        .apply_to(&props.security_protocol, &mut client);
     for (key, value) in &props.client_config {
         client.set(key, value);
     }
@@ -366,17 +373,21 @@ pub(crate) fn consumer_client_config(props: &KafkaChannelProperties) -> ClientCo
 
 /// Build the consumer client and subscribe to the topic. Creating the consumer does not
 /// connect (librdkafka connects lazily on first poll); a bad config fails closed here.
-fn open_session(config: &KafkaSourceConfig) -> Result<StreamConsumer, Diagnostic> {
+fn open_session(config: &KafkaSourceConfig) -> Result<ChannelConsumer, Diagnostic> {
     let props = &config.properties;
-    let consumer: StreamConsumer = consumer_client_config(props).create().map_err(|e| {
-        Diagnostic::error(
-            codes::INBOUND_CONFIG_INVALID,
-            format!(
-                "kafka channel '{}' could not build a consumer: {e}",
-                config.channel
-            ),
-        )
-    })?;
+    let context =
+        BrokerFailureRecorder::new(ClientRole::Inbound, format!("channel '{}'", config.channel));
+    let consumer: ChannelConsumer = consumer_client_config(props)
+        .create_with_context(context)
+        .map_err(|e| {
+            Diagnostic::error(
+                codes::INBOUND_CONFIG_INVALID,
+                format!(
+                    "kafka channel '{}' could not build a consumer: {e}",
+                    config.channel
+                ),
+            )
+        })?;
     consumer.subscribe(&[props.topic.as_str()]).map_err(|e| {
         Diagnostic::error(
             codes::INBOUND_CONSUMER_FAILED,
@@ -398,7 +409,7 @@ async fn run_session(
     intake: &Arc<dyn InboundIntake>,
     gate: &Arc<dyn LeaderGate>,
     stop: &Arc<StopToken>,
-    consumer: &StreamConsumer,
+    consumer: &ChannelConsumer,
 ) -> SessionEnd {
     // `on-complete`: settle callbacks bridge back here (see the module docs — the
     // consumer handle is deliberately NOT shared into them). Both live for exactly one
@@ -511,7 +522,7 @@ async fn run_session(
 /// tracker so an immediate settle can never commit past a still-parked earlier offset.
 fn settle_record(
     config: &KafkaSourceConfig,
-    consumer: &StreamConsumer,
+    consumer: &ChannelConsumer,
     offsets: &mut OffsetTracker,
     on_complete: bool,
     message: &BorrowedMessage<'_>,
@@ -619,7 +630,7 @@ fn deferred_settle(
 /// low watermark, if it moved.
 fn apply_deferred_settle(
     config: &KafkaSourceConfig,
-    consumer: &StreamConsumer,
+    consumer: &ChannelConsumer,
     offsets: &mut OffsetTracker,
     request: DeferredSettleRequest,
 ) {
@@ -644,7 +655,7 @@ fn apply_deferred_settle(
 /// settle, and the next settle commits a HIGHER watermark that subsumes this one.
 fn commit_watermark(
     config: &KafkaSourceConfig,
-    consumer: &StreamConsumer,
+    consumer: &ChannelConsumer,
     topic: &str,
     partition: i32,
     next: i64,
@@ -687,7 +698,7 @@ fn commit_watermark(
 
 /// Whether this consumer still holds the partition — the rebalance guard on every deferred
 /// commit (local state, no broker round-trip).
-fn owns_partition(consumer: &StreamConsumer, topic: &str, partition: i32) -> bool {
+fn owns_partition(consumer: &ChannelConsumer, topic: &str, partition: i32) -> bool {
     if consumer.assignment_lost() {
         return false;
     }
@@ -759,7 +770,7 @@ impl PartitionOffsets {
 /// (advance); `NackRequeue` seeks back to the record so the next poll re-reads it.
 fn execute_decision(
     config: &KafkaSourceConfig,
-    consumer: &StreamConsumer,
+    consumer: &ChannelConsumer,
     message: &BorrowedMessage<'_>,
     decision: AckDecision,
 ) -> Result<(), SessionEnd> {
@@ -784,7 +795,7 @@ fn execute_decision(
 /// the duplicate). Do NOT commit — the offset never advances.
 fn seek_back(
     config: &KafkaSourceConfig,
-    consumer: &StreamConsumer,
+    consumer: &ChannelConsumer,
     message: &BorrowedMessage<'_>,
 ) -> Result<(), SessionEnd> {
     if let Err(e) = consumer.seek(
@@ -887,6 +898,7 @@ mod tests {
             group_id: "g".to_string(),
             auto_offset_reset: "earliest".to_string(),
             security_protocol: "PLAINTEXT".to_string(),
+            security: Default::default(),
             client_config: BTreeMap::new(),
             ack_mode: super::super::AckMode::OnPersist,
             singleton: false,

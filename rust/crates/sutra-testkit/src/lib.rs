@@ -41,6 +41,8 @@ use std::sync::{Mutex, Once};
 ///
 /// Feature-gated (`conformance`) because it pulls testcontainers, lapin and kube-rs; the
 /// reaper above is what the crate's other consumers dev-depend on, and their builds stay light.
+#[cfg(feature = "broker-tls")]
+pub mod broker_tls;
 #[cfg(feature = "conformance")]
 pub mod conformance;
 

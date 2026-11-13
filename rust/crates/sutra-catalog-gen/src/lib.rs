@@ -49,7 +49,7 @@ impl Config {
             Some(p) => p,
             None => std::env::current_dir().context("resolving the current directory")?,
         };
-        let repo_root = repo_root.canonicalize().unwrap_or(repo_root);
+        let repo_root = dunce::canonicalize(&repo_root).unwrap_or(repo_root);
         Ok(Config::with_defaults(repo_root, output))
     }
 }

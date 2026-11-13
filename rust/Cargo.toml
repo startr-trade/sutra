@@ -80,7 +80,7 @@ lto = false
 codegen-units = 16
 
 [workspace.package]
-version = "0.6.20"
+version = "0.6.21"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/startr-trade/sutra"
@@ -90,6 +90,9 @@ repository = "https://github.com/startr-trade/sutra"
 publish = false
 
 [workspace.dependencies]
+# `canonicalize` without the `\\?\` verbatim prefix Windows adds, which breaks prefix comparisons
+# and leaks into printed paths. A no-op elsewhere.
+dunce = "1"
 bigdecimal = "0.4"
 regex = "1"
 fancy-regex = "0.16"
@@ -100,6 +103,9 @@ time = { version = "0.3", features = ["parsing", "formatting", "macros", "large-
 # dependency, deterministic across environments/containers).
 time-tz = { version = "2", features = ["db"] }
 getrandom = "0.2"
+# `password hash` / `password verify` (sutra-feel only): argon2id in PHC form. The salt comes from
+# `getrandom`, so the crate's own `rand` feature is not needed.
+argon2 = { version = "0.5", default-features = false, features = ["alloc", "password-hash"] }
 quick-xml = "0.41"
 num-bigint = "0.4"
 num-traits = "0.2"
@@ -119,13 +125,17 @@ lapin = "2"
 # offset commit, which the pure-Rust clients (rskafka is partition-level, no groups) do not
 # provide. The engine image is glibc/Debian (not musl) so the vendored librdkafka C build is the
 # friendly case. `default-features = false` (no `cmake-build`) uses librdkafka's own mklove
-# `configure`, which passes `--disable-{curl,ssl,gssapi,zlib,zstd}` for a truly minimal PLAINTEXT
-# build — NO curl/ssl/sasl/zlib C headers needed (the Kafka transport carries no channel-YAML
-# credentials; the broker authenticates and this build is PLAINTEXT). librdkafka's cmake path
-# keeps WITH_CURL coupled and breaks without libcurl-dev, so mklove is both leaner and more
-# portable; the only new builder-stage tool is `make` (a C compiler is already required by
-# ring). See rust/Dockerfile.
-rdkafka = { version = "0.39", default-features = false, features = ["tokio"] }
+# `configure`, which keeps curl, gssapi, zlib and zstd out. librdkafka's cmake path keeps WITH_CURL
+# coupled and breaks without libcurl-dev, so mklove is both leaner and more portable.
+#
+# `ssl-vendored` gives the Kafka transport TLS and SASL (PLAIN, SCRAM-SHA-256, SCRAM-SHA-512; SCRAM
+# needs libcrypto, GSSAPI stays off so no Cyrus SASL). librdkafka's only TLS backend is OpenSSL, so
+# this is the one place in the tree that is not rustls. It is vendored, compiled from source and
+# linked statically, because the alternative is linking the base image's libssl3: the binary would
+# then load a library it has so far been able to say it never loads. The OpenSSL version is pinned
+# by the lockfile (`openssl-src`), so `cargo audit` sees it. The builder needs `perl` (and `make`).
+# See rust/Dockerfile.
+rdkafka = { version = "0.39", default-features = false, features = ["tokio", "ssl-vendored"] }
 # Dependency-free Stream polling for lapin's Consumer (no futures-util).
 futures-core = "0.3"
 # AWS SQS transport: the official AWS SDK for SQS + its config loader. `aws-config`
@@ -180,6 +190,8 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 # ring at startup keeps every TLS client on the ring stack the rest of the tree uses (tiberius
 # honours an installed provider too).
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+# The async handshake for the AMQP 1.0 transport's native TLS, on that same ring provider.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
 # RS256 JWT signing for the GCP service-account OAuth2 jwt-bearer flow, and admin-JWT
 # verification. v10 requires the crypto provider to be chosen EXPLICITLY (v9 linked `ring`
 # implicitly): `rust_crypto` keeps the tree pure-Rust — no aws-lc-rs C toolchain, no openssl.

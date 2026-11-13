@@ -18,7 +18,11 @@ inventory = "0.3.24"
 async-trait = { workspace = true }
 time = { workspace = true }
 fe2o3-amqp = { workspace = true }
+# Native TLS for `tls: true` / `amqp10s://`: the handshake runs here on the ring provider, and the
+# secured stream is handed to fe2o3-amqp, whose own `rustls` feature stays off (see `amqp::tls`).
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
 
 [dev-dependencies]
-sutra-testkit = { path = "../sutra-testkit" }
+sutra-testkit = { path = "../sutra-testkit", features = ["broker-tls"] }
 testcontainers = { workspace = true }

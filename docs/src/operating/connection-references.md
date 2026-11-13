@@ -10,9 +10,9 @@ You need the engine, PostgreSQL and a broker. This was run on PostgreSQL 16 and 
 
 | Transport | Properties that may be a reference |
 |---|---|
-| `kafka` | `bootstrap.servers`, `topic`, `group.id` |
+| `kafka` | `bootstrap.servers`, `topic`, `group.id`, `tls-ca-file` |
 | `rabbitmq` | `host`, `port`, `virtual-host`, `queue`, `exchange` |
-| `amqp` | `host`, `port`, `queue`, `topic` |
+| `amqp` | `host`, `port`, `queue`, `topic`, `tls-ca-file` |
 | `gcp-pubsub` | `project-id`, `subscription`, `topic`, `endpoint-override` |
 | `file` | `spool.dir`, `directory` |
 | `aws-sqs` | `region`, `queue.url`, `endpoint-override`, `wait-time-seconds`, `max-messages`, `visibility-timeout-seconds` |
@@ -25,11 +25,13 @@ You need the engine, PostgreSQL and a broker. This was run on PostgreSQL 16 and 
 | `secret:KEY`, `${secret:KEY}` | the file `KEY` in `SUTRA_SECRETS_DIR`, default `/etc/sutra/secrets` |
 | `vault:`, `aws-secrets:`, `azure-kv:`, `gcp-secret:` | the vendor store, in a build that links it; the whole value only, or inside `${…}` |
 
-Other properties of these channels, such as `prefetch-count`, stay literal.
+Other properties of these channels, such as `prefetch-count`, stay literal, and so do the TLS and SASL switches
+(`tls`, `security.protocol`, `sasl.mechanism`, `tls-insecure-skip-verify`).
 
-**Credentials** (`username`, `password` on `rabbitmq` and `amqp`) take the whole-value forms above, `${secret:KEY}`
-included since 0.6.20, and `k8s:secret/<name>#<key>`. A literal, or text with a reference inside it such as `pre${X}`,
-is refused with `SUTRA.STARTUP.REFUSED.HARDCODED_SECRET`. See [section 5](#5-broker-credentials-from-a-secret-and-a-blank-reference).
+**Credentials** (`username`, `password` on `rabbitmq` and `amqp`; since 0.6.21 `sasl.username`, `sasl.password` on
+`kafka`, and `tls-ca-pem` on `amqp` and `kafka`) take the whole-value forms above, `${secret:KEY}` included since 0.6.20, and `k8s:secret/<name>#<key>`. A literal, or text with a reference inside it such as `pre${X}`,
+is refused with `SUTRA.STARTUP.REFUSED.HARDCODED_SECRET`. See [section 5](#5-broker-credentials-from-a-secret-and-a-blank-reference), and
+[Connecting to a TLS and SASL broker](broker-tls-sasl.md) for the TLS and SASL settings.
 
 ## 1. The channel
 

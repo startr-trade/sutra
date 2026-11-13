@@ -30,6 +30,8 @@ mod tc_ai_examples;
 mod tc_approval_hold;
 #[path = "all/tc_audit_sinks.rs"]
 mod tc_audit_sinks;
+#[path = "all/tc_broker_tls.rs"]
+mod tc_broker_tls;
 #[path = "all/tc_coverage_cycles.rs"]
 mod tc_coverage_cycles;
 #[path = "all/tc_dedup_refusal.rs"]
@@ -48,6 +50,8 @@ mod tc_money_transfer;
 mod tc_multi_replica;
 #[path = "all/tc_outbox_relay.rs"]
 mod tc_outbox_relay;
+#[path = "all/tc_password_sign_in.rs"]
+mod tc_password_sign_in;
 #[path = "all/tc_raw_message.rs"]
 mod tc_raw_message;
 #[path = "all/tc_shard_lanes.rs"]

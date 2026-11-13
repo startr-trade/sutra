@@ -19,6 +19,7 @@
 - [The q: namespace](building/q-namespace.md)
 - [Rules: DMN, FEEL, and .srl](building/rules.md)
 - [Data stores](building/data-stores.md)
+- [Signing a user in against a store](building/signing-in-against-a-store.md)
 - [Recordings and media references](building/recordings-and-media.md)
 - [Wait states and human tasks](building/wait-states.md)
 - [One endpoint, one deployment](building/endpoint-claims.md)
@@ -56,6 +57,7 @@
 - [Acknowledgement modes](operating/ack-modes.md)
 - [Refused deliveries and connection references](operating/inbound-refusals.md)
 - [References in connection properties](operating/connection-references.md)
+- [Connecting to a TLS and SASL broker](operating/broker-tls-sasl.md)
 - [Tuning for throughput](operating/throughput-tuning.md)
 - [Limits and quotas](operating/limits.md)
 - [Capacity pools and sessions](operating/capacity-pools.md)
@@ -66,6 +68,7 @@
 - [Upgrading to 0.6.18](operating/upgrading-0-6-18.md)
 - [Upgrading to 0.6.19](operating/upgrading-0-6-19.md)
 - [Upgrading to 0.6.20](operating/upgrading-0-6-20.md)
+- [Upgrading to 0.6.21](operating/upgrading-0-6-21.md)
 
 # Reference
 

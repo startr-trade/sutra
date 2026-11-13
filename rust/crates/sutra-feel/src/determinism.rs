@@ -16,7 +16,7 @@ use crate::error::FeelError;
 /// values on re-evaluation. Frozen at the engine level — extensions cannot bypass this list.
 ///
 /// When upgrading FEEL: any new builtin that reads ambient state must be added here.
-pub const NON_DETERMINISTIC_BUILTINS: [&str; 7] = [
+pub const NON_DETERMINISTIC_BUILTINS: [&str; 9] = [
     "now",
     "today",
     "currentDate", // alternate spelling some FEEL impls use
@@ -24,6 +24,10 @@ pub const NON_DETERMINISTIC_BUILTINS: [&str; 7] = [
     "uuid",
     "random",
     "randomNumber",
+    // Draws a fresh OS-random salt. Listed in both spellings: the spaced FEEL name is what a
+    // call site carries, the camelCase one is what a builtin-as-value lookup resolves to.
+    "password hash",
+    "passwordHash",
 ];
 
 /// One denied builtin invocation with its source offset.

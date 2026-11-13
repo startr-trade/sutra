@@ -27,16 +27,16 @@
 # ---- chef (shared toolchain layer) -------------------------------------------
 # Pin the bookworm variant so the builder's glibc matches the runtime image below.
 FROM rust:1.96-slim-bookworm AS chef
-# make + g++: the Kafka transport's rdkafka dependency vendors librdkafka and builds it from source
-# via librdkafka's mklove `configure` (the `cmake-build` feature is deliberately OFF — it keeps curl
-# coupled and needs libcurl-dev; mklove passes --disable-{curl,ssl,gssapi,zlib,zstd} for a minimal
-# PLAINTEXT build). The rust:*-slim image ships gcc + binutils (ring needs them) but neither make
-# nor a C++ compiler — mklove's C++ check is a hard FAIL without g++. No libssl-dev/libsasl2-dev/
-# libcurl-dev needed (the broker default is PLAINTEXT; mTLS is contract-UNSUPPORTED). Builder-stage
-# only; librdkafka links statically into the binary, so the debian:bookworm-slim runtime stays
-# unchanged.
+# make + g++ + perl: the Kafka transport's rdkafka dependency vendors librdkafka and builds it from
+# source via librdkafka's mklove `configure` (the `cmake-build` feature is deliberately OFF — it
+# keeps curl coupled and needs libcurl-dev; curl, gssapi, zlib and zstd are disabled), and vendors
+# OpenSSL for librdkafka's TLS and SASL. The rust:*-slim image ships gcc + binutils (ring needs them)
+# but neither make nor a C++ compiler — mklove's C++ check is a hard FAIL without g++ — and only
+# perl-base, which cannot run OpenSSL's Configure. No libssl-dev/libsasl2-dev/libcurl-dev needed.
+# Builder-stage only; librdkafka and OpenSSL link statically into the binary, so the runtime image
+# gains no library and the binary still lists none of libssl or libcrypto as NEEDED.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends make g++ \
+    && apt-get install -y --no-install-recommends make g++ perl \
     && rm -rf /var/lib/apt/lists/*
 RUN cargo install cargo-chef --locked
 WORKDIR /build
