@@ -217,4 +217,11 @@ jobs:
         working-directory: rust
         run: cargo test -p sutra-cli -p sutra-loader --no-fail-fast
       - name: make cross (clippy for this system's targets)
-        run: bash scripts/cross-clippy.sh
+        # The vendored OpenSSL (the Kafka client's, reached through dev-dependencies) runs its
+        # Configure with perl. Git Bash's perl lacks modules it needs, so on Windows use the
+        # runner's Strawberry Perl.
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            export OPENSSL_SRC_PERL='C:\Strawberry\perl\bin\perl.exe'
+          fi
+          bash scripts/cross-clippy.sh

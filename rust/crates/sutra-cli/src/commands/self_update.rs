@@ -57,12 +57,15 @@ pub fn engine_image_of(image: &str, tag: &str) -> String {
 }
 
 /// The published-asset target triple for the host, or `None` when this platform has no
-/// release build (macOS today, and anything exotic) — those install from source, and saying
-/// so is better than downloading a binary that cannot run.
+/// release build (anything outside the release matrix) — those install from source, and saying
+/// so is better than downloading a binary that cannot run. Keep this list in step with the
+/// targets the release workflow packages.
 pub fn target_triple() -> Option<&'static str> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("linux", "x86_64") => Some("x86_64-unknown-linux-musl"),
         ("linux", "aarch64") => Some("aarch64-unknown-linux-musl"),
+        ("macos", "aarch64") => Some("aarch64-apple-darwin"),
+        ("macos", "x86_64") => Some("x86_64-apple-darwin"),
         ("windows", "x86_64") => Some("x86_64-pc-windows-msvc"),
         _ => None,
     }
@@ -125,8 +128,8 @@ pub fn execute_with(
         return exit::USAGE;
     };
 
-    // `--runtime-only` never touches this binary, so an unpublished host platform (macOS
-    // today) can still pull the engine image.
+    // `--runtime-only` never touches this binary, so an unpublished host platform can still
+    // pull the engine image.
     let target = match target_triple() {
         Some(target) => target,
         None if args.runtime_only => "",
