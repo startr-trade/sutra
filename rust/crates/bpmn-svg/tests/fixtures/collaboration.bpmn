@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:d="urn:example:diagrams" targetNamespace="urn:example:diagrams">
+  <collaboration id="collaboration">
+    <participant id="customer" name="Customer" processRef="d:buyer"/>
+    <participant id="shop" name="Shop" processRef="seller"/>
+    <participant id="bank" name="Bank"/>
+    <messageFlow id="m-order" name="Order" sourceRef="place" targetRef="take"/>
+    <messageFlow id="m-confirm" sourceRef="ship" targetRef="receive"/>
+    <messageFlow id="m-pay" sourceRef="charge" targetRef="d:bank"/>
+  </collaboration>
+  <process id="buyer" isExecutable="false">
+    <startEvent id="b-start"/>
+    <sendTask id="place" name="Place order"/>
+    <receiveTask id="receive" name="Get confirmation"/>
+    <endEvent id="b-end"/>
+    <sequenceFlow id="b1" sourceRef="b-start" targetRef="place"/>
+    <sequenceFlow id="b2" sourceRef="place" targetRef="receive"/>
+    <sequenceFlow id="b3" sourceRef="receive" targetRef="b-end"/>
+  </process>
+  <process id="seller" isExecutable="false">
+    <startEvent id="s-start"/>
+    <receiveTask id="take" name="Take order"/>
+    <serviceTask id="charge" name="Charge card"/>
+    <sendTask id="ship" name="Confirm"/>
+    <endEvent id="s-end"/>
+    <sequenceFlow id="s1" sourceRef="s-start" targetRef="take"/>
+    <sequenceFlow id="s2" sourceRef="take" targetRef="charge"/>
+    <sequenceFlow id="s3" sourceRef="charge" targetRef="ship"/>
+    <sequenceFlow id="s4" sourceRef="ship" targetRef="s-end"/>
+  </process>
+</definitions>

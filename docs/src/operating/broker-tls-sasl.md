@@ -47,6 +47,7 @@ Outbound sends use one engine-wide configuration per transport, set in the envir
 | `SUTRA_SINK_KAFKA_TLS_CA_FILE`, `SUTRA_SINK_KAFKA_TLS_INSECURE_SKIP_VERIFY` | Trust |
 | `SUTRA_SINK_AMQP_USERNAME`, `SUTRA_SINK_AMQP_PASSWORD` | Default credentials |
 | `SUTRA_SINK_AMQP_TLS_CA_FILE`, `SUTRA_SINK_AMQP_TLS_INSECURE_SKIP_VERIFY` | Trust for `amqp10s://` destinations |
+| `SUTRA_SINK_AMQP_OPERATION_TIMEOUT_MS` | The bound on each broker round trip of a send (opening the connection with TLS and SASL, the session, the attach, the wait for the broker to accept the message, the close), default 30000. A broker that does not answer in time fails the attempt with the retryable `SUTRA.OUTBOUND.AMQP.SEND_TIMEOUT` and the outbox sends again; a send accepted just before its answer timed out can arrive twice, so receivers dedupe on `sutra-outbox-key`. Since 0.6.22. |
 
 ## Walkthrough: a message through both brokers
 

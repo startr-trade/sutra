@@ -139,7 +139,7 @@ fn strip_comments(src: &str) -> String {
 pub(crate) fn analyze(template: &[u8]) -> TemplateAnalysis {
     let src = String::from_utf8_lossy(template).into_owned();
     // Parse error — the render path surfaces it; analysis is empty.
-    if handlebars::template::Template::compile(&src).is_err() {
+    if crate::compiled_by_content(&src).is_err() {
         return TemplateAnalysis::default();
     }
 

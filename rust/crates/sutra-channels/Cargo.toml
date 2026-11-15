@@ -64,3 +64,10 @@ testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }
 # Reads what a dispatch logs where the log is the behaviour under test.
 tracing-subscriber = { version = "0.3", features = ["fmt"] }
+# The wait-index micro-bench (`cargo bench -p sutra-channels --bench wait_index`). The same minimal
+# feature set sutra-feel's benches use, so the supply-chain gate scans nothing new.
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "wait_index"
+harness = false

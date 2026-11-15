@@ -23,6 +23,7 @@
 - [Recordings and media references](building/recordings-and-media.md)
 - [Wait states and human tasks](building/wait-states.md)
 - [One endpoint, one deployment](building/endpoint-claims.md)
+- [A reply answers the instance waiting for it](building/waits-first.md)
 - [Upgrading a deployment in place](building/upgrading-in-place.md)
 - [Acceptance receipts](building/acceptance-receipts.md)
 - [External tasks: the pull worker surface](building/external-tasks.md)
@@ -69,6 +70,7 @@
 - [Upgrading to 0.6.19](operating/upgrading-0-6-19.md)
 - [Upgrading to 0.6.20](operating/upgrading-0-6-20.md)
 - [Upgrading to 0.6.21](operating/upgrading-0-6-21.md)
+- [Upgrading to 0.6.22](operating/upgrading-0-6-22.md)
 
 # Reference
 

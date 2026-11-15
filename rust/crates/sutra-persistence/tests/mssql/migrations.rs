@@ -18,14 +18,14 @@ async fn applies_dialect_migrations_once_and_is_idempotent() {
     let scripts = collect_migrations(&[root.as_path()]).unwrap();
     assert_eq!(
         scripts.len(),
-        19,
-        "reference set minus the four row-security scripts, plus V302/V304/V604/V605/V606/V803/V804 and the \
+        20,
+        "reference set minus the four row-security scripts, plus V302/V304/V305/V604/V605/V606/V803/V804 and the \
          V1001 deployment-archive store + V1003 its retained-channels flag (coverage is no longer an engine-database subsystem — §7)"
     );
 
     let mut conn = pool.acquire().await.unwrap();
     let first_run = apply_migrations(conn.client(), &scripts).await.unwrap();
-    assert_eq!(first_run, 19);
+    assert_eq!(first_run, 20);
     let second_run = apply_migrations(conn.client(), &scripts).await.unwrap();
     assert_eq!(second_run, 0, "already-applied versions are skipped");
 
@@ -44,8 +44,8 @@ async fn applies_dialect_migrations_once_and_is_idempotent() {
     assert_eq!(
         history,
         vec![
-            101, 201, 301, 302, 304, 401, 402, 501, 601, 603, 604, 605, 606, 701, 801, 803, 804,
-            1001, 1003
+            101, 201, 301, 302, 304, 305, 401, 402, 501, 601, 603, 604, 605, 606, 701, 801, 803,
+            804, 1001, 1003
         ]
     );
     drop(conn);

@@ -37,3 +37,27 @@ fn non_latin_labels_are_sized_by_characters_not_by_glyph_width() {
         task_width(&"x".repeat(60))
     );
 }
+
+/// The fixtures are synthetic: beyond the BPMN namespace they use only `urn:example:` ones, so no
+/// fixture carries a real project's namespace or content.
+#[test]
+fn the_fixtures_use_only_example_namespaces() {
+    let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_none_or(|e| e != "bpmn") {
+            continue;
+        }
+        let xml = std::fs::read_to_string(&path).unwrap();
+        for value in xml.split("=\"").skip(1).filter_map(|v| v.split('"').next()) {
+            if value.contains("://") || value.starts_with("urn:") {
+                assert!(
+                    value == "http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        || value.starts_with("urn:example:"),
+                    "{}: {value}",
+                    path.display()
+                );
+            }
+        }
+    }
+}

@@ -150,6 +150,28 @@ impl InboundChain {
         &self.codecs
     }
 
+    /// Whether two bindings decode a message identically, so one decode serves both: the same
+    /// codec name, and that name is no codec or a bare format (stateless, the same parser for
+    /// everyone), or it resolves to the very same codec under each binding's deployment. Two
+    /// versions' archive codecs are always different codecs, even when their bytes are identical:
+    /// each is scoped to its own deployment.
+    pub fn same_decoder(&self, a: &ChannelBinding, b: &ChannelBinding) -> bool {
+        let name = a.codec.trim();
+        if name != b.codec.trim() {
+            return false;
+        }
+        if name.is_empty() || self.formats.contract(name).is_some() {
+            return true;
+        }
+        match (
+            self.codecs.resolve(name, &a.deployment_id()),
+            self.codecs.resolve(name, &b.deployment_id()),
+        ) {
+            (Some(x), Some(y)) => Arc::ptr_eq(&x, &y),
+            _ => false,
+        }
+    }
+
     /// Channel-scoped decode (the inverted hot path's first step). Three routes:
     ///
     /// - **no codec** → content-type-driven format decode (case b): the parser is chosen purely

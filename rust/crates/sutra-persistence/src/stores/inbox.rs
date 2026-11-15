@@ -4,6 +4,13 @@
 //! Semantics: `(deployment_id, channel, event_id)` PK +
 //! `INSERT ... ON CONFLICT DO NOTHING`; the first observer sees one affected row, every
 //! concurrent duplicate sees zero — first-observer-wins with no read-then-insert race.
+//!
+//! Dedup is per OWNER (V305/V306): a row carries the owner key `deployment_owner` maps its
+//! deployment to, and a check finds a row written by any deployment of the same owner, so a
+//! redelivery that spans a version flip is a duplicate. The partial unique index on
+//! `(owner_id, channel, event_id)` arbitrates two versions racing one key; the insert names no
+//! conflict target, so whichever unique index the new row collides on decides. A deployment with no
+//! mapping row writes a NULL owner and dedupes within itself only.
 //! `prune_older_than` is the sanctioned cross-deployment maintenance op: it runs WITHOUT the
 //! deployment GUC and relies on an RLS-bypassing role (table owner in dev/test, a documented
 //! BYPASSRLS maintenance role in production).
@@ -46,9 +53,23 @@ pub struct PgInboxStore {
 }
 
 const SQL_INSERT: &str = "INSERT INTO inbox_seen \
-     (deployment_id, channel, event_id, seen_at, instance_id) \
-     VALUES ($1, $2, $3, $4, $5) \
-     ON CONFLICT (deployment_id, channel, event_id) DO NOTHING";
+     (deployment_id, channel, event_id, seen_at, instance_id, owner_id) \
+     VALUES ($1, $2, $3, $4, $5, \
+             (SELECT owner_id FROM deployment_owner WHERE deployment_id = $1)) \
+     ON CONFLICT DO NOTHING";
+
+/// The row a check finds: one this deployment wrote, or one any deployment of its owner wrote.
+const SQL_SEEN_BY: &str = "SELECT deployment_id FROM inbox_seen \
+     WHERE channel = $2 AND event_id = $3 \
+       AND (deployment_id = $1 \
+            OR owner_id = (SELECT owner_id FROM deployment_owner WHERE deployment_id = $1)) \
+     ORDER BY (deployment_id = $1) DESC LIMIT 1";
+
+const SQL_ORIGINAL_INSTANCE: &str = "SELECT instance_id FROM inbox_seen \
+     WHERE channel = $2 AND event_id = $3 \
+       AND (deployment_id = $1 \
+            OR owner_id = (SELECT owner_id FROM deployment_owner WHERE deployment_id = $1)) \
+     ORDER BY (deployment_id = $1) DESC LIMIT 1";
 
 const SQL_PRUNE: &str = "DELETE FROM inbox_seen WHERE seen_at < $1";
 
@@ -112,21 +133,23 @@ const SQL_HELD_BY_CHAIN: &str = "SELECT 1 FROM inflight_sync_chain \
 
 impl PgInboxStore {
     /// [`Self::seen`], and when a record exists, whether a chain's marker still holds it. The marker
-    /// is only read for a key that has a record, so a first delivery pays for one query.
+    /// is only read for a key that has a record, so a first delivery pays for one query. The marker
+    /// is read under the deployment that wrote the record: a chain still running on an older
+    /// version of the owner makes the record in doubt here too.
     pub async fn check(
         &self,
         deployment: &DeploymentId,
         channel: &str,
         event_id: &str,
     ) -> Result<InboxSeenState> {
-        if !self.seen(deployment, channel, event_id).await? {
+        let Some(writer) = self.seen_by(deployment, channel, event_id).await? else {
             return Ok(InboxSeenState::Absent);
-        }
+        };
         let key = serde_json::to_string(&[[channel, event_id]])
             .map_err(|e| PersistenceError::InvalidArgument(format!("inbox check key: {e}")))?;
-        let mut tx = begin_deployment_tx(&self.pool, deployment).await?;
+        let mut tx = begin_deployment_tx(&self.pool, &writer).await?;
         let held: Option<i32> = sqlx::query_scalar(SQL_HELD_BY_CHAIN)
-            .bind(deployment.as_str())
+            .bind(writer.as_str())
             .bind(key)
             .fetch_optional(&mut *tx)
             .await
@@ -141,29 +164,38 @@ impl PgInboxStore {
         })
     }
 
-    /// Whether `(deployment, channel, event_id)` is already recorded — a read, no write. The
-    /// engine checks before it processes a delivery and writes the record in the step that
-    /// processes it (`crate::step::record_inbox_seen_in`), so record and effects commit together.
+    /// Whether `(deployment, channel, event_id)` is already recorded — by this deployment or by
+    /// any deployment of its owner. A read, no write. The engine checks before it processes a
+    /// delivery and writes the record in the step that processes it
+    /// (`crate::step::record_inbox_seen_in`), so record and effects commit together.
     pub async fn seen(
         &self,
         deployment: &DeploymentId,
         channel: &str,
         event_id: &str,
     ) -> Result<bool> {
+        Ok(self.seen_by(deployment, channel, event_id).await?.is_some())
+    }
+
+    /// The deployment that wrote the record [`Self::seen`] finds, its own first.
+    async fn seen_by(
+        &self,
+        deployment: &DeploymentId,
+        channel: &str,
+        event_id: &str,
+    ) -> Result<Option<DeploymentId>> {
         let mut tx = begin_deployment_tx(&self.pool, deployment).await?;
-        let found: Option<i32> = sqlx::query_scalar(
-            "SELECT 1 FROM inbox_seen WHERE deployment_id = $1 AND channel = $2 AND event_id = $3",
-        )
-        .bind(deployment.as_str())
-        .bind(channel)
-        .bind(event_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(PersistenceError::db("inbox seen"))?;
+        let found: Option<String> = sqlx::query_scalar(SQL_SEEN_BY)
+            .bind(deployment.as_str())
+            .bind(channel)
+            .bind(event_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(PersistenceError::db("inbox seen"))?;
         tx.commit()
             .await
             .map_err(PersistenceError::db("inbox seen commit"))?;
-        Ok(found.is_some())
+        found.map(DeploymentId::new).transpose()
     }
 
     /// The instance kept with a recorded delivery. `None` for no record, and for a record that
@@ -175,16 +207,13 @@ impl PgInboxStore {
         event_id: &str,
     ) -> Result<Option<Uuid>> {
         let mut tx = begin_deployment_tx(&self.pool, deployment).await?;
-        let found: Option<Option<Uuid>> = sqlx::query_scalar(
-            "SELECT instance_id FROM inbox_seen \
-             WHERE deployment_id = $1 AND channel = $2 AND event_id = $3",
-        )
-        .bind(deployment.as_str())
-        .bind(channel)
-        .bind(event_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(PersistenceError::db("inbox original instance"))?;
+        let found: Option<Option<Uuid>> = sqlx::query_scalar(SQL_ORIGINAL_INSTANCE)
+            .bind(deployment.as_str())
+            .bind(channel)
+            .bind(event_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(PersistenceError::db("inbox original instance"))?;
         tx.commit()
             .await
             .map_err(PersistenceError::db("inbox original instance commit"))?;

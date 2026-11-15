@@ -50,6 +50,7 @@ pub mod diag;
 pub mod endpoint_claims;
 pub mod inline;
 pub mod intake;
+pub mod owner_scopes;
 pub mod policy;
 pub mod receipt;
 pub mod redaction;
@@ -146,6 +147,7 @@ pub use outbox_dispatch::{
     DispatchStats, LiveDeploymentSet, OutboxConcurrency, OutboxDispatcher, OutboxDispatcherHandle,
     OutboxRowStore, OutboxSignal, PoisonedDelivery, RetryPolicy, BOUNDED_RETRY_ATTR,
 };
+pub use owner_scopes::{OwnerScope, OwnerScopes};
 pub use policy::{
     ActiveInstanceCount, AllowAllFeatureProvider, Clock, ConcurrencyStore,
     DefaultTenantQuotaEnforcer, FeatureProvider, InMemoryActiveInstanceCount,

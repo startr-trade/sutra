@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL" targetNamespace="urn:example:diagrams">
+  <process id="flow-markers" isExecutable="true">
+    <startEvent id="s"/>
+    <userTask id="check" name="Check" default="f-default"/>
+    <exclusiveGateway id="which" name="Which?" default="g-default"/>
+    <manualTask id="a" name="Path A"/>
+    <manualTask id="b" name="Path B"/>
+    <manualTask id="c" name="Path C"/>
+    <endEvent id="e"/>
+    <sequenceFlow id="f1" sourceRef="s" targetRef="check"/>
+    <sequenceFlow id="f-default" sourceRef="check" targetRef="which"/>
+    <sequenceFlow id="f-cond" sourceRef="check" targetRef="c"><conditionExpression>urgent</conditionExpression></sequenceFlow>
+    <sequenceFlow id="g-default" sourceRef="which" targetRef="a"/>
+    <sequenceFlow id="g-cond" name="Large" sourceRef="which" targetRef="b"><conditionExpression>amount &gt; 100</conditionExpression></sequenceFlow>
+    <sequenceFlow id="g-long" sourceRef="which" targetRef="e"><conditionExpression>a condition far longer than forty characters in all</conditionExpression></sequenceFlow>
+    <sequenceFlow id="a-e" sourceRef="a" targetRef="e"/>
+    <sequenceFlow id="b-e" sourceRef="b" targetRef="e"/>
+    <sequenceFlow id="c-e" sourceRef="c" targetRef="e"/>
+  </process>
+</definitions>

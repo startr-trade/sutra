@@ -129,6 +129,17 @@ impl HbsTemplateEngine {
             inner: sutra_templates::HandlebarsTemplateEngine::new(),
         }
     }
+
+    /// Whether this engine renders `implementation` (a template file name).
+    pub fn renders(implementation: &str) -> bool {
+        implementation.to_ascii_lowercase().ends_with(".hbs")
+    }
+
+    /// Compile a template into the process-wide cache every engine renders from, so its first
+    /// render pays nothing (see `sutra_templates::precompile`). `Ok(true)` when compiled now.
+    pub fn precompile(template_id: &str, template: &[u8]) -> Result<bool, String> {
+        sutra_templates::precompile(template_id, template).map_err(|e| e.message)
+    }
 }
 
 impl TemplateEngine for HbsTemplateEngine {

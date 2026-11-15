@@ -160,6 +160,14 @@ pub async fn create_app_role(pool: &PgPool, tables: &[&str]) -> String {
             .await
             .expect("grant the audit_event BIGSERIAL sequence");
         }
+        // `inbox_seen`'s policy reads the deployment → owner map (V305), so a role that can read
+        // the table must be able to read the map too.
+        if *table == "inbox_seen" {
+            sqlx::query(&format!("GRANT SELECT ON deployment_owner TO {role}"))
+                .execute(pool)
+                .await
+                .expect("grant the deployment_owner map inbox_seen's policy reads");
+        }
     }
     role
 }

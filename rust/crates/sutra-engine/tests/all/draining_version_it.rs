@@ -540,12 +540,12 @@ fn same_channel_package(tenant: &str, module: &str, path: &str, sink: SocketAddr
     root
 }
 
-/// 7. Records behaviour, and it is a leak: the relay's fallback scope is every draining deployment,
-/// whoever owns it. Nothing should depend on this; it asserts only that the scenario was set up, so
-/// the suite stays green until a decision is made.
+/// 7. A message on one owner's channel never reaches another owner's parked instance, whatever the
+/// channel is called and whatever alias value the message carries: correlation searches only the
+/// live versions of the channel's own owner.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "docker"]
-async fn what_a_message_on_one_owners_channel_does_to_another_owners_draining_instance() {
+async fn a_message_on_one_owners_channel_never_reaches_another_owners_instance() {
     let (_pool, url) = fresh_db().await;
     let (sink, capture) = capture_server().await;
     let other = package(&same_channel_package("t2", "victim", "/victim", sink));
@@ -569,12 +569,14 @@ async fn what_a_message_on_one_owners_channel_does_to_another_owners_draining_in
 
     // A message on THIS owner's channel, with the alias value the other owner's instance parked on.
     let (status, body) = post(addr, "/caller/resume", br#"{"key":"SAME"}"#).await;
+    assert_ne!(status, 200, "nothing of this owner waits for it: {body}");
     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-    println!(
-        "OBSERVED 7 message on t1's channel with t2's alias value: {status} {body}; t2's parked \
-         instance completed {} time(s)",
-        capture.delivered("/t2-victim-done")
+    assert_eq!(
+        capture.delivered("/t2-victim-done"),
+        0,
+        "the other owner's parked instance was not resumed"
     );
+    assert_eq!(draining_count(addr).await, 1, "and it is still parked");
     engine.shutdown().await;
 }
 
@@ -1319,94 +1321,6 @@ fn modified_channel_package(version: &str, codec: &str, path: &str, sink: Socket
     root
 }
 
-/// A POST with its own content type, which the shared helper fixes to JSON.
-async fn post_typed(
-    addr: SocketAddr,
-    path: &str,
-    content_type: &str,
-    body: &[u8],
-) -> (u16, String) {
-    use std::io::{Read, Write};
-    let port = addr.port();
-    let head = format!(
-        "POST {path} HTTP/1.1\r\nHost: localhost\r\nX-Api-Key: flip-key\r\n\
-         Content-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
-    );
-    let body = body.to_vec();
-    tokio::task::spawn_blocking(move || {
-        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
-        stream.write_all(head.as_bytes()).expect("head");
-        stream.write_all(&body).expect("body");
-        let mut response = String::new();
-        stream.read_to_string(&mut response).expect("response");
-        let status = response
-            .split_whitespace()
-            .nth(1)
-            .and_then(|code| code.parse().ok())
-            .expect("status code");
-        let body = response
-            .split_once("\r\n\r\n")
-            .map(|(_, body)| body.to_string())
-            .unwrap_or_default();
-        (status, body)
-    })
-    .await
-    .expect("post task")
-}
-
-/// 9a. Records behaviour: v2 kept the channel's name and route and changed its codec.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "docker"]
-async fn what_decodes_a_resume_on_a_channel_the_new_version_changed() {
-    let (_pool, url) = fresh_db().await;
-    let (sink, capture) = capture_server().await;
-    let v1 = package(&modified_channel_package(
-        "1.0.0",
-        "json",
-        "/m/resume",
-        sink,
-    ));
-    let v2 = package(&modified_channel_package("2.0.0", "xml", "/m/resume", sink));
-    let engine = boot_db_engine(url).await;
-    let addr = engine.local_addr;
-    let (status, body) = post(addr, "/admin/deployments", &v1).await;
-    assert_eq!(status, 200, "v1: {body}");
-    for key in ["JSONKEY", "XMLKEY"] {
-        let start = format!(r#"{{"key":"{key}"}}"#);
-        let (status, body) = post(addr, "/m/start", start.as_bytes()).await;
-        assert_eq!(status, 200, "park {key}: {body}");
-    }
-    let (status, body) = post(addr, "/admin/deployments", &v2).await;
-    assert_eq!(status, 200, "v2: {body}");
-    println!("OBSERVED 9a v2 deploy: {body}");
-
-    let (status, body) = post_typed(
-        addr,
-        "/m/resume",
-        "application/json",
-        br#"{"key":"JSONKEY"}"#,
-    )
-    .await;
-    println!("OBSERVED 9a v1-format (application/json) resume: {status} {body}");
-    let (status, body) = post_typed(
-        addr,
-        "/m/resume",
-        "application/xml",
-        b"<m><key>XMLKEY</key></m>",
-    )
-    .await;
-    println!("OBSERVED 9a v2-format (application/xml) resume: {status} {body}");
-    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-    println!(
-        "OBSERVED 9a after 5s: v1 done {}, v2 done {}, draining {}",
-        capture.delivered("/1.0.0-modified-done"),
-        capture.delivered("/2.0.0-modified-done"),
-        draining_count(addr).await
-    );
-    engine.shutdown().await;
-}
-
 /// 9b. v2 keeps the channel's name and moves its route: v1's old address is gone, the new one
 /// resumes v1, and the deploy warns with the parked count.
 #[tokio::test(flavor = "multi_thread")]
@@ -2048,10 +1962,11 @@ fn wait_or_start_package(version: &str, wait: bool, sink: SocketAddr) -> PathBuf
     root
 }
 
-/// 12. Records behaviour: a correlated reply where v2 has a start event on that channel.
+/// 12. v1 parks on `reply-in`; v2 starts on `reply-in` instead. A correlated reply resumes v1's
+/// instance, and v2's start does not run: waits first.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "docker"]
-async fn what_a_correlated_reply_does_when_the_new_version_starts_on_that_channel() {
+async fn a_correlated_reply_resumes_the_old_version_before_a_new_start() {
     let (_pool, url) = fresh_db().await;
     let (sink, capture) = capture_server().await;
     let engine = boot_db_engine(url).await;
@@ -2065,17 +1980,189 @@ async fn what_a_correlated_reply_does_when_the_new_version_starts_on_that_channe
     let (status, body) = post(addr, "/admin/deployments", &v2).await;
     assert_eq!(status, 200, "v2: {body}");
     let (status, body) = post(addr, "/w/reply", br#"{"key":"K"}"#).await;
-    println!(
-        "OBSERVED 12 correlated reply: {status} {}",
-        &body[..body.len().min(300)]
-    );
-    tokio::time::sleep(std::time::Duration::from_secs(4)).await;
-    println!(
-        "OBSERVED 12 v1 instance resumed {} time(s), v2 start ran {} time(s), draining {}",
-        capture.delivered("/1.0.0-resumed"),
+    assert_eq!(status, 200, "the reply resumed v1: {body}");
+    assert!(wait_until(10, || async { capture.delivered("/1.0.0-resumed") == 1 }).await);
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    assert_eq!(
         capture.delivered("/2.0.0-started"),
-        draining_count(addr).await
+        0,
+        "no new instance on v2"
     );
+    // An uncorrelated message on the same channel is v2's start, as before.
+    let (status, body) = post(addr, "/w/reply", br#"{"key":"OTHER"}"#).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(wait_until(10, || async { capture.delivered("/2.0.0-started") == 1 }).await);
+    engine.shutdown().await;
+}
+
+/// One package: `held` starts on `begin` (parking on `both`, keyed by `key`) and on `both` (and
+/// reports `held-started`); `fresh` starts on `both`. With `broadcast`, `both` is a broadcast
+/// channel.
+fn start_and_wait_package(broadcast: bool, sink: SocketAddr) -> PathBuf {
+    let root = temp_root("drain-pkg");
+    let process = format!(
+        r#"  <bpmn:process id="held" name="Held" isExecutable="true">
+    <bpmn:extensionElements><q:variables>
+      <q:variable name="answer" type="object"/>
+    </q:variables></bpmn:extensionElements>
+    <bpmn:startEvent id="Start">
+      <bpmn:extensionElements><q:source channel="begin"/></bpmn:extensionElements>
+      <bpmn:outgoing>f1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:startEvent id="Again">
+      <bpmn:extensionElements><q:source channel="both"/></bpmn:extensionElements>
+      <bpmn:outgoing>g1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="g1" sourceRef="Again" targetRef="HeldStarted"/>
+{held_started}
+    <bpmn:sequenceFlow id="f1" sourceRef="Start" targetRef="Arm"/>
+    <bpmn:serviceTask id="Arm" name="Arm">
+      <bpmn:incoming>f1</bpmn:incoming><bpmn:outgoing>f2</bpmn:outgoing>
+      <bpmn:dataInputAssociation><bpmn:assignment>
+        <bpmn:from>{{key: payload.key}}</bpmn:from><bpmn:to>answer</bpmn:to>
+      </bpmn:assignment></bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="f2" sourceRef="Arm" targetRef="Await"/>
+    <bpmn:receiveTask id="Await" name="Await">
+      <bpmn:extensionElements>
+        <q:source channel="both" name="answer"/>
+        <q:alias name="heldKey" expression="answer.key" unique="true"/>
+      </bpmn:extensionElements>
+      <bpmn:incoming>f2</bpmn:incoming><bpmn:outgoing>f3</bpmn:outgoing>
+    </bpmn:receiveTask>
+    <bpmn:sequenceFlow id="f3" sourceRef="Await" targetRef="Done"/>
+{done}
+  </bpmn:process>
+  <bpmn:process id="fresh" name="Fresh" isExecutable="true">
+    <bpmn:startEvent id="FreshStart">
+      <bpmn:extensionElements><q:source channel="both"/></bpmn:extensionElements>
+      <bpmn:outgoing>h1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="h1" sourceRef="FreshStart" targetRef="FreshDone"/>
+{fresh_done}
+  </bpmn:process>"#,
+        held_started = report_and_end("HeldStarted", "g1", sink, "held-started"),
+        done = report_and_end("Done", "f3", sink, "held-resumed"),
+        fresh_done = report_and_end("FreshDone", "h1", sink, "fresh-started"),
+    );
+    write(
+        &root,
+        "bpmn/flow.bpmn",
+        &definitions("bothways", "1.0.0", "flow", &process),
+    );
+    let broadcast = if broadcast {
+        "    broadcast: true\n"
+    } else {
+        ""
+    };
+    write(
+        &root,
+        "channels.yaml",
+        &format!(
+            "channels:\n  - name: begin\n    transport: http\n    bind: \"POST /b/begin\"\n    codec: json\n{AUTH}  - name: both\n    transport: http\n    bind: \"POST /b/both\"\n    codec: json\n{broadcast}{AUTH}"
+        ),
+    );
+    write(&root, "package.yaml", &labels("t1", "bothways", "1.0.0"));
+    root
+}
+
+/// One version, a broadcast channel with a start in each of two processes and a wait in one of
+/// them. A message correlated to the parked `held` resumes it; `held` does not also start, and
+/// `fresh`, the other process subscribed by a start, still gets the message.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "docker"]
+async fn a_broadcast_correlated_message_resumes_its_wait_and_still_starts_others() {
+    let (_pool, url) = fresh_db().await;
+    let (sink, capture) = capture_server().await;
+    let engine = boot_db_engine(url).await;
+    let addr = engine.local_addr;
+    let v1 = package(&start_and_wait_package(true, sink));
+    let (status, body) = post(addr, "/admin/deployments", &v1).await;
+    assert_eq!(status, 200, "deploy: {body}");
+    let (status, body) = post(addr, "/b/begin", br#"{"key":"K"}"#).await;
+    assert_eq!(status, 200, "park: {body}");
+    let (status, body) = post(addr, "/b/both", br#"{"key":"K"}"#).await;
+    assert!(status < 300, "accepted: {status} {body}");
+    assert!(wait_until(10, || async { capture.delivered("/held-resumed") == 1 }).await);
+    assert!(wait_until(10, || async { capture.delivered("/fresh-started") == 1 }).await);
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    assert_eq!(
+        capture.delivered("/held-started"),
+        0,
+        "the holder does not also start"
+    );
+    // Uncorrelated, the broadcast fans out to both starts as before.
+    let (status, body) = post(addr, "/b/both", br#"{"key":"NEW"}"#).await;
+    assert!(status < 300, "accepted: {status} {body}");
+    assert!(wait_until(10, || async { capture.delivered("/held-started") == 1 }).await);
+    assert!(wait_until(10, || async { capture.delivered("/fresh-started") == 2 }).await);
+    engine.shutdown().await;
+}
+
+/// [`start_and_wait_package`] for a non-broadcast `both`, which takes one start: `held`'s second
+/// start moves to `begin-again`, leaving `held`'s wait and `fresh`'s start on `both`.
+fn one_start_one_wait_package(sink: SocketAddr) -> PathBuf {
+    let root = start_and_wait_package(false, sink);
+    let path = root.join("bpmn/flow.bpmn");
+    let text = std::fs::read_to_string(&path).expect("flow");
+    let text = text.replace(
+        r#"<bpmn:extensionElements><q:source channel="both"/></bpmn:extensionElements>
+      <bpmn:outgoing>g1</bpmn:outgoing>"#,
+        r#"<bpmn:extensionElements><q:source channel="begin-again"/></bpmn:extensionElements>
+      <bpmn:outgoing>g1</bpmn:outgoing>"#,
+    );
+    assert!(text.contains("begin-again"), "the second start moved");
+    std::fs::write(&path, text).expect("flow");
+    let channels = root.join("channels.yaml");
+    let text = std::fs::read_to_string(&channels).expect("channels");
+    std::fs::write(
+        &channels,
+        format!(
+            "{text}  - name: begin-again\n    transport: http\n    bind: \"POST /b/again\"\n    codec: json\n{AUTH}"
+        ),
+    )
+    .expect("channels");
+    root
+}
+
+/// One version: a correlated message on a channel with a start and a wait answers the wait and
+/// starts nothing; an uncorrelated one starts.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "docker"]
+async fn one_version_a_correlated_message_answers_the_wait_and_starts_nothing() {
+    let (_pool, url) = fresh_db().await;
+    let (sink, capture) = capture_server().await;
+    let engine = boot_db_engine(url).await;
+    let addr = engine.local_addr;
+    let v1 = package(&one_start_one_wait_package(sink));
+    let (status, body) = post(addr, "/admin/deployments", &v1).await;
+    assert_eq!(status, 200, "deploy: {body}");
+    let (status, body) = post(addr, "/b/begin", br#"{"key":"K"}"#).await;
+    assert_eq!(status, 200, "park: {body}");
+    let (status, body) = post(addr, "/b/both", br#"{"key":"K"}"#).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(wait_until(10, || async { capture.delivered("/held-resumed") == 1 }).await);
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    assert_eq!(capture.delivered("/fresh-started"), 0, "starts nothing");
+    engine.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "docker"]
+async fn one_version_an_uncorrelated_message_starts() {
+    let (_pool, url) = fresh_db().await;
+    let (sink, capture) = capture_server().await;
+    let engine = boot_db_engine(url).await;
+    let addr = engine.local_addr;
+    let v1 = package(&one_start_one_wait_package(sink));
+    let (status, body) = post(addr, "/admin/deployments", &v1).await;
+    assert_eq!(status, 200, "deploy: {body}");
+    let (status, body) = post(addr, "/b/begin", br#"{"key":"K"}"#).await;
+    assert_eq!(status, 200, "park: {body}");
+    let (status, body) = post(addr, "/b/both", br#"{"key":"NOT-PARKED"}"#).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(wait_until(10, || async { capture.delivered("/fresh-started") == 1 }).await);
+    assert_eq!(capture.delivered("/held-resumed"), 0);
     engine.shutdown().await;
 }
 
@@ -2273,44 +2360,75 @@ async fn post_with_header(
     .expect("post task")
 }
 
-/// 14. Records behaviour: a message v1 processed, sent again after v2 is active.
+/// v1 ran `EVENT-1` on `POST /r/in` (key header `X-Idem`), v2 (key header `v2_header`) is active.
+/// Returns the engine, the capture, and the status v1 answered a repeat of the key with.
+async fn v1_ran_event_then_v2(v2_header: &str) -> (sutra_engine::RunningEngine, Capture, u16) {
+    let (_pool, url) = fresh_db().await;
+    let (sink, capture) = capture_server().await;
+    let engine = boot_db_engine(url).await;
+    let addr = engine.local_addr;
+    let v1 = package(&idempotent_package("1.0.0", "X-Idem", sink));
+    let v2 = package(&idempotent_package("2.0.0", v2_header, sink));
+    let (status, body) = post(addr, "/admin/deployments", &v1).await;
+    assert_eq!(status, 200, "v1: {body}");
+    let (status, _) = post_with_header(addr, "/r/in", "X-Idem", "EVENT-1").await;
+    assert_eq!(status, 200);
+    assert!(wait_until(10, || async { capture.delivered("/1.0.0-ran") == 1 }).await);
+    // The control: on v1 alone, the same key again is a duplicate.
+    let (duplicate, _) = post_with_header(addr, "/r/in", "X-Idem", "EVENT-1").await;
+    assert_ne!(duplicate, 200, "a repeat on v1 is answered as a duplicate");
+    let (status, body) = post(addr, "/admin/deployments", &v2).await;
+    assert_eq!(status, 200, "v2: {body}");
+    (engine, capture, duplicate)
+}
+
+/// 14. A retry that spans the version flip is a duplicate on v2: dedup is per owner.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "docker"]
-async fn what_a_redelivery_spanning_the_flip_does() {
-    for (case, v2_header) in [
-        ("identical channel", "X-Idem"),
-        ("changed key header", "X-Idem-2"),
-    ] {
-        let (_pool, url) = fresh_db().await;
-        let (sink, capture) = capture_server().await;
-        let engine = boot_db_engine(url).await;
-        let addr = engine.local_addr;
-        let v1 = package(&idempotent_package("1.0.0", "X-Idem", sink));
-        let v2 = package(&idempotent_package("2.0.0", v2_header, sink));
-        let (status, body) = post(addr, "/admin/deployments", &v1).await;
-        assert_eq!(status, 200, "v1: {body}");
-        let (status, _) = post_with_header(addr, "/r/in", "X-Idem", "EVENT-1").await;
-        assert_eq!(status, 200);
-        assert!(wait_until(10, || async { capture.delivered("/1.0.0-ran") == 1 }).await);
-        // A control on v1 alone: the same key again is a duplicate.
-        let (status, _) = post_with_header(addr, "/r/in", "X-Idem", "EVENT-1").await;
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        println!(
-            "OBSERVED 14 [{case}] repeat before the flip: {status}, v1 ran {}",
-            capture.delivered("/1.0.0-ran")
-        );
+async fn a_redelivery_spanning_the_flip_is_a_duplicate() {
+    let (engine, capture, duplicate) = v1_ran_event_then_v2("X-Idem").await;
+    let (status, body) = post_with_header(engine.local_addr, "/r/in", "X-Idem", "EVENT-1").await;
+    assert_eq!(
+        status, duplicate,
+        "answered as v1 answered its duplicate: {body}"
+    );
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    assert_eq!(capture.delivered("/1.0.0-ran"), 1);
+    assert_eq!(
+        capture.delivered("/2.0.0-ran"),
+        0,
+        "v2 did not run it again"
+    );
+    engine.shutdown().await;
+}
 
-        let (status, body) = post(addr, "/admin/deployments", &v2).await;
-        assert_eq!(status, 200, "v2: {body}");
-        let (status, _) = post_with_header(addr, "/r/in", v2_header, "EVENT-1").await;
-        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-        println!(
-            "OBSERVED 14 [{case}] redelivery after the flip: {status}, v1 ran {}, v2 ran {}",
-            capture.delivered("/1.0.0-ran"),
-            capture.delivered("/2.0.0-ran")
-        );
-        engine.shutdown().await;
-    }
+/// v1's record still matches after v1 has retired: the row and the owner map outlive it.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "docker"]
+async fn the_retired_versions_row_still_matches() {
+    let (engine, capture, duplicate) = v1_ran_event_then_v2("X-Idem").await;
+    let addr = engine.local_addr;
+    assert!(
+        wait_until(30, || async { draining_count(addr).await == 0 }).await,
+        "v1 retires: no instances, nothing pending"
+    );
+    let (status, body) = post_with_header(addr, "/r/in", "X-Idem", "EVENT-1").await;
+    assert_eq!(status, duplicate, "{body}");
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    assert_eq!(capture.delivered("/2.0.0-ran"), 0);
+    engine.shutdown().await;
+}
+
+/// v2 reads its key from another header. The same request again carries no key v2 reads, so it is
+/// a new delivery and runs: a changed key cannot match.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "docker"]
+async fn a_changed_key_runs_again() {
+    let (engine, capture, _) = v1_ran_event_then_v2("X-Idem-2").await;
+    let (status, body) = post_with_header(engine.local_addr, "/r/in", "X-Idem", "EVENT-1").await;
+    assert_eq!(status, 200, "{body}");
+    assert!(wait_until(10, || async { capture.delivered("/2.0.0-ran") == 1 }).await);
+    engine.shutdown().await;
 }
 
 /// v1 parks each instance at a receive task and a message catch on `answer-in` at once (two
@@ -2431,5 +2549,564 @@ async fn the_warning_counts_distinct_parked_instances() {
         body.contains("channel 'answer-in' changes codec from t1--kinds--1.0.0; 2 instances of t1--kinds--1.0.0 are parked on it"),
         "{body}"
     );
+    engine.shutdown().await;
+}
+
+// ---- a resume is processed with the parked version's binding -------------------------------
+
+/// `held` parks on `pass-in` (keyed by `answer.key`) under `codec`. With `validator`, the wait's
+/// source runs `rules/v1-check.srl`, which refuses `flag` other than `"yes"` (`onValidation
+/// reject`). With `old_start`, a second process starts on `pass-in` and reports
+/// `<version>-pass-started`.
+fn second_pass_package(
+    version: &str,
+    codec: &str,
+    validator: bool,
+    old_start: bool,
+    sink: SocketAddr,
+) -> PathBuf {
+    let root = temp_root("drain-pkg");
+    let chain = if validator {
+        r#"<q:validators><q:complexValidator source="v1-check.srl"/></q:validators>"#
+    } else {
+        ""
+    };
+    let policy = if validator {
+        r#"<q:onValidation mode="reject"/>"#
+    } else {
+        ""
+    };
+    let mut process = format!(
+        r#"  <bpmn:process id="held" name="Held" isExecutable="true">
+    <bpmn:extensionElements><q:variables>
+      <q:variable name="answer" type="object"/>
+    </q:variables></bpmn:extensionElements>
+    <bpmn:startEvent id="Start">
+      <bpmn:extensionElements><q:source channel="pass-start"/></bpmn:extensionElements>
+      <bpmn:outgoing>f1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="Start" targetRef="Arm"/>
+    <bpmn:serviceTask id="Arm" name="Arm">
+      <bpmn:incoming>f1</bpmn:incoming><bpmn:outgoing>f2</bpmn:outgoing>
+      <bpmn:dataInputAssociation><bpmn:assignment>
+        <bpmn:from>{{key: payload.key}}</bpmn:from><bpmn:to>answer</bpmn:to>
+      </bpmn:assignment></bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="f2" sourceRef="Arm" targetRef="Await"/>
+    <bpmn:receiveTask id="Await" name="Await">
+      <bpmn:extensionElements>
+        <q:source channel="pass-in" name="answer">{chain}</q:source>
+        {policy}
+        <q:alias name="passKey" expression="answer.key" unique="true"/>
+      </bpmn:extensionElements>
+      <bpmn:incoming>f2</bpmn:incoming><bpmn:outgoing>f3</bpmn:outgoing>
+    </bpmn:receiveTask>
+    <bpmn:sequenceFlow id="f3" sourceRef="Await" targetRef="Done"/>
+{done}
+  </bpmn:process>"#,
+        done = report_and_end("Done", "f3", sink, &format!("{version}-pass-done")),
+    );
+    if old_start {
+        process.push_str(&format!(
+            r#"
+  <bpmn:process id="opener" name="Opener" isExecutable="true">
+    <bpmn:startEvent id="OpenStart">
+      <bpmn:extensionElements><q:source channel="pass-in"/></bpmn:extensionElements>
+      <bpmn:outgoing>o1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="o1" sourceRef="OpenStart" targetRef="Opened"/>
+{opened}
+  </bpmn:process>"#,
+            opened = report_and_end("Opened", "o1", sink, &format!("{version}-pass-started")),
+        ));
+    }
+    write(
+        &root,
+        "bpmn/held.bpmn",
+        &definitions("secondpass", version, "held", &process),
+    );
+    if validator {
+        write(
+            &root,
+            "rules/v1-check.srl",
+            "rule \"flag-must-be-yes\"\nwhen\n  exists(flag) and flag != \"yes\"\nthen\n  report(\"TEST.FLAG_NOT_YES\", \"flag\", \"refused-by-v1\");\nend\n",
+        );
+    }
+    write(
+        &root,
+        "channels.yaml",
+        &format!(
+            "channels:\n  - name: pass-start\n    transport: http\n    bind: \"POST /p/start\"\n    codec: json\n{AUTH}  - name: pass-in\n    transport: http\n    bind: \"POST /p/in\"\n    codec: {codec}\n{AUTH}"
+        ),
+    );
+    write(&root, "package.yaml", &labels("t1", "secondpass", version));
+    root
+}
+
+/// v1 (json, with a validator) parked with key `K`, then v2 (another codec, no validator).
+async fn v1_parked_then_v2(v1: PathBuf, v2: PathBuf) -> sutra_engine::RunningEngine {
+    let (_pool, url) = fresh_db().await;
+    let engine = boot_db_engine(url).await;
+    let addr = engine.local_addr;
+    let (status, body) = post(addr, "/admin/deployments", &package(&v1)).await;
+    assert_eq!(status, 200, "v1: {body}");
+    let (status, body) = post(addr, "/p/start", br#"{"key":"K"}"#).await;
+    assert_eq!(status, 200, "park: {body}");
+    let (status, body) = post(addr, "/admin/deployments", &package(&v2)).await;
+    assert_eq!(status, 200, "v2: {body}");
+    engine
+}
+
+/// v2 changes the channel's codec and drops v1's validator. A resume for v1's parked instance
+/// arrives on v2's route and is processed with v1's binding: v1's validator refuses what it
+/// refuses, the instance stays parked, and a message it accepts resumes it.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "docker"]
+async fn a_resume_on_a_changed_channel_is_processed_with_the_parked_versions_binding() {
+    let (sink, capture) = capture_server().await;
+    let engine = v1_parked_then_v2(
+        second_pass_package("1.0.0", "json", true, false, sink),
+        second_pass_package("2.0.0", "xml", false, false, sink),
+    )
+    .await;
+    let addr = engine.local_addr;
+    let (status, body) = post(addr, "/p/in", br#"{"key":"K","flag":"no"}"#).await;
+    assert!(
+        (400..500).contains(&status),
+        "v1's validator refused it: {status} {body}"
+    );
+    assert!(
+        body.contains("FLAG_NOT_YES") || body.contains("VALIDATION"),
+        "{body}"
+    );
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    assert_eq!(capture.delivered("/1.0.0-pass-done"), 0, "still parked");
+    let (status, body) = post(addr, "/p/in", br#"{"key":"K","flag":"yes"}"#).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(wait_until(10, || async { capture.delivered("/1.0.0-pass-done") == 1 }).await);
+    engine.shutdown().await;
+}
+
+/// v2 binds the channel to the flat `csv` contract, which refuses a nested JSON body. The same
+/// body decodes under v1's `json`, so the second pass finds the parked v1 instance and resumes it.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "docker"]
+async fn a_schema_codec_v2_refuses_still_resumes_v1_through_the_second_pass() {
+    let (sink, capture) = capture_server().await;
+    let engine = v1_parked_then_v2(
+        second_pass_package("1.0.0", "json", false, false, sink),
+        second_pass_package("2.0.0", "csv", false, false, sink),
+    )
+    .await;
+    let (status, body) = post(
+        engine.local_addr,
+        "/p/in",
+        br#"{"key":"K","detail":{"nested":true}}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "resumed through v1's codec: {body}");
+    assert!(wait_until(10, || async { capture.delivered("/1.0.0-pass-done") == 1 }).await);
+    engine.shutdown().await;
+}
+
+/// The same refused body with a key nothing waits for: the answer is v2's own decode refusal, as
+/// it was before waits first, not a correlation error.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "docker"]
+async fn a_bad_body_with_no_match_gets_the_holders_error() {
+    let (sink, capture) = capture_server().await;
+    let engine = v1_parked_then_v2(
+        second_pass_package("1.0.0", "json", false, false, sink),
+        second_pass_package("2.0.0", "csv", false, false, sink),
+    )
+    .await;
+    let (status, body) = post(
+        engine.local_addr,
+        "/p/in",
+        br#"{"key":"NOBODY","detail":{"nested":true}}"#,
+    )
+    .await;
+    // `CAPABILITY_MISMATCH` answers 500, as it always has (`status_for_code`).
+    assert_eq!(status, 500, "{body}");
+    assert!(
+        body.contains("CAPABILITY_MISMATCH"),
+        "v2's decode refusal: {body}"
+    );
+    assert_eq!(capture.delivered("/1.0.0-pass-done"), 0);
+    engine.shutdown().await;
+}
+
+/// v1 also starts on the channel. The second pass only ever resumes: an unmatched body that v1's
+/// codec decodes and v2's refuses starts nothing on v1.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "docker"]
+async fn a_second_pass_never_starts_on_the_old_version() {
+    let (sink, capture) = capture_server().await;
+    let engine = v1_parked_then_v2(
+        second_pass_package("1.0.0", "json", false, true, sink),
+        second_pass_package("2.0.0", "csv", false, false, sink),
+    )
+    .await;
+    let (status, body) = post(
+        engine.local_addr,
+        "/p/in",
+        br#"{"key":"NOBODY","detail":{"nested":true}}"#,
+    )
+    .await;
+    assert_eq!(status, 500, "v2's own decode refusal: {body}");
+    assert!(body.contains("CAPABILITY_MISMATCH"), "{body}");
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    assert_eq!(
+        capture.delivered("/1.0.0-pass-started"),
+        0,
+        "nothing started on v1"
+    );
+    assert_eq!(capture.delivered("/1.0.0-pass-done"), 0);
+    engine.shutdown().await;
+}
+
+// ---- waits first at tier 2: the refusals and the second process -------------------------------
+
+/// `first` and `second` each park on `gate-<name>` and then wait on the shared `shared-wait`,
+/// keyed by `answer.key` under an alias of their own; each reports `<name>-done`. `starter` starts
+/// on `shared-wait` too and reports `starter-ran`.
+fn two_waiters_package(sink: SocketAddr) -> PathBuf {
+    let root = temp_root("drain-pkg");
+    let waiter = |name: &str| {
+        format!(
+            r#"  <bpmn:process id="{name}" name="{name}" isExecutable="true">
+    <bpmn:extensionElements><q:variables>
+      <q:variable name="answer" type="object"/>
+    </q:variables></bpmn:extensionElements>
+    <bpmn:startEvent id="{name}Start">
+      <bpmn:extensionElements><q:source channel="begin-{name}"/></bpmn:extensionElements>
+      <bpmn:outgoing>{name}1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="{name}1" sourceRef="{name}Start" targetRef="{name}Arm"/>
+    <bpmn:serviceTask id="{name}Arm" name="Arm">
+      <bpmn:incoming>{name}1</bpmn:incoming><bpmn:outgoing>{name}2</bpmn:outgoing>
+      <bpmn:dataInputAssociation><bpmn:assignment>
+        <bpmn:from>{{key: payload.key}}</bpmn:from><bpmn:to>answer</bpmn:to>
+      </bpmn:assignment></bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="{name}2" sourceRef="{name}Arm" targetRef="{name}Gate"/>
+    <bpmn:receiveTask id="{name}Gate" name="Gate">
+      <bpmn:extensionElements>
+        <q:source channel="gate-{name}" name="answer"/>
+        <q:alias name="{name}Key" expression="answer.key" unique="true"/>
+      </bpmn:extensionElements>
+      <bpmn:incoming>{name}2</bpmn:incoming><bpmn:outgoing>{name}3</bpmn:outgoing>
+    </bpmn:receiveTask>
+    <bpmn:sequenceFlow id="{name}3" sourceRef="{name}Gate" targetRef="{name}Wait"/>
+    <bpmn:receiveTask id="{name}Wait" name="Wait">
+      <bpmn:extensionElements>
+        <q:source channel="shared-wait" name="answer"/>
+        <q:alias name="{name}Key" expression="answer.key" unique="true"/>
+      </bpmn:extensionElements>
+      <bpmn:incoming>{name}3</bpmn:incoming><bpmn:outgoing>{name}4</bpmn:outgoing>
+    </bpmn:receiveTask>
+    <bpmn:sequenceFlow id="{name}4" sourceRef="{name}Wait" targetRef="{name}Done"/>
+{done}
+  </bpmn:process>
+"#,
+            done = report_and_end(
+                &format!("{name}Done"),
+                &format!("{name}4"),
+                sink,
+                &format!("{name}-done")
+            ),
+        )
+    };
+    let starter = format!(
+        r#"  <bpmn:process id="starter" name="Starter" isExecutable="true">
+    <bpmn:startEvent id="StarterStart">
+      <bpmn:extensionElements><q:source channel="shared-wait"/></bpmn:extensionElements>
+      <bpmn:outgoing>s1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="s1" sourceRef="StarterStart" targetRef="StarterRan"/>
+{ran}
+  </bpmn:process>"#,
+        ran = report_and_end("StarterRan", "s1", sink, "starter-ran"),
+    );
+    let body = format!("{}{}{starter}", waiter("first"), waiter("second"));
+    write(
+        &root,
+        "bpmn/waiters.bpmn",
+        &definitions("waiters", "1.0.0", "waiters", &body),
+    );
+    let mut channels = String::from("channels:\n");
+    for name in [
+        "begin-first",
+        "begin-second",
+        "gate-first",
+        "gate-second",
+        "shared-wait",
+    ] {
+        channels.push_str(&format!(
+            "  - name: {name}\n    transport: http\n    bind: \"POST /tw/{name}\"\n    codec: json\n{AUTH}"
+        ));
+    }
+    write(&root, "channels.yaml", &channels);
+    write(&root, "package.yaml", &labels("t1", "waiters", "1.0.0"));
+    root
+}
+
+async fn deploy_two_waiters() -> (sutra_engine::RunningEngine, Capture, sqlx::PgPool) {
+    let (pool, url) = fresh_db().await;
+    let (sink, capture) = capture_server().await;
+    let engine = boot_db_engine(url).await;
+    let (status, body) = post(
+        engine.local_addr,
+        "/admin/deployments",
+        &package(&two_waiters_package(sink)),
+    )
+    .await;
+    assert_eq!(status, 200, "deploy: {body}");
+    (engine, capture, pool)
+}
+
+/// The second process waiting on a channel is tried: `first` holds no instance for the key,
+/// `second` does, and the message resumes `second`'s instance and starts nothing.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "docker"]
+async fn the_second_process_on_a_channel_is_tried_at_tier_two() {
+    let (engine, capture, _pool) = deploy_two_waiters().await;
+    let addr = engine.local_addr;
+    let (status, body) = post(addr, "/tw/begin-second", br#"{"key":"S-1"}"#).await;
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = post(addr, "/tw/gate-second", br#"{"key":"S-1"}"#).await;
+    assert_eq!(status, 200, "now at its shared wait: {body}");
+    let (status, body) = post(addr, "/tw/shared-wait", br#"{"key":"S-1"}"#).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(wait_until(10, || async { capture.delivered("/second-done") == 1 }).await);
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    assert_eq!(
+        capture.delivered("/starter-ran"),
+        0,
+        "a correlated message starts nothing"
+    );
+    engine.shutdown().await;
+}
+
+/// The key names a live instance parked somewhere else (its gate): the message is refused as a
+/// wait not reached yet, and no start runs.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "docker"]
+async fn an_alias_hit_not_at_the_wait_is_refused_not_started_at_tier_two() {
+    let (engine, capture, _pool) = deploy_two_waiters().await;
+    let addr = engine.local_addr;
+    let (status, body) = post(addr, "/tw/begin-first", br#"{"key":"F-1"}"#).await;
+    assert_eq!(status, 200, "parked at its gate: {body}");
+    let (status, body) = post(addr, "/tw/shared-wait", br#"{"key":"F-1"}"#).await;
+    assert_ne!(status, 200, "refused: {body}");
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    assert_eq!(capture.delivered("/starter-ran"), 0, "not started");
+    assert_eq!(capture.delivered("/first-done"), 0);
+    engine.shutdown().await;
+}
+
+/// The alias lookup fails (its table is renamed away for the moment): the delivery is refused,
+/// never guessed into a start. With the table back, the same message resumes the instance.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "docker"]
+async fn a_failed_store_lookup_refuses_rather_than_starts_at_tier_two() {
+    let (engine, capture, pool) = deploy_two_waiters().await;
+    let addr = engine.local_addr;
+    let (status, body) = post(addr, "/tw/begin-first", br#"{"key":"L-1"}"#).await;
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = post(addr, "/tw/gate-first", br#"{"key":"L-1"}"#).await;
+    assert_eq!(status, 200, "{body}");
+    sqlx::query("ALTER TABLE alias_index RENAME TO alias_index_away")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (status, body) = post(addr, "/tw/shared-wait", br#"{"key":"L-1"}"#).await;
+    sqlx::query("ALTER TABLE alias_index_away RENAME TO alias_index")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(status >= 500, "refused as unavailable: {status} {body}");
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    assert_eq!(
+        capture.delivered("/starter-ran"),
+        0,
+        "never guessed into a start"
+    );
+    let (status, body) = post(addr, "/tw/shared-wait", br#"{"key":"L-1"}"#).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(wait_until(10, || async { capture.delivered("/first-done") == 1 }).await);
+    engine.shutdown().await;
+}
+
+// ---- dedup per owner, two engines on one database ---------------------------------------------
+
+/// Two engines share one database, each serving its own folder: one holds v1, the other v2 of the
+/// same owner. The same keyed message reaches both at once: it runs once.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "docker"]
+async fn two_versions_racing_one_key_commit_once() {
+    let (_pool, url) = fresh_db().await;
+    let (sink, capture) = capture_server().await;
+    let dir_v1 = temp_root("race-v1");
+    let dir_v2 = temp_root("race-v2");
+    crate::archive_activation_conformance::place_archive(
+        &dir_v1,
+        "redeliver-1.sutra",
+        &package(&idempotent_package("1.0.0", "X-Idem", sink)),
+    );
+    crate::archive_activation_conformance::place_archive(
+        &dir_v2,
+        "redeliver-2.sutra",
+        &package(&idempotent_package("2.0.0", "X-Idem", sink)),
+    );
+    let a =
+        crate::archive_activation_conformance::boot_archive_engine(dir_v1, Some(url.clone())).await;
+    let b = crate::archive_activation_conformance::boot_archive_engine(dir_v2, Some(url)).await;
+    let (pa, pb) = (a.local_addr, b.local_addr);
+    assert!(
+        wait_until(30, || async {
+            post_with_header(pa, "/r/in", "X-Idem", "WARMUP-A").await.0 == 200
+                && post_with_header(pb, "/r/in", "X-Idem", "WARMUP-B").await.0 == 200
+        })
+        .await,
+        "both engines serve their version"
+    );
+    for round in 0..5 {
+        let key = format!("RACE-{round}");
+        // Either answer is fine: the loser is a duplicate, or its step rolls back as a
+        // concurrent one. What must not happen is that both run.
+        let _ = tokio::join!(
+            post_with_header(pa, "/r/in", "X-Idem", &key),
+            post_with_header(pb, "/r/in", "X-Idem", &key)
+        );
+    }
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    let ran = capture.delivered("/1.0.0-ran") + capture.delivered("/2.0.0-ran");
+    // Two warm-ups and five raced keys, each run once.
+    assert_eq!(
+        ran,
+        7,
+        "v1 ran {}, v2 ran {}",
+        capture.delivered("/1.0.0-ran"),
+        capture.delivered("/2.0.0-ran")
+    );
+    a.shutdown().await;
+    b.shutdown().await;
+}
+
+// ---- a call keeps the parked version's definition ----------------------------------------------
+
+/// `caller` parks on `sync-release`, then calls `to-sync` (a channel-call), which v1 declares
+/// synchronous (`ack-mode: on-complete`: the call is made inline and its answer completes the
+/// task) and v2 asynchronous (sent through the outbox, answered on `sync-response`). Each version's
+/// address names it.
+fn sync_or_async_package(version: &str, sync: bool, sink: SocketAddr) -> PathBuf {
+    let root = temp_root("drain-pkg");
+    // Synchronous, the response is the call's answer. Asynchronous, it arrives on a channel of its
+    // own, correlated by the key.
+    let call_extensions = if sync {
+        r#"<bpmn:extensionElements><q:timeout duration="PT30S"/></bpmn:extensionElements>"#
+    } else {
+        r#"<bpmn:extensionElements>
+        <q:source channel="sync-response"/>
+        <q:alias name="callKey" expression="payload.key" unique="true"/>
+        <q:timeout duration="PT120S"/>
+      </bpmn:extensionElements>"#
+    };
+    let process = format!(
+        r#"  <bpmn:process id="caller" name="Caller" isExecutable="true">
+    <bpmn:extensionElements><q:variables>
+      <q:variable name="release" type="object"/>
+      <q:variable name="responseBody" type="object"/>
+    </q:variables></bpmn:extensionElements>
+    <bpmn:startEvent id="Start">
+      <bpmn:extensionElements><q:source channel="sync-begin"/></bpmn:extensionElements>
+      <bpmn:outgoing>c1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="c1" sourceRef="Start" targetRef="Arm"/>
+    <bpmn:serviceTask id="Arm" name="Arm">
+      <bpmn:incoming>c1</bpmn:incoming><bpmn:outgoing>c2</bpmn:outgoing>
+      <bpmn:dataInputAssociation><bpmn:assignment>
+        <bpmn:from>{{key: payload.key}}</bpmn:from><bpmn:to>release</bpmn:to>
+      </bpmn:assignment></bpmn:dataInputAssociation>
+      <bpmn:dataInputAssociation><bpmn:assignment>
+        <bpmn:from>{{key: payload.key}}</bpmn:from><bpmn:to>responseBody</bpmn:to>
+      </bpmn:assignment></bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="c2" sourceRef="Arm" targetRef="Await"/>
+    <bpmn:receiveTask id="Await" name="Await">
+      <bpmn:extensionElements>
+        <q:source channel="sync-release" name="release"/>
+        <q:alias name="syncKey" expression="release.key" unique="true"/>
+      </bpmn:extensionElements>
+      <bpmn:incoming>c2</bpmn:incoming><bpmn:outgoing>c3</bpmn:outgoing>
+    </bpmn:receiveTask>
+    <bpmn:sequenceFlow id="c3" sourceRef="Await" targetRef="Call"/>
+    <bpmn:serviceTask id="Call" name="Call" implementation="channel:to-sync">
+      {call_extensions}
+      <bpmn:incoming>c3</bpmn:incoming><bpmn:outgoing>c4</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="c4" sourceRef="Call" targetRef="CallDone"/>
+{done}
+  </bpmn:process>"#,
+        done = report_and_end("CallDone", "c4", sink, &format!("{version}-call-done")),
+    );
+    write(
+        &root,
+        "bpmn/caller.bpmn",
+        &definitions("syncasync", version, "caller", &process),
+    );
+    let tail = if sync {
+        "    ack-mode: on-complete\n".to_string()
+    } else {
+        format!(
+            "  - name: sync-response\n    transport: http\n    bind: \"POST /sa/response\"\n    codec: json\n{AUTH}"
+        )
+    };
+    write(
+        &root,
+        "channels.yaml",
+        &format!(
+            "channels:\n  - name: sync-begin\n    transport: http\n    bind: \"POST /sa/begin\"\n    codec: json\n{AUTH}  - name: sync-release\n    transport: http\n    bind: \"POST /sa/release\"\n    codec: json\n{AUTH}  - name: to-sync\n    direction: outbound\n    transport: http\n    bind: \"http://{sink}/{version}-sync\"\n    cloudevents-mode: none\n{tail}"
+        ),
+    );
+    write(&root, "package.yaml", &labels("t1", "syncasync", version));
+    root
+}
+
+/// v2 makes `to-sync` asynchronous. v1's parked instance, released after the flip, still calls
+/// as v1 declares: inline, to v1's address, once, and the call's answer completes the flow.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "docker"]
+async fn a_changed_sync_to_async_channel_still_sends_as_v1() {
+    let (_pool, url) = fresh_db().await;
+    let (sink, capture) = capture_server().await;
+    let engine = boot_db_engine(url).await;
+    let addr = engine.local_addr;
+    let v1 = package(&sync_or_async_package("1.0.0", true, sink));
+    let (status, body) = post(addr, "/admin/deployments", &v1).await;
+    assert_eq!(status, 200, "v1: {body}");
+    let (status, body) = post(addr, "/sa/begin", br#"{"key":"K"}"#).await;
+    assert_eq!(status, 200, "park: {body}");
+    let v2 = package(&sync_or_async_package("2.0.0", false, sink));
+    let (status, body) = post(addr, "/admin/deployments", &v2).await;
+    assert_eq!(status, 200, "v2: {body}");
+    let (status, body) = post(addr, "/sa/release", br#"{"key":"K"}"#).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        capture.delivered("/1.0.0-sync"),
+        1,
+        "made inline, inside the release, on v1's address"
+    );
+    // The call's answer completed the flow; v2's asynchronous call would have parked it waiting
+    // for `sync-response`.
+    assert!(wait_until(10, || async { capture.delivered("/1.0.0-call-done") == 1 }).await);
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    assert_eq!(
+        capture.delivered("/1.0.0-sync"),
+        1,
+        "once: not also through the outbox"
+    );
+    assert_eq!(capture.delivered("/2.0.0-sync"), 0);
     engine.shutdown().await;
 }

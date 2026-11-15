@@ -24,6 +24,18 @@
 //! installed_on`. The `checksum` column (sha256 hex of the script bytes, [`script_checksum`])
 //! enables drift detection by `sutra migrate verify`; it was added pre-GA with no installed
 //! data to migrate.
+//!
+//! **Scripts that cannot run in a transaction.** A script whose first line is
+//! [`NO_TRANSACTION_DIRECTIVE`] (`-- sutra:no-transaction`) runs outside one: a statement such as
+//! `CREATE INDEX CONCURRENTLY` is refused inside a transaction block, and it is what lets an index
+//! be built on a large live table without blocking its writes. Such a script runs under a
+//! session-level advisory lock, so two engine replicas booting together apply it once: the runner
+//! takes the lock (polling for it: a session blocked on it would deadlock a concurrent index
+//! build), re-reads the ledger, skips the script if a peer already applied it, otherwise
+//! runs each `;`-terminated statement in autocommit and records the ledger row, then unlocks. A
+//! crash part-way leaves the script unrecorded, so it runs again in full on the next boot, and its
+//! statements must therefore be safe to repeat (`DROP INDEX CONCURRENTLY IF EXISTS` first clears an
+//! index a crashed concurrent build left invalid).
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -32,6 +44,16 @@ use sha2::{Digest, Sha256};
 use sqlx::{Connection, PgConnection};
 
 use crate::{PersistenceError, Result};
+
+/// The first line that marks a script as one to run outside a transaction (see the module docs).
+pub const NO_TRANSACTION_DIRECTIVE: &str = "-- sutra:no-transaction";
+
+/// The advisory-lock key the runner holds while it applies a no-transaction script. A constant
+/// shared by every engine on one database: `'sutra_mig'` as eight ASCII bytes.
+const NO_TRANSACTION_LOCK_KEY: i64 = 0x7375_7472_615f_6d69;
+
+/// How often a runner waiting for that lock tries it again.
+const NO_TRANSACTION_LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// One discovered migration script.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,6 +66,47 @@ pub struct MigrationScript {
     pub path: PathBuf,
     /// File contents (UTF-8 SQL, possibly multi-statement).
     pub sql: String,
+}
+
+impl MigrationScript {
+    /// Whether this script must run outside a transaction: its first line is
+    /// [`NO_TRANSACTION_DIRECTIVE`].
+    pub fn runs_without_transaction(&self) -> bool {
+        self.sql
+            .lines()
+            .next()
+            .is_some_and(|first| first.trim() == NO_TRANSACTION_DIRECTIVE)
+    }
+}
+
+/// The statements of a no-transaction script, in order: its text split at each `;` that ends a
+/// line, with `--` comment lines dropped and empty statements skipped. Such a script holds plain
+/// DDL; a `;` inside a string literal or a function body is not supported there.
+pub fn split_statements(sql: &str) -> Vec<String> {
+    let mut statements = Vec::new();
+    let mut current = String::new();
+    for line in sql.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with("--") {
+            continue;
+        }
+        if !current.is_empty() {
+            current.push('\n');
+        }
+        current.push_str(line);
+        if trimmed.ends_with(';') {
+            let statement = current.trim().trim_end_matches(';').trim().to_owned();
+            if !statement.is_empty() {
+                statements.push(statement);
+            }
+            current.clear();
+        }
+    }
+    let rest = current.trim();
+    if !rest.is_empty() {
+        statements.push(rest.to_owned());
+    }
+    statements
 }
 
 /// Recursively collects `V<number>__<description>.sql` scripts under each root, sorted
@@ -180,6 +243,12 @@ pub async fn apply_migrations(conn: &mut PgConnection, scripts: &[MigrationScrip
         if applied.contains(&script.version) {
             continue;
         }
+        if script.runs_without_transaction() {
+            if apply_without_transaction(conn, script).await? {
+                ran += 1;
+            }
+            continue;
+        }
         let mut tx = conn
             .begin()
             .await
@@ -187,38 +256,102 @@ pub async fn apply_migrations(conn: &mut PgConnection, scripts: &[MigrationScrip
         sqlx::raw_sql(&script.sql)
             .execute(&mut *tx)
             .await
-            .map_err(|e| {
-                let mut msg = String::new();
-                let _ = write!(
-                    msg,
-                    "migration V{} ({}) failed: {e}",
-                    script.version, script.description
-                );
-                PersistenceError::Migration(msg)
-            })?;
-        sqlx::query(
-            "INSERT INTO sutra_schema_history (version, description, script, checksum) \
-             VALUES ($1, $2, $3, $4)",
-        )
-        .bind(script.version)
-        .bind(&script.description)
-        .bind(
-            script
-                .path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or_default(),
-        )
-        .bind(script_checksum(&script.sql))
-        .execute(&mut *tx)
-        .await
-        .map_err(PersistenceError::db("record sutra_schema_history row"))?;
+            .map_err(|e| script_failed(script, &e))?;
+        record_applied(&mut tx, script).await?;
         tx.commit()
             .await
             .map_err(PersistenceError::db("commit migration"))?;
         ran += 1;
     }
     Ok(ran)
+}
+
+fn script_failed(script: &MigrationScript, e: &sqlx::Error) -> PersistenceError {
+    let mut msg = String::new();
+    let _ = write!(
+        msg,
+        "migration V{} ({}) failed: {e}",
+        script.version, script.description
+    );
+    PersistenceError::Migration(msg)
+}
+
+async fn record_applied(conn: &mut PgConnection, script: &MigrationScript) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO sutra_schema_history (version, description, script, checksum) \
+         VALUES ($1, $2, $3, $4)",
+    )
+    .bind(script.version)
+    .bind(&script.description)
+    .bind(
+        script
+            .path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default(),
+    )
+    .bind(script_checksum(&script.sql))
+    .execute(&mut *conn)
+    .await
+    .map_err(PersistenceError::db("record sutra_schema_history row"))?;
+    Ok(())
+}
+
+/// Apply one no-transaction script under the runner's advisory lock. `Ok(false)` when a peer
+/// applied it while this runner waited for the lock.
+async fn apply_without_transaction(
+    conn: &mut PgConnection,
+    script: &MigrationScript,
+) -> Result<bool> {
+    // Polled with the non-blocking form, not waited for with `pg_advisory_lock`: a concurrent index
+    // build waits for every transaction that is running when it starts, and a session blocked in
+    // `pg_advisory_lock` is one, waiting in turn on the builder's lock, which PostgreSQL resolves
+    // by aborting one of the two as a deadlock. Each try is a statement that ends at once.
+    loop {
+        let taken: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
+            .bind(NO_TRANSACTION_LOCK_KEY)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(PersistenceError::db("take the migration lock"))?;
+        if taken {
+            break;
+        }
+        // A sleep in the server, so this crate needs no timer of its own. It waits on no lock.
+        sqlx::query("SELECT pg_sleep($1)")
+            .bind(NO_TRANSACTION_LOCK_POLL.as_secs_f64())
+            .execute(&mut *conn)
+            .await
+            .map_err(PersistenceError::db("wait for the migration lock"))?;
+    }
+    let outcome = apply_locked(conn, script).await;
+    let unlocked = sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(NO_TRANSACTION_LOCK_KEY)
+        .execute(&mut *conn)
+        .await
+        .map_err(PersistenceError::db("release the migration lock"));
+    let ran = outcome?;
+    unlocked?;
+    Ok(ran)
+}
+
+async fn apply_locked(conn: &mut PgConnection, script: &MigrationScript) -> Result<bool> {
+    let already: Option<i64> =
+        sqlx::query_scalar("SELECT version FROM sutra_schema_history WHERE version = $1")
+            .bind(script.version)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(PersistenceError::db("re-read sutra_schema_history"))?;
+    if already.is_some() {
+        return Ok(false);
+    }
+    for statement in split_statements(&script.sql) {
+        sqlx::raw_sql(&statement)
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| script_failed(script, &e))?;
+    }
+    record_applied(conn, script).await?;
+    Ok(true)
 }
 
 /// One applied-migration row from the `sutra_schema_history` ledger.
@@ -308,11 +441,42 @@ mod tests {
         assert_eq!(
             versions,
             vec![
-                101, 201, 202, 203, 301, 304, 401, 402, 403, 404, 501, 601, 602, 603, 604, 605,
-                606, 701, 702, 801, 802, 1001, 1002, 1003, 1101, 1201, 1202, 1301
+                101, 201, 202, 203, 301, 304, 305, 306, 401, 402, 403, 404, 501, 601, 602, 603,
+                604, 605, 606, 701, 702, 801, 802, 1001, 1002, 1003, 1101, 1201, 1202, 1301
             ]
         );
         assert_eq!(scripts[0].description, "alias_index");
+    }
+
+    #[test]
+    fn the_directive_is_read_from_the_first_line_only() {
+        let script = |sql: &str| MigrationScript {
+            version: 1,
+            description: "x".to_owned(),
+            path: PathBuf::from("V1__x.sql"),
+            sql: sql.to_owned(),
+        };
+        assert!(
+            script("-- sutra:no-transaction\nCREATE INDEX CONCURRENTLY i ON t (c);")
+                .runs_without_transaction()
+        );
+        assert!(
+            !script("-- a comment\n-- sutra:no-transaction\nSELECT 1;").runs_without_transaction()
+        );
+        assert!(!script("SELECT 1;").runs_without_transaction());
+    }
+
+    #[test]
+    fn statements_split_at_line_ending_semicolons_without_comments() {
+        let sql = "-- sutra:no-transaction\n-- why\nDROP INDEX CONCURRENTLY IF EXISTS i;\n\n\
+                   CREATE UNIQUE INDEX CONCURRENTLY i\n  ON t (a, b) WHERE a IS NOT NULL;\n";
+        assert_eq!(
+            split_statements(sql),
+            vec![
+                "DROP INDEX CONCURRENTLY IF EXISTS i".to_owned(),
+                "CREATE UNIQUE INDEX CONCURRENTLY i\n  ON t (a, b) WHERE a IS NOT NULL".to_owned(),
+            ]
+        );
     }
 
     #[test]

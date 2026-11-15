@@ -80,7 +80,7 @@ lto = false
 codegen-units = 16
 
 [workspace.package]
-version = "0.6.21"
+version = "0.6.22"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/startr-trade/sutra"
@@ -224,4 +224,13 @@ async-recursion = "1"
 # material); num-bigint-dig's debug-build multiplication would make that keygen take tens
 # of seconds, so it alone is optimized even in dev builds.
 [profile.dev.package.num-bigint-dig]
+opt-level = 3
+
+# Handlebars asks pest for the line and column of every token, and pest counts them from the start
+# of the text each time, so compiling a template is quadratic in its size. Unoptimised, that makes
+# a large template take minutes to compile in a dev build (tests, `sutra lint`); optimised, seconds.
+[profile.dev.package.pest]
+opt-level = 3
+
+[profile.dev.package.handlebars]
 opt-level = 3

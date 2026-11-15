@@ -7,9 +7,9 @@
 use std::fs;
 use std::path::PathBuf;
 
-use bpmn_svg::{parse, render, Options};
+use bpmn_svg::{parse, render, Model, NodeAttrs, Options};
 
-const FIXTURES: [&str; 7] = [
+const FIXTURES: [&str; 9] = [
     "tasks",
     "events",
     "gateways",
@@ -17,6 +17,8 @@ const FIXTURES: [&str; 7] = [
     "boundary-events",
     "several-processes",
     "messages",
+    "flow-markers",
+    "collaboration",
 ];
 
 fn fixtures_dir() -> PathBuf {
@@ -112,6 +114,40 @@ fn rendering_twice_gives_identical_bytes() {
                 "{name}"
             );
         }
+    }
+}
+
+/// Options using every hook: an id prefix, and attributes on every node and flow.
+fn every_hook(model: &Model) -> Options {
+    let mut options = Options::new().id_prefix("r-").css_variables(true);
+    for (id, _) in model.element_ids("") {
+        let attrs = NodeAttrs::new()
+            .href(format!("/x/{id}"))
+            .title(format!("About {id}"))
+            .class("c")
+            .data("id", id.clone())
+            .data("n", "1");
+        options = options
+            .node_attrs(id.clone(), attrs.clone())
+            .flow_attrs(id, attrs);
+    }
+    options
+}
+
+#[test]
+fn rendering_with_every_hook_twice_gives_identical_bytes() {
+    for name in FIXTURES {
+        let model = parse(&fixture(name)).unwrap();
+        let first = render(&model, &every_hook(&model)).unwrap();
+        for _ in 0..20 {
+            let again = parse(&fixture(name)).unwrap();
+            assert!(
+                render(&again, &every_hook(&again)).unwrap() == first,
+                "{name}"
+            );
+        }
+        let hidden = every_hook(&model).show_ids(false);
+        assert!(render(&model, &hidden).unwrap() == render(&model, &hidden).unwrap());
     }
 }
 

@@ -13,6 +13,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use rdkafka::client::ClientContext;
 use rdkafka::consumer::ConsumerContext;
@@ -270,16 +271,22 @@ pub(crate) enum ClientRole {
     Outbound,
 }
 
+/// How often, at most, a failure that keeps repeating is summarised in the log.
+pub(crate) const REPEAT_SUMMARY_INTERVAL: Duration = Duration::from_secs(30);
+
 /// A librdkafka client context. Connection failures surface only as background errors, and a
 /// producer's queued message would otherwise report nothing better than a delivery timeout, so this
 /// records the last TLS or SASL failure and logs it under a stable code. librdkafka repeats the
-/// error on every reconnect; each distinct failure is logged once. Clones share one record, so the
-/// holder of a client can read what the client's own context saw.
+/// error on every reconnect attempt, each time with different text (timings, broker ids), so the
+/// first failure under a code is logged in full and its repeats are counted: at most one summary
+/// line per [`REPEAT_SUMMARY_INTERVAL`], until [`clear`](Self::clear) (a success) resets it. Clones
+/// share one record, so the holder of a client can read what the client's own context saw.
 #[derive(Clone)]
 pub struct BrokerFailureRecorder {
     role: ClientRole,
     label: String,
     last: Arc<Mutex<Option<Diagnostic>>>,
+    repeats: Arc<Mutex<RepeatThrottle>>,
 }
 
 impl BrokerFailureRecorder {
@@ -288,6 +295,7 @@ impl BrokerFailureRecorder {
             role,
             label: label.into(),
             last: Arc::new(Mutex::new(None)),
+            repeats: Arc::new(Mutex::new(RepeatThrottle::default())),
         }
     }
 
@@ -299,11 +307,16 @@ impl BrokerFailureRecorder {
             .clone()
     }
 
+    /// The client reached the broker: forget the failure, so the next one is logged in full.
     pub(crate) fn clear(&self) {
         *self
             .last
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        self.repeats
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .reset();
     }
 
     fn code_for(&self, failure: BrokerFailureKind) -> &'static str {
@@ -315,6 +328,81 @@ impl BrokerFailureRecorder {
             (ClientRole::Outbound, BrokerFailureKind::Auth) => codes::OUTBOUND_BROKER_AUTH_FAILED,
         }
     }
+
+    /// Record one classified failure at `now` and log what the throttle allows.
+    fn record(&self, code: &'static str, reason: &str, now: Instant) {
+        let diagnostic = Diagnostic::error(code, format!("kafka {}: {reason}", self.label));
+        let decision = self
+            .repeats
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .on_failure(code, now);
+        match decision {
+            RepeatDecision::Full => warn!(client = %self.label, code, "{}", diagnostic.message),
+            RepeatDecision::Summary { repeats, over } => warn!(
+                client = %self.label,
+                code,
+                repeats,
+                "kafka {}: the same failure repeated {repeats} more times in the last {}s; \
+                 latest: {reason}",
+                self.label,
+                over.as_secs()
+            ),
+            RepeatDecision::Quiet => {}
+        }
+        *self
+            .last
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(diagnostic);
+    }
+}
+
+/// What [`RepeatThrottle::on_failure`] lets the log show for one failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RepeatDecision {
+    /// The first failure under its code since the last reset: log it in full.
+    Full,
+    /// A repeat, and the interval has passed: log one line with the count since the last line.
+    Summary { repeats: u64, over: Duration },
+    /// A repeat inside the interval: count it, log nothing.
+    Quiet,
+}
+
+/// The repeat counter behind [`BrokerFailureRecorder`], with the clock passed in.
+#[derive(Debug, Default)]
+pub(crate) struct RepeatThrottle {
+    /// The code last logged in full, and when the last line (full or summary) was written.
+    logged: Option<(&'static str, Instant)>,
+    /// Repeats counted since that line.
+    repeats: u64,
+}
+
+impl RepeatThrottle {
+    pub(crate) fn on_failure(&mut self, code: &'static str, now: Instant) -> RepeatDecision {
+        match self.logged {
+            Some((logged_code, since)) if logged_code == code => {
+                self.repeats += 1;
+                let over = now.saturating_duration_since(since);
+                if over >= REPEAT_SUMMARY_INTERVAL {
+                    let repeats = std::mem::take(&mut self.repeats);
+                    self.logged = Some((code, now));
+                    RepeatDecision::Summary { repeats, over }
+                } else {
+                    RepeatDecision::Quiet
+                }
+            }
+            // A first failure, or a different kind of failure: an operator must see it now.
+            _ => {
+                self.logged = Some((code, now));
+                self.repeats = 0;
+                RepeatDecision::Full
+            }
+        }
+    }
+
+    pub(crate) fn reset(&mut self) {
+        *self = RepeatThrottle::default();
+    }
 }
 
 impl ClientContext for BrokerFailureRecorder {
@@ -323,19 +411,7 @@ impl ClientContext for BrokerFailureRecorder {
             warn!(client = %self.label, "librdkafka: {error}: {reason}");
             return;
         };
-        let code = self.code_for(failure);
-        let diagnostic = Diagnostic::error(code, format!("kafka {}: {reason}", self.label));
-        let mut last = self
-            .last
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let repeated = last
-            .as_ref()
-            .is_some_and(|d| d.message == diagnostic.message);
-        if !repeated {
-            warn!(client = %self.label, code, "{}", diagnostic.message);
-        }
-        *last = Some(diagnostic);
+        self.record(self.code_for(failure), reason, Instant::now());
     }
 }
 
@@ -565,6 +641,63 @@ mod tests {
         );
         recorder.clear();
         assert!(recorder.last_failure().is_none());
+    }
+
+    #[test]
+    fn a_repeated_failure_is_logged_once_then_summarised_every_interval() {
+        let mut throttle = RepeatThrottle::default();
+        let t0 = Instant::now();
+        let at = |secs: u64| t0 + Duration::from_secs(secs);
+        let tls = super::super::codes::INBOUND_BROKER_TLS_FAILED;
+        assert_eq!(throttle.on_failure(tls, t0), RepeatDecision::Full);
+        // 740 repeats inside the first interval: nothing more is logged.
+        for _ in 0..740 {
+            assert_eq!(throttle.on_failure(tls, at(20)), RepeatDecision::Quiet);
+        }
+        assert_eq!(
+            throttle.on_failure(tls, at(30)),
+            RepeatDecision::Summary {
+                repeats: 741,
+                over: Duration::from_secs(30)
+            }
+        );
+        assert_eq!(throttle.on_failure(tls, at(45)), RepeatDecision::Quiet);
+        assert_eq!(
+            throttle.on_failure(tls, at(60)),
+            RepeatDecision::Summary {
+                repeats: 2,
+                over: Duration::from_secs(30)
+            }
+        );
+    }
+
+    #[test]
+    fn a_different_failure_is_logged_in_full_at_once() {
+        let mut throttle = RepeatThrottle::default();
+        let t0 = Instant::now();
+        let tls = super::super::codes::INBOUND_BROKER_TLS_FAILED;
+        let auth = super::super::codes::INBOUND_BROKER_AUTH_FAILED;
+        assert_eq!(throttle.on_failure(tls, t0), RepeatDecision::Full);
+        assert_eq!(throttle.on_failure(auth, t0), RepeatDecision::Full);
+        assert_eq!(throttle.on_failure(auth, t0), RepeatDecision::Quiet);
+    }
+
+    #[test]
+    fn a_success_resets_so_the_next_failure_is_logged_in_full() {
+        let recorder = BrokerFailureRecorder::new(ClientRole::Inbound, "channel 'in'");
+        let tls = super::super::codes::INBOUND_BROKER_TLS_FAILED;
+        let now = Instant::now();
+        recorder.record(tls, "SSL handshake failed", now);
+        assert_eq!(
+            recorder.repeats.lock().unwrap().on_failure(tls, now),
+            RepeatDecision::Quiet
+        );
+        recorder.clear();
+        assert!(recorder.last_failure().is_none());
+        assert_eq!(
+            recorder.repeats.lock().unwrap().on_failure(tls, now),
+            RepeatDecision::Full
+        );
     }
 
     #[test]

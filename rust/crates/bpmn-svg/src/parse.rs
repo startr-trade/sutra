@@ -11,8 +11,8 @@ use quick_xml::name::ResolveResult;
 use quick_xml::reader::NsReader;
 
 use crate::model::{
-    EventGlyph, FlowNode, GatewayType, LoopMarker, Model, NodeKind, Process, SequenceFlow,
-    SubProcessKind, TaskType,
+    EventGlyph, FlowNode, GatewayType, LoopMarker, MessageFlow, Model, NodeKind, Participant,
+    Process, SequenceFlow, SubProcessKind, TaskType,
 };
 
 const BPMN_NS: &str = "http://www.omg.org/spec/BPMN/20100524/MODEL";
@@ -29,8 +29,8 @@ pub enum Error {
     Malformed(String),
     /// The document is well-formed, but its root is not a BPMN `<definitions>`.
     NotBpmn(String),
-    /// A BPMN element cannot be drawn: an id is missing or repeated, or a boundary event has no
-    /// host.
+    /// A BPMN element cannot be drawn: an id is missing or repeated, a boundary event has no
+    /// host, or a participant has no id.
     Invalid(String),
 }
 
@@ -64,17 +64,60 @@ pub fn parse(bpmn_xml: &str) -> Result<Model, Error> {
         .filter(|c| c.is_bpmn("process"))
         .map(read_scope)
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(Model { processes })
+    let mut participants = Vec::new();
+    let mut message_flows = Vec::new();
+    for collaboration in root.children.iter().filter(|c| c.is_bpmn("collaboration")) {
+        for element in collaboration.children.iter().filter(|c| c.bpmn) {
+            match element.local.as_str() {
+                "participant" => participants.push(participant(element)?),
+                "messageFlow" => {
+                    let mut flow = MessageFlow::new(
+                        element.attr("id"),
+                        local_part(element.attr("sourceRef")),
+                        local_part(element.attr("targetRef")),
+                    );
+                    flow.label = non_blank(element.attr("name"));
+                    message_flows.push(flow);
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(Model {
+        processes,
+        participants,
+        message_flows,
+    })
+}
+
+/// A collaboration's participant. It needs an id, because message flows attach to it by id.
+fn participant(element: &Element) -> Result<Participant, Error> {
+    let id = element.attr("id");
+    if id.is_empty() {
+        return Err(Error::Invalid("a <participant> has no id".to_string()));
+    }
+    let mut p = Participant::new(id);
+    p.name = non_blank(element.attr("name"));
+    let process_ref = local_part(element.attr("processRef"));
+    p.process_ref = (!process_ref.trim().is_empty()).then(|| process_ref.to_string());
+    Ok(p)
+}
+
+/// A QName reference's local part: the id it names.
+fn local_part(qname: &str) -> &str {
+    qname.rsplit(':').next().unwrap_or(qname)
 }
 
 // ---- the document ----------------------------------------------------------------------------
 
-/// An element reduced to what classification reads: text content is never used.
+/// An element reduced to what classification reads.
 struct Element {
     bpmn: bool,
     local: String,
     /// Unprefixed attributes.
     attrs: HashMap<String, String>,
+    /// The element's own text content, entities resolved. Only a condition's text is used.
+    text: String,
     children: Vec<Element>,
 }
 
@@ -89,6 +132,10 @@ impl Element {
 
     fn has_child(&self, local: &str) -> bool {
         self.children.iter().any(|c| c.is_bpmn(local))
+    }
+
+    fn child(&self, local: &str) -> Option<&Element> {
+        self.children.iter().find(|c| c.is_bpmn(local))
     }
 }
 
@@ -120,7 +167,24 @@ fn read_document(xml: &str) -> Result<Element, Error> {
                     None => root = Some(element),
                 }
             }
-            (_, Event::GeneralRef(reference)) => check_reference(&reference)?,
+            (_, Event::GeneralRef(reference)) => {
+                let resolved = resolve_reference(&reference)?;
+                if let Some(parent) = stack.last_mut() {
+                    parent.text.push_str(&resolved);
+                }
+            }
+            (_, Event::Text(text)) => {
+                if let Some(parent) = stack.last_mut() {
+                    parent
+                        .text
+                        .push_str(&text.xml10_content().map_err(malformed)?);
+                }
+            }
+            (_, Event::CData(data)) => {
+                if let Some(parent) = stack.last_mut() {
+                    parent.text.push_str(&data.decode().map_err(malformed)?);
+                }
+            }
             (_, Event::DocType(_)) => return Err(malformed("a DOCTYPE is not allowed")),
             (_, Event::Eof) => break,
             _ => {}
@@ -151,22 +215,26 @@ fn read_element(bpmn: bool, start: &BytesStart<'_>) -> Result<Element, Error> {
         bpmn,
         local: String::from_utf8_lossy(start.local_name().as_ref()).into_owned(),
         attrs,
+        text: String::new(),
         children: Vec::new(),
     })
 }
 
-/// A reference in text content is unused, but one that names an undeclared entity is not
-/// well-formed.
-fn check_reference(reference: &BytesRef<'_>) -> Result<(), Error> {
-    if reference.resolve_char_ref().map_err(malformed)?.is_some() {
-        return Ok(());
+/// A reference in text content: a character reference or a predefined entity. One that names an
+/// undeclared entity is not well-formed.
+fn resolve_reference(reference: &BytesRef<'_>) -> Result<String, Error> {
+    if let Some(c) = reference.resolve_char_ref().map_err(malformed)? {
+        return Ok(c.to_string());
     }
     let name = reference.decode().map_err(malformed)?;
     match quick_xml::escape::resolve_predefined_entity(&name) {
-        Some(_) => Ok(()),
+        Some(text) => Ok(text.to_string()),
         None => Err(malformed(format!("unknown entity reference '&{name};'"))),
     }
 }
+
+/// The longest condition text drawn as a flow's caption; a longer one is left off.
+const MAX_CONDITION_CAPTION: usize = 40;
 
 // ---- classification --------------------------------------------------------------------------
 
@@ -179,11 +247,7 @@ fn read_scope(scope: &Element) -> Result<Process, Error> {
     let mut seen = HashSet::new();
     for element in scope.children.iter().filter(|c| c.bpmn) {
         if element.local == "sequenceFlow" {
-            flows.push(SequenceFlow {
-                id: element.attr("id").to_string(),
-                source_ref: element.attr("sourceRef").to_string(),
-                target_ref: element.attr("targetRef").to_string(),
-            });
+            flows.push(sequence_flow(element));
             continue;
         }
         let Some(kind) = classify(element)? else {
@@ -203,11 +267,40 @@ fn read_scope(scope: &Element) -> Result<Process, Error> {
             markers: markers(element),
         });
     }
+    // A flow is its source's default when the source element names it in `default`.
+    let defaults: HashMap<&str, &str> = scope
+        .children
+        .iter()
+        .filter(|c| c.bpmn && c.local != "sequenceFlow")
+        .filter_map(|c| c.attrs.get("default").map(|d| (c.attr("id"), d.as_str())))
+        .collect();
+    for f in &mut flows {
+        f.is_default =
+            !f.id.is_empty() && defaults.get(f.source_ref.as_str()) == Some(&f.id.as_str());
+    }
     Ok(Process {
         id: scope.attr("id").to_string(),
         nodes,
         flows,
     })
+}
+
+/// A sequence flow: its caption is the non-blank `name`, else a short condition's text.
+fn sequence_flow(element: &Element) -> SequenceFlow {
+    let mut flow = SequenceFlow::new(
+        element.attr("id"),
+        element.attr("sourceRef"),
+        element.attr("targetRef"),
+    );
+    let condition = element.child("conditionExpression");
+    flow.conditional = condition.is_some();
+    flow.label = non_blank(element.attr("name")).or_else(|| {
+        condition
+            .map(|c| c.text.trim())
+            .filter(|t| !t.is_empty() && t.chars().count() <= MAX_CONDITION_CAPTION)
+            .map(str::to_string)
+    });
+    flow
 }
 
 fn non_blank(text: &str) -> Option<String> {
@@ -217,17 +310,12 @@ fn non_blank(text: &str) -> Option<String> {
 /// The visual type of one element, or `None` when it is not a flow node this model draws.
 fn classify(e: &Element) -> Result<Option<NodeKind>, Error> {
     Ok(Some(match e.local.as_str() {
-        "startEvent" => NodeKind::StartEvent(if e.has_child("timerEventDefinition") {
-            EventGlyph::Timer
-        } else {
-            // A start event with no timer draws the message glyph, including a none start.
-            EventGlyph::Message
-        }),
+        "startEvent" => NodeKind::StartEvent(start_glyph(e)),
         "endEvent" => NodeKind::EndEvent(end_glyph(e)),
         "intermediateThrowEvent" | "implicitThrowEvent" => {
-            NodeKind::IntermediateThrowEvent(throw_glyph(e))
+            NodeKind::IntermediateThrowEvent(Some(throw_glyph(e)))
         }
-        "intermediateCatchEvent" => NodeKind::IntermediateCatchEvent(catch_glyph(e)),
+        "intermediateCatchEvent" => NodeKind::IntermediateCatchEvent(Some(catch_glyph(e))),
         "boundaryEvent" => {
             let attached = e.attr("attachedToRef");
             if attached.trim().is_empty() {
@@ -238,7 +326,7 @@ fn classify(e: &Element) -> Result<Option<NodeKind>, Error> {
             }
             NodeKind::BoundaryEvent {
                 // A QName: the id is its local part.
-                attached_to_ref: attached.rsplit(':').next().unwrap_or(attached).to_string(),
+                attached_to_ref: local_part(attached).to_string(),
                 glyph: boundary_glyph(e),
             }
         }
@@ -247,7 +335,8 @@ fn classify(e: &Element) -> Result<Option<NodeKind>, Error> {
         "sendTask" => NodeKind::Task(TaskType::Send),
         "userTask" => NodeKind::Task(TaskType::User),
         "businessRuleTask" => NodeKind::Task(TaskType::BusinessRule),
-        "manualTask" | "task" => NodeKind::Task(TaskType::Manual),
+        "manualTask" => NodeKind::Task(TaskType::Manual),
+        "task" => NodeKind::Task(TaskType::Plain),
         "receiveTask" => NodeKind::Task(TaskType::Receive),
         "callActivity" => NodeKind::CallActivity,
         "subProcess" | "transaction" | "adHocSubProcess" => NodeKind::SubProcess {
@@ -269,6 +358,33 @@ fn sub_process_kind(e: &Element) -> SubProcessKind {
         _ if e.attr("triggeredByEvent") == "true" => SubProcessKind::Event,
         "transaction" => SubProcessKind::Transaction,
         _ => SubProcessKind::Embedded,
+    }
+}
+
+/// A start event's trigger: none for a none start, the definition's glyph for one, multiple (or
+/// parallel multiple, with `parallelMultiple="true"`) for several.
+fn start_glyph(e: &Element) -> Option<EventGlyph> {
+    let mut definitions = e
+        .children
+        .iter()
+        .filter(|c| c.bpmn && c.local.ends_with("EventDefinition"));
+    let first = definitions.next()?;
+    if definitions.next().is_some() {
+        return Some(if e.attr("parallelMultiple") == "true" {
+            EventGlyph::ParallelMultiple
+        } else {
+            EventGlyph::Multiple
+        });
+    }
+    match first.local.as_str() {
+        "messageEventDefinition" => Some(EventGlyph::Message),
+        "timerEventDefinition" => Some(EventGlyph::Timer),
+        "conditionalEventDefinition" => Some(EventGlyph::Conditional),
+        "signalEventDefinition" => Some(EventGlyph::Signal),
+        "errorEventDefinition" => Some(EventGlyph::Error),
+        "escalationEventDefinition" => Some(EventGlyph::Escalation),
+        "compensateEventDefinition" => Some(EventGlyph::Compensate),
+        _ => None,
     }
 }
 

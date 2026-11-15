@@ -1065,6 +1065,44 @@ fn warn_degraded_sync_calls(
     }
 }
 
+/// Compile every Handlebars template the deployment ships into the process-wide cache, so the
+/// first message that renders one pays nothing: compiling costs time in proportion to the square
+/// of a template's size (seconds for a few hundred KB). A template already compiled from the same
+/// source, by an earlier plan of this deployment, is not compiled again. One that does not compile
+/// is left uncached: it fails at render exactly as it would have, and `sutra lint` refuses it
+/// before that.
+fn precompile_templates(
+    dep: &DeploymentId,
+    d: &sutra_loader::LoadedDeployment,
+    templates: &[(String, Vec<u8>)],
+) {
+    let started = std::time::Instant::now();
+    let (mut compiled, mut cached, mut failed) = (0usize, 0usize, 0usize);
+    for ((id, _), (key, bytes)) in d.templates.iter().zip(templates) {
+        if !HbsTemplateEngine::renders(id) {
+            continue;
+        }
+        match HbsTemplateEngine::precompile(key, bytes) {
+            Ok(true) => compiled += 1,
+            Ok(false) => cached += 1,
+            Err(e) => {
+                failed += 1;
+                tracing::debug!(deployment = %dep.value(), template = %id, "template precompile skipped: {e}");
+            }
+        }
+    }
+    if compiled + cached + failed > 0 {
+        info!(
+            deployment = %dep.value(),
+            compiled,
+            cached,
+            failed,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "deployment templates precompiled"
+        );
+    }
+}
+
 pub(crate) fn plan_deployment(
     d: &LoadedDeployment,
 ) -> Result<DeploymentPlan, Box<dyn std::error::Error>> {
@@ -1096,7 +1134,7 @@ pub(crate) fn plan_deployment(
     }
     let resolved_start_timers = resolve_start_timer_expressions(&dep, &modules, &config)?;
 
-    let templates = d
+    let templates: Vec<(String, Vec<u8>)> = d
         .templates
         .iter()
         .map(|(id, a)| {
@@ -1106,6 +1144,7 @@ pub(crate) fn plan_deployment(
             )
         })
         .collect();
+    precompile_templates(&dep, d, &templates);
     let scripts = d
         .scripts
         .iter()
@@ -1801,6 +1840,8 @@ pub(crate) struct SharedRegistries {
     codecs: Arc<CodecRegistry>,
     formats: Arc<sutra_channels::FormatRegistry>,
     outbound_channels: Arc<OutboundChannelRegistry>,
+    /// Each served deployment's owner's live versions and their inbound bindings.
+    owner_scopes: Arc<sutra_channels::OwnerScopes>,
 }
 
 /// Build the activation's shared read-only registries — the once-per-activation half of what
@@ -1929,7 +1970,34 @@ pub(crate) fn build_shared_registries(
         codecs: Arc::new(codecs),
         formats: Arc::new(sutra_channels::FormatRegistry::with_builtins()),
         outbound_channels: Arc::new(outbound_channels),
+        owner_scopes: Arc::new(owner_scopes_of(active, draining)),
     })
+}
+
+/// The owner scopes of an activation: every plan's owner and inbound bindings, active plans first,
+/// then the draining tail in its order (most recently drained first). A draining plan's bindings are
+/// all there, including those the channel registry leaves out because a newer version serves the
+/// same channel name: a hit on it is processed with its own.
+fn owner_scopes_of(
+    active: &[DeploymentPlan],
+    draining: &[DeploymentPlan],
+) -> sutra_channels::OwnerScopes {
+    sutra_channels::OwnerScopes::build(
+        active
+            .iter()
+            .chain(draining.iter())
+            .map(|plan| {
+                (
+                    plan.facts.owner.clone(),
+                    plan.dep.clone(),
+                    plan.definitions
+                        .iter()
+                        .map(|def| def.binding.clone())
+                        .collect(),
+                )
+            })
+            .collect(),
+    )
 }
 
 /// Install the engine's transport audit journal over `sinks`, routing deployment-level events of
@@ -2012,14 +2080,6 @@ pub(crate) fn build_engine(
     // The runtime's enqueue → dispatcher link, handed to this lane's persistence bridge.
     outbox_signal: sutra_channels::OutboxSignal,
 ) -> ChannelEngine {
-    let prior_deployments: Vec<(DeploymentId, sutra_channels::Namespace)> = draining
-        .iter()
-        .map(|plan| (plan.dep.clone(), plan.namespace.clone()))
-        .collect();
-    let active_owners: HashMap<DeploymentId, sutra_channels::Namespace> = active
-        .iter()
-        .map(|plan| (plan.dep.clone(), plan.namespace.clone()))
-        .collect();
     // The read-only registries (processes, codecs, validators, templates, scripts, decisions,
     // outbound channels) are NOT built here any more: `build_shared_registries` built them once
     // for this activation and `shared` is a pointer to that one set — see [`SharedRegistries`].
@@ -2423,8 +2483,8 @@ pub(crate) fn build_engine(
     // dispatcher maintains the rows at its park/terminal commit points and reads
     // COUNT(*) at admission — replica-coherent and crash-safe.
     .with_concurrency_store(concurrency_store)
-    // DRAINING scopes for relay correlation — pinned instances resume.
-    .with_prior_deployments(prior_deployments, active_owners)
+    // Each owner's live versions, for correlation: pinned instances resume, on their own bindings.
+    .with_owner_scopes(Arc::clone(&shared.owner_scopes))
     // Synchronous outbound calls: every transport's inline caller, and the same secret
     // resolution the outbox uses for the async path.
     .with_inline_callers(inline_callers())

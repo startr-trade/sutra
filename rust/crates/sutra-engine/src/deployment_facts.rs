@@ -37,6 +37,22 @@ pub enum ConnectionView {
     Declared,
 }
 
+/// The key the inbox dedupes under for every deployment of one owner: `own-` and the first 24
+/// hex digits of the sha256 of `owner` (a [`deployment_owner`] string). Fixed-width, so it fits
+/// the store's column whatever the labels are; an unlabeled package's owner names its own id, so
+/// its key is its own too.
+pub fn deployment_owner_id(owner: &str) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+    let digest = Sha256::digest(owner.as_bytes());
+    let mut out = String::with_capacity(28);
+    out.push_str("own-");
+    for byte in &digest[..12] {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
 /// What one deployment claims from the namespaces every deployment of this engine shares: its
 /// inbound endpoints and its data-store connections. Cheap to derive from a verified archive,
 /// without planning it.
@@ -262,8 +278,9 @@ impl NewStartOnWait {
         DeployWarning {
             code: sutra_channels::codes::DEPLOY_ENDPOINT_START_ON_WAIT.to_string(),
             message: format!(
-                "channel '{}' gets start event '{}', where {} waits on it: start events are tried \
-                 first, so a reply for a parked instance starts a new one; {}",
+                "channel '{}' gets start event '{}', where {} waits on it: a reply that correlates \
+                 to a parked instance still resumes it, and one that does not starts an instance of \
+                 the new version; {}",
                 self.channel,
                 self.start_node,
                 self.older_label,
@@ -1170,6 +1187,28 @@ pub fn evaluate_candidate_with_holds(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_owner_id_is_fixed_width_and_shared_by_an_owners_versions() {
+        let v1 = super::deployment_owner_id(&deployment_owner("acme", "orders", "dep-1"));
+        let v2 = super::deployment_owner_id(&deployment_owner("acme", "orders", "dep-2"));
+        let other = super::deployment_owner_id(&deployment_owner("acme", "billing", "dep-3"));
+        assert_eq!(v1, v2);
+        assert_ne!(v1, other);
+        assert_eq!(v1.len(), 28);
+        assert!(v1.starts_with("own-"));
+        let a = super::deployment_owner_id(&deployment_owner(
+            sutra_channels::UNLABELED_PACKAGE_LABEL,
+            "m",
+            "dep-a",
+        ));
+        let b = super::deployment_owner_id(&deployment_owner(
+            sutra_channels::UNLABELED_PACKAGE_LABEL,
+            "m",
+            "dep-b",
+        ));
+        assert_ne!(a, b, "an unlabeled package dedupes alone");
+    }
+
     use super::*;
     use sutra_channels::EndpointClaim;
 

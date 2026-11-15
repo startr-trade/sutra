@@ -1832,6 +1832,37 @@ pub(crate) struct ActivationHooks {
 /// rewire every transport's channels. **Source-agnostic** — the dir watcher passes
 /// `directory.active_plans()` etc.; the sync deploy API (db source) passes the store's active
 /// plans. In-flight dispatches finish on the old snapshot; unchanged channels keep serving.
+/// `(deployment id, owner id)` for each plan: what the inbox reads to dedupe per owner.
+pub(crate) fn deployment_owner_rows<'a>(
+    plans: impl IntoIterator<Item = &'a DeploymentPlan>,
+) -> Vec<(String, String)> {
+    plans
+        .into_iter()
+        .map(|plan| {
+            (
+                plan.dep.value().to_string(),
+                crate::deployment_facts::deployment_owner_id(&plan.facts.owner),
+            )
+        })
+        .collect()
+}
+
+/// Record each plan's owner before any of them serves, so its first dedup check already sees the
+/// rows its owner's other versions wrote. No database, no record: the in-memory inbox is per
+/// deployment.
+pub(crate) async fn record_deployment_owners<'a>(
+    pool: Option<&PgPool>,
+    plans: impl IntoIterator<Item = &'a DeploymentPlan>,
+) -> Result<(), String> {
+    let Some(pool) = pool else {
+        return Ok(());
+    };
+    sutra_persistence::stores::PgDeploymentOwnerStore::new(pool.clone())
+        .upsert_many(&deployment_owner_rows(plans))
+        .await
+        .map_err(|e| format!("could not record the deployments' owners: {e}"))
+}
+
 pub(crate) async fn activate_plans(
     active: Vec<DeploymentPlan>,
     draining: Vec<DeploymentPlan>,
@@ -1876,6 +1907,8 @@ pub(crate) async fn activate_plans(
         return Err(describe_endpoint_refusal(&collisions));
     }
     prepare_transports(&hooks.transports, &active_definitions)?;
+    // Before anything serves: a failure here leaves the old state serving.
+    record_deployment_owners(hooks.pool.as_ref(), active.iter().chain(draining.iter())).await?;
 
     // The timer-start schedules the ACTIVE set declares, computed BEFORE `active` is moved into
     // the actor rebuild. The arming instant is read once so every relative `<timeDuration>` start
@@ -2446,6 +2479,13 @@ impl DeployController {
             )
             .await
             .map_err(|e| e.to_string())?;
+        // With the row: a peer replica that activates it from the store finds its owner recorded.
+        sutra_persistence::stores::PgDeploymentOwnerStore::upsert_many_in(
+            &mut tx,
+            &deployment_owner_rows([&plan]),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
         tx.commit().await.map_err(|e| e.to_string())?;
         Ok((deployment_id, slot, revision, warnings))
     }

@@ -283,8 +283,8 @@ pub mod codes {
     pub const CONFIG_CALL_ACTIVITY_UNKNOWN_CALLED_ELEMENT: &str =
         "SUTRA.CONFIG.CALL_ACTIVITY.UNKNOWN_CALLED_ELEMENT";
     /// One package has a start event and a wait on the same channel with message types that can
-    /// overlap. A message meant for the wait also matches the start, and start events are tried
-    /// first, so it starts a new instance and the parked one keeps waiting.
+    /// overlap. A message that correlates to a parked instance answers its wait and starts nothing;
+    /// one that does not starts a new instance.
     pub const CONFIG_CHANNEL_START_AND_WAIT: &str = "SUTRA.CONFIG.CHANNEL.START_AND_WAIT";
 
     // ---- the reserved SUTRA.DEPLOY.* family — the sealed-archive load checks ----

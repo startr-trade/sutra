@@ -1,7 +1,7 @@
 [package]
 name = "bpmn-svg"
 description = "Draws BPMN 2.0 process diagrams as self-contained SVG, with a layered auto-layout for files that carry no BPMN-DI"
-version = "0.1.0"
+version = "0.2.0"
 edition.workspace = true
 license = "MIT OR Apache-2.0"
 repository.workspace = true

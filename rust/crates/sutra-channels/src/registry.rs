@@ -471,6 +471,44 @@ pub struct ProcessModuleRegistry {
     /// [`Self::selector_faults`]), so dispatch can treat a missing entry as fail-closed rather
     /// than as a reason to parse anything.
     selectors: HashMap<String, HashMap<SelectorKey, CompiledSource>>,
+    /// deployment → channel → the message types its waits accept: what the dispatcher asks before
+    /// it spends anything on correlation. Built in [`Self::register`] from [`wait_subscriptions`].
+    waits: HashMap<String, HashMap<String, WaitTypes>>,
+}
+
+/// The message types the waits on one channel of one deployment accept, in the three tiers a relay
+/// resolves by: any (a wait declaring no type), an exact `messageTypeValue`, or a
+/// `messageTypePattern` (compiled anchored, as the relay anchors it).
+#[derive(Clone, Default)]
+struct WaitTypes {
+    untyped: bool,
+    exact: std::collections::HashSet<String>,
+    patterns: Vec<regex::Regex>,
+}
+
+impl WaitTypes {
+    fn add(&mut self, wait: &WaitSubscription) {
+        match (&wait.message_type, &wait.message_type_pattern) {
+            (Some(exact), _) => {
+                self.exact.insert(exact.clone());
+            }
+            (None, Some(pattern)) => {
+                // A malformed pattern is a selector fault, so its deployment never activates; were
+                // one reached anyway, it matches nothing, as the relay's own match does.
+                if let Ok(re) = regex::Regex::new(&format!("^(?:{pattern})$")) {
+                    self.patterns.push(re);
+                }
+            }
+            (None, None) => self.untyped = true,
+        }
+    }
+
+    fn may_match(&self, message_type: Option<&str>) -> bool {
+        self.untyped
+            || message_type.is_some_and(|mt| {
+                self.exact.contains(mt) || self.patterns.iter().any(|re| re.is_match(mt))
+            })
+    }
 }
 
 /// One start event's compiled selector: its predicate AST, and the fault that stopped the
@@ -602,8 +640,38 @@ impl ProcessModuleRegistry {
                     );
                 }
             }
+            let waits = self
+                .waits
+                .entry(deployment.value().to_string())
+                .or_default();
+            for wait in wait_subscriptions(p) {
+                waits.entry(wait.channel.clone()).or_default().add(&wait);
+            }
             entry.push(Arc::new(p.clone()));
         }
+    }
+
+    /// Whether any wait of `deployment` subscribes to `channel`. Two hash lookups, no allocation:
+    /// the dispatcher's fast path for a message nothing can be waiting for.
+    pub fn waits_on_channel(&self, deployment: &DeploymentId, channel: &str) -> bool {
+        self.waits
+            .get(deployment.value())
+            .is_some_and(|channels| channels.contains_key(channel))
+    }
+
+    /// Whether a wait of `deployment` on `channel` can accept a message of `message_type`: the same
+    /// answer as asking [`Self::resolve_relay_targets`] whether any target's type tier matches,
+    /// before predicates. No allocation.
+    pub fn wait_may_match(
+        &self,
+        deployment: &DeploymentId,
+        channel: &str,
+        message_type: Option<&str>,
+    ) -> bool {
+        self.waits
+            .get(deployment.value())
+            .and_then(|channels| channels.get(channel))
+            .is_some_and(|types| types.may_match(message_type))
     }
 
     /// Every selector that failed to compile. Activation refuses a deployment with any, so a

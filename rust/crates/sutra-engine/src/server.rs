@@ -495,6 +495,12 @@ pub async fn serve(config: EngineConfig) -> Result<RunningEngine, Box<dyn std::e
     // engine actor spawns (hoisted out of the per-shard build; see `seed_declared_coverage`).
     // Its return value is the activation-initial covered-set snapshot the per-lane builds
     // apply — the read is hoisted here with the seed (Phase 3: no `block_on` in the build).
+    // Each served deployment's owner, before any lane can check an inbox key.
+    crate::deploy::record_deployment_owners(
+        pool.as_ref(),
+        boot_plans.iter().chain(boot_draining_plans.iter()),
+    )
+    .await?;
     let initial_coverage =
         crate::assembly::seed_declared_coverage(&boot_plans, &boot_draining_plans).await;
 

@@ -9,7 +9,7 @@
 //! wait-state process fails fast with `SUTRA.INBOUND.PERSISTENCE_REQUIRED` (the
 //! posture when no `InstanceStore` is wired).
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -335,12 +335,12 @@ pub struct ChannelEngine {
     /// `(module_key, channel)` of every inbound channel named by another channel's
     /// `session-end: on-message` → the session channels it ends.
     session_end_targets: BTreeMap<(String, String), Vec<String>>,
-    /// DRAINING deployments (the deployment lifecycle), most recently drained first: relay
-    /// correlation falls back to these scopes, for the same owner only, so an instance pinned to
-    /// a flipped-away deployment keeps resuming until it retires. New intake never starts here.
-    prior_deployments: Vec<(DeploymentId, Namespace)>,
-    /// The owner of each ACTIVE deployment, to compare a draining one's with.
-    active_owners: HashMap<DeploymentId, Namespace>,
+    /// Each served deployment's owner's live versions, itself first, with each version's own
+    /// inbound bindings: correlation searches these scopes, for the same owner only, so an
+    /// instance pinned to a flipped-away deployment keeps resuming until it retires, and a hit is
+    /// processed with the binding of the version it is parked on. Empty for a bare builder: every
+    /// deployment is then alone.
+    owner_scopes: Arc<crate::owner_scopes::OwnerScopes>,
     /// The engine-wide deferred-ack registry (`ack-mode: on-complete` broker
     /// transports). Shared (`Arc`) with the executor's listener bus, the sweep task and
     /// across activation flips; `None` = no deferral capability (tests / bare builders):
@@ -426,8 +426,7 @@ impl ChannelEngine {
                 pool_admission: std::cell::RefCell::new(None),
                 session_releases: std::cell::RefCell::new(Vec::new()),
                 session_end_targets: BTreeMap::new(),
-                prior_deployments: Vec::new(),
-                active_owners: HashMap::new(),
+                owner_scopes: Arc::new(crate::owner_scopes::OwnerScopes::default()),
                 deferred_acks: None,
                 pending_settle: std::cell::RefCell::new(None),
                 intake_counter: std::cell::RefCell::new(0),
@@ -758,9 +757,45 @@ impl ChannelEngine {
         }
 
         // ---- decode ONCE, up front (channel-scoped codec) --------------------------------
-        let decoded =
-            self.chain
-                .decode(&binding, &message.body, message.content_type.as_deref())?;
+        // Kept as a `Result`: a message this binding cannot decode may still be the answer a
+        // parked older version waits for, under that version's codec (`correlate_first`).
+        let holder = self
+            .chain
+            .decode(&binding, &message.body, message.content_type.as_deref());
+
+        // ---- waits first ------------------------------------------------------------------
+        // A message that correlates to a parked instance of this owner answers it and starts
+        // nothing. On a broadcast channel only the process holding the wait is kept from
+        // starting: every other process subscribed by a start still gets the message.
+        if binding.broadcast
+            && !self
+                .processes
+                .starts_on_channel(&deployment, &message.channel)
+                .is_empty()
+        {
+            // A resume followed by starts is a fan-out, and a fan-out takes the async path.
+            self.inline_capable.set(false);
+        }
+        let waited = self
+            .correlate_first(&binding, &deployment, &holder, message)
+            .await?;
+        let resumed_process = match waited {
+            Some((outcome, _)) if !binding.broadcast => return Ok(outcome),
+            Some((outcome, process_id)) => Some((outcome, process_id)),
+            None => None,
+        };
+        let decoded = match holder {
+            Ok(decoded) => decoded,
+            Err(diagnostic) => match resumed_process {
+                // The resume was the delivery; the starts this binding cannot decode for do not
+                // run.
+                Some((outcome, _)) => return Ok(outcome),
+                None => return Err(diagnostic),
+            },
+        };
+        // The deployment start resolution runs in: the channel's own. One local, so the next step
+        // of self-send recognition can assign the sender's deployment here.
+        let start_deployment = deployment.clone();
         let message_type = decoded.as_ref().and_then(|d| d.message_type.clone());
 
         // The context a `<q:source filterExpression>` is evaluated against: the codec's reported
@@ -792,7 +827,7 @@ impl ChannelEngine {
             )
             .entered();
             let resolution = self.processes.resolve_handlers(
-                &deployment,
+                &start_deployment,
                 &message.channel,
                 message_type.as_deref(),
                 &selector_ctx,
@@ -812,7 +847,19 @@ impl ChannelEngine {
             resolution
         };
         let predicate_faults = resolution.predicate_faults;
-        let handlers = resolution.handlers;
+        let mut handlers = resolution.handlers;
+        if let Some((outcome, process_id)) = resumed_process {
+            // Broadcast, after a resume: the other processes' starts, and the resume's outcome when
+            // there are none.
+            handlers.retain(|h| h.process.id != process_id);
+            let mut last = outcome;
+            for handler in &handlers {
+                last = self
+                    .drive_one(handler, &binding, &start_deployment, message, &decoded)
+                    .await?;
+            }
+            return Ok(last);
+        }
         if handlers.is_empty() {
             // `session-end: on-message`: this channel ends sessions another channel admitted. A
             // correlated message releases its instance's slot whether or not a wait in the flow
@@ -905,7 +952,7 @@ impl ChannelEngine {
         let mut last = None;
         for handler in selected {
             last = Some(
-                self.drive_one(handler, &binding, &deployment, message, &decoded)
+                self.drive_one(handler, &binding, &start_deployment, message, &decoded)
                     .await?,
             );
         }
@@ -1504,26 +1551,15 @@ impl ChannelEngine {
             .find_map(|session| session.call_key_in(&message.headers))
     }
 
-    /// The deployment scopes an instance correlated through `deployment` can live in: the live
-    /// one first, then the DRAINING ones of the same owner. Another owner's instance is never in
-    /// scope, whatever its channel is called and whatever its alias holds.
+    /// The deployment scopes an instance correlated through `deployment` can live in: that one
+    /// first, then the owner's other live versions. Another owner's instance is never in scope,
+    /// whatever its channel is called and whatever its alias holds.
     fn session_scopes(&self, deployment: &DeploymentId) -> Vec<DeploymentId> {
-        let mut scopes = vec![deployment.clone()];
-        let owner = self.active_owners.get(deployment).or_else(|| {
-            self.prior_deployments
-                .iter()
-                .find(|(prior, _)| prior == deployment)
-                .map(|(_, owner)| owner)
-        });
-        let Some(owner) = owner else {
-            return scopes;
-        };
-        for (prior, prior_owner) in &self.prior_deployments {
-            if owner.same_owner(prior_owner) && !scopes.contains(prior) {
-                scopes.push(prior.clone());
-            }
+        let live = self.owner_scopes.live_for(deployment);
+        if live.is_empty() {
+            return vec![deployment.clone()];
         }
-        scopes
+        live.iter().map(|scope| scope.deployment.clone()).collect()
     }
 
     /// Release the sessions a reply ended (`session-end: on-reply`) since the last flush: the
@@ -2465,6 +2501,297 @@ impl ChannelEngine {
         }
     }
 
+    /// **Waits first.** Before any start event is resolved: does this message answer a wait an
+    /// instance of the channel's owner is parked at, in any of the owner's live versions? A hit
+    /// resumes that instance and is the whole dispatch, so a correlated message never also starts
+    /// a new instance. `Ok(None)` is no correlation: the caller goes on with start resolution, and
+    /// with the holder's own decode error, if it had one.
+    ///
+    /// Costs nothing on a channel no live version waits on (the wait index, two hash lookups per
+    /// version). Pass 1 probes each version whose waits can take the holder's decoded message type,
+    /// with the holder's decode. Pass 2 decodes once more for each version whose binding of the
+    /// channel decodes differently (a changed codec), and probes that version with it. A probe runs
+    /// no validators: it only computes the correlation and looks the alias up. A hit is then
+    /// processed with the parked version's own binding, validators and reply codec.
+    ///
+    /// A store error during a probe refuses the delivery: guessing it into a start could start a
+    /// second instance for a message that answers a parked one. Returns the hit's process id with
+    /// the outcome, so a broadcast channel can still run the starts of every other process.
+    async fn correlate_first(
+        &self,
+        binding: &ChannelBinding,
+        deployment: &DeploymentId,
+        holder: &Result<Option<DecodeResult>, Diagnostic>,
+        message: &InboundMessage,
+    ) -> Result<Option<(DispatchOutcome, String)>, Diagnostic> {
+        let Some(bridge) = self.bridge.clone() else {
+            return Ok(None);
+        };
+        let live = self.owner_scopes.live_for(deployment);
+        // A deployment the scopes do not know (a bare builder) is alone, with its own binding.
+        let scopes: Vec<(&DeploymentId, &ChannelBinding)> = if live.is_empty() {
+            vec![(deployment, binding)]
+        } else {
+            live.iter()
+                .map(|scope| {
+                    (
+                        &scope.deployment,
+                        scope.binding(&message.channel).unwrap_or(binding),
+                    )
+                })
+                .collect()
+        };
+        let channel = message.channel.as_str();
+        // THE FAST PATH: nothing any live version has can be waiting for this message.
+        if !scopes
+            .iter()
+            .any(|(scope, _)| self.processes.waits_on_channel(scope, channel))
+        {
+            return Ok(None);
+        }
+
+        // Pass 1: the holder's decode, every live version whose waits can take its type.
+        if let Ok(decoded) = holder {
+            let message_type = decoded.as_ref().and_then(|d| d.message_type.as_deref());
+            for (scope, own) in &scopes {
+                if !self.processes.wait_may_match(scope, channel, message_type) {
+                    continue;
+                }
+                if let Some(hit) = self.probe_scope(&bridge, scope, decoded, message).await? {
+                    let outcome = self
+                        .finish_wait_hit(&bridge, binding, decoded, scope, own, hit, message)
+                        .await?;
+                    return Ok(Some(outcome));
+                }
+            }
+        }
+
+        // Pass 2: another version whose binding decodes differently, each distinct decoder once.
+        let mut decodes: Vec<(&ChannelBinding, Result<Option<DecodeResult>, Diagnostic>)> =
+            Vec::new();
+        for (scope, own) in scopes.iter().skip(1) {
+            if !self.processes.waits_on_channel(scope, channel)
+                || self.chain.same_decoder(binding, own)
+            {
+                continue;
+            }
+            let index = match decodes
+                .iter()
+                .position(|(seen, _)| self.chain.same_decoder(seen, own))
+            {
+                Some(index) => index,
+                None => {
+                    decodes.push((
+                        own,
+                        self.chain
+                            .decode(own, &message.body, message.content_type.as_deref()),
+                    ));
+                    decodes.len() - 1
+                }
+            };
+            let Ok(decoded) = &decodes[index].1 else {
+                continue;
+            };
+            if decoded
+                .as_ref()
+                .is_some_and(|d| d.outcome == sutra_codec_spi::DecodeOutcome::Fatal)
+            {
+                continue;
+            }
+            let message_type = decoded.as_ref().and_then(|d| d.message_type.as_deref());
+            if !self.processes.wait_may_match(scope, channel, message_type) {
+                continue;
+            }
+            if let Some(hit) = self.probe_scope(&bridge, scope, decoded, message).await? {
+                let decoded = decoded.clone();
+                let outcome = self
+                    .finish_wait_hit(&bridge, own, &decoded, scope, own, hit, message)
+                    .await?;
+                return Ok(Some(outcome));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Does an instance in `scope` wait for this message? Every process with a wait on the channel
+    /// that can take the message's type, in the relay's order: compute its correlation from the
+    /// message alone and look the alias up. The first live instance found is the hit, wherever it
+    /// is parked; one that is not at this wait yet is refused by the resume (`WAIT_PENDING`), never
+    /// started.
+    async fn probe_scope(
+        &self,
+        bridge: &Rc<dyn InstanceBridge>,
+        scope: &DeploymentId,
+        decoded: &Option<DecodeResult>,
+        message: &InboundMessage,
+    ) -> Result<Option<WaitHit>, Diagnostic> {
+        let fatal = decoded
+            .as_ref()
+            .is_some_and(|d| d.outcome == sutra_codec_spi::DecodeOutcome::Fatal);
+        let selector_ctx = if fatal {
+            sutra_feel::FeelContext::new()
+        } else {
+            crate::intake::selector_context(
+                decoded.as_ref(),
+                decoded.as_ref().and_then(|d| d.message_type.as_deref()),
+            )
+        };
+        let targets = self.processes.resolve_relay_targets(
+            scope,
+            &message.channel,
+            decoded.as_ref().and_then(|d| d.message_type.as_deref()),
+            &selector_ctx,
+        );
+        let mut tried: Vec<&str> = Vec::new();
+        for target in &targets {
+            let process = &target.process;
+            if tried.contains(&process.id.as_str()) {
+                continue;
+            }
+            tried.push(process.id.as_str());
+            let candidate_nodes: Vec<String> = targets
+                .iter()
+                .filter(|t| Arc::ptr_eq(&t.process, process) || t.process.id == process.id)
+                .map(|t| t.wait_node_id.clone())
+                .collect();
+            let variables = correlation_variables(process, &target.wait_node_id, decoded, message);
+            // The same correlation the relay computes: the wait node's own alias first, then the
+            // process's start-event `onConflict="correlate"` alias.
+            let Some((alias_name, alias_value)) =
+                correlation_for_wait_node(process, &target.wait_node_id, &variables).or_else(
+                    || {
+                        let relay_payload = process
+                            .bindings_for(&target.wait_node_id)
+                            .sources
+                            .iter()
+                            .find(|source| source.channel == message.channel)
+                            .map(|source| source.name.as_str());
+                        correlation_for(process, &variables, relay_payload)
+                    },
+                )
+            else {
+                continue;
+            };
+            if let Some(instance_id) = bridge
+                .find_live_alias(scope, &alias_name, &alias_value)
+                .await?
+            {
+                return Ok(Some(WaitHit {
+                    process: Arc::clone(process),
+                    wait_node_id: target.wait_node_id.clone(),
+                    candidate_nodes,
+                    alias_name,
+                    alias_value,
+                    instance_id,
+                }));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Process a hit: a session-ending channel releases its session and resumes; any other is
+    /// driven as a wait hit. Returns the outcome with the hit's process id.
+    #[allow(clippy::too_many_arguments)]
+    async fn finish_wait_hit(
+        &self,
+        bridge: &Rc<dyn InstanceBridge>,
+        decoded_with: &ChannelBinding,
+        decoded: &Option<DecodeResult>,
+        scope: &DeploymentId,
+        own: &ChannelBinding,
+        hit: WaitHit,
+        message: &InboundMessage,
+    ) -> Result<(DispatchOutcome, String), Diagnostic> {
+        let process_id = hit.process.id.clone();
+        if self
+            .session_end_targets
+            .contains_key(&(own.namespace.module_key(), message.channel.clone()))
+        {
+            let outcome = self
+                .end_session_on_message(own, scope, decoded, message)
+                .await?;
+            return Ok((outcome, process_id));
+        }
+        let outcome = self
+            .drive_wait_hit(bridge, decoded_with, decoded, scope, own, hit, message)
+            .await?;
+        Ok((outcome, process_id))
+    }
+
+    /// Resume the instance a probe found, as the version it is parked on: its own binding of the
+    /// channel (decoded again only if that binding decodes differently), its own validators, its
+    /// own reply codec. A validation rejection is the error and leaves the instance parked.
+    #[allow(clippy::too_many_arguments)]
+    async fn drive_wait_hit(
+        &self,
+        bridge: &Rc<dyn InstanceBridge>,
+        decoded_with: &ChannelBinding,
+        decoded: &Option<DecodeResult>,
+        scope: &DeploymentId,
+        own: &ChannelBinding,
+        hit: WaitHit,
+        message: &InboundMessage,
+    ) -> Result<DispatchOutcome, Diagnostic> {
+        let redecoded;
+        let decoded_own = if self.chain.same_decoder(decoded_with, own) {
+            decoded
+        } else {
+            redecoded = self
+                .chain
+                .decode(own, &message.body, message.content_type.as_deref())?;
+            &redecoded
+        };
+        let mut variables = self.relay_intake_variables(
+            &hit.process,
+            &hit.wait_node_id,
+            own,
+            decoded_own,
+            message,
+        )?;
+        if let Some(duplicate) = self
+            .check_declared_dedup_key(
+                &hit.process,
+                &hit.wait_node_id,
+                scope,
+                message,
+                &mut variables,
+            )
+            .await?
+        {
+            return Ok(duplicate);
+        }
+        let resolution = self
+            .relay_tail(
+                bridge,
+                own,
+                scope,
+                hit.instance_id,
+                &hit.wait_node_id,
+                hit.candidate_nodes,
+                variables,
+                hit.alias_name,
+                hit.alias_value,
+                message,
+            )
+            .await?;
+        Ok(self.relay_outcome(resolution))
+    }
+
+    /// A resumed or handed-off relay as the dispatch's outcome.
+    fn relay_outcome(&self, resolution: RelayResolution) -> DispatchOutcome {
+        match resolution {
+            RelayResolution::Resumed(outcome) => outcome,
+            RelayResolution::Handoff(resolved) => DispatchOutcome::Handoff {
+                shard: crate::http::shard_index_of(&resolved.instance_id, self.shard.count),
+                resolved,
+            },
+            // `relay_tail` only resumes or hands off.
+            RelayResolution::NoTargets | RelayResolution::NotCorrelated(_) => {
+                unreachable!("relay_tail resolves to a resume or a handoff")
+            }
+        }
+    }
+
     /// One correlation attempt inside a single deployment scope — the body of the
     /// relay path, with "no live instance" reported as data (so the caller can fall back
     /// to a DRAINING scope) instead of an error.
@@ -2570,6 +2897,38 @@ impl ChannelEngine {
             ));
         };
 
+        self.relay_tail(
+            bridge,
+            binding,
+            deployment,
+            instance_id,
+            &target.wait_node_id,
+            candidate_nodes,
+            relay_vars,
+            alias_name,
+            alias_value,
+            message,
+        )
+        .await
+    }
+
+    /// What follows a correlation that named an instance: hand it to its shard's lane, or resume
+    /// it here (claim, load, guards, resume, commit). `binding` is the binding the message is
+    /// processed under, whose labels the resume carries and whose codec any reply uses.
+    #[allow(clippy::too_many_arguments)]
+    async fn relay_tail(
+        &self,
+        bridge: &Rc<dyn InstanceBridge>,
+        binding: &ChannelBinding,
+        deployment: &DeploymentId,
+        instance_id: String,
+        wait_node_id: &str,
+        candidate_nodes: Vec<String>,
+        relay_vars: Variables,
+        alias_name: String,
+        alias_value: String,
+        message: &InboundMessage,
+    ) -> Result<RelayResolution, Diagnostic> {
         // Shard routing seam (execution scale-out §1.1): correlation just named the
         // instance. When its lane is another shard's, answer the router with the resolved
         // resume instead of executing here — the owner shard re-runs the race-safe tail
@@ -2582,7 +2941,7 @@ impl ChannelEngine {
             return Ok(RelayResolution::Handoff(Box::new(ResolvedResume {
                 deployment: deployment.clone(),
                 instance_id,
-                wait_node_id: target.wait_node_id.clone(),
+                wait_node_id: wait_node_id.to_string(),
                 candidate_nodes,
                 variables: relay_vars,
                 alias_name,
@@ -2603,7 +2962,7 @@ impl ChannelEngine {
                 bridge,
                 deployment,
                 &instance_id,
-                &target.wait_node_id,
+                wait_node_id,
                 &candidate_nodes,
                 relay_vars,
                 &alias_name,
@@ -5588,18 +5947,12 @@ impl ChannelEngineBuilder {
         self
     }
 
-    /// Declare the DRAINING deployments (most recently drained first), each with its owner:
-    /// relay correlation falls back to these scopes, for the same owner only, so instances pinned
-    /// to a flipped-away deployment keep resuming until it retires. Their processes / artifacts
-    /// must still be registered under their own deployment ids. `active` names the owner of each
-    /// active deployment, to compare with.
-    pub fn with_prior_deployments(
-        mut self,
-        prior: Vec<(DeploymentId, Namespace)>,
-        active: HashMap<DeploymentId, Namespace>,
-    ) -> Self {
-        self.engine.prior_deployments = prior;
-        self.engine.active_owners = active;
+    /// Declare each served deployment's owner scopes ([`crate::OwnerScopes`]): correlation
+    /// searches the owner's live versions, the message's own deployment first, so instances
+    /// pinned to a flipped-away deployment keep resuming until it retires. Their processes and
+    /// artifacts must still be registered under their own deployment ids.
+    pub fn with_owner_scopes(mut self, scopes: Arc<crate::owner_scopes::OwnerScopes>) -> Self {
+        self.engine.owner_scopes = scopes;
         self
     }
 
@@ -5772,6 +6125,43 @@ pub enum ChannelCallPoisonOutcome {
 }
 
 /// Outcome of one relay-correlation attempt inside a single deployment scope.
+/// What a waits-first probe found: the instance a message correlates to, and where it waits.
+struct WaitHit {
+    process: Arc<ProcessDefinition>,
+    wait_node_id: String,
+    candidate_nodes: Vec<String>,
+    alias_name: String,
+    alias_value: String,
+    instance_id: String,
+}
+
+/// The variables a probe computes a wait's correlation from: the projected `event` view, the
+/// decoded payload under the node's `<q:source name>` and the codec's attributes under `attr`, as
+/// the intake projects them, but with no validator, redactor or `<q:onValidation>` run.
+fn correlation_variables(
+    process: &ProcessDefinition,
+    wait_node_id: &str,
+    decoded: &Option<DecodeResult>,
+    message: &InboundMessage,
+) -> Variables {
+    let mut variables = project_variables(message);
+    if let (Some(decoded), Some(source)) = (decoded, process.bindings_for(wait_node_id).source()) {
+        variables.insert(
+            source.name.clone(),
+            decoded
+                .payload
+                .as_ref()
+                .map(crate::intake::payload_view)
+                .unwrap_or(FeelValue::Null),
+        );
+        variables.insert(
+            crate::intake::SELECTOR_ATTRIBUTE_ROOT.to_string(),
+            crate::intake::attribute_map(Some(decoded)),
+        );
+    }
+    variables
+}
+
 enum RelayResolution {
     /// No wait node in this scope subscribes to the channel.
     NoTargets,

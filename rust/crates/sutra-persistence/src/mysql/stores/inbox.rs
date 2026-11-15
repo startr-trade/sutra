@@ -18,8 +18,13 @@ pub struct MySqlInboxStore {
     pool: MySqlPool,
 }
 
-const SQL_INSERT: &str = "INSERT INTO inbox_seen (deployment_id, channel, event_id, seen_at) \
-     VALUES (?, ?, ?, ?)";
+/// The row carries the owner key its deployment maps to (V305), so the unique index
+/// `(owner_id, channel, event_id)` refuses a key another version of the owner already recorded. No
+/// mapping row means a NULL owner: the primary key alone arbitrates, within the deployment. The
+/// deployment id is bound twice (positional parameters).
+const SQL_INSERT: &str =
+    "INSERT INTO inbox_seen (deployment_id, channel, event_id, seen_at, owner_id) \
+     SELECT ?, ?, ?, ?, (SELECT owner_id FROM deployment_owner WHERE deployment_id = ?)";
 
 const SQL_PRUNE: &str = "DELETE FROM inbox_seen WHERE seen_at < ?";
 
@@ -46,6 +51,7 @@ impl MySqlInboxStore {
             .bind(channel)
             .bind(event_id)
             .bind(to_db(OffsetDateTime::now_utc()))
+            .bind(deployment.as_str())
             .execute(conn)
             .await;
         match inserted {

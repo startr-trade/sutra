@@ -985,12 +985,11 @@ fn imec_relay_wait_alias_correlates_from_inbound_header() {
     assert_eq!(d.code, "SUTRA.RUNTIME.RELAY.CORRELATION_NOT_FOUND");
 
     // The relay derived its correlation value from the inbound HEADER and asked find_live_alias for
-    // exactly that (name, value).
+    // exactly that (name, value): once in the waits-first probe and once more when the miss re-walks
+    // the relay with full intake, which is what keeps its diagnostics as they were.
     let lookups = bridge.alias_lookups.borrow().clone();
-    assert_eq!(
-        lookups,
-        vec![("corrAlias".to_string(), "CORR-55".to_string())]
-    );
+    let expected = ("corrAlias".to_string(), "CORR-55".to_string());
+    assert_eq!(lookups, vec![expected.clone(), expected]);
 }
 
 // ==================== one channel, several wait nodes =========================================
@@ -1113,9 +1112,11 @@ fn a_relay_correlates_through_the_start_alias_when_the_wait_renames_its_payload(
     message.content_type = Some("application/json".to_string());
     let d = expect_err(drive(engine.dispatch(&message)));
     assert_eq!(d.code, "SUTRA.RUNTIME.RELAY.CORRELATION_NOT_FOUND");
+    // Looked up by the waits-first probe, then again by the miss's relay walk.
+    let expected = ("orderId".to_string(), "K-7".to_string());
     assert_eq!(
         *bridge.alias_lookups.borrow(),
-        [("orderId".to_string(), "K-7".to_string())],
+        [expected.clone(), expected],
         "the relay derived the start alias from its renamed payload: {}",
         d.message
     );

@@ -17,8 +17,13 @@ pub struct MssqlInboxStore {
     pool: MssqlPool,
 }
 
-const SQL_INSERT: &str = "INSERT INTO inbox_seen (deployment_id, channel, event_id, seen_at) \
-     VALUES (@P1, @P2, @P3, @P4)";
+/// The row carries the owner key its deployment maps to (V305), so the filtered unique index
+/// `(owner_id, channel, event_id)` refuses a key another version of the owner already recorded. No
+/// mapping row means a NULL owner: the primary key alone arbitrates, within the deployment.
+const SQL_INSERT: &str =
+    "INSERT INTO inbox_seen (deployment_id, channel, event_id, seen_at, owner_id) \
+     SELECT @P1, @P2, @P3, @P4, \
+            (SELECT owner_id FROM deployment_owner WHERE deployment_id = @P1)";
 
 const SQL_PRUNE: &str = "DELETE FROM inbox_seen WHERE seen_at < @P1";
 

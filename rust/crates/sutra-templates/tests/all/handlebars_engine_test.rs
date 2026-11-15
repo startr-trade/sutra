@@ -215,3 +215,25 @@ fn reuses_compiled_template_across_renders() {
     assert_eq!(render(&e, "same", tpl, json!({"v": "1"})), "<V>1</V>");
     assert_eq!(render(&e, "same", tpl, json!({"v": "2"})), "<V>2</V>");
 }
+
+#[test]
+fn a_template_id_reused_by_another_engine_with_new_source_renders_the_new_source() {
+    // The compile is shared process-wide by template id; a different source under the same id must
+    // never be served from that cache.
+    let first = engine();
+    let second = engine();
+    let tpl_a = "<A>{{v}}</A>";
+    let tpl_b = "<B>{{v}}</B>";
+    assert_eq!(
+        render(&first, "shared-id", tpl_a, json!({"v": "1"})),
+        "<A>1</A>"
+    );
+    assert_eq!(
+        render(&second, "shared-id", tpl_a, json!({"v": "2"})),
+        "<A>2</A>"
+    );
+    assert_eq!(
+        render(&engine(), "shared-id", tpl_b, json!({"v": "3"})),
+        "<B>3</B>"
+    );
+}

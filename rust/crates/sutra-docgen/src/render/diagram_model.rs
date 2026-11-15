@@ -9,33 +9,32 @@ use sutra_bpmn::{Node, ProcessDefinition};
 
 /// Map a module's processes, in order.
 pub fn to_diagram_model(processes: &[ProcessDefinition]) -> Model {
-    Model {
-        processes: processes.iter().map(map_process).collect(),
-    }
+    processes
+        .iter()
+        .fold(Model::new(), |model, p| model.process(map_process(p)))
 }
 
 fn map_process(p: &ProcessDefinition) -> Process {
-    Process {
-        id: p.id.clone(),
-        nodes: p.nodes().iter().map(map_node).collect(),
-        flows: p
-            .flows()
-            .iter()
-            .map(|f| SequenceFlow {
-                id: f.id.clone(),
-                source_ref: f.source_ref.clone(),
-                target_ref: f.target_ref.clone(),
-            })
-            .collect(),
-    }
+    let process = p
+        .nodes()
+        .iter()
+        .fold(Process::new(p.id.clone()), |process, n| {
+            process.node(map_node(n))
+        });
+    p.flows().iter().fold(process, |process, f| {
+        process.flow(SequenceFlow::new(
+            f.id.clone(),
+            f.source_ref.clone(),
+            f.target_ref.clone(),
+        ))
+    })
 }
 
 fn node(id: &str, name: &Option<String>, kind: NodeKind) -> FlowNode {
-    FlowNode {
-        id: id.to_string(),
-        label: name.clone(),
-        kind,
-        markers: Vec::new(),
+    let node = FlowNode::new(id, kind);
+    match name {
+        Some(name) => node.label(name.clone()),
+        None => node,
     }
 }
 
@@ -50,11 +49,9 @@ fn map_node(n: &Node) -> FlowNode {
     let id = n.id();
     match n {
         Node::StartEvent { name, timer, .. } => {
-            let glyph = if timer.is_some() {
-                EventGlyph::Timer
-            } else {
-                EventGlyph::Message
-            };
+            // A start with no timer is a none start (or a channel-driven one, which BPMN draws
+            // the same): a plain circle.
+            let glyph = timer.as_ref().map(|_| EventGlyph::Timer);
             node(id, name, NodeKind::StartEvent(glyph))
         }
         Node::EndEvent { name, .. } => node(id, name, NodeKind::EndEvent(None)),
@@ -76,20 +73,22 @@ fn map_node(n: &Node) -> FlowNode {
                 k if k.starts_with("Compensat") => EventGlyph::Compensate,
                 _ => EventGlyph::Message,
             };
-            node(id, name, NodeKind::IntermediateThrowEvent(glyph))
+            node(id, name, NodeKind::IntermediateThrowEvent(Some(glyph)))
         }
-        Node::LinkCatchEvent { name, .. } => {
-            node(id, name, NodeKind::IntermediateCatchEvent(EventGlyph::Link))
-        }
+        Node::LinkCatchEvent { name, .. } => node(
+            id,
+            name,
+            NodeKind::IntermediateCatchEvent(Some(EventGlyph::Link)),
+        ),
         Node::MessageCatchEvent { name, .. } => node(
             id,
             name,
-            NodeKind::IntermediateCatchEvent(EventGlyph::Message),
+            NodeKind::IntermediateCatchEvent(Some(EventGlyph::Message)),
         ),
         Node::TimerCatchEvent { name, .. } => node(
             id,
             name,
-            NodeKind::IntermediateCatchEvent(EventGlyph::Timer),
+            NodeKind::IntermediateCatchEvent(Some(EventGlyph::Timer)),
         ),
         Node::BoundaryEvent {
             name,
@@ -117,7 +116,15 @@ fn map_node(n: &Node) -> FlowNode {
         // A data task is an engine extension of a service task; BPMN has no glyph for it.
         Node::DataTask { name, .. } => node(id, name, NodeKind::Task(TaskType::Plain)),
         Node::ScriptTask { name, .. } => node(id, name, NodeKind::Task(TaskType::Script)),
-        Node::ManualTask { name, .. } => node(id, name, NodeKind::Task(TaskType::Manual)),
+        Node::ManualTask { name, untyped, .. } => {
+            // An untyped `<task>` runs as a manual task but draws with no glyph.
+            let task = if *untyped {
+                TaskType::Plain
+            } else {
+                TaskType::Manual
+            };
+            node(id, name, NodeKind::Task(task))
+        }
         Node::SendTask { name, .. } => node(id, name, NodeKind::Task(TaskType::Send)),
         Node::BusinessRuleTask { name, .. } => {
             node(id, name, NodeKind::Task(TaskType::BusinessRule))
@@ -135,7 +142,24 @@ fn map_node(n: &Node) -> FlowNode {
             node(id, name, sub_process(SubProcessKind::AdHoc, inner))
         }
         Node::EventSubProcess { name, inner, .. } => {
-            node(id, name, sub_process(SubProcessKind::Event, inner))
+            let mut mapped = map_process(inner);
+            // The loader admits only an error-triggered event sub-process, so its first start
+            // event is an error start.
+            if let Some(start) = mapped
+                .nodes
+                .iter_mut()
+                .find(|n| matches!(n.kind, NodeKind::StartEvent(_)))
+            {
+                start.kind = NodeKind::StartEvent(Some(EventGlyph::Error));
+            }
+            node(
+                id,
+                name,
+                NodeKind::SubProcess {
+                    kind: SubProcessKind::Event,
+                    inner: mapped,
+                },
+            )
         }
         Node::ExclusiveGateway { name, .. } => {
             node(id, name, NodeKind::Gateway(GatewayType::Exclusive))

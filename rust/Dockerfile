@@ -84,13 +84,30 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --profile ${CARGO_PROFILE} -p sutra-dist \
     && cp target/${CARGO_PROFILE}/sutra-engine /build/sutra-engine
 
+# ---- CA trust store ------------------------------------------------------------
+# The engine trusts /etc/ssl/certs/ca-certificates.crt for TLS (postgres, brokers, HTTP
+# callbacks). The distroless base can lag Debian's ca-certificates updates, which can REMOVE
+# distrusted roots (20250419~deb12u2 drops "AAA Certificate Services" and "emSign ECC Root
+# CA - G3"), so the bundle is taken from an up-to-date bookworm instead. The build fails if
+# the installed package is older than that update or either distrusted root is still present.
+FROM debian:bookworm-slim AS certs
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && v="$(dpkg-query -W -f='${Version}' ca-certificates)" \
+    && dpkg --compare-versions "$v" ge '20250419~deb12u2' \
+    || { echo "ca-certificates $v is older than 20250419~deb12u2" >&2; exit 1; }
+# ca-certificates installs one file per root under /usr/share/ca-certificates/mozilla, named
+# after the certificate; the bundle is built from those files.
+RUN ! ls /usr/share/ca-certificates/mozilla | grep -E 'Comodo_AAA|emSign_ECC_Root_CA_-_G3' \
+    || { echo "a distrusted root is still in the CA bundle" >&2; exit 1; }
+
 # ---- runtime (distroless) ----------------------------------------------------
 # gcr.io/distroless/cc-debian12 — glibc + libgcc + libstdc++ + CA certs, no shell/package
 # manager/apt (~20 MB base). glibc is REQUIRED: the binary statically links librdkafka (Kafka
 # transport) + ring (rustls), both glibc-built by the bookworm builder above — a musl/`scratch`
-# variant is blocked on the rdkafka-sys musl build. CA certs ship in the base
-# (TLS to postgres/brokers), so no apt-get. The `[profile.release] strip` (rust/Cargo.toml)
-# already stripped the binary. Together with the strip this closes the footprint regression
+# variant is blocked on the rdkafka-sys musl build. The CA bundle is replaced from the `certs`
+# stage above (TLS to postgres/brokers), so the runtime still needs no apt-get. The
+# `[profile.release] strip` (rust/Cargo.toml) already stripped the binary. Together with the strip this closes the footprint regression
 # (debian-slim runtime + unstripped binary → distroless + stripped binary).
 #
 # PINNED BY DIGEST, not by a moving tag: the runtime base is part of the shipped
@@ -99,6 +116,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # `docker inspect --format '{{index .RepoDigests 0}}'`), never implicitly.
 FROM gcr.io/distroless/cc-debian12@sha256:e8e7ee4b8b106d4c5fde9e422a321b2b8a2d5cca546c97adcce927f3e1d36e36
 COPY --from=builder /build/sutra-engine /usr/local/bin/sutra-engine
+COPY --from=certs /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 
 # The engine-internal migration SQL — now Rust-owned under
 # sutra-persistence/migrations: shipped/{core,audit} are byte-identical copies of the

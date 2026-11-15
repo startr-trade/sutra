@@ -23,8 +23,8 @@ use rdkafka::producer::{FutureProducer, FutureRecord};
 use rdkafka::util::Timeout;
 use rdkafka::{ClientConfig, Message as _};
 use sutra_testkit::broker_tls::{
-    start_tls_artemis, start_tls_kafka, unique_token, BrokerPlacement, TestBrokerPki,
-    TlsArtemisBroker, TlsKafkaBroker, KAFKA_NETWORK_SASL_SSL_PORT,
+    start_tls_artemis, start_tls_artemis_with_login, start_tls_kafka, unique_token,
+    BrokerPlacement, TestBrokerPki, TlsArtemisBroker, TlsKafkaBroker, KAFKA_NETWORK_SASL_SSL_PORT,
 };
 
 use crate::support::engine::{self, EngineBuilder, EngineHandle, PgFixture};
@@ -343,6 +343,34 @@ async fn tc_kafka_wrong_ca_is_refused_with_a_clear_log() {
     .await;
 }
 
+/// librdkafka retries a failed handshake many times a second, each time with different text. The
+/// engine logs the first failure in full and then at most one summary line per 30 s, so a wrong CA
+/// does not flood the log.
+#[ignore = "docker"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tc_kafka_wrong_ca_logs_the_failure_once_then_a_count() {
+    const CODE: &str = "SUTRA.INBOUND.KAFKA.BROKER_TLS_FAILED";
+    let _suite = sutra_testkit::hold_suite!("brokertlskafka", "brokertlsamqp");
+    let f = kafka_fixture();
+    let in_topic = format!("in-{}", unique_token("t"));
+    create_topics(f, &[&in_topic]).await;
+    let archives = seal_package(&kafka_channels(f, &in_topic, "unused-out"));
+    let engine = kafka_engine(f, &archives, &f.broker.password, &f.pki.foreign_ca_pem);
+    assert_logs_code_without_secret(engine, CODE, &f.broker.password).await;
+    // Inside one summary interval of the first line: before the throttle this was ~740 lines.
+    tokio::time::sleep(Duration::from_secs(25)).await;
+    let logs = container_logs(engine.container.id());
+    let lines: Vec<&str> = logs.lines().filter(|l| l.contains(CODE)).collect();
+    let full = lines.iter().filter(|l| !l.contains("repeated")).count();
+    assert_eq!(full, 1, "one full failure line, got:\n{}", lines.join("\n"));
+    assert!(
+        lines.len() <= 2,
+        "at most one summary line inside 30 s, got {}:\n{}",
+        lines.len(),
+        lines.join("\n")
+    );
+}
+
 // ---- AMQP 1.0 -----------------------------------------------------------------------------------
 
 struct ArtemisFixture {
@@ -506,6 +534,113 @@ async fn tc_amqp_tls_message_in_result_out_through_the_engine() {
         !logs.contains(&f.broker.password),
         "the engine log holds the password"
     );
+}
+
+/// The output broker stops answering (its container is paused) while the engine sends a result to
+/// it. Each attempt fails with the coded, retryable `SEND_TIMEOUT` instead of waiting forever, and
+/// once the broker answers again the result arrives, once.
+#[ignore = "docker"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tc_amqp_a_broker_that_stops_answering_times_out_and_the_result_arrives_once() {
+    let _suite = sutra_testkit::hold_suite!("brokertlskafka", "brokertlsamqp");
+    let f = artemis_fixture();
+    // A second broker, for the output only, with the same login so the sink's engine-wide
+    // credentials work on both. Leaked: dropping a container is a blocking `docker rm`.
+    let out_name = format!("brokertlsamqp-out-{}", util::short_id());
+    let out: &'static TlsArtemisBroker = {
+        let (name, user, pw) = (
+            out_name.clone(),
+            f.broker.username.clone(),
+            f.broker.password.clone(),
+        );
+        std::thread::spawn(move || {
+            let pki = TestBrokerPki::generate(&[name.as_str()]);
+            Box::leak(Box::new(start_tls_artemis_with_login(
+                &pki,
+                &BrokerPlacement {
+                    network: Some(util::network_for("brokertlsamqp").to_string()),
+                    container_name: Some(name),
+                },
+                &user,
+                &pw,
+            ))) as &'static TlsArtemisBroker
+        })
+        .join()
+        .expect("output broker")
+    };
+    let in_queue = format!("in-{}", unique_token("q"));
+    let out_queue = format!("out-{}", unique_token("q"));
+    let channels = amqp_channels(f, &in_queue, &out_queue).replace(
+        &format!("bind: amqp10s://{}/{out_queue}", f.broker_name),
+        &format!("bind: amqp10://{out_name}/{out_queue}"),
+    );
+    assert!(
+        channels.contains(&out_name),
+        "the output moved to the second broker"
+    );
+    let archives = seal_package(&channels);
+    let password = f.broker.password.clone();
+    let engine = start_engine(
+        "brokertlsamqp",
+        move |builder: EngineBuilder| {
+            builder
+                .env("BROKER_USER", f.broker.username.clone())
+                .secret("BROKER_PASSWORD", password.clone())
+                .mount_read_only(&ca_dir(&f.pki), CA_MOUNT)
+                .env("SUTRA_SINK_AMQP_USERNAME", f.broker.username.clone())
+                .env("SUTRA_SINK_AMQP_PASSWORD", password)
+                .env("SUTRA_SINK_AMQP_TLS_CA_FILE", format!("{CA_MOUNT}/ca.pem"))
+                .env("SUTRA_SINK_AMQP_OPERATION_TIMEOUT_MS", "2000")
+        },
+        &archives,
+    );
+
+    docker(&["pause", out.container.id()]);
+    let reference = unique_token("ref");
+    amqp_send(f, &in_queue, &format!(r#"{{"ref":"{reference}"}}"#)).await;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !container_logs(engine.container.id()).contains("SUTRA.OUTBOUND.AMQP.SEND_TIMEOUT") {
+        assert!(
+            Instant::now() < deadline,
+            "no SEND_TIMEOUT while the broker was paused:\n{}",
+            container_logs(engine.container.id())
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    docker(&["unpause", out.container.id()]);
+
+    let uri = format!(
+        "amqp://{}:{}@127.0.0.1:{}",
+        f.broker.username, f.broker.password, out.plain_port
+    );
+    let mut connection = Connection::open("tc-reader-paused", uri.as_str())
+        .await
+        .expect("open the output broker");
+    let mut session = Session::begin(&mut connection).await.expect("session");
+    let mut receiver = Receiver::attach(&mut session, "tc-reader-paused", out_queue.as_str())
+        .await
+        .expect("attach");
+    let first = tokio::time::timeout(Duration::from_secs(90), receiver.recv::<Body<Value>>())
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "no result after the broker resumed:\n{}",
+                container_logs(engine.container.id())
+            )
+        })
+        .expect("recv");
+    receiver.accept(&first).await.expect("accept");
+    let again = tokio::time::timeout(Duration::from_secs(10), receiver.recv::<Body<Value>>()).await;
+    assert!(again.is_err(), "the result arrived once");
+    let _ = receiver.close().await;
+    let _ = session.end().await;
+    let _ = connection.close().await;
+    assert!(!container_logs(engine.container.id()).contains(&f.broker.password));
+}
+
+fn docker(args: &[&str]) {
+    let status = Command::new("docker").args(args).status().expect("docker");
+    assert!(status.success(), "docker {args:?}");
 }
 
 #[ignore = "docker"]

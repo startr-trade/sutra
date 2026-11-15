@@ -39,6 +39,8 @@ mod lint_start_and_wait_test;
 mod lint_store_structure_test;
 #[path = "all/lint_stream_test.rs"]
 mod lint_stream_test;
+#[path = "all/lint_template_compile_once_test.rs"]
+mod lint_template_compile_once_test;
 #[path = "all/lint_template_fields_test.rs"]
 mod lint_template_fields_test;
 #[path = "all/lint_timer_config_test.rs"]

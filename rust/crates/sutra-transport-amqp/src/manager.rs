@@ -43,6 +43,34 @@ pub const SINK_TLS_CA_FILE_ENV: &str = "SUTRA_SINK_AMQP_TLS_CA_FILE";
 /// `amqp10s://` sends.
 pub const SINK_TLS_INSECURE_SKIP_VERIFY_ENV: &str = "SUTRA_SINK_AMQP_TLS_INSECURE_SKIP_VERIFY";
 
+/// The env var bounding each broker round trip of an outbound send, in milliseconds (default
+/// 30000). Unset, blank or not a positive integer: the default, with a warning for a bad value.
+pub const SINK_OPERATION_TIMEOUT_ENV: &str = "SUTRA_SINK_AMQP_OPERATION_TIMEOUT_MS";
+
+/// The sink's operation timeout from the environment (see [`SINK_OPERATION_TIMEOUT_ENV`]).
+pub fn sink_operation_timeout_from_env() -> std::time::Duration {
+    sink_operation_timeout_from(std::env::var(SINK_OPERATION_TIMEOUT_ENV).ok().as_deref())
+}
+
+fn sink_operation_timeout_from(value: Option<&str>) -> std::time::Duration {
+    let default = crate::amqp::sink::DEFAULT_OPERATION_TIMEOUT;
+    match value.map(str::trim).filter(|v| !v.is_empty()) {
+        None => default,
+        Some(v) => match v.parse::<u64>() {
+            Ok(ms) if ms > 0 => std::time::Duration::from_millis(ms),
+            _ => {
+                tracing::warn!(
+                    code = crate::amqp::codes::OUTBOUND_CONFIG_INVALID,
+                    "{SINK_OPERATION_TIMEOUT_ENV} must be a positive number of milliseconds, got \
+                     '{v}'; using {} ms",
+                    default.as_millis()
+                );
+                default
+            }
+        },
+    }
+}
+
 /// Register the AMQP 1.0 sink into an outbox [`SinkRegistry`] under its claimed schemes
 /// (`amqp10` / `amqp10s`), carrying the engine-wide default credentials.
 pub fn register_amqp_sink(
@@ -62,7 +90,9 @@ pub fn register_amqp_sink_with_tls(
     tls_settings: Result<AmqpTlsProperties, String>,
 ) {
     registry.register(Arc::new(
-        AmqpMessageSink::new(username, password).with_tls_settings(tls_settings),
+        AmqpMessageSink::new(username, password)
+            .with_tls_settings(tls_settings)
+            .with_operation_timeout(sink_operation_timeout_from_env()),
     ));
 }
 
@@ -650,6 +680,20 @@ mod sink_tls_env_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_operation_timeout_reads_milliseconds_and_falls_back_on_a_bad_value() {
+        use std::time::Duration;
+        let default = crate::amqp::sink::DEFAULT_OPERATION_TIMEOUT;
+        assert_eq!(sink_operation_timeout_from(None), default);
+        assert_eq!(sink_operation_timeout_from(Some(" ")), default);
+        assert_eq!(
+            sink_operation_timeout_from(Some("2500")),
+            Duration::from_millis(2500)
+        );
+        assert_eq!(sink_operation_timeout_from(Some("0")), default);
+        assert_eq!(sink_operation_timeout_from(Some("soon")), default);
+    }
 
     #[test]
     fn sink_registry_resolves_amqp10_destinations_after_registration() {

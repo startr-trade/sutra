@@ -62,6 +62,8 @@ mod shard_scale_out_it;
 mod shard_support;
 #[path = "all/smoke.rs"]
 mod smoke;
+#[path = "all/template_precompile_it.rs"]
+mod template_precompile_it;
 #[path = "all/terminal_retention_it.rs"]
 mod terminal_retention_it;
 #[path = "all/time_skipping_it.rs"]

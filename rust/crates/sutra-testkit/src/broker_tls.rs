@@ -142,9 +142,24 @@ pub struct TlsArtemisBroker {
 
 /// Start Artemis with `pki`'s server certificate on an AMQPS acceptor. The image has `openssl`,
 /// which turns the PEM pair into the PKCS#12 store Artemis loads.
+///
+/// Every address the broker auto-creates is ANYCAST, a queue that keeps a message until someone
+/// takes it, as a deployment's provisioned queues do. Artemis' own default is MULTICAST, which
+/// drops a message no consumer is attached for yet: a test that sends before the engine's consumer
+/// attaches, or before its own reader attaches to the output, then loses the message silently.
 pub fn start_tls_artemis(pki: &TestBrokerPki, placement: &BrokerPlacement) -> TlsArtemisBroker {
-    let username = "svcbroker".to_string();
-    let password = unique_token("pw");
+    start_tls_artemis_with_login(pki, placement, "svcbroker", &unique_token("pw"))
+}
+
+/// [`start_tls_artemis`] with a given login, so two brokers can share one set of credentials.
+pub fn start_tls_artemis_with_login(
+    pki: &TestBrokerPki,
+    placement: &BrokerPlacement,
+    username: &str,
+    password: &str,
+) -> TlsArtemisBroker {
+    let username = username.to_string();
+    let password = password.to_string();
     let store = unique_token("st");
     let script = format!(
         "set -e; \
@@ -155,6 +170,10 @@ pub fn start_tls_artemis(pki: &TestBrokerPki, placement: &BrokerPlacement) -> Tl
          sed -i 's#</acceptors>#<acceptor name=\"amqps\">tcp://0.0.0.0:{ARTEMIS_TLS_PORT}?sslEnabled=true;\
 keyStorePath=/tmp/broker.p12;keyStorePassword={store};keyStoreType=PKCS12;protocols=AMQP;\
 saslMechanisms=PLAIN</acceptor></acceptors>#' etc/broker.xml; \
+         sed -i 's#<address-setting match=\"\\#\">#<address-setting match=\"\\#\">\
+<default-address-routing-type>ANYCAST</default-address-routing-type>\
+<default-queue-routing-type>ANYCAST</default-queue-routing-type>#' etc/broker.xml; \
+         grep -q '<default-queue-routing-type>ANYCAST' etc/broker.xml; \
          exec ./bin/artemis run"
     );
     let mut image = GenericImage::new("apache/activemq-artemis", "latest-alpine")

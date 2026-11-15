@@ -4619,8 +4619,9 @@ fn check_called_elements(
     }
 }
 
-/// A start event and a wait on one channel, with message types that can overlap: a message meant
-/// for the wait also matches the start, and start events are tried first. A warning, at the start.
+/// A start event and a wait on one channel, with message types that can overlap: a message that
+/// correlates to a parked instance answers its wait and starts nothing, so a flow that meant to
+/// start a second instance with a repeated key does not. A warning, at the start.
 fn check_start_and_wait(
     deployment: &LoadedDeployment,
     dep_label: &str,
@@ -4672,9 +4673,10 @@ fn check_start_and_wait(
                         format!(
                             "deployment {dep_label}: process '{}' start event '{}' and the wait at \
                              {} are both on channel '{channel}' with message types that can \
-                             overlap. Start events are tried first, so a message meant for a \
-                             parked instance starts a new one; give them disjoint message types or \
-                             separate channels",
+                             overlap. A message that correlates to a parked instance answers its \
+                             wait and starts nothing, so a repeated key never starts a second \
+                             instance; give them disjoint message types or separate channels if one \
+                             is meant",
                             process.id,
                             start.id(),
                             overlapping.join(", ")

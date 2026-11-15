@@ -21,10 +21,7 @@ fn reads_a_file_with_no_bpmn_di() {
     assert_eq!(process.id, "p");
     assert_eq!(process.nodes[0].id, "s");
     assert_eq!(process.nodes[0].label.as_deref(), Some("Go"));
-    assert_eq!(
-        process.nodes[0].kind,
-        NodeKind::StartEvent(EventGlyph::Message)
-    );
+    assert_eq!(process.nodes[0].kind, NodeKind::StartEvent(None));
     assert_eq!(process.nodes[1].label, None);
     assert_eq!(process.nodes[1].kind, NodeKind::EndEvent(None));
     assert_eq!(process.flows[0].id, "f");
@@ -47,9 +44,12 @@ fn reads_a_prefixed_bpmn_namespace() {
 
 #[test]
 fn ignores_vendor_extensions_and_bpmn_di() {
+    // A condition is part of the model since it captions and marks its flow, so the plain form
+    // carries it too; everything else in the decorated form must fall away.
     let plain = document(
         "<process id=\"p\"><startEvent id=\"s\"/><serviceTask id=\"t\" name=\"Work\"/>\
-         <sequenceFlow id=\"f\" sourceRef=\"s\" targetRef=\"t\"/></process>",
+         <sequenceFlow id=\"f\" sourceRef=\"s\" targetRef=\"t\">\
+         <conditionExpression>x &gt; 1</conditionExpression></sequenceFlow></process>",
     );
     let decorated = format!(
         "<definitions xmlns=\"{BPMN}\" xmlns:v=\"urn:example:vendor\" \
@@ -181,29 +181,29 @@ fn classifies_every_visual_type() {
     let nodes = &model.processes[0].nodes;
     let kind = |id: &str| &nodes.iter().find(|n| n.id == id).unwrap().kind;
     let markers = |id: &str| &nodes.iter().find(|n| n.id == id).unwrap().markers;
-    assert_eq!(kind("a"), &NodeKind::StartEvent(EventGlyph::Timer));
+    assert_eq!(kind("a"), &NodeKind::StartEvent(Some(EventGlyph::Timer)));
     assert_eq!(kind("b"), &NodeKind::EndEvent(Some(EventGlyph::Error)));
     assert_eq!(kind("c"), &NodeKind::EndEvent(Some(EventGlyph::Terminate)));
     assert_eq!(kind("d"), &NodeKind::EndEvent(Some(EventGlyph::Cancel)));
     assert_eq!(
         kind("e"),
-        &NodeKind::IntermediateThrowEvent(EventGlyph::Signal)
+        &NodeKind::IntermediateThrowEvent(Some(EventGlyph::Signal))
     );
     assert_eq!(
         kind("f"),
-        &NodeKind::IntermediateThrowEvent(EventGlyph::Link)
+        &NodeKind::IntermediateThrowEvent(Some(EventGlyph::Link))
     );
     assert_eq!(
         kind("g"),
-        &NodeKind::IntermediateCatchEvent(EventGlyph::Timer)
+        &NodeKind::IntermediateCatchEvent(Some(EventGlyph::Timer))
     );
     assert_eq!(
         kind("h"),
-        &NodeKind::IntermediateCatchEvent(EventGlyph::Link)
+        &NodeKind::IntermediateCatchEvent(Some(EventGlyph::Link))
     );
     assert_eq!(
         kind("i"),
-        &NodeKind::IntermediateCatchEvent(EventGlyph::Message)
+        &NodeKind::IntermediateCatchEvent(Some(EventGlyph::Message))
     );
     assert_eq!(
         kind("j"),
@@ -213,7 +213,7 @@ fn classifies_every_visual_type() {
         },
         "an attachedToRef QName resolves to its local part"
     );
-    assert_eq!(kind("k"), &NodeKind::Task(TaskType::Manual));
+    assert_eq!(kind("k"), &NodeKind::Task(TaskType::Plain));
     assert_eq!(kind("l"), &NodeKind::CallActivity);
     assert_eq!(kind("m"), &NodeKind::Gateway(GatewayType::EventBased));
     assert_eq!(kind("n"), &NodeKind::Gateway(GatewayType::Complex));
@@ -260,4 +260,103 @@ fn a_dangling_reference_is_not_drawn_and_does_not_panic() {
         "a hostless boundary event is not drawn"
     );
     assert!(!svg.contains("(f1)"));
+}
+
+#[test]
+fn reads_participants_and_message_flows() {
+    let model = parse(&document(
+        "<collaboration id=\"c1\">\
+           <participant id=\"a\" name=\"Alpha\" processRef=\"x:pa\"/>\
+           <participant id=\"b\" name=\" \"/>\
+           <messageFlow id=\"m1\" name=\"Ask\" sourceRef=\"x:t\" targetRef=\"b\"/>\
+         </collaboration>\
+         <process id=\"pa\"><userTask id=\"t\"/></process>\
+         <collaboration id=\"c2\">\
+           <participant id=\"c\" processRef=\"\"/>\
+           <messageFlow id=\"m2\" sourceRef=\"b\" targetRef=\"t\"/>\
+         </collaboration>",
+    ))
+    .unwrap();
+    let ids: Vec<_> = model.participants.iter().map(|p| p.id.as_str()).collect();
+    assert_eq!(
+        ids,
+        ["a", "b", "c"],
+        "several collaborations, in document order"
+    );
+    assert_eq!(model.participants[0].name.as_deref(), Some("Alpha"));
+    assert_eq!(model.participants[0].process_ref.as_deref(), Some("pa"));
+    assert_eq!(model.participants[1].name, None);
+    assert_eq!(model.participants[1].process_ref, None);
+    assert_eq!(model.participants[2].process_ref, None);
+    let m1 = &model.message_flows[0];
+    assert_eq!(
+        (
+            m1.id.as_str(),
+            m1.source_ref.as_str(),
+            m1.target_ref.as_str()
+        ),
+        ("m1", "t", "b")
+    );
+    assert_eq!(m1.label.as_deref(), Some("Ask"));
+    assert_eq!(model.message_flows[1].label, None);
+    assert!(matches!(
+        parse(&document(
+            "<collaboration><participant name=\"x\"/></collaboration>"
+        )),
+        Err(Error::Invalid(_))
+    ));
+}
+
+#[test]
+fn untyped_task_and_none_start_are_plain() {
+    let model = parse(&document(
+        "<process id=\"p\">\
+           <startEvent id=\"none\"/>\
+           <startEvent id=\"message\"><messageEventDefinition/></startEvent>\
+           <startEvent id=\"timer\"><timerEventDefinition/></startEvent>\
+           <startEvent id=\"conditional\"><conditionalEventDefinition/></startEvent>\
+           <startEvent id=\"signal\"><signalEventDefinition/></startEvent>\
+           <startEvent id=\"multiple\"><messageEventDefinition/><signalEventDefinition/></startEvent>\
+           <startEvent id=\"parallel\" parallelMultiple=\"true\">\
+             <messageEventDefinition/><timerEventDefinition/></startEvent>\
+           <startEvent id=\"vendor\"><extensionElements/></startEvent>\
+           <task id=\"untyped\"/>\
+           <manualTask id=\"manual\"/>\
+         </process>",
+    ))
+    .unwrap();
+    let kind = |id: &str| {
+        model.processes[0]
+            .nodes
+            .iter()
+            .find(|n| n.id == id)
+            .unwrap()
+            .kind
+            .clone()
+    };
+    assert_eq!(kind("none"), NodeKind::StartEvent(None));
+    assert_eq!(kind("vendor"), NodeKind::StartEvent(None));
+    assert_eq!(
+        kind("message"),
+        NodeKind::StartEvent(Some(EventGlyph::Message))
+    );
+    assert_eq!(kind("timer"), NodeKind::StartEvent(Some(EventGlyph::Timer)));
+    assert_eq!(
+        kind("conditional"),
+        NodeKind::StartEvent(Some(EventGlyph::Conditional))
+    );
+    assert_eq!(
+        kind("signal"),
+        NodeKind::StartEvent(Some(EventGlyph::Signal))
+    );
+    assert_eq!(
+        kind("multiple"),
+        NodeKind::StartEvent(Some(EventGlyph::Multiple))
+    );
+    assert_eq!(
+        kind("parallel"),
+        NodeKind::StartEvent(Some(EventGlyph::ParallelMultiple))
+    );
+    assert_eq!(kind("untyped"), NodeKind::Task(TaskType::Plain));
+    assert_eq!(kind("manual"), NodeKind::Task(TaskType::Manual));
 }

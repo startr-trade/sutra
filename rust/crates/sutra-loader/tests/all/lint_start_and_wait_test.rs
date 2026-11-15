@@ -1,5 +1,5 @@
-//! A start event and a wait on one channel with overlapping message types warn: start events are
-//! tried first, so a message meant for the parked instance starts a new one.
+//! A start event and a wait on one channel with overlapping message types warn: a message that
+//! correlates to a parked instance answers its wait and starts nothing.
 
 use std::path::Path;
 

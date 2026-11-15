@@ -22,8 +22,9 @@ mod analyzer;
 mod helpers;
 
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use handlebars::{Handlebars, RenderErrorReason};
 use serde_json::Value as Json;
@@ -57,8 +58,181 @@ impl fmt::Display for TemplateError {
 
 impl std::error::Error for TemplateError {}
 
+/// Templates compiled in this process, shared by every engine: `template id → (source, compiled)`.
+///
+/// Compiling is the expensive half of a template's life: handlebars asks its parser for the line
+/// and column of every token, which the parser counts from the start of the text, so the cost grows
+/// with the square of the template's size (about 0.8 s for 100 KB and 3.4 s for 200 KB in a release
+/// build). Each actor lane owns its own engine, and every activation builds new ones, so without
+/// this each lane would compile each template again on its first render after every flip. With it,
+/// a template is compiled once per process for as long as its id holds the same source: template
+/// ids are deployment-scoped, so in practice once per deployment.
+///
+/// The source is kept and compared on every hit, so a reused id with new content is compiled
+/// afresh, never served stale. The map is cleared when it passes [`COMPILED_CACHE_LIMIT`] entries,
+/// which bounds what retired deployments leave behind.
+static COMPILED: OnceLock<Mutex<HashMap<String, CompiledEntry>>> = OnceLock::new();
+
+/// How many distinct template ids (and texts, for lint) the process-wide cache holds before it
+/// starts again.
+const COMPILED_CACHE_LIMIT: usize = 4096;
+
+#[derive(Clone)]
+struct CompiledEntry {
+    source: Arc<str>,
+    template: Arc<handlebars::template::Template>,
+}
+
+/// The cache key for a template known only by its text (lint and analysis have no stable id: one
+/// package's `templates/x.hbs` is another's): `content:` and a 64-bit hash of the text. A hit still
+/// compares the whole source, so a hash collision compiles afresh instead of serving another
+/// template.
+fn content_key(src: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    src.hash(&mut hasher);
+    format!("content:{}:{:016x}", src.len(), hasher.finish())
+}
+
+/// How many times this process has compiled each distinct template text, by [`content_key`].
+static COMPILES: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
+
+/// How many times this process has compiled exactly `template` (any id). For tests and
+/// diagnostics: with the cache working, a template is compiled once however many lint checks,
+/// analyses, deploys and renders see it.
+pub fn compile_count(template: &[u8]) -> u64 {
+    let src = String::from_utf8_lossy(template);
+    COMPILES
+        .get()
+        .and_then(|counts| {
+            counts
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(&content_key(&src))
+                .copied()
+        })
+        .unwrap_or(0)
+}
+
+fn cached(key: &str, src: &str) -> Option<Arc<handlebars::template::Template>> {
+    COMPILED
+        .get()?
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(key)
+        .filter(|entry| &*entry.source == src)
+        .map(|entry| Arc::clone(&entry.template))
+}
+
+fn store(key: &str, src: &str, template: &Arc<handlebars::template::Template>) {
+    let cache = COMPILED.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut map = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if map.len() >= COMPILED_CACHE_LIMIT && !map.contains_key(key) {
+        map.clear();
+    }
+    map.insert(
+        key.to_string(),
+        CompiledEntry {
+            source: Arc::from(src),
+            template: Arc::clone(template),
+        },
+    );
+}
+
+/// The compiled form of `src`, by its text alone (see [`content_key`]): compiled once per process
+/// however often lint and analysis ask.
+fn compiled_by_content(
+    src: &str,
+) -> Result<Arc<handlebars::template::Template>, handlebars::TemplateError> {
+    let key = content_key(src);
+    if let Some(hit) = cached(&key, src) {
+        return Ok(hit);
+    }
+    let template = Arc::new(compile_counted(src, None)?);
+    store(&key, src, &template);
+    Ok(template)
+}
+
+/// Compile, and count it.
+fn compile_counted(
+    src: &str,
+    name: Option<&str>,
+) -> Result<handlebars::template::Template, handlebars::TemplateError> {
+    // Named, as `register_template_string` names it, so an error names the template. This engine
+    // never sets `prevent_indent`, the one other option that call compiles with.
+    let template = match name {
+        Some(name) => handlebars::template::Template::compile_with_name(src, name.to_string()),
+        None => handlebars::template::Template::compile(src),
+    }?;
+    *COMPILES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .entry(content_key(src))
+        .or_insert(0) += 1;
+    Ok(template)
+}
+
+/// The compiled form of `src` under `template_id`: from the process-wide cache when the id was
+/// compiled from the same source, else from the same text compiled under no id (by lint at
+/// deploy), named for this id, else compiled now. Either way cached under the id.
+fn compiled_template(
+    template_id: &str,
+    src: &str,
+) -> Result<Arc<handlebars::template::Template>, handlebars::TemplateError> {
+    if let Some(hit) = cached(template_id, src) {
+        return Ok(hit);
+    }
+    // Compiled outside the lock: another lane compiling another template must not wait on this one.
+    let template = match cached(&content_key(src), src) {
+        Some(by_content) => {
+            let mut named = (*by_content).clone();
+            named.name = Some(template_id.to_string());
+            Arc::new(named)
+        }
+        None => Arc::new(compile_counted(src, Some(template_id))?),
+    };
+    store(template_id, src, &template);
+    Ok(template)
+}
+
+/// Compile `template` under `template_id` into the process-wide cache now, so its first render
+/// does not pay for the compile. `Ok(true)` when it was compiled now (or taken from the compile
+/// lint made of the same text), `Ok(false)` when the cache
+/// already held this id with this source. A template that does not compile is not cached, and
+/// renders fail on it exactly as they would have without this call.
+pub fn precompile(template_id: &str, template: &[u8]) -> Result<bool, TemplateError> {
+    let src = String::from_utf8_lossy(template);
+    if is_compiled(template_id, template) {
+        return Ok(false);
+    }
+    compiled_template(template_id, &src)
+        .map(|_| true)
+        .map_err(|e| {
+            TemplateError::new(format!("Invalid Handlebars template '{template_id}': {e}"))
+        })
+}
+
+/// Whether the process-wide cache holds `template_id` compiled from exactly `template`.
+pub fn is_compiled(template_id: &str, template: &[u8]) -> bool {
+    let src = String::from_utf8_lossy(template);
+    COMPILED
+        .get()
+        .map(|cache| {
+            cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(template_id)
+                .is_some_and(|entry| *entry.source == *src)
+        })
+        .unwrap_or(false)
+}
+
 /// The strict Handlebars engine. Compiled templates are cached by their immutable
-/// module-scoped id (single-threaded here — the sync executor owns one engine).
+/// module-scoped id (single-threaded here — the sync executor owns one engine), and the compile
+/// itself is shared process-wide (see [`COMPILED`]).
 pub struct HandlebarsTemplateEngine {
     registry: RefCell<Handlebars<'static>>,
     compiled: RefCell<HashSet<String>>,
@@ -105,7 +279,7 @@ impl HandlebarsTemplateEngine {
     /// deliberately returns empty on a parse error, so packaging needs this explicit check).
     pub fn check(&self, template: &[u8]) -> Result<(), TemplateError> {
         let src = String::from_utf8_lossy(template);
-        handlebars::template::Template::compile(&src)
+        compiled_by_content(&src)
             .map(|_| ())
             .map_err(|e| TemplateError::new(format!("Invalid Handlebars template: {e}")))
     }
@@ -121,13 +295,13 @@ impl HandlebarsTemplateEngine {
             return Err(TemplateError::new("templateId is required"));
         }
         if !self.compiled.borrow().contains(template_id) {
-            let src = String::from_utf8_lossy(template).into_owned();
+            let src = String::from_utf8_lossy(template);
+            let compiled = compiled_template(template_id, &src).map_err(|e| {
+                TemplateError::new(format!("Invalid Handlebars template '{template_id}': {e}"))
+            })?;
             self.registry
                 .borrow_mut()
-                .register_template_string(template_id, src)
-                .map_err(|e| {
-                    TemplateError::new(format!("Invalid Handlebars template '{template_id}': {e}"))
-                })?;
+                .register_template(template_id, (*compiled).clone());
             self.compiled.borrow_mut().insert(template_id.to_string());
         }
         // Strip null-valued map entries so an explicitly-null value strict-fails exactly like
@@ -201,5 +375,69 @@ mod null_strip_tests {
         for case in cases {
             assert_eq!(has_null_entry(&case), strip_nulls(&case) != case, "{case}");
         }
+    }
+}
+
+#[cfg(test)]
+mod compiled_cache_tests {
+    use super::*;
+
+    #[test]
+    fn one_id_and_source_is_compiled_once_per_process() {
+        let a = compiled_template("cache-test-once", "<A>{{v}}</A>").unwrap();
+        let b = compiled_template("cache-test-once", "<A>{{v}}</A>").unwrap();
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "the second lookup reuses the first compile"
+        );
+        let changed = compiled_template("cache-test-once", "<B>{{v}}</B>").unwrap();
+        assert!(
+            !Arc::ptr_eq(&a, &changed),
+            "new source under the id compiles afresh"
+        );
+    }
+
+    #[test]
+    fn a_precompiled_template_is_compiled_before_its_first_render() {
+        let src = b"<P>{{v}}</P>";
+        assert!(!is_compiled("cache-test-pre", src));
+        assert!(precompile("cache-test-pre", src).unwrap(), "compiled now");
+        assert!(is_compiled("cache-test-pre", src));
+        assert!(
+            !precompile("cache-test-pre", src).unwrap(),
+            "already cached"
+        );
+        let engine = HandlebarsTemplateEngine::new();
+        let out = engine
+            .render("cache-test-pre", src, &serde_json::json!({"v": "1"}))
+            .unwrap();
+        assert_eq!(out, "<P>1</P>");
+        assert!(precompile("cache-test-bad", b"{{#if x}}open").is_err());
+        assert!(!is_compiled("cache-test-bad", b"{{#if x}}open"));
+    }
+
+    #[test]
+    fn lint_checks_analyses_and_renders_compile_a_template_once() {
+        let src = b"<Once>{{payload.a}}{{#if payload.b}}{{payload.c}}{{/if}}</Once>";
+        let engine = HandlebarsTemplateEngine::new();
+        engine.check(src).unwrap();
+        engine.check(src).unwrap();
+        let _ = engine.analyze(src);
+        let _ = HandlebarsTemplateEngine::new().analyze(src);
+        precompile("cache-test-once-all", src).unwrap();
+        engine
+            .render(
+                "cache-test-once-all",
+                src,
+                &serde_json::json!({"payload": {"a": 1, "b": false}}),
+            )
+            .unwrap();
+        assert_eq!(compile_count(src), 1);
+    }
+
+    #[test]
+    fn a_compile_error_is_not_cached() {
+        assert!(compiled_template("cache-test-err", "{{#if x}}open").is_err());
+        assert!(compiled_template("cache-test-err", "{{x}}").is_ok());
     }
 }

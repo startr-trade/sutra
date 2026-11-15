@@ -23,8 +23,19 @@
 //! An `amqp10s://` destination is secured natively (see [`super::tls`]) under the engine-wide
 //! trust settings (`SUTRA_SINK_AMQP_TLS_CA_FILE`, `SUTRA_SINK_AMQP_TLS_INSECURE_SKIP_VERIFY`). A
 //! destination URI can hold a password, so every diagnostic here names it redacted.
+//!
+//! **Every broker round trip is bounded.** Opening the connection (TCP, TLS, AMQP open and SASL),
+//! beginning the session, attaching the sender and waiting for the disposition each get at most
+//! the sink's operation timeout ([`DEFAULT_OPERATION_TIMEOUT`], 30 s, or
+//! `SUTRA_SINK_AMQP_OPERATION_TIMEOUT_MS`). A broker that stops answering fails the send with the
+//! retryable `SUTRA.OUTBOUND.AMQP.SEND_TIMEOUT`, so the outbox sends again later instead of one
+//! delivery worker waiting forever. A send that timed out waiting for its disposition may already
+//! have been accepted, so the retry can deliver it twice; the `sutra-outbox-key` property is what a
+//! receiver dedupes that on. Closing after the outcome is bounded the same way and never changes it.
 
+use std::future::Future;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use fe2o3_amqp::types::messaging::{ApplicationProperties, Message};
 use fe2o3_amqp::{Connection, Sender, Session};
@@ -46,6 +57,10 @@ use super::{SCHEME, SCHEME_TLS};
 /// The container-id fe2o3 announces on the AMQP `open` performative.
 const CONTAINER_ID: &str = "sutra-amqp-sink";
 
+/// How long one broker round trip of a send may take by default: the same bound the TLS connect
+/// and handshake have.
+pub const DEFAULT_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// The outbound AMQP 1.0 transport. `default_username`/`default_password` are the engine-wide
 /// SASL credentials applied when a destination URI carries no userinfo.
 pub struct AmqpMessageSink {
@@ -57,6 +72,8 @@ pub struct AmqpMessageSink {
     /// The loaded client configuration, so the CA bundle is read once rather than per send. A
     /// failed load is not cached.
     tls_config: Mutex<Option<Arc<rustls::ClientConfig>>>,
+    /// The bound on each broker round trip of a send.
+    operation_timeout: Duration,
 }
 
 impl AmqpMessageSink {
@@ -72,7 +89,14 @@ impl AmqpMessageSink {
             default_password: default_password.filter(|s| !s.is_empty()),
             tls_settings: Ok(AmqpTlsProperties::default()),
             tls_config: Mutex::new(None),
+            operation_timeout: DEFAULT_OPERATION_TIMEOUT,
         }
+    }
+
+    /// Bound each broker round trip of a send by `timeout` instead of the default 30 s.
+    pub fn with_operation_timeout(mut self, timeout: Duration) -> AmqpMessageSink {
+        self.operation_timeout = timeout;
+        self
     }
 
     /// Set the trust settings for `amqp10s://` destinations. `Err` holds why the engine-wide
@@ -145,34 +169,61 @@ impl MessageSink for AmqpMessageSink {
             } else {
                 None
             };
-            deliver(&destination, message, tls_config).await
+            deliver(&destination, message, tls_config, self.operation_timeout).await
         })
     }
 }
 
+/// Run one broker round trip of a send under `timeout`. `Err` names the step for the diagnostic.
+async fn bounded<T>(
+    timeout: Duration,
+    step: &str,
+    redacted: &str,
+    fut: impl Future<Output = T>,
+) -> Result<T, SendOutcome> {
+    tokio::time::timeout(timeout, fut).await.map_err(|_| {
+        SendOutcome::RetryableFailure(Diagnostic::error(
+            codes::OUTBOUND_SEND_TIMEOUT,
+            format!(
+                "amqp sink got no answer from {redacted} within {} ms while it {step}; the outbox \
+                 sends again",
+                timeout.as_millis()
+            ),
+        ))
+    })
+}
+
 /// Open a connection → session → sender, send the projected message, settle the outcome,
 /// then close. Connection/session/send failures are RETRYABLE (the outbox loop re-attempts);
-/// a broker that rejects the disposition is likewise retryable.
+/// a broker that rejects the disposition is likewise retryable, and so is a broker that does not
+/// answer a step within `timeout`.
 async fn deliver(
     destination: &AmqpDestination,
     message: &OutboundMessage,
     tls_config: Option<Arc<rustls::ClientConfig>>,
+    timeout: Duration,
 ) -> SendOutcome {
-    let opened = match tls_config {
-        Some(config) => {
-            let target = AmqpBrokerTarget {
-                host: &destination.host,
-                port: destination.port,
-                username: destination.username.as_deref(),
-                password: destination.password.as_deref(),
-            };
-            open_tls_connection(CONTAINER_ID, &target, config).await
-        }
-        None => Connection::open(CONTAINER_ID, destination.connection_uri().as_str())
-            .await
-            .map_err(classify_open_error),
-    };
     let redacted = redact_destination(&message.destination);
+    let open = async {
+        match tls_config {
+            Some(config) => {
+                let target = AmqpBrokerTarget {
+                    host: &destination.host,
+                    port: destination.port,
+                    username: destination.username.as_deref(),
+                    password: destination.password.as_deref(),
+                };
+                open_tls_connection(CONTAINER_ID, &target, config).await
+            }
+            None => Connection::open(CONTAINER_ID, destination.connection_uri().as_str())
+                .await
+                .map_err(classify_open_error),
+        }
+    };
+    let opened = match bounded(timeout, "opened the connection", &redacted, open).await {
+        Ok(opened) => opened,
+        Err(timed_out) => return timed_out,
+    };
     let mut connection = match opened {
         Ok(c) => c,
         Err(failure) => {
@@ -187,9 +238,16 @@ async fn deliver(
             ));
         }
     };
-    let outcome = deliver_on_connection(&mut connection, destination, message, &redacted).await;
-    // Best-effort close (the disposition already settled).
-    let _ = connection.close().await;
+    let outcome =
+        deliver_on_connection(&mut connection, destination, message, &redacted, timeout).await;
+    // Best-effort close (the outcome is already decided), bounded like every other step.
+    let _ = bounded(
+        timeout,
+        "closed the connection",
+        &redacted,
+        connection.close(),
+    )
+    .await;
     outcome
 }
 
@@ -198,35 +256,61 @@ async fn deliver_on_connection(
     destination: &AmqpDestination,
     message: &OutboundMessage,
     redacted: &str,
+    timeout: Duration,
 ) -> SendOutcome {
-    let mut session = match Session::begin(connection).await {
-        Ok(s) => s,
-        Err(e) => {
+    let begun = bounded(
+        timeout,
+        "began a session",
+        redacted,
+        Session::begin(connection),
+    )
+    .await;
+    let mut session = match begun {
+        Err(timed_out) => return timed_out,
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
             return SendOutcome::RetryableFailure(Diagnostic::error(
                 codes::OUTBOUND_SEND_FAILED,
                 format!("amqp sink could not begin a session to {redacted}: {e}"),
             ));
         }
     };
-    let mut sender = match Sender::attach(
-        &mut session,
-        format!("{CONTAINER_ID}-{}", destination.address),
-        destination.address.as_str(),
+    let attached = bounded(
+        timeout,
+        "attached a sender",
+        redacted,
+        Sender::attach(
+            &mut session,
+            format!("{CONTAINER_ID}-{}", destination.address),
+            destination.address.as_str(),
+        ),
     )
-    .await
-    {
-        Ok(s) => s,
-        Err(e) => {
-            let _ = session.end().await;
-            return SendOutcome::RetryableFailure(Diagnostic::error(
-                codes::OUTBOUND_SEND_FAILED,
-                format!("amqp sink could not attach a sender to {redacted}: {e}"),
-            ));
+    .await;
+    let mut sender = match attached {
+        Ok(Ok(s)) => s,
+        failed => {
+            let _ = bounded(timeout, "ended the session", redacted, session.end()).await;
+            return match failed {
+                Err(timed_out) => timed_out,
+                Ok(Err(e)) => SendOutcome::RetryableFailure(Diagnostic::error(
+                    codes::OUTBOUND_SEND_FAILED,
+                    format!("amqp sink could not attach a sender to {redacted}: {e}"),
+                )),
+                Ok(Ok(_)) => unreachable!("matched above"),
+            };
         }
     };
 
-    let outcome = match sender.send(build_message(message)).await {
-        Ok(outcome) => {
+    let sent = bounded(
+        timeout,
+        "waited for the broker to settle the message",
+        redacted,
+        sender.send(build_message(message)),
+    )
+    .await;
+    let outcome = match sent {
+        Err(timed_out) => timed_out,
+        Ok(Ok(outcome)) => {
             if outcome.is_accepted() {
                 SendOutcome::Delivered
             } else {
@@ -238,14 +322,14 @@ async fn deliver_on_connection(
                 ))
             }
         }
-        Err(e) => SendOutcome::RetryableFailure(Diagnostic::error(
+        Ok(Err(e)) => SendOutcome::RetryableFailure(Diagnostic::error(
             codes::OUTBOUND_SEND_FAILED,
             format!("amqp publish to {redacted} failed: {e}"),
         )),
     };
 
-    let _ = sender.close().await;
-    let _ = session.end().await;
+    let _ = bounded(timeout, "closed the sender", redacted, sender.close()).await;
+    let _ = bounded(timeout, "ended the session", redacted, session.end()).await;
     outcome
 }
 
@@ -460,6 +544,46 @@ mod tests {
             }
             other => panic!("expected RetryableFailure, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn a_broker_that_never_answers_is_a_retryable_coded_timeout() {
+        // A listener that accepts the TCP connection and then says nothing: the AMQP open waits for
+        // a header that never comes.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let silent = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+        let sink =
+            AmqpMessageSink::new(None, None).with_operation_timeout(Duration::from_millis(300));
+        let started = std::time::Instant::now();
+        let outcome = sink
+            .send(&message(&format!(
+                "amqp10://svc:hunter2@127.0.0.1:{port}/q"
+            )))
+            .await;
+        silent.abort();
+        match outcome {
+            SendOutcome::RetryableFailure(d) => {
+                assert_eq!(d.code, codes::OUTBOUND_SEND_TIMEOUT, "{}", d.message);
+                assert!(d.message.contains("opened the connection"), "{}", d.message);
+                assert!(!d.message.contains("hunter2"), "{}", d.message);
+            }
+            other => panic!("expected a retryable timeout, got {other:?}"),
+        }
+        assert!(started.elapsed() < Duration::from_secs(5), "bounded");
+    }
+
+    #[tokio::test]
+    async fn the_operation_timeout_defaults_to_the_connect_bound() {
+        assert_eq!(
+            AmqpMessageSink::new(None, None).operation_timeout,
+            DEFAULT_OPERATION_TIMEOUT
+        );
     }
 
     #[tokio::test]

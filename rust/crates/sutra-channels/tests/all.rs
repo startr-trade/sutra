@@ -41,11 +41,17 @@ mod reply_encode_test;
 mod resume_commit_refusal_test;
 #[path = "all/retry_redrive_test.rs"]
 mod retry_redrive_test;
+#[path = "all/same_decoder_test.rs"]
+mod same_decoder_test;
 #[path = "all/select_predicate_test.rs"]
 mod select_predicate_test;
 #[path = "all/shard_router_pin_test.rs"]
 mod shard_router_pin_test;
 #[path = "all/shard_scale_out_test.rs"]
 mod shard_scale_out_test;
+#[path = "all/wait_index_test.rs"]
+mod wait_index_test;
 #[path = "all/wait_loop_dispatch_test.rs"]
 mod wait_loop_dispatch_test;
+#[path = "all/waits_first_test.rs"]
+mod waits_first_test;

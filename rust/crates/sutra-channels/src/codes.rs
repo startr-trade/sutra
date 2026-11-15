@@ -31,8 +31,8 @@ pub const DEPLOY_ENDPOINT_SUPERSEDED: &str = "SUTRA.DEPLOY.ENDPOINT.SUPERSEDED";
 /// under another name. A warning: the parked instances resume through what the new version serves.
 pub const DEPLOY_ENDPOINT_CHANNEL_CHANGED: &str = "SUTRA.DEPLOY.ENDPOINT.CHANNEL_CHANGED";
 /// A deployment adds a start event on a channel an older version of its owner waits on, with a
-/// message type that can overlap. Start events are tried first, so a reply meant for a parked
-/// instance starts a new one instead. A warning.
+/// message type that can overlap. A reply that correlates to a parked instance still resumes it;
+/// one that does not now starts an instance of the new version. A warning.
 pub const DEPLOY_ENDPOINT_START_ON_WAIT: &str = "SUTRA.DEPLOY.ENDPOINT.START_ON_WAIT";
 /// A deployment in a folder is an older version than one its owner already has there on a shared
 /// endpoint, so it does not serve: in a folder the highest version wins, at every scan and restart.

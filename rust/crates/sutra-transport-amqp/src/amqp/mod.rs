@@ -54,6 +54,9 @@ pub mod codes {
     pub const INBOUND_BROKER_AUTH_FAILED: &str = "SUTRA.INBOUND.AMQP.BROKER_AUTH_FAILED";
 
     pub const OUTBOUND_SEND_FAILED: &str = "SUTRA.OUTBOUND.AMQP.SEND_FAILED";
+    /// A step of an outbound send (open, session, attach, send, settle) got no answer from the
+    /// broker within the sink's operation timeout. Retryable: the outbox sends again.
+    pub const OUTBOUND_SEND_TIMEOUT: &str = "SUTRA.OUTBOUND.AMQP.SEND_TIMEOUT";
     pub const OUTBOUND_DESTINATION_MISSING: &str = "SUTRA.OUTBOUND.AMQP.DESTINATION_MISSING";
     pub const OUTBOUND_CONFIG_INVALID: &str = "SUTRA.OUTBOUND.AMQP.CONFIG_INVALID";
     /// The sink's TLS trust settings could not be loaded, or the handshake failed.

@@ -277,7 +277,7 @@ dependencies = [
  "libc",
  "portable-atomic",
  "rustc-hash",
- "rustix 1.1.4",
+ "rustix 1.1.6",
  "tokio",
  "tokio-stream",
  "xattr",
@@ -378,7 +378,7 @@ dependencies = [
  "futures-lite 2.6.1",
  "parking",
  "polling 3.11.0",
- "rustix 1.1.4",
+ "rustix 1.1.6",
  "slab",
  "windows-sys 0.61.2",
 ]
@@ -1156,7 +1156,7 @@ dependencies = [
 
 [[package]]
 name = "bpmn-svg"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "quick-xml",
 ]
@@ -2091,7 +2091,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3118,7 +3118,7 @@ checksum = "3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46"
 dependencies = [
  "hermit-abi 0.5.2",
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4262,7 +4262,7 @@ dependencies = [
  "concurrent-queue",
  "hermit-abi 0.5.2",
  "pin-project-lite",
- "rustix 1.1.4",
+ "rustix 1.1.6",
  "windows-sys 0.61.2",
 ]
 
@@ -4476,7 +4476,7 @@ dependencies = [
  "once_cell",
  "socket2 0.6.5",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4880,15 +4880,15 @@ dependencies = [
 
 [[package]]
 name = "rustix"
-version = "1.1.4"
+version = "1.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6fe4565b9518b83ef4f91bb47ce29620ca828bd32cb7e408f0062e9930ba190"
+checksum = "e5e76742e5294153d4dde1207dbec5bdd81eef6fabdc0d2118babadabfd858aa"
 dependencies = [
  "bitflags 2.13.1",
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4982,7 +4982,7 @@ dependencies = [
  "security-framework 3.7.0",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -5783,18 +5783,18 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "sutra-archtest"
-version = "0.6.21"
+version = "0.6.22"
 
 [[package]]
 name = "sutra-bench-packager"
-version = "0.6.21"
+version = "0.6.22"
 dependencies = [
  "sutra-loader",
 ]
 
 [[package]]
 name = "sutra-bpmn"
-version = "0.6.21"
+version = "0.6.22"
 dependencies = [
  "quick-xml",
  "regex",
@@ -5804,7 +5804,7 @@ dependencies = [
 
 [[package]]
 name = "sutra-catalog-gen"
-version = "0.6.21"
+version = "0.6.22"
 dependencies = [
  "anyhow",
  "dunce",
@@ -5817,12 +5817,13 @@ dependencies = [
 
 [[package]]
 name = "sutra-channels"
-version = "0.6.21"
+version = "0.6.22"
 dependencies = [
  "async-trait",
  "axum",
  "base64 0.22.1",
  "bigdecimal",
+ "criterion",
  "futures-core",
  "getrandom 0.2.17",
  "http-body-util",
@@ -5856,7 +5857,7 @@ dependencies = [
 
 [[package]]
 name = "sutra-cli"
-version = "0.6.21"
+version = "0.6.22"
 dependencies = [
  "async-trait",
  "clap",
@@ -5904,7 +5905,7 @@ dependencies = [
 
 [[package]]
 name = "sutra-codec-schema"
-version = "0.6.21"
+version = "0.6.22"
 dependencies = [
  "inventory",
  "quick-xml",
@@ -5917,7 +5918,7 @@ dependencies = [
 
 [[package]]
 name = "sutra-codec-spi"
-version = "0.6.21"
+version = "0.6.22"
 dependencies = [
  "inventory",
  "serde_json",
@@ -5926,7 +5927,7 @@ dependencies = [
 
 [[package]]
 name = "sutra-conformance"
-version = "0.6.21"
+version = "0.6.22"
 dependencies = [
  "base64 0.22.1",
  "fe2o3-amqp",
@@ -5948,7 +5949,7 @@ dependencies = [
 
 [[package]]
 name = "sutra-crypto"
-version = "0.6.21"
+version = "0.6.22"
 dependencies = [
  "aes-gcm",
  "hkdf",
@@ -5959,7 +5960,7 @@ dependencies = [
 
 [[package]]
 name = "sutra-datastore"
-version = "0.6.21"
+version = "0.6.22"
 dependencies = [
  "serde_json",
  "serde_yaml",
@@ -5976,7 +5977,7 @@ dependencies = [
 
 [[package]]
 name = "sutra-dist"
-version = "0.6.21"
+version = "0.6.22"
 dependencies = [
  "aws-sdk-sqs",
  "reqwest",
@@ -6016,7 +6017,7 @@ dependencies = [
 
 [[package]]
 name = "sutra-dmn"
-version = "0.6.21"
+version = "0.6.22"
 dependencies = [
  "bigdecimal",
  "quick-xml",
@@ -6026,7 +6027,7 @@ dependencies = [
 
 [[package]]
 name = "sutra-docgen"
-version = "0.6.21"
+version = "0.6.22"
 dependencies = [
  "anyhow",
  "bpmn-svg",
@@ -6041,7 +6042,7 @@ dependencies = [
 
 [[package]]
 name = "sutra-engine"
-version = "0.6.21"
+version = "0.6.22"
 dependencies = [
  "async-trait",
  "axum",
@@ -6062,6 +6063,7 @@ dependencies = [
  "rustls",
  "serde_json",
  "serde_yaml_ng",
+ "sha2 0.10.9",
  "sqlx",
  "sutra-bpmn",
  "sutra-channels",
@@ -6108,7 +6110,7 @@ dependencies = [
 
 [[package]]
 name = "sutra-envref-aws"
-version = "0.6.21"
+version = "0.6.22"
 dependencies = [
  "aws-config",
  "aws-sdk-secretsmanager",
@@ -6121,7 +6123,7 @@ dependencies = [
 
 [[package]]
 name = "sutra-envref-azure"
-version = "0.6.21"
+version = "0.6.22"
 dependencies = [
  "inventory",
  "reqwest",
@@ -6132,7 +6134,7 @@ dependencies = [
 
 [[package]]
 name = "sutra-envref-gcp"
-version = "0.6.21"
+version = "0.6.22"
 dependencies = [
  "base64 0.22.1",
  "inventory",
@@ -6145,14 +6147,14 @@ dependencies = [
 
 [[package]]
 name = "sutra-envref-spi"
-version = "0.6.21"
+version = "0.6.22"
 dependencies = [
  "inventory",
 ]
 
 [[package]]
 name = "sutra-envref-vault"
-version = "0.6.21"
+version = "0.6.22"
 dependencies = [
  "inventory",
  "serde_json",
@@ -6165,7 +6167,7 @@ dependencies = [
 
 [[package]]
 name = "sutra-executor"
-version = "0.6.21"
+version = "0.6.22"
 dependencies = [
  "async-recursion",
  "async-trait",
@@ -6188,7 +6190,7 @@ dependencies = [
 
 [[package]]
 name = "sutra-feel"
-version = "0.6.21"
+version = "0.6.22"
 dependencies = [
  "argon2",
  "bigdecimal",
@@ -6204,7 +6206,7 @@ dependencies = [
 
 [[package]]
 name = "sutra-formats"
-version = "0.6.21"
+version = "0.6.22"
 dependencies = [
  "inventory",
  "quick-xml",
@@ -6215,7 +6217,7 @@ dependencies = [
 
 [[package]]
 name = "sutra-lint-core"
-version = "0.6.21"
+version = "0.6.22"
 dependencies = [
  "getrandom 0.2.17",
  "serde",
@@ -6226,7 +6228,7 @@ dependencies = [
 
 [[package]]
 name = "sutra-llm-anthropic"
-version = "0.6.21"
+version = "0.6.22"
 dependencies = [
  "inventory",
  "serde_json",
@@ -6236,7 +6238,7 @@ dependencies = [
 
 [[package]]
 name = "sutra-llm-bedrock"
-version = "0.6.21"
+version = "0.6.22"
 dependencies = [
  "inventory",
  "serde_json",
@@ -6246,7 +6248,7 @@ dependencies = [
 
 [[package]]
 name = "sutra-llm-gemini"
-version = "0.6.21"
+version = "0.6.22"
 dependencies = [
  "base64 0.22.1",
  "futures-util",
@@ -6261,7 +6263,7 @@ dependencies = [
 
 [[package]]
 name = "sutra-llm-openai"
-version = "0.6.21"
+version = "0.6.22"
 dependencies = [
  "base64 0.22.1",
  "futures-util",
@@ -6278,7 +6280,7 @@ dependencies = [
 
 [[package]]
 name = "sutra-llm-spi"
-version = "0.6.21"
+version = "0.6.22"
 dependencies = [
  "http-body-util",
  "hyper",
@@ -6293,7 +6295,7 @@ dependencies = [
 
 [[package]]
 name = "sutra-loader"
-version = "0.6.21"
+version = "0.6.22"
 dependencies = [
  "bigdecimal",
  "dunce",
@@ -6319,7 +6321,7 @@ dependencies = [
 
 [[package]]
 name = "sutra-objectstore"
-version = "0.6.21"
+version = "0.6.22"
 dependencies = [
  "base64 0.22.1",
  "hmac 0.12.1",
@@ -6338,7 +6340,7 @@ dependencies = [
 
 [[package]]
 name = "sutra-openapi"
-version = "0.6.21"
+version = "0.6.22"
 dependencies = [
  "serde_json",
  "serde_yaml_ng",
@@ -6349,7 +6351,7 @@ dependencies = [
 
 [[package]]
 name = "sutra-persistence"
-version = "0.6.21"
+version = "0.6.22"
 dependencies = [
  "base64 0.22.1",
  "bigdecimal",
@@ -6370,7 +6372,7 @@ dependencies = [
 
 [[package]]
 name = "sutra-redactor-spi"
-version = "0.6.21"
+version = "0.6.22"
 dependencies = [
  "inventory",
  "sutra-executor",
@@ -6379,7 +6381,7 @@ dependencies = [
 
 [[package]]
 name = "sutra-redactor-template"
-version = "0.6.21"
+version = "0.6.22"
 dependencies = [
  "sutra-executor",
  "sutra-feel",
@@ -6389,21 +6391,21 @@ dependencies = [
 
 [[package]]
 name = "sutra-schema-gen"
-version = "0.6.21"
+version = "0.6.22"
 dependencies = [
  "quick-xml",
 ]
 
 [[package]]
 name = "sutra-srl"
-version = "0.6.21"
+version = "0.6.22"
 dependencies = [
  "sutra-feel",
 ]
 
 [[package]]
 name = "sutra-templates"
-version = "0.6.21"
+version = "0.6.22"
 dependencies = [
  "handlebars",
  "regex",
@@ -6412,7 +6414,7 @@ dependencies = [
 
 [[package]]
 name = "sutra-testkit"
-version = "0.6.21"
+version = "0.6.22"
 dependencies = [
  "k8s-openapi",
  "kube",
@@ -6429,7 +6431,7 @@ dependencies = [
 
 [[package]]
 name = "sutra-transport-amqp"
-version = "0.6.21"
+version = "0.6.22"
 dependencies = [
  "async-trait",
  "fe2o3-amqp",
@@ -6450,7 +6452,7 @@ dependencies = [
 
 [[package]]
 name = "sutra-transport-dapr"
-version = "0.6.21"
+version = "0.6.22"
 dependencies = [
  "async-trait",
  "axum",
@@ -6466,7 +6468,7 @@ dependencies = [
 
 [[package]]
 name = "sutra-transport-file"
-version = "0.6.21"
+version = "0.6.22"
 dependencies = [
  "async-trait",
  "inventory",
@@ -6483,7 +6485,7 @@ dependencies = [
 
 [[package]]
 name = "sutra-transport-gcp-pubsub"
-version = "0.6.21"
+version = "0.6.22"
 dependencies = [
  "async-trait",
  "google-cloud-gax",
@@ -6503,7 +6505,7 @@ dependencies = [
 
 [[package]]
 name = "sutra-transport-http"
-version = "0.6.21"
+version = "0.6.22"
 dependencies = [
  "async-trait",
  "axum",
@@ -6522,7 +6524,7 @@ dependencies = [
 
 [[package]]
 name = "sutra-transport-kafka"
-version = "0.6.21"
+version = "0.6.22"
 dependencies = [
  "async-trait",
  "inventory",
@@ -6541,7 +6543,7 @@ dependencies = [
 
 [[package]]
 name = "sutra-transport-knative"
-version = "0.6.21"
+version = "0.6.22"
 dependencies = [
  "async-trait",
  "axum",
@@ -6560,7 +6562,7 @@ dependencies = [
 
 [[package]]
 name = "sutra-transport-llm"
-version = "0.6.21"
+version = "0.6.22"
 dependencies = [
  "async-trait",
  "axum",
@@ -6587,7 +6589,7 @@ dependencies = [
 
 [[package]]
 name = "sutra-transport-rabbitmq"
-version = "0.6.21"
+version = "0.6.22"
 dependencies = [
  "async-trait",
  "futures-core",
@@ -6607,7 +6609,7 @@ dependencies = [
 
 [[package]]
 name = "sutra-transport-spi"
-version = "0.6.21"
+version = "0.6.22"
 dependencies = [
  "async-trait",
  "axum",
@@ -6623,7 +6625,7 @@ dependencies = [
 
 [[package]]
 name = "sutra-transport-sqs"
-version = "0.6.21"
+version = "0.6.22"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -6644,7 +6646,7 @@ dependencies = [
 
 [[package]]
 name = "sutra-xsd"
-version = "0.6.21"
+version = "0.6.22"
 dependencies = [
  "bigdecimal",
  "quick-xml",
@@ -6737,8 +6739,8 @@ dependencies = [
  "fastrand 2.5.0",
  "getrandom 0.3.4",
  "once_cell",
- "rustix 1.1.4",
- "windows-sys 0.61.2",
+ "rustix 1.1.6",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -8071,7 +8073,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32e45ad4206f6d2479085147f02bc2ef834ac85886624a23575ae137c8aa8156"
 dependencies = [
  "libc",
- "rustix 1.1.4",
+ "rustix 1.1.6",
 ]
 
 [[package]]

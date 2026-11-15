@@ -34,7 +34,12 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 
-use crate::model::{FlowNode, GatewayType, NodeKind, Process, SubProcessKind};
+use crate::attrs::{assign_element_ids, escape_attr, valid_class, valid_data_key};
+use crate::model::{
+    EventGlyph, FlowNode, GatewayType, Model, NodeKind, Participant, Process, SubProcessKind,
+    TaskType,
+};
+use crate::{NodeAttrs, Options};
 
 // ---- geometry constants ----------------------------------------------------------------------
 
@@ -47,6 +52,8 @@ const BOUNDARY_SIZE: f64 = 36.0; // event circle drawn for a boundary event
 const BOUNDARY_DROP: f64 = 30.0; // how far a boundary edge drops below the host before turning
 const LEFT_STUB: f64 = 22.0; // horizontal stub before an edge enters a left edge
 const PROCESS_GAP: f64 = 60.0; // vertical gap when a file declares several processes
+const POOL_HEADER: f64 = 30.0; // a pool's header strip, holding its rotated name
+const BLACKBOX_H: f64 = 60.0; // the height of a black-box pool's empty band
 const TASK_PAD_X: f64 = 12.0; // horizontal padding each side of a task box's centred label
 const TASK_MIN_W: f64 = 120.0; // minimum task-box width
 const TASK_H: f64 = 64.0; // task-box height
@@ -75,6 +82,7 @@ enum Class {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Gw {
     Exclusive,
+    EventBased,
     Parallel,
     Inclusive,
     Complex,
@@ -83,9 +91,13 @@ enum Gw {
 /// How one node draws: its shape family, BPMN glyph, activity markers and border weight.
 struct Visual<'a> {
     class: Class,
+    /// The node group's built-in classes.
+    group: &'static str,
     gateway: Gw,
     /// `<bpmn:transaction>` draws the doubled inline boundary; other containers a single rect.
     transaction: bool,
+    /// An event sub-process draws a dotted border.
+    dotted: bool,
     label: Option<&'a str>,
     /// Event-definition glyph (`message` / `timer` / `error` / `escalation` / `signal` /
     /// `terminate` / `link` / `cancel` / `compensate`), or `""`.
@@ -106,8 +118,10 @@ struct Visual<'a> {
 fn base(class: Class, label: Option<&str>) -> Visual<'_> {
     Visual {
         class,
+        group: "",
         gateway: Gw::Exclusive,
         transaction: false,
+        dotted: false,
         label,
         icon: "",
         task_icon: "",
@@ -128,7 +142,7 @@ fn classify(n: &FlowNode) -> Visual<'_> {
     let mut v = match &n.kind {
         NodeKind::StartEvent(glyph) => {
             let mut v = base(Class::StartEvent, label);
-            v.icon = glyph.as_str();
+            v.icon = glyph.map_or("", EventGlyph::as_str);
             v
         }
         NodeKind::EndEvent(glyph) => {
@@ -141,13 +155,13 @@ fn classify(n: &FlowNode) -> Visual<'_> {
         }
         NodeKind::IntermediateThrowEvent(glyph) => {
             let mut v = base(Class::IntermediateEvent, label);
-            v.icon = glyph.as_str();
+            v.icon = glyph.map_or("", EventGlyph::as_str);
             v.throwing = true;
             v
         }
         NodeKind::IntermediateCatchEvent(glyph) => {
             let mut v = base(Class::IntermediateEvent, label);
-            v.icon = glyph.as_str();
+            v.icon = glyph.map_or("", EventGlyph::as_str);
             v
         }
         NodeKind::BoundaryEvent { glyph, .. } => {
@@ -171,16 +185,15 @@ fn classify(n: &FlowNode) -> Visual<'_> {
             match kind {
                 SubProcessKind::Transaction => v.transaction = true,
                 SubProcessKind::AdHoc => v.markers.push("ad-hoc"),
-                SubProcessKind::Embedded | SubProcessKind::Event => {}
+                SubProcessKind::Event => v.dotted = true,
+                SubProcessKind::Embedded => {}
             }
             v
         }
         NodeKind::Gateway(GatewayType::Exclusive) => base(Class::Gateway, label),
-        // BPMN marks the event-based gateway with a message pentagon inside a double ring; the
-        // closest marker this renderer has is the message icon on a gateway shape.
         NodeKind::Gateway(GatewayType::EventBased) => {
             let mut v = base(Class::Gateway, label);
-            v.icon = "message";
+            v.gateway = Gw::EventBased;
             v
         }
         NodeKind::Gateway(GatewayType::Inclusive) => {
@@ -201,16 +214,57 @@ fn classify(n: &FlowNode) -> Visual<'_> {
     };
     // A loop decorates the activity it wraps: draw the shape, add the marker.
     v.markers.extend(n.markers.iter().map(|m| m.as_str()));
+    v.group = node_group_class(&n.kind);
     v
+}
+
+/// The fixed class list of a node's group: `bpmn-node`, its family, and its subkind.
+fn node_group_class(kind: &NodeKind) -> &'static str {
+    match kind {
+        NodeKind::StartEvent(_) => "bpmn-node bpmn-event bpmn-event-start",
+        NodeKind::EndEvent(_) => "bpmn-node bpmn-event bpmn-event-end",
+        NodeKind::IntermediateThrowEvent(_) => "bpmn-node bpmn-event bpmn-event-intermediate-throw",
+        NodeKind::IntermediateCatchEvent(_) => "bpmn-node bpmn-event bpmn-event-intermediate-catch",
+        NodeKind::BoundaryEvent { .. } => "bpmn-node bpmn-event bpmn-event-boundary",
+        NodeKind::Task(t) => match t {
+            TaskType::Plain => "bpmn-node bpmn-task bpmn-task-plain",
+            TaskType::Service => "bpmn-node bpmn-task bpmn-task-service",
+            TaskType::Script => "bpmn-node bpmn-task bpmn-task-script",
+            TaskType::Send => "bpmn-node bpmn-task bpmn-task-send",
+            TaskType::User => "bpmn-node bpmn-task bpmn-task-user",
+            TaskType::BusinessRule => "bpmn-node bpmn-task bpmn-task-business-rule",
+            TaskType::Manual => "bpmn-node bpmn-task bpmn-task-manual",
+            TaskType::Receive => "bpmn-node bpmn-task bpmn-task-receive",
+        },
+        NodeKind::CallActivity => "bpmn-node bpmn-call-activity",
+        NodeKind::SubProcess { kind, .. } => match kind {
+            SubProcessKind::Embedded => "bpmn-node bpmn-subprocess bpmn-subprocess-embedded",
+            SubProcessKind::Transaction => "bpmn-node bpmn-subprocess bpmn-subprocess-transaction",
+            SubProcessKind::AdHoc => "bpmn-node bpmn-subprocess bpmn-subprocess-ad-hoc",
+            SubProcessKind::Event => "bpmn-node bpmn-subprocess bpmn-subprocess-event",
+        },
+        NodeKind::Gateway(g) => match g {
+            GatewayType::Exclusive => "bpmn-node bpmn-gateway bpmn-gateway-exclusive",
+            GatewayType::EventBased => "bpmn-node bpmn-gateway bpmn-gateway-event-based",
+            GatewayType::Inclusive => "bpmn-node bpmn-gateway bpmn-gateway-inclusive",
+            GatewayType::Parallel => "bpmn-node bpmn-gateway bpmn-gateway-parallel",
+            GatewayType::Complex => "bpmn-node bpmn-gateway bpmn-gateway-complex",
+        },
+    }
 }
 
 // ---- draw model -------------------------------------------------------------------------------
 
 struct Shape {
     id: String,
+    /// The id as captioned: the id, or empty when ids are not shown.
+    id_text: String,
     class: Class,
+    group: &'static str,
     gateway: Gw,
     transaction: bool,
+    /// An event sub-process draws a dotted border.
+    dotted: bool,
     /// An expanded container encloses its children instead of drawing as a plain box.
     expanded: bool,
     x: f64,
@@ -227,7 +281,34 @@ struct Shape {
 
 struct Edge {
     id: String,
+    /// The edge group's built-in classes.
+    group: &'static str,
     points: Vec<(f64, f64)>,
+    /// The caption text, if the edge has one.
+    caption: Option<String>,
+    /// The marker at the source end.
+    marker: FlowMarker,
+    /// A message flow: dashed, with an open circle at the source and an open arrowhead.
+    message: bool,
+}
+
+/// The marker a sequence flow carries at its source end.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FlowMarker {
+    None,
+    /// The source's default flow: a slash across the line.
+    Default,
+    /// A condition on a flow leaving an activity: an open diamond.
+    Conditional,
+}
+
+/// A flow's caption: its label when non-blank, else `(id)` when ids are shown.
+fn flow_caption(label: &Option<String>, id: &str, show_ids: bool) -> Option<String> {
+    match opt(label) {
+        Some(l) => Some(l.to_string()),
+        None if show_ids && !id.is_empty() => Some(format!("({id})")),
+        None => None,
+    }
 }
 
 #[derive(Default)]
@@ -267,8 +348,11 @@ struct ScopeLayout {
 /// One laid-out box during placement.
 struct BoxInfo {
     class: Class,
+    group: &'static str,
     gateway: Gw,
     transaction: bool,
+    /// An event sub-process draws a dotted border.
+    dotted: bool,
     label: String,
     icon: &'static str,
     task_icon: &'static str,
@@ -284,37 +368,270 @@ struct BoxInfo {
 
 // ---- public entry ------------------------------------------------------------------------------
 
-/// Render every process as one self-contained SVG document, or `None` when they declare no flow
-/// nodes at all (an empty diagram is worse than none).
-pub(crate) fn render_module_svg(processes: &[Process]) -> Option<String> {
+/// What the SVG pass needs from the options: the caller hooks and the element ids.
+struct Hooks<'a> {
+    options: &'a Options,
+    /// The marker-id prefix: the id prefix, or empty.
+    prefix: &'a str,
+    /// BPMN id to element id; empty when no prefix is set.
+    ids: BTreeMap<String, String>,
+}
+
+impl Hooks<'_> {
+    /// Open an element's group: built-in classes, then the caller's valid classes, the element id,
+    /// `data-*` attributes, the title, and the link. Returns whether a link was opened.
+    fn open(&self, sb: &mut String, group: &str, id: &str, attrs: Option<&NodeAttrs>) -> bool {
+        sb.push_str("<g class=\"");
+        sb.push_str(group);
+        if let Some(a) = attrs {
+            for c in a.classes.iter().filter(|c| valid_class(c)) {
+                sb.push(' ');
+                sb.push_str(c);
+            }
+        }
+        sb.push('"');
+        if let Some(element_id) = self.ids.get(id) {
+            let _ = write!(sb, " id=\"{}\"", escape_attr(element_id));
+        }
+        let Some(a) = attrs else {
+            sb.push('>');
+            return false;
+        };
+        for (k, v) in a.data.iter().filter(|(k, _)| valid_data_key(k)) {
+            let _ = write!(sb, " data-{k}=\"{}\"", escape_attr(v));
+        }
+        sb.push('>');
+        if let Some(t) = &a.title {
+            let _ = write!(sb, "<title>{}</title>", escape_text(t));
+        }
+        if let Some(h) = &a.href {
+            let _ = write!(sb, "<a href=\"{}\">", escape_attr(h));
+            return true;
+        }
+        false
+    }
+
+    fn close(sb: &mut String, linked: bool) {
+        if linked {
+            sb.push_str("</a>");
+        }
+        sb.push_str("</g>");
+    }
+
+    /// A `url(#…)` reference to one of the `<defs>` markers.
+    fn marker(&self, name: &str) -> String {
+        escape_attr(&format!("{}{name}", self.prefix))
+    }
+}
+
+/// Render the model as one self-contained SVG document, or `None` when it declares no flow nodes
+/// at all (an empty diagram is worse than none).
+pub(crate) fn render_model_svg(model: &Model, options: &Options) -> Option<String> {
+    let prefix = options.id_prefix.as_deref().unwrap_or("");
+    let hooks = Hooks {
+        options,
+        prefix,
+        ids: if options.id_prefix.is_some() {
+            assign_element_ids(model, prefix)
+        } else {
+            BTreeMap::new()
+        },
+    };
+    let show_ids = options.show_ids;
     let mut shapes: Vec<Shape> = Vec::new();
     let mut edges: Vec<Edge> = Vec::new();
+    let mut pools: Vec<Pool> = Vec::new();
     let mut bounds = Bounds::default();
 
-    let mut offset_y = 0.0;
-    for p in processes {
-        let sl = layout_scope(p);
-        if sl.shapes.is_empty() {
-            continue;
-        }
-        for s in sl.shapes {
-            let s = offset_shape(s, 0.0, offset_y);
-            bounds.expand(s.x, s.y, s.x + s.w, s.y + s.h);
-            shapes.push(s);
-        }
-        for e in sl.edges {
-            let e = offset_edge(e, 0.0, offset_y);
-            for p in &e.points {
-                bounds.expand(p.0, p.1, p.0, p.1);
-            }
-            edges.push(e);
-        }
-        offset_y += sl.h + PROCESS_GAP;
+    // Bands, top to bottom: each participant in document order, with its process when it names
+    // one; then every process no participant references, stacked as plain bands with no pool.
+    let referenced = |p: &Process| {
+        model
+            .participants
+            .iter()
+            .any(|part| part.process_ref.as_deref() == Some(p.id.as_str()))
+    };
+    let mut bands: Vec<(Option<&Participant>, Option<ScopeLayout>)> = Vec::new();
+    for part in &model.participants {
+        let process = part
+            .process_ref
+            .as_deref()
+            .and_then(|r| model.processes.iter().find(|p| p.id == r));
+        let layout = process
+            .map(|p| layout_scope(p, show_ids))
+            .filter(|sl| !sl.shapes.is_empty());
+        bands.push((Some(part), layout));
     }
-    if shapes.is_empty() {
+    for p in model.processes.iter().filter(|p| !referenced(p)) {
+        let sl = layout_scope(p, show_ids);
+        if !sl.shapes.is_empty() {
+            bands.push((None, Some(sl)));
+        }
+    }
+
+    // Pools share one width: the widest band's.
+    let pool_w = bands
+        .iter()
+        .map(|(part, sl)| match (part, sl) {
+            (Some(_), Some(sl)) => POOL_HEADER + 2.0 * SUB_PAD + sl.w,
+            (Some(_), None) => POOL_HEADER + 2.0 * SUB_PAD + TASK_MIN_W,
+            (None, Some(sl)) => sl.w,
+            (None, None) => 0.0,
+        })
+        .fold(0.0f64, f64::max);
+
+    // Each node's box and band, and each pool's band, for message-flow routing. The first node
+    // with an id wins.
+    let mut node_at: BTreeMap<String, (Rect, usize)> = BTreeMap::new();
+    let mut band_y: Vec<(f64, f64)> = Vec::new();
+    let mut offset_y = 0.0;
+    for (band, (part, sl)) in bands.into_iter().enumerate() {
+        let (dx, dy, h) = match (part, &sl) {
+            (Some(_), Some(sl)) => (
+                POOL_HEADER + SUB_PAD,
+                offset_y + SUB_PAD,
+                sl.h + 2.0 * SUB_PAD,
+            ),
+            (Some(_), None) => (0.0, offset_y, BLACKBOX_H),
+            (None, Some(sl)) => (0.0, offset_y, sl.h),
+            (None, None) => continue,
+        };
+        if let Some(part) = part {
+            bounds.expand(0.0, offset_y, pool_w, offset_y + h);
+            pools.push(Pool {
+                id: part.id.clone(),
+                name: opt(&part.name).unwrap_or("").to_string(),
+                band,
+                y: offset_y,
+                w: pool_w,
+                h,
+                collapsed: sl.is_none(),
+            });
+        }
+        if let Some(sl) = sl {
+            for s in sl.shapes {
+                let s = offset_shape(s, dx, dy);
+                bounds.expand(s.x, s.y, s.x + s.w, s.y + s.h);
+                node_at
+                    .entry(s.id.clone())
+                    .or_insert(((s.x, s.y, s.w, s.h), band));
+                shapes.push(s);
+            }
+            for e in sl.edges {
+                let e = offset_edge(e, dx, dy);
+                for p in &e.points {
+                    bounds.expand(p.0, p.1, p.0, p.1);
+                }
+                edges.push(e);
+            }
+        }
+        band_y.push((offset_y, offset_y + h));
+        offset_y += h + PROCESS_GAP;
+    }
+    if shapes.is_empty() && pools.is_empty() {
         return None;
     }
-    Some(build_svg(&shapes, &edges, bounds))
+
+    // Message flows, after every band is placed.
+    for f in &model.message_flows {
+        let end = |id: &str| -> Option<MessageEnd> {
+            if let Some(&(b, band)) = node_at.get(id) {
+                return Some(MessageEnd::Node { b, band });
+            }
+            pools
+                .iter()
+                .find(|p| p.id == id && !id.is_empty())
+                .map(|p| MessageEnd::Pool {
+                    x0: 0.0,
+                    x1: p.w,
+                    band: p.band,
+                })
+        };
+        let (Some(src), Some(tgt)) = (end(&f.source_ref), end(&f.target_ref)) else {
+            continue;
+        };
+        let points = route_message_flow(&src, &tgt, &band_y);
+        for p in &points {
+            bounds.expand(p.0, p.1, p.0, p.1);
+        }
+        edges.push(Edge {
+            id: f.id.clone(),
+            group: "bpmn-message-flow",
+            points,
+            caption: flow_caption(&f.label, &f.id, show_ids),
+            marker: FlowMarker::None,
+            message: true,
+        });
+    }
+    Some(build_svg(&shapes, &edges, &pools, bounds, &hooks))
+}
+
+/// A box as `(x, y, width, height)`.
+type Rect = (f64, f64, f64, f64);
+
+/// A pool: a participant's band, with its name in a header strip on the left.
+struct Pool {
+    id: String,
+    name: String,
+    /// The index of its band in `band_y`.
+    band: usize,
+    y: f64,
+    w: f64,
+    h: f64,
+    /// A black-box pool: no process inside.
+    collapsed: bool,
+}
+
+/// One end of a message flow: a node's box, or a pool's x-range; each with its band.
+enum MessageEnd {
+    Node { b: Rect, band: usize },
+    Pool { x0: f64, x1: f64, band: usize },
+}
+
+impl MessageEnd {
+    fn band(&self) -> usize {
+        match self {
+            MessageEnd::Node { band, .. } | MessageEnd::Pool { band, .. } => *band,
+        }
+    }
+
+    fn centre_x(&self) -> f64 {
+        match self {
+            MessageEnd::Node { b, .. } => b.0 + b.2 / 2.0,
+            MessageEnd::Pool { x0, x1, .. } => (x0 + x1) / 2.0,
+        }
+    }
+
+    /// Where the flow attaches: a node's centre-x, or the other end's centre-x clamped into the
+    /// pool; on the top or bottom edge, whichever faces the route.
+    fn attach(&self, other: &MessageEnd, top: bool, band_y: &[(f64, f64)]) -> (f64, f64) {
+        match self {
+            MessageEnd::Node { b, .. } => (b.0 + b.2 / 2.0, if top { b.1 } else { b.1 + b.3 }),
+            MessageEnd::Pool { x0, x1, band } => {
+                let (y0, y1) = band_y[*band];
+                (other.centre_x().clamp(*x0, *x1), if top { y0 } else { y1 })
+            }
+        }
+    }
+}
+
+/// Route a message flow: vertical from the source to the middle of the gap beside the target's
+/// band on the source's side, across to the target's x, and vertical into the target. Two ends in
+/// one band route below it.
+fn route_message_flow(
+    src: &MessageEnd,
+    tgt: &MessageEnd,
+    band_y: &[(f64, f64)],
+) -> Vec<(f64, f64)> {
+    let (sb, tb) = (src.band(), tgt.band());
+    let (s_top, t_top, gap_y) = match sb.cmp(&tb) {
+        std::cmp::Ordering::Less => (false, true, band_y[tb].0 - PROCESS_GAP / 2.0),
+        std::cmp::Ordering::Greater => (true, false, band_y[tb].1 + PROCESS_GAP / 2.0),
+        std::cmp::Ordering::Equal => (false, false, band_y[tb].1 + PROCESS_GAP / 2.0),
+    };
+    let (sx, sy) = src.attach(tgt, s_top, band_y);
+    let (tx, ty) = tgt.attach(src, t_top, band_y);
+    orthogonal_path(&[(sx, sy), (sx, gap_y), (tx, gap_y), (tx, ty)])
 }
 
 // ---- layout ------------------------------------------------------------------------------------
@@ -322,7 +639,7 @@ pub(crate) fn render_module_svg(processes: &[Process]) -> Option<String> {
 /// Lay out one scope from its direct nodes. Containers recurse and are drawn expanded around their
 /// content; boundary events are pinned to the bottom edge of the box they attach to. The result is
 /// normalised so its min corner is `(0, 0)`, ready for a parent to offset.
-fn layout_scope(p: &Process) -> ScopeLayout {
+fn layout_scope(p: &Process, show_ids: bool) -> ScopeLayout {
     let mut out = ScopeLayout::default();
 
     // Boundary events are pinned to a host edge, never laid out as free graph nodes.
@@ -347,20 +664,25 @@ fn layout_scope(p: &Process) -> ScopeLayout {
             continue;
         }
         let v = classify(n);
-        let inner = v.inner.filter(|ip| !ip.nodes.is_empty()).map(layout_scope);
+        let inner = v
+            .inner
+            .filter(|ip| !ip.nodes.is_empty())
+            .map(|ip| layout_scope(ip, show_ids));
         let label = v.label.unwrap_or("").to_string();
         let (w, h) = match &inner {
             Some(il) if !il.shapes.is_empty() => {
                 (il.w + 2.0 * SUB_PAD, il.h + SUB_HEADER + 2.0 * SUB_PAD)
             }
-            _ => box_size(v.class, &label, &id),
+            _ => box_size(v.class, &label, if show_ids { &id } else { "" }),
         };
         boxes.insert(
             id.clone(),
             BoxInfo {
                 class: v.class,
+                group: v.group,
                 gateway: v.gateway,
                 transaction: v.transaction,
+                dotted: v.dotted,
                 label,
                 icon: v.icon,
                 task_icon: v.task_icon,
@@ -438,9 +760,11 @@ fn layout_scope(p: &Process) -> ScopeLayout {
             continue;
         }
         let (rs, rt) = (rank[&f.source_ref], rank[&f.target_ref]);
-        if rt == rs + 1 && !f.id.is_empty() {
-            let label_w = (f.id.chars().count() as f64 + 2.0) * ID_CHAR_W + LEFT_STUB + 40.0;
-            gap_after[rs] = gap_after[rs].max(label_w);
+        if rt == rs + 1 {
+            if let Some(caption) = flow_caption(&f.label, &f.id, show_ids) {
+                let label_w = caption.chars().count() as f64 * ID_CHAR_W + LEFT_STUB + 40.0;
+                gap_after[rs] = gap_after[rs].max(label_w);
+            }
         }
     }
     let mut col_left_x = vec![0.0f64; max_rank + 1];
@@ -503,9 +827,12 @@ fn layout_scope(p: &Process) -> ScopeLayout {
         let inner = b.inner.take();
         out.shapes.push(Shape {
             id: id.clone(),
+            id_text: if show_ids { id.clone() } else { String::new() },
             class: b.class,
+            group: b.group,
             gateway: b.gateway,
             transaction: b.transaction,
+            dotted: b.dotted,
             expanded: inner.is_some(),
             x,
             y,
@@ -552,9 +879,18 @@ fn layout_scope(p: &Process) -> ScopeLayout {
             let v = p.nodes.iter().find(|n| n.id == *be_id).map(classify);
             out.shapes.push(Shape {
                 id: be_id.clone(),
+                id_text: if show_ids {
+                    be_id.clone()
+                } else {
+                    String::new()
+                },
                 class: Class::BoundaryEvent,
+                group: v
+                    .as_ref()
+                    .map_or("bpmn-node bpmn-event bpmn-event-boundary", |v| v.group),
                 gateway: Gw::Exclusive,
                 transaction: false,
+                dotted: false,
                 expanded: false,
                 x: bcx - BOUNDARY_SIZE / 2.0,
                 y: bottom_y - BOUNDARY_SIZE / 2.0,
@@ -623,9 +959,32 @@ fn layout_scope(p: &Process) -> ScopeLayout {
                 orthogonal_path(&[(sx, sy), (tx, ty)])
             }
         };
+        // Default wins over a condition (BPMN forbids both); a condition draws its diamond only on
+        // a flow leaving an activity, never one leaving a gateway or an event.
+        let from_activity = boxes
+            .get(&f.source_ref)
+            .is_some_and(|b| b.class == Class::Task);
+        let (group, marker) = if f.is_default {
+            ("bpmn-flow bpmn-flow-default", FlowMarker::Default)
+        } else if f.conditional {
+            (
+                "bpmn-flow bpmn-flow-conditional",
+                if from_activity {
+                    FlowMarker::Conditional
+                } else {
+                    FlowMarker::None
+                },
+            )
+        } else {
+            ("bpmn-flow", FlowMarker::None)
+        };
         out.edges.push(Edge {
             id: f.id.clone(),
+            group,
             points: pts,
+            caption: flow_caption(&f.label, &f.id, show_ids),
+            marker,
+            message: false,
         });
     }
 
@@ -909,7 +1268,13 @@ fn normalize(sl: &mut ScopeLayout) {
 
 // ---- SVG ----------------------------------------------------------------------------------------
 
-fn build_svg(shapes: &[Shape], edges: &[Edge], mut bounds: Bounds) -> String {
+fn build_svg(
+    shapes: &[Shape],
+    edges: &[Edge],
+    pools: &[Pool],
+    mut bounds: Bounds,
+    hooks: &Hooks<'_>,
+) -> String {
     // Place every edge caption FIRST (needs global knowledge of all routed segments) so each is
     // offset off its own line and kept clear of every other line and node.
     let mut segments: Vec<(f64, f64, f64, f64)> = Vec::new();
@@ -926,7 +1291,7 @@ fn build_svg(shapes: &[Shape], edges: &[Edge], mut bounds: Bounds) -> String {
         .collect();
 
     let mut label_boxes: Vec<(f64, f64, f64, f64)> = Vec::new();
-    let mut label_svgs: Vec<String> = Vec::new();
+    let mut label_svgs: Vec<(&str, String)> = Vec::new();
     for e in edges {
         place_edge_label(e, &segments, &node_boxes, &mut label_boxes, &mut label_svgs);
     }
@@ -954,21 +1319,55 @@ fn build_svg(shapes: &[Shape], edges: &[Edge], mut bounds: Bounds) -> String {
         fmt(width),
         fmt(height)
     );
-    sb.push_str(
-        "<defs><marker id=\"arrow\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" \
+    let _ = write!(
+        sb,
+        "<defs><marker id=\"{}\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" \
          markerWidth=\"8\" markerHeight=\"8\" orient=\"auto-start-reverse\">\
-         <path d=\"M0,0 L10,5 L0,10 z\" fill=\"#333\"/></marker></defs>",
+         <path d=\"M0,0 L10,5 L0,10 z\" fill=\"#333\"/></marker>",
+        hooks.marker("arrow")
     );
+    if edges.iter().any(|e| e.message) {
+        let _ = write!(
+            sb,
+            "<marker id=\"{}\" viewBox=\"0 0 10 10\" refX=\"5\" refY=\"5\" \
+             markerWidth=\"8\" markerHeight=\"8\">\
+             <circle cx=\"5\" cy=\"5\" r=\"4\" fill=\"#fff\" stroke=\"#333\"/></marker>\
+             <marker id=\"{}\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" \
+             markerWidth=\"8\" markerHeight=\"8\" orient=\"auto-start-reverse\">\
+             <path d=\"M0,0 L10,5 L0,10 z\" fill=\"#fff\" stroke=\"#333\"/></marker>",
+            hooks.marker("open-circle"),
+            hooks.marker("open-arrow")
+        );
+    }
+    sb.push_str("</defs>");
+    // Pools at the back.
+    for p in pools {
+        let group = if p.collapsed {
+            "bpmn-pool bpmn-pool-collapsed"
+        } else {
+            "bpmn-pool"
+        };
+        let linked = hooks.open(&mut sb, group, &p.id, None);
+        sb.push_str(&render_pool(p));
+        Hooks::close(&mut sb, linked);
+    }
     // Edge PATHS first so shapes overpaint their endpoints; shapes next; edge LABELS last so a
-    // caption stays legible on top of lines and beside shapes.
+    // caption stays legible on top of lines and beside shapes. Each edge has two groups sharing
+    // its classes: the path group carries the element id and the caller's attributes, the
+    // caption group only the classes.
     for e in edges {
-        sb.push_str(&render_edge_path(e));
+        let linked = hooks.open(&mut sb, e.group, &e.id, hooks.options.flow_attrs.get(&e.id));
+        sb.push_str(&render_edge_path(e, hooks));
+        sb.push_str(&flow_marker_svg(e));
+        Hooks::close(&mut sb, linked);
     }
     for s in shapes {
+        let linked = hooks.open(&mut sb, s.group, &s.id, hooks.options.node_attrs.get(&s.id));
         sb.push_str(&render_shape(s));
+        Hooks::close(&mut sb, linked);
     }
-    for l in &label_svgs {
-        sb.push_str(l);
+    for (group, l) in &label_svgs {
+        let _ = write!(sb, "<g class=\"{group}\">{l}</g>");
     }
     sb.push_str("</svg>");
     sb
@@ -992,11 +1391,12 @@ fn render_container(s: &Shape) -> String {
     let _ = write!(
         sb,
         "<rect x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" rx=\"6\" ry=\"6\" \
-         fill=\"none\" stroke=\"#333\" stroke-width=\"1.5\"/>",
+         fill=\"none\" stroke=\"#333\" stroke-width=\"1.5\"{}/>",
         fmt(s.x),
         fmt(s.y),
         fmt(s.w),
-        fmt(s.h)
+        fmt(s.h),
+        dots(s)
     );
     if s.transaction {
         let i = 3.0;
@@ -1022,7 +1422,7 @@ fn render_container(s: &Shape) -> String {
             escape_text(&s.label)
         );
     }
-    if !s.id.is_empty() {
+    if !s.id_text.is_empty() {
         let iy = if has_name { ly + 11.0 } else { ly };
         let _ = write!(
             sb,
@@ -1030,7 +1430,7 @@ fn render_container(s: &Shape) -> String {
              font-size=\"9\" fill=\"#888\">({})</text>",
             fmt(s.x + 10.0),
             fmt(iy),
-            escape_text(&s.id)
+            escape_text(&s.id_text)
         );
     }
     sb
@@ -1064,7 +1464,7 @@ fn render_event(s: &Shape) -> String {
     if !s.icon.is_empty() {
         sb.push_str(&event_icon_svg(s.icon, cx, cy, r * 0.55, s.throwing));
     }
-    append_label(&mut sb, &s.label, &s.id, cx, s.y + s.h + 14.0);
+    append_label(&mut sb, &s.label, &s.id_text, cx, s.y + s.h + 14.0);
     sb
 }
 
@@ -1086,7 +1486,7 @@ fn render_gateway(s: &Shape) -> String {
         fmt(cy)
     );
     sb.push_str(&gateway_marker(s.gateway, cx, cy, s.w.min(s.h) * 0.28));
-    append_label(&mut sb, &s.label, &s.id, cx, s.y + s.h + 14.0);
+    append_label(&mut sb, &s.label, &s.id_text, cx, s.y + s.h + 14.0);
     sb
 }
 
@@ -1129,6 +1529,17 @@ fn gateway_marker(gw: Gw, cx: f64, cy: f64, m: f64) -> String {
             fmt(cy - m * 0.7),
             STROKE
         ),
+        // A double ring around an open pentagon.
+        Gw::EventBased => format!(
+            "<circle cx=\"{}\" cy=\"{}\" r=\"14\" fill=\"none\" stroke=\"#333\" stroke-width=\"1\"/>\
+             <circle cx=\"{}\" cy=\"{}\" r=\"11\" fill=\"none\" stroke=\"#333\" stroke-width=\"1\"/>\
+             <polygon points=\"{}\" fill=\"none\" stroke=\"#333\" stroke-width=\"1.2\"/>",
+            fmt(cx),
+            fmt(cy),
+            fmt(cx),
+            fmt(cy),
+            pentagon(cx, cy, 7.0)
+        ),
         Gw::Exclusive => {
             let d = m * 0.8;
             format!(
@@ -1147,22 +1558,38 @@ fn gateway_marker(gw: Gw, cx: f64, cy: f64, m: f64) -> String {
     }
 }
 
+/// The dotted border of an event sub-process, or nothing.
+fn dots(s: &Shape) -> &'static str {
+    if s.dotted {
+        " stroke-dasharray=\"2 3\""
+    } else {
+        ""
+    }
+}
+
 fn render_task(s: &Shape) -> String {
     let mut sb = String::with_capacity(256);
     let _ = write!(
         sb,
         "<rect x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" rx=\"6\" ry=\"6\" fill=\"#fff\" \
-         stroke=\"#333\" stroke-width=\"{}\"/>",
+         stroke=\"#333\" stroke-width=\"{}\"{}/>",
         fmt(s.x),
         fmt(s.y),
         fmt(s.w),
         fmt(s.h),
-        if s.thick { "3.5" } else { "1.5" }
+        if s.thick { "3.5" } else { "1.5" },
+        dots(s)
     );
     if !s.task_icon.is_empty() {
         sb.push_str(&task_icon_svg(s.task_icon, s.x + 4.0, s.y + 4.0));
     }
-    append_label(&mut sb, &s.label, &s.id, s.x + s.w / 2.0, s.y + s.h / 2.0);
+    append_label(
+        &mut sb,
+        &s.label,
+        &s.id_text,
+        s.x + s.w / 2.0,
+        s.y + s.h / 2.0,
+    );
     if !s.markers.is_empty() {
         sb.push_str(&markers_svg(&s.markers, s.x + s.w / 2.0, s.y + s.h - 9.0));
     }
@@ -1197,7 +1624,7 @@ fn append_label(sb: &mut String, label: &str, id: &str, cx: f64, cy: f64) {
     }
 }
 
-fn render_edge_path(e: &Edge) -> String {
+fn render_edge_path(e: &Edge, hooks: &Hooks<'_>) -> String {
     let mut d = String::new();
     for (i, p) in e.points.iter().enumerate() {
         let _ = write!(
@@ -1208,11 +1635,99 @@ fn render_edge_path(e: &Edge) -> String {
             fmt(p.1)
         );
     }
+    if e.message {
+        return format!(
+            "<path d=\"{}\" fill=\"none\" stroke=\"#333\" stroke-width=\"1.2\" \
+             stroke-dasharray=\"6 4\" marker-start=\"url(#{})\" marker-end=\"url(#{})\"/>",
+            d.trim_end(),
+            hooks.marker("open-circle"),
+            hooks.marker("open-arrow")
+        );
+    }
     format!(
         "<path d=\"{}\" fill=\"none\" stroke=\"#333\" stroke-width=\"1.2\" \
-         marker-end=\"url(#arrow)\"/>",
-        d.trim_end()
+         marker-end=\"url(#{})\"/>",
+        d.trim_end(),
+        hooks.marker("arrow")
     )
+}
+
+/// A pool: its outline, the header strip's divider, and the name rotated −90° and centred in the
+/// strip.
+fn render_pool(p: &Pool) -> String {
+    let mut sb = String::with_capacity(320);
+    let _ = write!(
+        sb,
+        "<rect x=\"0\" y=\"{}\" width=\"{}\" height=\"{}\" fill=\"none\" stroke=\"#333\" \
+         stroke-width=\"1.5\"/><path d=\"M{},{} V{}\" fill=\"none\" stroke=\"#333\" \
+         stroke-width=\"1.5\"/>",
+        fmt(p.y),
+        fmt(p.w),
+        fmt(p.h),
+        fmt(POOL_HEADER),
+        fmt(p.y),
+        fmt(p.y + p.h)
+    );
+    if !p.name.is_empty() {
+        let (cx, cy) = (POOL_HEADER / 2.0, p.y + p.h / 2.0);
+        let _ = write!(
+            sb,
+            "<text x=\"{}\" y=\"{}\" transform=\"rotate(-90 {} {})\" text-anchor=\"middle\" \
+             font-family=\"system-ui, sans-serif\" font-size=\"11\" font-weight=\"600\" \
+             fill=\"#222\">{}</text>",
+            fmt(cx),
+            fmt(cy + 4.0),
+            fmt(cx),
+            fmt(cy),
+            escape_text(&p.name)
+        );
+    }
+    sb
+}
+
+/// The source-end marker of a sequence flow, drawn over its first segment: the default slash, a
+/// 10-unit stroke at 45° crossing the line 8 units from the source; or the conditional diamond,
+/// 12 long and 8 wide, its near tip on the source boundary.
+fn flow_marker_svg(e: &Edge) -> String {
+    if e.marker == FlowMarker::None || e.points.len() < 2 {
+        return String::new();
+    }
+    let (a, b) = (e.points[0], e.points[1]);
+    let len = ((b.0 - a.0).powi(2) + (b.1 - a.1).powi(2)).sqrt();
+    if len < 0.01 {
+        return String::new();
+    }
+    let (dx, dy) = ((b.0 - a.0) / len, (b.1 - a.1) / len);
+    match e.marker {
+        FlowMarker::Default => {
+            let (cx, cy) = (a.0 + 8.0 * dx, a.1 + 8.0 * dy);
+            // The line's direction turned 45° counter-clockwise on screen: a `/` on a rightward flow.
+            let h = std::f64::consts::FRAC_1_SQRT_2;
+            let (ux, uy) = (h * (dx + dy), h * (dy - dx));
+            format!(
+                "<path d=\"M{},{} L{},{}\" fill=\"none\" stroke=\"#333\" stroke-width=\"1.2\"/>",
+                fmt(cx - 5.0 * ux),
+                fmt(cy - 5.0 * uy),
+                fmt(cx + 5.0 * ux),
+                fmt(cy + 5.0 * uy)
+            )
+        }
+        _ => {
+            let (nx, ny) = (-dy, dx);
+            format!(
+                "<polygon points=\"{},{} {},{} {},{} {},{}\" fill=\"#fff\" stroke=\"#333\" \
+                 stroke-width=\"1.2\"/>",
+                fmt(a.0),
+                fmt(a.1),
+                fmt(a.0 + 6.0 * dx + 4.0 * nx),
+                fmt(a.1 + 6.0 * dy + 4.0 * ny),
+                fmt(a.0 + 12.0 * dx),
+                fmt(a.1 + 12.0 * dy),
+                fmt(a.0 + 6.0 * dx - 4.0 * nx),
+                fmt(a.1 + 6.0 * dy - 4.0 * ny)
+            )
+        }
+    }
 }
 
 /// Place a flow's `(id)` caption so it stays legible: offset perpendicular off its own line (so the
@@ -1220,14 +1735,17 @@ fn render_edge_path(e: &Edge) -> String {
 /// routed segment, any node shape, and any previously-placed caption. If none is fully clear the
 /// least-bad wins — a node overlap is penalised worst, then another caption, then a line (which the
 /// caption's own background rect mostly masks anyway).
-fn place_edge_label(
-    e: &Edge,
+fn place_edge_label<'e>(
+    e: &'e Edge,
     segments: &[(f64, f64, f64, f64)],
     node_boxes: &[(f64, f64, f64, f64)],
     label_boxes: &mut Vec<(f64, f64, f64, f64)>,
-    label_svgs: &mut Vec<String>,
+    label_svgs: &mut Vec<(&'e str, String)>,
 ) {
-    if e.id.is_empty() || e.points.len() < 2 {
+    let Some(text) = e.caption.as_deref() else {
+        return;
+    };
+    if e.points.len() < 2 {
         return;
     }
     // The longest leg carries the caption — a degenerate stub would push it off the diagram.
@@ -1244,7 +1762,6 @@ fn place_edge_label(
     let (mx, my) = ((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0);
     let horizontal = (b.1 - a.1).abs() <= (b.0 - a.0).abs();
 
-    let text = format!("({})", e.id);
     let w = text.chars().count() as f64 * ID_CHAR_W + 6.0;
     let h = LINE_ASCENT + LINE_DESCENT;
 
@@ -1272,7 +1789,9 @@ fn place_edge_label(
     }
     let box_ = (chosen.0, chosen.1, w, h);
     label_boxes.push(box_);
-    label_svgs.push(format!(
+    label_svgs.push((
+        e.group,
+        format!(
         "<rect x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" fill=\"#ffffffe6\" stroke=\"none\"/>\
          <text x=\"{}\" y=\"{}\" text-anchor=\"middle\" font-family=\"system-ui, sans-serif\" \
          font-size=\"9\" fill=\"#888\">{}</text>",
@@ -1282,7 +1801,8 @@ fn place_edge_label(
         fmt(box_.3),
         fmt(box_.0 + w / 2.0),
         fmt(box_.1 + LINE_ASCENT),
-        escape_text(&text)
+        escape_text(text)
+    ),
     ));
 }
 
@@ -1338,11 +1858,11 @@ fn cross(p1x: f64, p1y: f64, p2x: f64, p2y: f64, px: f64, py: f64) -> f64 {
 fn expand_for_node_labels(bounds: &mut Bounds, shapes: &[Shape]) {
     for s in shapes {
         let has_name = !s.label.trim().is_empty();
-        let lines = usize::from(has_name) + usize::from(!s.id.is_empty());
+        let lines = usize::from(has_name) + usize::from(!s.id_text.is_empty());
         if lines == 0 {
             continue;
         }
-        let w = caption_width(&s.label, &s.id);
+        let w = caption_width(&s.label, &s.id_text);
         let (cx, top) = if s.expanded {
             (s.x + 10.0 + w / 2.0, s.y + 15.0 - LINE_ASCENT)
         } else if s.class == Class::Task {
@@ -1465,6 +1985,64 @@ fn event_icon_svg(icon: &str, cx: f64, cy: f64, r: f64, throwing: bool) -> Strin
             fill,
             stroke
         ),
+        // A page with four ruled lines.
+        "conditional" => {
+            let mut svg = format!(
+                "<rect x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" fill=\"none\" {}/>",
+                fmt(cx - r * 0.6),
+                fmt(cy - r * 0.75),
+                fmt(r * 1.2),
+                fmt(r * 1.5),
+                stroke
+            );
+            let mut d = String::new();
+            for i in 0..4 {
+                let y = cy - r * 0.45 + f64::from(i) * r * 0.3;
+                let _ = write!(
+                    d,
+                    "M{},{} H{} ",
+                    fmt(cx - r * 0.4),
+                    fmt(y),
+                    fmt(cx + r * 0.4)
+                );
+            }
+            let _ = write!(
+                svg,
+                "<path d=\"{}\" fill=\"none\" {}/>",
+                d.trim_end(),
+                stroke
+            );
+            svg
+        }
+        "multiple" => format!(
+            "<polygon points=\"{}\" fill=\"{}\" {}/>",
+            pentagon(cx, cy, r * 0.8),
+            fill,
+            stroke
+        ),
+        // An open plus.
+        "parallel-multiple" => {
+            let (a, e) = (r * 0.25, r * 0.8);
+            let points = [
+                (-a, -e),
+                (a, -e),
+                (a, -a),
+                (e, -a),
+                (e, a),
+                (a, a),
+                (a, e),
+                (-a, e),
+                (-a, a),
+                (-e, a),
+                (-e, -a),
+                (-a, -a),
+            ]
+            .iter()
+            .map(|(x, y)| format!("{},{}", fmt(cx + x), fmt(cy + y)))
+            .collect::<Vec<_>>()
+            .join(" ");
+            format!("<polygon points=\"{points}\" fill=\"none\" {stroke}/>")
+        }
         // message (the default)
         _ => format!(
             "<rect x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" fill=\"{}\" {}/>\
@@ -1484,6 +2062,17 @@ fn event_icon_svg(icon: &str, cx: f64, cy: f64, r: f64, throwing: bool) -> Strin
             stroke
         ),
     }
+}
+
+/// A regular pentagon's points, one vertex straight up, as a `points` value.
+fn pentagon(cx: f64, cy: f64, r: f64) -> String {
+    (0..5)
+        .map(|k| {
+            let a = (-90.0 + 72.0 * f64::from(k)).to_radians();
+            format!("{},{}", fmt(cx + r * a.cos()), fmt(cy + r * a.sin()))
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// The task-type glyph in an activity's top-left corner (BPMN convention). Drawn in a 14×14 box.

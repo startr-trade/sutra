@@ -298,6 +298,10 @@ async fn supervise(
     stop: Arc<StopToken>,
 ) {
     let mut backoff = config.reconnect_min;
+    // One recorder for the channel's whole life, shared by every consumer it opens: a broker
+    // failure that outlives a reconnect is still the same failure, logged once with a count.
+    let failures =
+        BrokerFailureRecorder::new(ClientRole::Inbound, format!("channel '{}'", config.channel));
     loop {
         if stop.is_requested() {
             return;
@@ -309,7 +313,7 @@ async fn supervise(
             }
             continue;
         }
-        match open_session(&config) {
+        match open_session(&config, &failures) {
             Err(diagnostic) => {
                 // NON-FATAL: WARN + retry in the background; readiness unaffected.
                 warn!(
@@ -373,10 +377,12 @@ pub(crate) fn consumer_client_config(props: &KafkaChannelProperties) -> ClientCo
 
 /// Build the consumer client and subscribe to the topic. Creating the consumer does not
 /// connect (librdkafka connects lazily on first poll); a bad config fails closed here.
-fn open_session(config: &KafkaSourceConfig) -> Result<ChannelConsumer, Diagnostic> {
+fn open_session(
+    config: &KafkaSourceConfig,
+    failures: &BrokerFailureRecorder,
+) -> Result<ChannelConsumer, Diagnostic> {
     let props = &config.properties;
-    let context =
-        BrokerFailureRecorder::new(ClientRole::Inbound, format!("channel '{}'", config.channel));
+    let context = failures.clone();
     let consumer: ChannelConsumer = consumer_client_config(props)
         .create_with_context(context)
         .map_err(|e| {
@@ -438,7 +444,11 @@ async fn run_session(
             received = consumer.recv() => received,
         };
         let message = match received {
-            Ok(m) => m,
+            Ok(m) => {
+                // A record arrived, so the broker connection works: a later failure is new.
+                consumer.context().clear();
+                m
+            }
             Err(e) => {
                 warn!(channel = %config.channel, error = %e, "kafka recv failed");
                 return SessionEnd::ConnectionLost;

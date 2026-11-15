@@ -5,7 +5,7 @@
 use std::path::{Path, PathBuf};
 
 use sqlx::postgres::PgPoolOptions;
-use sutra_persistence::migrate::{apply_migrations, collect_migrations};
+use sutra_persistence::migrate::{apply_migrations, collect_migrations, MigrationScript};
 
 use crate::fixture::shipped_migration_roots;
 
@@ -24,8 +24,8 @@ async fn applies_java_migrations_once_and_is_idempotent() {
     let scripts = collect_migrations(&refs).unwrap();
     assert_eq!(
         scripts.len(),
-        28,
-        "V101..V802 subsystems + V304 inbox instance + V404 terminal-retention marker + V604 outbox poison flag + V606 outbox emitting node + \
+        30,
+        "V101..V802 subsystems + V304 inbox instance + V305/V306 inbox owner + V404 terminal-retention marker + V604 outbox poison flag + V606 outbox emitting node + \
          V605 external-task pull parking + V1001 deployment-archive + V1002 endpoint holder + V1003 retained channels (deploy family) + \
          V1101 subject-index + V1201 dead-letter + V1202 dead-letter payload capture + \
          V1301 data-key + V202 audit transport events + V203 audit journal ordinal"
@@ -33,7 +33,7 @@ async fn applies_java_migrations_once_and_is_idempotent() {
 
     let mut conn = migrated_pool.acquire().await.unwrap();
     let first_run = apply_migrations(&mut conn, &scripts).await.unwrap();
-    assert_eq!(first_run, 28);
+    assert_eq!(first_run, 30);
     let second_run = apply_migrations(&mut conn, &scripts).await.unwrap();
     assert_eq!(second_run, 0, "already-applied versions are skipped");
     drop(conn);
@@ -46,8 +46,8 @@ async fn applies_java_migrations_once_and_is_idempotent() {
     assert_eq!(
         history,
         vec![
-            101, 201, 202, 203, 301, 304, 401, 402, 403, 404, 501, 601, 602, 603, 604, 605, 606,
-            701, 702, 801, 802, 1001, 1002, 1003, 1101, 1201, 1202, 1301
+            101, 201, 202, 203, 301, 304, 305, 306, 401, 402, 403, 404, 501, 601, 602, 603, 604,
+            605, 606, 701, 702, 801, 802, 1001, 1002, 1003, 1101, 1201, 1202, 1301
         ]
     );
 
@@ -180,6 +180,105 @@ async fn the_high_churn_tables_carry_their_autovacuum_settings() {
             "{table}"
         );
     }
+}
+
+fn no_transaction_script(version: i64) -> MigrationScript {
+    MigrationScript {
+        version,
+        description: "rebuild_t_key".to_owned(),
+        path: PathBuf::from(format!("V{version}__rebuild_t_key.sql")),
+        sql: "-- sutra:no-transaction\n\
+              -- Rebuilt concurrently, so writes to t are never blocked.\n\
+              DROP INDEX CONCURRENTLY IF EXISTS t_key;\n\
+              CREATE UNIQUE INDEX CONCURRENTLY t_key ON t (a) WHERE a IS NOT NULL;\n"
+            .to_owned(),
+    }
+}
+
+async fn index_is_valid(pool: &sqlx::PgPool, name: &str) -> Option<bool> {
+    sqlx::query_scalar(
+        "SELECT i.indisvalid FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid \
+         WHERE c.relname = $1",
+    )
+    .bind(name)
+    .fetch_optional(pool)
+    .await
+    .unwrap()
+}
+
+/// A script marked `-- sutra:no-transaction` runs its statements in autocommit (a concurrent
+/// index build is refused inside a transaction), and its DROP first clears an index a crashed
+/// build left invalid.
+#[ignore = "docker"]
+#[tokio::test]
+async fn a_no_transaction_script_rebuilds_an_invalid_index() {
+    let (pool, _) = fresh_unmigrated().await;
+    sqlx::raw_sql("CREATE TABLE t (a TEXT); CREATE UNIQUE INDEX t_key ON t (a);")
+        .execute(&pool)
+        .await
+        .unwrap();
+    // What a crash inside CREATE INDEX CONCURRENTLY leaves behind.
+    sqlx::query(
+        "UPDATE pg_index SET indisvalid = false \
+         WHERE indexrelid = 't_key'::regclass",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_eq!(index_is_valid(&pool, "t_key").await, Some(false));
+
+    let mut conn = pool.acquire().await.unwrap();
+    let ran = apply_migrations(&mut conn, &[no_transaction_script(9001)])
+        .await
+        .unwrap();
+    assert_eq!(ran, 1);
+    drop(conn);
+    assert_eq!(index_is_valid(&pool, "t_key").await, Some(true));
+    let partial: String =
+        sqlx::query_scalar("SELECT indexdef FROM pg_indexes WHERE indexname = 't_key'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(partial.contains("WHERE (a IS NOT NULL)"), "{partial}");
+    let recorded: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM sutra_schema_history WHERE version = 9001")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(recorded, 1);
+}
+
+/// Two engines booting together on one database apply a no-transaction script once: the second
+/// waits on the runner's advisory lock, re-reads the ledger and skips it.
+#[ignore = "docker"]
+#[tokio::test]
+async fn two_runners_apply_it_once() {
+    let (pool, _) = fresh_unmigrated().await;
+    sqlx::raw_sql("CREATE TABLE t (a TEXT);")
+        .execute(&pool)
+        .await
+        .unwrap();
+    // The ledger table first: both runners creating it at once is not what this proves.
+    let mut setup = pool.acquire().await.unwrap();
+    apply_migrations(&mut setup, &[]).await.unwrap();
+    drop(setup);
+
+    let scripts = [no_transaction_script(9002)];
+    let mut first = pool.acquire().await.unwrap();
+    let mut second = pool.acquire().await.unwrap();
+    let (a, b) = tokio::join!(
+        apply_migrations(&mut first, &scripts),
+        apply_migrations(&mut second, &scripts)
+    );
+    assert_eq!(a.unwrap() + b.unwrap(), 1, "exactly one runner applied it");
+    drop((first, second));
+    let recorded: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM sutra_schema_history WHERE version = 9002")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(recorded, 1);
+    assert_eq!(index_is_valid(&pool, "t_key").await, Some(true));
 }
 
 /// Creates a database WITHOUT running the fixture's migrations.
