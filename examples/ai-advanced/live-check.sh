@@ -46,7 +46,7 @@
 #                         name; your account may offer other ids. Each variable is substituted into
 #                         a copy of the channels at deploy time (the committed YAML is unchanged).
 #                         A model-not-found failure names the variable to set.
-#   SUTRA_ENGINE_IMAGE    the engine image (default ghcr.io/startr-trade/sutra:0.6.22; to check this
+#   SUTRA_ENGINE_IMAGE    the engine image (default ghcr.io/startr-trade/sutra:0.6.23; to check this
 #                         tree instead, use sutra-rust-engine:dev built by `make image`)
 #   SUTRA_BIN             the `sutra` CLI, 0.5.0 or later (default: a build in rust/target, else PATH)
 #   GEMINI_LIVE_MODEL     the Gemini Live model (default gemini-3.8-live, the model the
@@ -207,14 +207,14 @@ fi
 
 [ -n "$sutra_bin" ] || { echo "no sutra CLI: set SUTRA_BIN or put sutra on PATH" >&2; exit 2; }
 # The examples use 0.5.0 features (sync calls without <q:alias>, q:stream); an older CLI rejects them.
-cli_version=$("$sutra_bin" --version | awk '{print $NF}')
+cli_version=$("$sutra_bin" --version | awk '{print $2}')
 if [ "$(printf '%s\n' 0.5.0 "$cli_version" | sort -V | head -1)" != 0.5.0 ]; then
     echo "sutra CLI $cli_version at $sutra_bin is older than 0.5.0; build one (cargo build -p sutra-cli)" >&2
     echo "and point SUTRA_BIN at it, e.g. SUTRA_BIN=\$PWD/rust/target/debug/sutra" >&2
     exit 2
 fi
-echo "using $("$sutra_bin" --version) ($sutra_bin); engine image ${SUTRA_ENGINE_IMAGE:-ghcr.io/startr-trade/sutra:0.6.22}"
-image=${SUTRA_ENGINE_IMAGE:-ghcr.io/startr-trade/sutra:0.6.22}
+echo "using $("$sutra_bin" --version) ($sutra_bin); engine image ${SUTRA_ENGINE_IMAGE:-ghcr.io/startr-trade/sutra:0.6.23}"
+image=${SUTRA_ENGINE_IMAGE:-ghcr.io/startr-trade/sutra:0.6.23}
 if ! docker image inspect "$image" >/dev/null 2>&1 && ! docker pull -q "$image" >/dev/null 2>&1; then
     echo "engine image $image is not available locally and cannot be pulled; build one (make image)" >&2
     echo "and set SUTRA_ENGINE_IMAGE, e.g. SUTRA_ENGINE_IMAGE=sutra-rust-engine:dev" >&2

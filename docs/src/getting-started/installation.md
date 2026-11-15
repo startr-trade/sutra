@@ -30,7 +30,7 @@ Useful knobs:
 
 ```bash
 # Pin a version instead of taking the newest release
-curl -fsSL …/install.sh | sh -s -- --version v0.6.22
+curl -fsSL …/install.sh | sh -s -- --version v0.6.23
 
 # Install somewhere specific
 curl -fsSL …/install.sh | SUTRA_INSTALL_DIR=~/bin sh
@@ -48,15 +48,15 @@ order worth trying:
 ```bash
 # 1. the SAME installer, served from the release instead of the raw CDN (different host, and
 #    the script is versioned with the binaries it installs)
-curl -fsSL https://github.com/startr-trade/sutra/releases/download/v0.6.22/install.sh \
-  | sh -s -- --version v0.6.22
+curl -fsSL https://github.com/startr-trade/sutra/releases/download/v0.6.23/install.sh \
+  | sh -s -- --version v0.6.23
 
 # 2. a token, which moves the API to 5000 requests an hour
 GH_TOKEN=$(gh auth token) curl -fsSL …/install.sh | sh
 
 # 3. no installer at all — the assets are plain files
 #    (swap in your target: aarch64-unknown-linux-musl, aarch64-apple-darwin, x86_64-apple-darwin)
-gh release download v0.6.22 -R startr-trade/sutra \
+gh release download v0.6.23 -R startr-trade/sutra \
   -p 'sutra-*-x86_64-unknown-linux-musl.tar.gz' -p SHA256SUMS
 sha256sum --ignore-missing -c SHA256SUMS
 tar xzf sutra-*-x86_64-unknown-linux-musl.tar.gz --strip-components=1 -C ~/.local/bin
@@ -77,6 +77,9 @@ Verify the install:
 ```bash
 sutra --version
 ```
+
+It prints the version and the build it came from, for example
+`sutra 0.6.23 (1a2b3c4, built 2026-11-15)`: the release commit and that commit's date.
 
 ### Published targets
 
@@ -125,7 +128,7 @@ installer's business.
 ## Get the engine image
 
 ```bash
-docker pull ghcr.io/startr-trade/sutra:0.6.22
+docker pull ghcr.io/startr-trade/sutra:0.6.23
 ```
 
 One generic image runs every application: behavior comes entirely from the deployment
@@ -144,7 +147,9 @@ sutra self-update --runtime-only   # only the engine image
 Updates are **never automatic** — nothing runs on a timer or as a side effect of another
 command. Every download is checksum-verified against the release's `SHA256SUMS` before it is
 installed, and the binary is replaced by an atomic rename, so an interrupted update cannot
-leave a half-written executable on your PATH. `--version <tag>` pins or rolls back.
+leave a half-written executable on your PATH. `--version <tag>` pins or rolls back; without it,
+`self-update` only ever moves to a newer release. Release candidates count as older than their
+release, and compare by number (`rc.10` is newer than `rc.9`).
 
 Keeping the CLI and the engine on the same release is worth doing deliberately: they are
 built, tested and published from one tag, which is what `--runtime` is for.

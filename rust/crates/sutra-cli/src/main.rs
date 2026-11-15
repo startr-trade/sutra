@@ -21,7 +21,7 @@ fn main() {
     // composition root for OTHER distributions, and a hardcoded repository would let their
     // `self-update` install THIS binary over theirs.
     std::process::exit(sutra_cli::run_with_update_source(
-        sutra_cli::VERSION,
+        sutra_cli::engine_version_line(),
         sutra_cli::UpdateSource {
             channel: sutra_cli::UpdateChannel::GithubReleases {
                 repo: "startr-trade/sutra".to_string(),

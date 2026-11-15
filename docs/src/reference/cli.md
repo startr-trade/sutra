@@ -362,26 +362,36 @@ instance did, offline. See [Logging and audit](../operating/logging.md).
 ### `sutra version`
 
 ```
-sutra version            # sutra 0.6.13
+sutra version            # sutra 0.6.23 (1a2b3c4, built 2026-11-15)
 sutra --version          # identical text
 sutra version --format json
 ```
 
-Prints the tool version. The program name is **derived from the running binary**, not
+Prints the tool version and the build it came from. The parenthesis names the commit the binary
+was built from (`-dirty` appended when tracked files had uncommitted changes) and that commit's
+date in UTC. It is never the wall clock, so two builds of one commit print the same line. An
+unknown part is left out rather than guessed: `sutra 0.6.23 (1a2b3c4)` without a date, plain
+`sutra 0.6.23` when git is unavailable and no build variable was set. A release build takes both
+from `SUTRA_BUILD_COMMIT` and `SOURCE_DATE_EPOCH`; a local build reads them from git. The engine
+image's `sutra-engine --version` prints the same, and its `sutra-engine starting` log line carries
+`version`, `commit` and `built` fields.
+
+The program name is **derived from the running binary**, not
 hardcoded: a distribution that embeds this CLI as a library (`sutra_cli::run`) under its own
 binary name prints that name, and one that versions itself independently of the engine
 (`sutra_cli::run_with_version`) prints its own version with the embedded engine's underneath:
 
 ```
 <tool> 2.0.0
-sutra  0.6.13 (engine)
+sutra  0.6.23 (engine)
 ```
 
 `--format json` is the structured form and always separates the two — `version` is the
-reporting tool's own, `engine` the embedded engine's (equal for this binary):
+reporting tool's own, `engine` the embedded engine's (equal for this binary). `commit` and
+`built` are present when known:
 
 ```json
-{"name":"sutra","version":"0.6.13","engine":"0.6.13"}
+{"name":"sutra","version":"0.6.23","engine":"0.6.23","commit":"1a2b3c4","built":"2026-11-15"}
 ```
 
 ---

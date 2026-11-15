@@ -169,6 +169,17 @@ jobs:
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
 
+      # The engine stamps `sutra-engine --version` and its startup log with the commit and that
+      # commit's UTC time. The build context (rust/) has no .git, so both are passed in as build
+      # arguments: the RESOLVED commit (on a re-release the ambient github.sha is a branch head)
+      # and its committer timestamp, never the wall clock.
+      - name: Build identity
+        id: ident
+        run: |
+          set -eu
+          echo "commit=${{ needs.tag.outputs.sha }}" >> "$GITHUB_OUTPUT"
+          echo "epoch=$(git log -1 --format=%ct HEAD)" >> "$GITHUB_OUTPUT"
+
       # NO QEMU. Each architecture is built on a runner of that architecture (see the
       # `platform` matrix): arm64 on GitHub's hosted `ubuntu-24.04-arm`, which is free for
       # public repositories. Emulating an arm64 Rust build under binfmt recompiled the whole
@@ -196,6 +207,9 @@ jobs:
           context: ./rust
           file: ./rust/Dockerfile
           platforms: ${{ matrix.platform }}
+          build-args: |
+            SUTRA_BUILD_COMMIT=${{ steps.ident.outputs.commit }}
+            SOURCE_DATE_EPOCH=${{ steps.ident.outputs.epoch }}
           # org.opencontainers.image.source is what makes ghcr.io LINK this package to the
           # repository — which is how the package shows up on the repo page and how a reader
           # gets from the image back to the code. Without it the package is an orphan in the
@@ -244,17 +258,24 @@ jobs:
         run: docker pull "${IMAGE_NAME}@${DIGEST}"
 
       # The entrypoint binary EXECUTES on this architecture and its configuration layer runs.
-      # The engine has no --version to interrogate (it is a server, not a CLI), so the signal is
-      # its documented refusal: with no deployments directory it exits non-zero saying
+      # `--version` must name the release commit, which proves the build arguments reached the
+      # binary. Beyond that the signal is the engine's documented refusal: with no deployments directory it exits non-zero saying
       # "configuration invalid — refusing to start". A wrong-architecture binary, a broken
       # ENTRYPOINT path or a missing shared library never reach that message — which is exactly
       # the class of defect a distroless image hides until someone runs it.
       - name: The image's engine runs on this architecture
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
+          COMMIT: ${{ steps.ident.outputs.commit }}
         run: |
           set -eu
           img="${IMAGE_NAME}@${DIGEST}"
+          version="$(docker run --rm "$img" --version)"
+          echo "$version"
+          case "$version" in
+            *"(${COMMIT:0:7}, built "*) ;;
+            *) echo "::error::sutra-engine --version does not name commit ${COMMIT:0:7} and its date: '$version'" >&2; exit 1 ;;
+          esac
           # Both runs below are EXPECTED to exit non-zero, so each failure is captured rather
           # than left to `set -e` — `cmd; echo $?` and `cmd && { ... }` would both abort this
           # step on exactly the behaviour being asserted.
@@ -277,7 +298,7 @@ jobs:
             echo "::error::--health-check reported success with no engine running" >&2
             exit 1
           fi
-          echo "engine runs on ${{ matrix.platform }}, refuses without config, health-check fails closed"
+          echo "engine runs on ${{ matrix.platform }}, names ${COMMIT:0:7}, refuses without config, health-check fails closed"
 
       # Scanned before the tag exists, on the tagged tree's own image, failing on any finding the
       # triage record does not already account for. `make scan-image` is this same gate locally.
@@ -552,6 +573,16 @@ jobs:
           toolchain: 1.96.0
           targets: ${{ matrix.target }}
 
+      # `sutra --version` names the commit and that commit's UTC date. The build script reads
+      # these two variables before git, so every target, including the `cross` container (which
+      # forwards them through rust/Cross.toml) and the shallow checkout, prints the same line.
+      - name: Build identity
+        shell: bash
+        run: |
+          set -eu
+          echo "SUTRA_BUILD_COMMIT=${{ needs.tag.outputs.sha }}" >> "$GITHUB_ENV"
+          echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct HEAD)" >> "$GITHUB_ENV"
+
       # The workspace pins its toolchain (rust/rust-toolchain.toml) and cargo obeys the
       # pin, so the cross-target must be on THAT toolchain. The action above installs the
       # same version with the target (an archtest keeps the two equal); this step stays as
@@ -593,6 +624,25 @@ jobs:
         if: ${{ !matrix.use_cross }}
         working-directory: rust
         run: cargo build --release --locked -p sutra-cli --target ${{ matrix.target }}
+
+      # Every non-cross target runs on its own architecture, so the built binary can be asked
+      # what it is. It must name the release commit and its date; the aarch64 musl build is a
+      # cross-compile this runner cannot execute.
+      - name: The built CLI names its commit
+        if: ${{ !matrix.use_cross }}
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -eu
+          bin="rust/target/${TARGET}/release/sutra"
+          [ -f "${bin}.exe" ] && bin="${bin}.exe"
+          version="$("$bin" --version)"
+          echo "$version"
+          case "$version" in
+            *"(${SUTRA_BUILD_COMMIT:0:7}, built "*) ;;
+            *) echo "::error::sutra --version does not name commit ${SUTRA_BUILD_COMMIT:0:7} and its date: '$version'" >&2; exit 1 ;;
+          esac
 
       - name: Resolve release tag
         id: tag

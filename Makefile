@@ -178,8 +178,13 @@ test-k8s: ## Tier-3: the k8s conformance suites (needs a running kind cluster).
 ## The SHIPPED image uses the full-LTO `release` (the Dockerfile's default CARGO_PROFILE):
 ## build that with a plain `docker build -f rust/Dockerfile rust/`.
 IMAGE ?= sutra-rust-engine:dev
+## BUILD_ARGS stamps the engine with this checkout's commit (`-dirty` when tracked files differ)
+## and that commit's UTC time, never the wall clock: the build context has no .git to read.
+BUILD_COMMIT := $(shell git rev-parse --short=7 HEAD 2>/dev/null)$(if $(shell git status --porcelain --untracked-files=no 2>/dev/null),-dirty)
+BUILD_EPOCH := $(shell git log -1 --format=%ct 2>/dev/null)
+BUILD_ARGS = $(if $(BUILD_COMMIT),--build-arg SUTRA_BUILD_COMMIT=$(BUILD_COMMIT)) $(if $(BUILD_EPOCH),--build-arg SOURCE_DATE_EPOCH=$(BUILD_EPOCH))
 image: ## Build the local tier-2 engine image (IMAGE=, default sutra-rust-engine:dev; fast `release-it`).
-	DOCKER_BUILDKIT=1 docker build --build-arg CARGO_PROFILE=release-it -t $(IMAGE) -f rust/Dockerfile rust/
+	DOCKER_BUILDKIT=1 docker build --build-arg CARGO_PROFILE=release-it $(BUILD_ARGS) -t $(IMAGE) -f rust/Dockerfile rust/
 
 ## Build + push the k8s-IT engine image with the FAST `release-it` profile (no LTO, parallel
 ## codegen — ~2x faster than the shipped `release`; a few MB larger, irrelevant for functional
@@ -203,7 +208,7 @@ IMG ?= localhost:5000/sutra-engine:k8s-it
 KUBECONFIG_IT ?= deploy/k8s-it/cluster/sutra-fednow-it-config
 K8S_NAMESPACE ?= default
 image-it: ## Build + push the fast (release-it) engine image for k8s ITs, then roll deployment/sutra-engine (IMG=<tag>).
-	DOCKER_BUILDKIT=1 docker build --build-arg CARGO_PROFILE=release-it -t $(IMG) -f rust/Dockerfile rust/
+	DOCKER_BUILDKIT=1 docker build --build-arg CARGO_PROFILE=release-it $(BUILD_ARGS) -t $(IMG) -f rust/Dockerfile rust/
 	docker push $(IMG)
 	kubectl --kubeconfig $(KUBECONFIG_IT) -n $(K8S_NAMESPACE) set image deployment/sutra-engine engine=$(IMG)
 	kubectl --kubeconfig $(KUBECONFIG_IT) -n $(K8S_NAMESPACE) rollout restart deployment/sutra-engine

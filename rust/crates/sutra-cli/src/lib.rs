@@ -59,6 +59,10 @@ use clap::{CommandFactory, FromArgMatches, Parser};
 use std::sync::OnceLock;
 
 pub(crate) mod bpmn_walk;
+// The build script's resolution logic, compiled here only so its unit tests run.
+#[cfg(test)]
+#[path = "../build_info.rs"]
+mod build_info;
 pub mod commands;
 pub mod compat;
 pub mod embedded;
@@ -78,6 +82,60 @@ pub const NAME: &str = "sutra";
 /// The engine's own version. A distribution that versions itself independently renders this
 /// alongside its own version (see [`run_with_version`]).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// The commit this build came from (7 characters, `-dirty` when tracked files had uncommitted
+/// changes), or `None` when neither `SUTRA_BUILD_COMMIT` nor git could say. Never guessed.
+pub const COMMIT: Option<&str> = option_env!("SUTRA_RESOLVED_COMMIT");
+
+/// The build date, UTC `YYYY-MM-DD`: `SOURCE_DATE_EPOCH`, else the commit's own date. Never the
+/// wall clock, so two builds of one commit are byte-identical.
+pub const BUILT: Option<&str> = option_env!("SUTRA_RESOLVED_BUILT");
+
+/// Whether this process reports the engine's own build (set by [`run`]); a distribution passing
+/// its own block to [`run_with_version`] reports its own build information instead.
+static ENGINE_BUILD: OnceLock<()> = OnceLock::new();
+
+pub(crate) fn reports_engine_build() -> bool {
+    ENGINE_BUILD.get().is_some()
+}
+
+/// The engine's own `--version` text, with this build's commit and date (see [`version_line`]).
+/// Pass it to [`run_with_version`] / [`run_with_update_source`] to report the engine's own build;
+/// calling it also makes `version --format json` carry `commit` and `built`. A distribution that
+/// versions itself reports its own build information and does not call this.
+pub fn engine_version_line() -> String {
+    let _ = ENGINE_BUILD.set(());
+    version_line(VERSION, COMMIT, BUILT)
+}
+
+/// The version text for `--version`: `0.6.23 (6db6ae0, built 2026-11-15)`. Unknown parts are
+/// omitted, never guessed: no date gives `0.6.23 (6db6ae0)`, neither gives `0.6.23`. Pure.
+pub fn version_line(version: &str, commit: Option<&str>, built: Option<&str>) -> String {
+    match (commit, built) {
+        (Some(c), Some(b)) => format!("{version} ({c}, built {b})"),
+        (Some(c), None) => format!("{version} ({c})"),
+        (None, Some(b)) => format!("{version} (built {b})"),
+        (None, None) => version.to_string(),
+    }
+}
+
+/// The `version --format json` payload; `commit` and `built` keys are absent when unknown. Pure.
+pub fn version_json(
+    name: &str,
+    version: &str,
+    engine: &str,
+    commit: Option<&str>,
+    built: Option<&str>,
+) -> serde_json::Value {
+    let mut v = serde_json::json!({ "name": name, "version": version, "engine": engine });
+    if let Some(c) = commit {
+        v["commit"] = c.into();
+    }
+    if let Some(b) = built {
+        v["built"] = b.into();
+    }
+    v
+}
 
 /// The version string `--version` and `version` print, set once by [`run_with_version`].
 /// Unset (direct library use, tests) means the engine's own [`VERSION`].
@@ -194,6 +252,10 @@ fn runtime_image_of(declared: Option<&str>, product: &str) -> String {
 /// handed [`run_with_version`], which by that function's contract is the product's own version
 /// with the embedded engine described on the lines below it. [`VERSION`] when unset.
 pub fn product_version() -> &'static str {
+    if reports_engine_build() {
+        // `--version` text carries the build suffix; the version itself stays bare.
+        return VERSION;
+    }
     version_string().lines().next().unwrap_or(VERSION)
 }
 
@@ -257,7 +319,7 @@ pub(crate) fn version_string() -> &'static str {
 /// Reports the engine's own [`VERSION`]; see [`run_with_version`] for distributions that
 /// version themselves independently.
 pub fn run() -> i32 {
-    run_with_version(VERSION)
+    run_with_version(engine_version_line())
 }
 
 /// [`run`], with the version string a distribution reports for itself.
@@ -493,5 +555,51 @@ mod tests {
         };
         assert_eq!(verify.conn.url.as_deref(), Some("postgres://db/x"));
         assert_eq!(verify.expected_head, Some(803));
+    }
+}
+
+#[cfg(test)]
+mod version_tests {
+    use super::*;
+
+    #[test]
+    fn version_line_with_all_values() {
+        assert_eq!(
+            version_line("0.6.23", Some("6db6ae0"), Some("2026-11-15")),
+            "0.6.23 (6db6ae0, built 2026-11-15)"
+        );
+    }
+
+    #[test]
+    fn version_line_with_some_values() {
+        assert_eq!(
+            version_line("0.6.23", Some("6db6ae0-dirty"), None),
+            "0.6.23 (6db6ae0-dirty)"
+        );
+        assert_eq!(
+            version_line("0.6.23", None, Some("2026-11-15")),
+            "0.6.23 (built 2026-11-15)"
+        );
+    }
+
+    #[test]
+    fn version_line_with_no_values_is_the_bare_version() {
+        assert_eq!(version_line("0.6.23", None, None), "0.6.23");
+    }
+
+    #[test]
+    fn version_json_omits_unknown_fields() {
+        let full = version_json(
+            "sutra",
+            "0.6.23",
+            "0.6.23",
+            Some("6db6ae0"),
+            Some("2026-11-15"),
+        );
+        assert_eq!(full["commit"], "6db6ae0");
+        assert_eq!(full["built"], "2026-11-15");
+        let bare = version_json("sutra", "0.6.23", "0.6.23", None, None);
+        assert!(bare.get("commit").is_none() && bare.get("built").is_none());
+        assert_eq!(bare["version"], "0.6.23");
     }
 }

@@ -1,0 +1,8 @@
+# Settings for `cross`, which the release workflow uses for the aarch64 musl CLI build.
+#
+# `cross` builds inside a container that sees only the environment it is told to pass through.
+# The CLI's build script stamps `sutra --version` with SUTRA_BUILD_COMMIT and SOURCE_DATE_EPOCH;
+# without this list a cross-built binary would print the bare version, and the container has no
+# git history to fall back on.
+[build.env]
+passthrough = ["SUTRA_BUILD_COMMIT", "SOURCE_DATE_EPOCH"]

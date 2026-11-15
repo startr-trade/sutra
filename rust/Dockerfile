@@ -75,6 +75,11 @@ COPY crates ./crates
 # tests/data/`, which travel with `COPY crates`. A distribution that DOES carry a corpus (for
 # `sutra schemagen`, or for a codec that embeds one) keeps it in its own tree and copies it in
 # its own image build.
+# Build identity for `sutra-engine --version` and its startup log. The build context is rust/,
+# with no .git, so the caller passes the commit and its UTC commit time; unset means the binary
+# reports neither. Declared after the dependency layers so a new commit does not invalidate them.
+ARG SUTRA_BUILD_COMMIT
+ARG SOURCE_DATE_EPOCH
 # The target dir is a cache mount (not part of the image), so copy the finished binary OUT of it
 # to a normal path for the runtime stage's COPY --from.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \

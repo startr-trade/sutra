@@ -13,6 +13,56 @@ This is the changelog for the **Rust-native** engine (`rust/` workspace). It beg
 
 Nothing yet.
 
+## [0.6.23] — 2026-11-15
+
+**2026-11-15.** **`sutra --version` and `sutra-engine --version` name the build they came from:**
+the commit and that commit's date, so a bug report or a running engine can be traced to its
+source. **`sutra self-update` picks the newest release** from a file-store listing whatever order
+the listing is in, never offers an older release as an update, and asks for the running binary's own
+libc. There is no migration, and no archive format, deploymentId or snapshot format change.
+
+## Before you upgrade
+
+**Check these against what you run:**
+
+- **`sutra --version` prints more than the version.** It now reads
+  `sutra 0.6.23 (1a2b3c4, built 2026-11-15)`. A script that took the last word of that line as the
+  version now gets `2026-11-15)`; take the second word, or use `sutra version --format json` and
+  its `version` field.
+
+## Build information
+
+- **The text.** `sutra 0.6.23 (1a2b3c4, built 2026-11-15)`: the short commit, with `-dirty` when
+  tracked files differed from it at build time, and the commit's UTC date. Neither comes from the
+  wall clock, so two builds of one commit print the same line.
+- **Where it comes from.** `SUTRA_BUILD_COMMIT` and `SOURCE_DATE_EPOCH` when set, else git. A part
+  that cannot be found is left out, so a build from a source archive without git prints the bare
+  version, as before.
+- **`sutra version --format json`** gains `commit` and `built`, each present only when known.
+- **The engine.** `sutra-engine --version` prints the same line, and the `sutra-engine starting`
+  log line carries `version`, `commit` and `built` fields. The image build takes
+  `SUTRA_BUILD_COMMIT` and `SOURCE_DATE_EPOCH` build arguments (`make image` passes them from the
+  checkout), and the published image and CLI archives are stamped with the release commit.
+
+## Fixes
+
+- **`self-update` picked the wrong release from a file-store listing.** The first matching entry
+  in the listing won, so with `v2.0.0-rc.1` listed before `v2.0.0-rc.4` the older one was
+  installed. The newest release is now chosen by version. Pre-release identifiers compare dot by
+  dot, numbers as numbers, so `rc.10` is above `rc.9`, and a release is above its own release
+  candidates. Only `--version` can install an older release than the one running.
+- **`self-update` on a glibc build asked for a musl asset.** It now asks for the running binary's
+  own libc first, and falls back to the other libc of the same architecture. sutra's own release
+  binaries are musl builds and are unchanged.
+- **`examples/ai-advanced/live-check.sh`** read the CLI version as the last word of `--version`,
+  which the build suffix broke; it reads the second word.
+
+## Known
+
+- **`SUTRA.INBOUND.CAPABILITY_MISMATCH` answers HTTP 500.** A body the channel's codec or format
+  contract cannot take is the caller's fault, and a later release will answer it with 415. Nothing
+  changes in 0.6.23.
+
 ## [0.6.22] — 2026-11-15
 
 **2026-11-15.** **A message now answers the instance waiting for it before it

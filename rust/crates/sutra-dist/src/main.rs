@@ -122,10 +122,29 @@ async fn health_check() -> ! {
 #[global_allocator]
 static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+/// The commit and build date resolved by `build.rs` (empty when unknown, never guessed).
+const COMMIT: Option<&str> = option_env!("SUTRA_RESOLVED_COMMIT");
+const BUILT: Option<&str> = option_env!("SUTRA_RESOLVED_BUILT");
+
+/// `0.6.23 (6db6ae0, built 2026-11-15)`; unknown parts are omitted.
+fn version_line() -> String {
+    let version = env!("CARGO_PKG_VERSION");
+    match (COMMIT, BUILT) {
+        (Some(c), Some(b)) => format!("{version} ({c}, built {b})"),
+        (Some(c), None) => format!("{version} ({c})"),
+        (None, Some(b)) => format!("{version} (built {b})"),
+        (None, None) => version.to_string(),
+    }
+}
+
 #[tokio::main]
 async fn main() {
     // The health probe runs BEFORE any telemetry or config work: it is a short-lived
     // sidecar invocation of the same image, not an engine boot.
+    if std::env::args().any(|a| a == "--version" || a == "-V") {
+        println!("sutra-engine {}", version_line());
+        return;
+    }
     if std::env::args().any(|a| a == "--health-check") {
         health_check().await;
     }
@@ -152,6 +171,9 @@ async fn main() {
         http_port = config.http_port,
         has_datasource = config.datasource_url.is_some(),
         telemetry_active = config.telemetry.is_active(),
+        version = env!("CARGO_PKG_VERSION"),
+        commit = COMMIT.unwrap_or(""),
+        built = BUILT.unwrap_or(""),
         "sutra-engine starting"
     );
 

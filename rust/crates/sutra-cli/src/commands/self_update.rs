@@ -14,7 +14,7 @@
 //!   a rename, so an interrupted update can never leave a half-written executable on PATH.
 //!   Windows cannot rename over a running image, so the old one is moved aside first.
 //!
-//! The version/asset arithmetic ([`Release`], [`asset_name`], [`target_triple`]) is pure and
+//! The version/asset arithmetic ([`compare_versions`], [`asset_name_of`], [`target_candidates`]) is pure and
 //! unit-tested; only [`fetch`] and the install step touch the network or the filesystem.
 
 use std::path::{Path, PathBuf};
@@ -56,19 +56,45 @@ pub fn engine_image_of(image: &str, tag: &str) -> String {
     format!("{image}:{}", normalize(tag))
 }
 
-/// The published-asset target triple for the host, or `None` when this platform has no
-/// release build (anything outside the release matrix) — those install from source, and saying
-/// so is better than downloading a binary that cannot run. Keep this list in step with the
-/// targets the release workflow packages.
-pub fn target_triple() -> Option<&'static str> {
-    match (std::env::consts::OS, std::env::consts::ARCH) {
-        ("linux", "x86_64") => Some("x86_64-unknown-linux-musl"),
-        ("linux", "aarch64") => Some("aarch64-unknown-linux-musl"),
-        ("macos", "aarch64") => Some("aarch64-apple-darwin"),
-        ("macos", "x86_64") => Some("x86_64-apple-darwin"),
-        ("windows", "x86_64") => Some("x86_64-pc-windows-msvc"),
-        _ => None,
+/// The published-asset target triples to try for this host, best first, or an empty list when
+/// this platform has no release build (anything outside the release matrix) — those install
+/// from source, and saying so is better than downloading a binary that cannot run. Keep this
+/// list in step with the targets the release workflows package.
+///
+/// On Linux a distribution may publish glibc builds, musl builds, or both, so the running
+/// binary's own libc comes first and the other libc of the same OS/arch is the fallback.
+pub fn target_candidates() -> Vec<&'static str> {
+    candidates_for(
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        cfg!(target_env = "gnu"),
+    )
+}
+
+fn candidates_for(os: &str, arch: &str, gnu: bool) -> Vec<&'static str> {
+    match (os, arch, gnu) {
+        ("linux", "x86_64", true) => {
+            vec!["x86_64-unknown-linux-gnu", "x86_64-unknown-linux-musl"]
+        }
+        ("linux", "x86_64", false) => {
+            vec!["x86_64-unknown-linux-musl", "x86_64-unknown-linux-gnu"]
+        }
+        ("linux", "aarch64", true) => {
+            vec!["aarch64-unknown-linux-gnu", "aarch64-unknown-linux-musl"]
+        }
+        ("linux", "aarch64", false) => {
+            vec!["aarch64-unknown-linux-musl", "aarch64-unknown-linux-gnu"]
+        }
+        ("macos", "aarch64", _) => vec!["aarch64-apple-darwin"],
+        ("macos", "x86_64", _) => vec!["x86_64-apple-darwin"],
+        ("windows", "x86_64", _) => vec!["x86_64-pc-windows-msvc"],
+        _ => Vec::new(),
     }
+}
+
+/// The preferred published-asset target triple for the host (see [`target_candidates`]).
+pub fn target_triple() -> Option<&'static str> {
+    target_candidates().first().copied()
 }
 
 /// The release-asset file name for a tag + target — the exact shape `release.yml` packages
@@ -130,7 +156,8 @@ pub fn execute_with(
 
     // `--runtime-only` never touches this binary, so an unpublished host platform can still
     // pull the engine image.
-    let target = match target_triple() {
+    let candidates = target_candidates();
+    let target = match candidates.first().copied() {
         Some(target) => target,
         None if args.runtime_only => "",
         None => {
@@ -164,17 +191,21 @@ pub fn execute_with(
     // multi-line block ("<product> 2.0.0\nsutra 0.2.0-rc.1 (engine)"); line one is the
     // product. Comparing the engine's version against a product's release tags would report
     // an update on every run, forever.
-    let current = crate::version_string()
-        .lines()
+    let current = crate::product_version()
+        .split(" (")
         .next()
         .unwrap_or(crate::VERSION)
         .rsplit(' ')
         .next()
         .unwrap_or(crate::VERSION);
+    let mut listed_target: Option<String> = None;
     let wanted = match args.version.clone() {
         Some(tag) => tag,
-        None => match latest_tag(&src.channel, &src.binary, token.as_deref()) {
-            Ok(tag) => tag,
+        None => match latest_tag(&src.channel, &src.binary, token.as_deref(), &candidates) {
+            Ok((tag, listed)) => {
+                listed_target = listed;
+                tag
+            }
             Err(msg) => {
                 let _ = writeln!(io.err, "self-update: {msg}");
                 return exit::USAGE;
@@ -182,7 +213,10 @@ pub fn execute_with(
         },
     };
 
-    let available = differs(current, &wanted);
+    // A pinned `--version` may move backwards; the newest-release lookup never offers an older
+    // release than the one running as an "update".
+    let available = differs(current, &wanted)
+        && (args.version.is_some() || compare_versions(&wanted, current).is_gt());
     if args.check {
         match format {
             ReportFormat::Json => {
@@ -242,12 +276,25 @@ pub fn execute_with(
         }
     };
 
-    let _ = writeln!(io.out, "updating {current} -> {wanted} ({target})");
-    if let Err(msg) = install(src, &wanted, target, &exe, token.as_deref()) {
-        let _ = writeln!(io.err, "self-update: {msg}");
-        return exit::USAGE;
+    // A listing already named the asset's target; otherwise try the candidates in order.
+    let to_try: Vec<String> = match listed_target {
+        Some(t) => vec![t],
+        None => candidates.iter().map(|t| t.to_string()).collect(),
+    };
+    let _ = writeln!(
+        io.out,
+        "updating {current} -> {wanted} ({})",
+        to_try.first().map(String::as_str).unwrap_or(target)
+    );
+    match install(src, &wanted, &to_try, &exe, token.as_deref()) {
+        Ok(used) => {
+            let _ = writeln!(io.out, "installed {wanted} ({used}) at {}", exe.display());
+        }
+        Err(msg) => {
+            let _ = writeln!(io.err, "self-update: {msg}");
+            return exit::USAGE;
+        }
     }
-    let _ = writeln!(io.out, "installed {wanted} at {}", exe.display());
 
     if args.runtime {
         if let Err(msg) = pull_engine(src, &wanted, io) {
@@ -379,26 +426,92 @@ fn tag_name_of(body: &[u8]) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-/// A sortable key for a `v`-prefixed tag: numeric segments compare as numbers, so v0.10.0 sorts
-/// above v0.9.0 where a string compare would not. A pre-release suffix (`-rc.1`) keeps its text
-/// in the last element, which orders rc.1 < rc.2 and, being longer than the empty string of a
-/// bare release, sorts a pre-release BELOW its own final release.
-fn version_key(tag: &str) -> (Vec<u64>, String) {
-    let body = tag.trim_start_matches('v');
-    let (core, suffix) = body.split_once('-').unwrap_or((body, ""));
-    let nums = core
-        .split('.')
-        .map(|p| p.parse::<u64>().unwrap_or(0))
-        .collect();
-    // An empty suffix must sort ABOVE any pre-release, so invert: bare -> "~" (high), rc -> text.
-    (
-        nums,
-        if suffix.is_empty() {
-            "~".to_string()
-        } else {
-            suffix.to_string()
-        },
-    )
+/// Orders two release tags by semver precedence: the numeric core compares as numbers (v0.10.0
+/// above v0.9.0), a pre-release sorts below its own release, and pre-release identifiers
+/// compare one dot-separated identifier at a time, numeric ones numerically and below any
+/// alphanumeric one (so rc.10 is above rc.9, and rc.9 above rc.1). Build metadata is ignored.
+pub fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    fn split(tag: &str) -> (Vec<u64>, Option<Vec<String>>) {
+        let body = tag.trim().trim_start_matches('v');
+        let body = body.split_once('+').map_or(body, |(b, _)| b);
+        let (core, pre) = match body.split_once('-') {
+            Some((c, p)) => (c, Some(p.split('.').map(str::to_string).collect())),
+            None => (body, None),
+        };
+        let nums = core
+            .split('.')
+            .map(|p| p.parse::<u64>().unwrap_or(0))
+            .collect();
+        (nums, pre)
+    }
+    fn cmp_ident(a: &str, b: &str) -> Ordering {
+        match (a.parse::<u64>(), b.parse::<u64>()) {
+            (Ok(x), Ok(y)) => x.cmp(&y),
+            (Ok(_), Err(_)) => Ordering::Less,
+            (Err(_), Ok(_)) => Ordering::Greater,
+            (Err(_), Err(_)) => a.cmp(b),
+        }
+    }
+    let (mut an, ap) = split(a);
+    let (mut bn, bp) = split(b);
+    let width = an.len().max(bn.len());
+    an.resize(width, 0);
+    bn.resize(width, 0);
+    an.cmp(&bn).then_with(|| match (ap, bp) {
+        (None, None) => Ordering::Equal,
+        (None, Some(_)) => Ordering::Greater,
+        (Some(_), None) => Ordering::Less,
+        (Some(x), Some(y)) => {
+            for (i, j) in x.iter().zip(y.iter()) {
+                let c = cmp_ident(i, j);
+                if c.is_ne() {
+                    return c;
+                }
+            }
+            x.len().cmp(&y.len())
+        }
+    })
+}
+
+/// `(tag, target)` of a store asset named `<binary>-<tag>-<target>.tar.gz|.zip`, or `None` for
+/// anything else in the listing (checksum files, other products' artifacts).
+fn parse_asset(binary: &str, name: &str) -> Option<(String, String)> {
+    let rest = name.strip_prefix(&format!("{binary}-"))?;
+    let stem = rest
+        .strip_suffix(".tar.gz")
+        .or_else(|| rest.strip_suffix(".zip"))?;
+    // Every published target begins with an architecture segment, so that is where the tag ends.
+    let cut = stem.find("-x86_64").or_else(|| stem.find("-aarch64"))?;
+    Some((stem[..cut].to_string(), stem[cut + 1..].to_string()))
+}
+
+/// The newest release in a listing that has an asset for one of `candidates`, with the target of
+/// that asset (the best-ranked candidate the release carries). Listing order is irrelevant.
+fn newest_in_listing(
+    names: &[String],
+    binary: &str,
+    candidates: &[&str],
+) -> Option<(String, String)> {
+    let rank_of = |t: &str| candidates.iter().position(|c| *c == t);
+    let mut best: Option<(String, String)> = None;
+    for (tag, target) in names.iter().filter_map(|n| parse_asset(binary, n)) {
+        let Some(rank) = rank_of(&target) else {
+            continue;
+        };
+        let better = match &best {
+            None => true,
+            Some((bt, btarget)) => match compare_versions(&tag, bt) {
+                std::cmp::Ordering::Greater => true,
+                std::cmp::Ordering::Equal => rank < rank_of(btarget).unwrap_or(usize::MAX),
+                std::cmp::Ordering::Less => false,
+            },
+        };
+        if better {
+            best = Some((tag, target));
+        }
+    }
+    best
 }
 
 /// The newest release tag on this distribution's channel, pre-releases included.
@@ -406,7 +519,8 @@ fn latest_tag(
     channel: &crate::UpdateChannel,
     binary: &str,
     token: Option<&str>,
-) -> Result<String, String> {
+    candidates: &[&str],
+) -> Result<(String, Option<String>), String> {
     match channel {
         // THREE sources, because each has a failure mode the next one covers. The release LIST
         // was the only source here, and it has been seen answering `[]` while the release was
@@ -421,7 +535,7 @@ fn latest_tag(
                 token,
             ) {
                 if let Some(tag) = tag_name_of(&body) {
-                    return Ok(tag);
+                    return Ok((tag, None));
                 }
             }
             // (b) the list, which does include pre-releases.
@@ -435,7 +549,7 @@ fn latest_tag(
                     .and_then(|r| r.get("tag_name"))
                     .and_then(|t| t.as_str())
                 {
-                    return Ok(tag.to_string());
+                    return Ok((tag.to_string(), None));
                 }
             }
             // (c) git TAGS — a different endpoint, which answered when the list did not. Newest
@@ -457,7 +571,7 @@ fn latest_tag(
                         .collect()
                 })
                 .unwrap_or_default();
-            tags.sort_by_key(|t| std::cmp::Reverse(version_key(t)));
+            tags.sort_by(|a, b| compare_versions(b, a));
             for tag in tags {
                 if fetch(
                     &format!("https://api.github.com/repos/{repo}/releases/tags/{tag}"),
@@ -465,7 +579,7 @@ fn latest_tag(
                 )
                 .is_ok()
                 {
-                    return Ok(tag);
+                    return Ok((tag, None));
                 }
             }
             Err(format!(
@@ -500,20 +614,17 @@ fn latest_tag(
             }
             .and_then(|v| v.as_array())
             .ok_or_else(|| format!("release index has no array at '{index_pointer}'"))?;
-            entries
+            let names: Vec<String> = entries
                 .iter()
-                .find_map(|entry| {
-                    let name = entry.get(index_name_field)?.as_str()?;
-                    let rest = name.strip_prefix(&format!("{binary}-"))?;
-                    // Every published target begins with an architecture segment, so that is
-                    // where the tag ends.
-                    let cut = rest.find("-x86_64").or_else(|| rest.find("-aarch64"))?;
-                    Some(rest[..cut].to_string())
-                })
+                .filter_map(|e| e.get(index_name_field)?.as_str().map(str::to_string))
+                .collect();
+            newest_in_listing(&names, binary, candidates)
+                .map(|(tag, target)| (tag, Some(target)))
                 .ok_or_else(|| {
                     format!(
-                        "no {binary} release found in the index \
-                         (private store? set the auth variable, or pass --version)"
+                        "no {binary} release for {} found in the index \
+                         (private store? set the auth variable, or pass --version)",
+                        candidates.join(" / ")
                     )
                 })
         }
@@ -523,11 +634,10 @@ fn latest_tag(
 fn install(
     src: &crate::UpdateSource,
     tag: &str,
-    target: &str,
+    targets: &[String],
     exe: &Path,
     token: Option<&str>,
-) -> Result<(), String> {
-    let asset = asset_name_of(&src.binary, tag, target);
+) -> Result<String, String> {
     let base = match &src.channel {
         crate::UpdateChannel::GithubReleases { repo } => {
             format!("https://github.com/{repo}/releases/download/{tag}")
@@ -536,7 +646,24 @@ fn install(
         crate::UpdateChannel::FileStore { base, .. } => base.clone(),
     };
 
-    let archive = fetch(&format!("{base}/{asset}"), token)?;
+    // The first target whose asset exists wins; only a 404 moves on to the next candidate.
+    let mut found: Option<(Vec<u8>, String, String)> = None;
+    let mut last_err = String::from("no target to install");
+    for target in targets {
+        let asset = asset_name_of(&src.binary, tag, target);
+        match fetch(&format!("{base}/{asset}"), token) {
+            Ok(bytes) => {
+                found = Some((bytes, asset, target.clone()));
+                break;
+            }
+            Err(e) if e.contains("HTTP 404") => last_err = e,
+            Err(e) => return Err(e),
+        }
+    }
+    let Some((archive, asset, target)) = found else {
+        return Err(last_err);
+    };
+    let target = target.as_str();
     let sums_name = match &src.channel {
         crate::UpdateChannel::GithubReleases { .. } => "SHA256SUMS".to_string(),
         // A flat store holds several artifacts' sums side by side, so the checksum file is
@@ -571,7 +698,8 @@ fn install(
     std::fs::rename(&staged, exe).map_err(|e| {
         let _ = std::fs::remove_file(&staged);
         format!("installing into {}: {e}", exe.display())
-    })
+    })?;
+    Ok(target.to_string())
 }
 
 /// Compare the archive's SHA-256 against its `SHA256SUMS` line. Fail-closed on every
@@ -728,6 +856,87 @@ mod tests {
         );
     }
 
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn prerelease_identifiers_compare_numerically_and_a_release_beats_its_prereleases() {
+        use std::cmp::Ordering::{Greater, Less};
+        assert_eq!(compare_versions("v2.0.0-rc.10", "v2.0.0-rc.9"), Greater);
+        assert_eq!(compare_versions("v2.0.0-rc.9", "v2.0.0-rc.1"), Greater);
+        assert_eq!(compare_versions("1.0.0", "1.0.0-rc.9"), Greater);
+        assert_eq!(compare_versions("v0.10.0", "v0.9.0"), Greater);
+        assert_eq!(compare_versions("v2.0.0-rc.4", "v2.0.0"), Less);
+        assert_eq!(compare_versions("v1.0.0-rc.1", "v1.0.0-rc"), Greater);
+        assert_eq!(compare_versions("v1.0.0-1", "v1.0.0-rc"), Less);
+    }
+
+    #[test]
+    fn listing_order_does_not_decide_the_newest_release() {
+        let gnu = ["x86_64-unknown-linux-gnu", "x86_64-unknown-linux-musl"];
+        let files = names(&[
+            "SHA256SUMS-sutra.txt",
+            "other-v9.0.0-x86_64-unknown-linux-gnu.tar.gz",
+            "sutra-v2.0.0-rc.1-x86_64-unknown-linux-gnu.tar.gz",
+            "sutra-v2.0.0-rc.10-x86_64-unknown-linux-gnu.tar.gz",
+            "sutra-v2.0.0-rc.4-x86_64-unknown-linux-gnu.tar.gz",
+            "sutra-v2.0.0-rc.5-x86_64-unknown-linux-gnu.tar.gz",
+            "sutra-v0.9.0-x86_64-unknown-linux-gnu.tar.gz",
+            "sutra-v3.0.0-aarch64-unknown-linux-gnu.tar.gz",
+        ]);
+        let (tag, target) = newest_in_listing(&files, "sutra", &gnu).unwrap();
+        assert_eq!(
+            (tag.as_str(), target.as_str()),
+            ("v2.0.0-rc.10", "x86_64-unknown-linux-gnu")
+        );
+        let mut reversed = files.clone();
+        reversed.reverse();
+        assert_eq!(
+            newest_in_listing(&reversed, "sutra", &gnu).unwrap().0,
+            "v2.0.0-rc.10"
+        );
+        // A final release outranks every pre-release.
+        let mut with_final = files;
+        with_final.push("sutra-v2.0.0-x86_64-unknown-linux-gnu.tar.gz".into());
+        assert_eq!(
+            newest_in_listing(&with_final, "sutra", &gnu).unwrap().0,
+            "v2.0.0"
+        );
+    }
+
+    #[test]
+    fn libc_preference_and_fallback_follow_the_running_binary() {
+        let only_musl = names(&["sutra-v1.0.0-x86_64-unknown-linux-musl.tar.gz"]);
+        let both = names(&[
+            "sutra-v1.0.0-x86_64-unknown-linux-musl.tar.gz",
+            "sutra-v1.0.0-x86_64-unknown-linux-gnu.tar.gz",
+        ]);
+        let gnu = candidates_for("linux", "x86_64", true);
+        let musl = candidates_for("linux", "x86_64", false);
+        let pick = |n: &[String], c: &[&str]| newest_in_listing(n, "sutra", c).unwrap().1;
+        assert_eq!(pick(&both, &gnu), "x86_64-unknown-linux-gnu");
+        assert_eq!(pick(&only_musl, &gnu), "x86_64-unknown-linux-musl");
+        assert_eq!(pick(&both, &musl), "x86_64-unknown-linux-musl");
+        assert_eq!(
+            candidates_for("linux", "aarch64", true)[0],
+            "aarch64-unknown-linux-gnu"
+        );
+        assert_eq!(
+            candidates_for("macos", "aarch64", true),
+            ["aarch64-apple-darwin"]
+        );
+        assert!(candidates_for("plan9", "x86_64", false).is_empty());
+    }
+
+    #[test]
+    fn an_older_listing_entry_is_never_newer_than_the_running_version() {
+        use std::cmp::Ordering::Greater;
+        // The reported bug: running rc.4, the lookup found rc.1 and offered it as an update.
+        assert_ne!(compare_versions("v2.0.0-rc.1", "2.0.0-rc.4"), Greater);
+        assert_eq!(compare_versions("v2.0.0-rc.5", "2.0.0-rc.4"), Greater);
+    }
+
     #[test]
     fn a_v_prefix_is_not_a_version_difference() {
         assert!(!differs("0.2.0-rc.1", "v0.2.0-rc.1"));
@@ -854,5 +1063,197 @@ mod tests {
         assert_eq!(payload["updateAvailable"], true);
         assert_eq!(payload["latest"], "v99.0.0");
         assert_eq!(payload["current"], crate::VERSION);
+    }
+
+    // ---- end to end against a local file store -------------------------------------------
+
+    /// A one-thread HTTP/1.1 file store on 127.0.0.1: `/index` answers `listing`, every other
+    /// path answers 503 (so an install attempt stops before anything is written next to the
+    /// running test binary). Returns the base URL and the request paths it has seen.
+    fn local_store(
+        listing: serde_json::Value,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use std::io::{Read, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = seen.clone();
+        let body = listing.to_string();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut request = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => request.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let line = String::from_utf8_lossy(&request);
+                let path = line.split_whitespace().nth(1).unwrap_or("").to_string();
+                log.lock().unwrap().push(path.clone());
+                let (status, payload) = if path == "/index" {
+                    ("200 OK", body.as_str())
+                } else {
+                    (
+                        "503 Service Unavailable",
+                        "store refuses downloads in this test",
+                    )
+                };
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                    payload.len()
+                );
+            }
+        });
+        (base, seen)
+    }
+
+    fn file_store_source(base: &str) -> crate::UpdateSource {
+        crate::UpdateSource {
+            channel: crate::UpdateChannel::FileStore {
+                base: format!("{base}/files"),
+                index_url: Some(format!("{base}/index")),
+                index_pointer: "/values".to_string(),
+                index_name_field: "name".to_string(),
+            },
+            binary: "sutra".to_string(),
+            image: None,
+            token_command: None,
+        }
+    }
+
+    fn listing_of(names: &[String]) -> serde_json::Value {
+        serde_json::json!({
+            "values": names.iter().map(|n| serde_json::json!({ "name": n })).collect::<Vec<_>>()
+        })
+    }
+
+    /// `execute_with` over a real HTTP listing, shuffled, with release candidates whose
+    /// alphabetical order is not their version order, both libcs, a newer release for a
+    /// foreign target and another product's binary: it requests the newest release's asset for
+    /// this host's preferred target, and nothing else.
+    #[test]
+    fn execute_with_installs_the_newest_matching_asset_from_a_shuffled_file_store() {
+        let candidates = target_candidates();
+        let Some(primary) = candidates.first().copied() else {
+            return; // no published build for this host: nothing to choose
+        };
+        let mut names = vec![
+            asset_name_of("sutra", "v99.0.0-rc.4", primary),
+            "sutra-v99.0.0-rc.10-x86_64-unknown-linux-musl.tar.gz".to_string(),
+            asset_name_of("sutra", "v99.0.0-rc.1", primary),
+            "SHA256SUMS-sutra.txt".to_string(),
+            "sutra-v99.1.0-x86_64-unknown-freebsd.tar.gz".to_string(),
+            asset_name_of("sutra", "v99.0.0-rc.10", primary),
+            "sutra-v99.0.0-rc.5-aarch64-unknown-linux-musl.tar.gz".to_string(),
+            asset_name_of("other-tool", "v100.0.0", primary),
+            "sutra-v99.0.0-rc.10-aarch64-unknown-linux-gnu.tar.gz".to_string(),
+            asset_name_of("sutra", "v99.0.0-rc.5", primary),
+            "sutra-v99.0.0-rc.10-x86_64-unknown-linux-gnu.tar.gz".to_string(),
+        ];
+        names.dedup();
+        let (base, seen) = local_store(listing_of(&names));
+        let src = file_store_source(&base);
+
+        // --check reports the newest release by version, not by listing position.
+        let global = GlobalArgs {
+            format: Some("json".to_string()),
+            ..GlobalArgs::default()
+        };
+        let check = SelfUpdateArgs {
+            check: true,
+            ..SelfUpdateArgs::default()
+        };
+        let (code, out, err) = run_captured("", |io| execute_with(check, &global, io, Some(&src)));
+        assert_eq!(code, crate::exit::OK, "{err}");
+        let payload: serde_json::Value = serde_json::from_str(out.trim()).expect("json");
+        assert_eq!(payload["latest"], "v99.0.0-rc.10", "{out}");
+        assert_eq!(payload["updateAvailable"], true, "{out}");
+
+        // The install path asks the store for exactly that release's asset for this host's own
+        // target (the store then refuses, so nothing is installed).
+        let (code, out, err) = run_captured("", |io| {
+            execute_with(
+                SelfUpdateArgs::default(),
+                &GlobalArgs::default(),
+                io,
+                Some(&src),
+            )
+        });
+        assert_eq!(code, crate::exit::USAGE, "{out}{err}");
+        assert!(
+            out.contains(&format!("-> v99.0.0-rc.10 ({primary})")),
+            "{out}"
+        );
+        assert!(err.contains("HTTP 503"), "{err}");
+        let downloads: Vec<String> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|p| p.starts_with("/files/"))
+            .cloned()
+            .collect();
+        assert_eq!(
+            downloads,
+            vec![format!(
+                "/files/{}",
+                asset_name_of("sutra", "v99.0.0-rc.10", primary)
+            )]
+        );
+    }
+
+    /// A listing whose newest release is older than (or equal to) the running one offers no
+    /// update and downloads nothing.
+    #[test]
+    fn execute_with_refuses_a_downgrade_from_a_file_store_listing() {
+        let candidates = target_candidates();
+        let Some(primary) = candidates.first().copied() else {
+            return;
+        };
+        let names = vec![
+            asset_name_of("sutra", "v0.0.1-rc.10", primary),
+            asset_name_of("sutra", &format!("v{}", crate::VERSION), primary),
+            asset_name_of("sutra", "v0.0.1", primary),
+            asset_name_of("sutra", "v0.0.1-rc.5", primary),
+        ];
+        let (base, seen) = local_store(listing_of(&names));
+        let src = file_store_source(&base);
+
+        let global = GlobalArgs {
+            format: Some("json".to_string()),
+            ..GlobalArgs::default()
+        };
+        let check = SelfUpdateArgs {
+            check: true,
+            ..SelfUpdateArgs::default()
+        };
+        let (code, out, err) = run_captured("", |io| execute_with(check, &global, io, Some(&src)));
+        assert_eq!(code, crate::exit::OK, "{err}");
+        let payload: serde_json::Value = serde_json::from_str(out.trim()).expect("json");
+        assert_eq!(payload["updateAvailable"], false, "{out}");
+
+        let (code, out, err) = run_captured("", |io| {
+            execute_with(
+                SelfUpdateArgs::default(),
+                &GlobalArgs::default(),
+                io,
+                Some(&src),
+            )
+        });
+        assert_eq!(code, crate::exit::OK, "{err}");
+        assert!(out.contains("nothing to do"), "{out}");
+        assert!(
+            !seen
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|p| p.starts_with("/files/")),
+            "a downgrade must download nothing: {:?}",
+            seen.lock().unwrap()
+        );
     }
 }

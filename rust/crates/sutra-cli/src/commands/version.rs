@@ -34,11 +34,20 @@ pub fn execute(_args: VersionArgs, global: &GlobalArgs, io: &mut Io<'_>) -> i32 
         ReportFormat::Json => {
             // Structured, so a script never has to split a version block: `version` is the
             // product's own (the first line), `engine` always the embedded engine's.
-            let payload = serde_json::json!({
-                "name": crate::program_name(),
-                "version": crate::version_string().lines().next().unwrap_or_default(),
-                "engine": crate::VERSION,
-            });
+            // `commit` / `built` describe the engine build only when this process reports it
+            // (`sutra_cli::run`); a distribution reports its own build information.
+            let (commit, built) = if crate::reports_engine_build() {
+                (crate::COMMIT, crate::BUILT)
+            } else {
+                (None, None)
+            };
+            let payload = crate::version_json(
+                &crate::program_name(),
+                crate::product_version(),
+                crate::VERSION,
+                commit,
+                built,
+            );
             let _ = writeln!(io.out, "{payload}");
         }
     }
