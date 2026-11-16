@@ -58,6 +58,9 @@ vulnerabilities:
   - id: CVE-2026-84243
     statement: "libc6 (glibc) in the distroless base; Debian ships no fixed package (2.36-9+deb12u14, status affected, 2026-10-31). Not reachable: the flaw is in message-catalog lookup driven by the LANGUAGE variable, which glibc consults only after setlocale() selects a non-C locale; the engine binary imports no setlocale, gettext or textdomain symbol (readelf --dyn-syms), so it runs in the C locale, and the base image carries no locale data. The variable is also set by the operator, not by input."
     expired_at: 2026-12-09
+  - id: CVE-2026-125709
+    statement: "libstdc++ streambuf left inconsistent after an I/O error on overflow, reported against gcc-12-base / libgcc-s1 / libgomp1 / libstdc++6 in the distroless base (MEDIUM). Not reachable: the engine binary does not link libstdc++ or libgomp (readelf -d on the 0.6.23 binary: NEEDED is only libgcc_s, libm, libc, ld-linux; readelf --dyn-syms imports no std:: symbol), and libgcc_s carries no streambuf. Debian ships no fixed package."
+    expired_at: 2026-12-16
   - id: CVE-2026-115456
     statement: "libstdc++ std::from_chars out-of-bounds read, reported against gcc-12-base / libgcc-s1 / libgomp1 / libstdc++6 in the distroless base (LOW). Not reachable: the engine binary does not link libstdc++ or libgomp at all (readelf -d: NEEDED is only libgcc_s, libm, libc, ld-linux; 0.6.20 binary), and libgcc_s carries no from_chars. Debian ships no fixed package."
     expired_at: 2026-12-10

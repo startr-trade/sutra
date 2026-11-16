@@ -13,6 +13,16 @@ This is the changelog for the **Rust-native** engine (`rust/` workspace). It beg
 
 Nothing yet.
 
+## [0.6.24] — 2026-11-16
+
+**2026-11-16.** The same code as 0.6.23, released because the 0.6.23 release run stopped at the
+engine image's security scan.
+
+### Security
+
+- CVE-2026-125709 (libstdc++ streambuf, MEDIUM, no Debian fix) triaged in `.trivyignore.yaml` until
+  2026-12-16: reported against libstdc++ in the distroless base, which the engine does not link.
+
 ## [0.6.23] — 2026-11-15
 
 **2026-11-15.** **`sutra --version` and `sutra-engine --version` name the build they came from:**
