@@ -140,18 +140,17 @@ jobs:
           - platform: linux/amd64
             runner: ubuntu-24.04
             slug: amd64
-            # Starts WARM. trivy.yml builds this exact Dockerfile, this exact context, at
-            # this exact default profile on every push to main — and a cache written on the
-            # DEFAULT BRANCH is readable from a tag ref (one written on a tag ref is not).
-            # So the chef-cook dependency layer, ~500 crates and the bulk of this build,
-            # is imported rather than recompiled.
-            cache_from: type=gha,scope=trivy-image
+            # Cold, like arm64. Until 2026-11, trivy.yml built this image on every push to main
+            # to warm this cache; that compile ran beside CI on every commit and its cache was
+            # usually missed anyway (the build-identity args differ per commit: 1 min in v0.6.21,
+            # 11 min in v0.6.24). A release builds what it ships, once, and scans it below.
+            cache_from: ""
           # GitHub's hosted arm64 Linux runner — free on public repos, and a NATIVE arm
           # compile rather than an emulated one.
           - platform: linux/arm64
             runner: ubuntu-24.04-arm
             slug: arm64
-            # Cold, and deliberately: nothing on main builds arm64, so there is no cache to
+            # Cold, and deliberately: nothing on main builds an image, so there is no cache to
             # import. Warming it would mean a daily arm64 build existing only to serve this
             # rare job — more compute spent than saved. Native arm is what makes that trade
             # fine; the cold build costs roughly what the amd64 leg costs.
@@ -551,9 +550,14 @@ jobs:
             os: macos-15
             use_cross: false
             archive: tar.gz
-          # Intel macOS. `macos-15-intel` is the live x86_64 label; the old `macos-13` is gone.
+          # Intel macOS, built on the SAME Apple-silicon runner. Xcode's toolchain targets x86_64
+          # natively (it is how Intel slices of universal apps are built), and `ring`'s C builds
+          # with that clang for either architecture; CI's cli-portability job already compiles
+          # this target on `macos-15`. The Intel runner it replaces was the release's critical
+          # path: 16.6 min in v0.6.21, 21.3 min in v0.6.24, and a second macOS job to queue for.
+          # The version check below runs the Intel binary under Rosetta.
           - target: x86_64-apple-darwin
-            os: macos-15-intel
+            os: macos-15
             use_cross: false
             archive: tar.gz
           # Windows: the MSVC dependency tree adds only schannel + windows-sys (pure-Rust
@@ -628,6 +632,13 @@ jobs:
       # Every non-cross target runs on its own architecture, so the built binary can be asked
       # what it is. It must name the release commit and its date; the aarch64 musl build is a
       # cross-compile this runner cannot execute.
+      # The Intel macOS binary is built on Apple silicon; Rosetta runs it for the check below.
+      # GitHub's arm64 macOS images ship it, but installing is idempotent and makes the check
+      # independent of the image's contents. `oahd` is Rosetta's daemon.
+      - name: Rosetta, to run the Intel macOS binary
+        if: matrix.target == 'x86_64-apple-darwin'
+        run: /usr/bin/pgrep -q oahd || softwareupdate --install-rosetta --agree-to-license
+
       - name: The built CLI names its commit
         if: ${{ !matrix.use_cross }}
         shell: bash

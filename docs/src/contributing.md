@@ -52,12 +52,15 @@ cargo build --release -p sutra-dist    # the `sutra-engine` binary (the composit
 | 1+2 | `make test-all` | A Docker daemon |
 | 3 | `make test-k8s` | A running `kind` cluster (`make -C deploy/k8s-it init` first) |
 
-The CI workflow (`.github/workflows/ci.yml`) mirrors the local gate chain exactly — `cargo fmt
---all --check`, `make lint`, `make test`, `make audit` — so a contributor who is green locally is
-green in CI. Tier-2 runs nightly rather than per-PR (a Docker-heavy suite is slow and
+The CI workflow (`.github/workflows/ci.yml`) mirrors the local gate chain exactly. `make ci` runs
+the same jobs locally, cheapest first: `make actionlint`, `make fmt-check`, `make lint`,
+`make cross`, `make test`, `make audit` and `make scan-deps` (Trivy over the lockfiles, secrets and
+IaC files). A contributor who is green locally is green in CI. No CI job builds an image: the
+release builds the image it ships, once, and scans it before tagging it. Tier-2 runs nightly rather than per-PR (a Docker-heavy suite is slow and
 resource-flaky on a small hosted runner for signal tier-1 already covers on most changes); tier-3
 stays a local/milestone gate, since it needs a provisioned `kind` cluster CI doesn't have.
-CodeQL and Trivy scans run on their own schedules alongside CI.
+CodeQL runs on its own schedule, and a weekly Trivy run scans the tree and the newest published
+image for vulnerabilities disclosed since they shipped.
 
 Tier-1 covers the whole workspace — no crate is held out of it, so a green `make test` means the
 whole workspace is green, not a subset of it.

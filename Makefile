@@ -20,7 +20,7 @@ CATALOG_OUTPUT := $(if $(wildcard docs/design/artifact-documentation),docs/desig
 
 .PHONY: catalog catalog-rust catalog-check catalog-rust-check install-hooks verify-workflows verify-docs \
 	print-catalog-output \
-	help ci fmt-check cross test test-docker test-all test-k8s lint docker-clean audit scan-deps scan-image codeql \
+	help ci actionlint fmt-check cross test test-docker test-all test-k8s lint docker-clean audit scan-deps scan-image codeql \
 	image image-it
 
 ## Regenerate the catalog. Only the rust/ pages are written; anything else in the
@@ -136,13 +136,22 @@ verify-workflows: ## Verify workflow YAML + that every action reference resolves
 ## The local CI gate: what the CI workflow's jobs run, cheapest first, stopping at the first
 ## failure. Run it before every push. Tier-2, the image scan and CodeQL are not in it: they run
 ## nightly or once per release.
-ci: ## Local CI, cheapest first: fmt-check, lint, cross, test, audit, scan-deps.
+ci: ## Local CI, cheapest first, the jobs of ci.yml: actionlint, fmt-check, lint, cross, test, audit, scan-deps.
+	$(MAKE) --no-print-directory actionlint
 	$(MAKE) --no-print-directory fmt-check
 	$(MAKE) --no-print-directory lint
 	$(MAKE) --no-print-directory cross
 	$(MAKE) --no-print-directory test
 	$(MAKE) --no-print-directory audit
 	$(MAKE) --no-print-directory scan-deps
+
+## The image and digest ci.yml's actionlint job uses, so the local check is the same check. A tree
+## without workflows (the private checkout carries none) has nothing to lint and passes.
+ACTIONLINT_IMAGE := rhysd/actionlint@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667
+actionlint: ## Lint the GitHub workflows (shellcheck included), as ci.yml's first job does; needs Docker.
+	@if [ -d .github/workflows ]; then \
+	  docker run --rm -v "$$PWD:/repo" -w /repo $(ACTIONLINT_IMAGE) -color; \
+	else echo "actionlint: no .github/workflows in this tree, nothing to lint"; fi
 
 fmt-check: ## rustfmt check over the workspace (fails on any unformatted file).
 	cd rust && cargo fmt --all --check

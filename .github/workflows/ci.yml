@@ -12,8 +12,11 @@ name: CI
 #   make audit     → cargo audit + cargo deny check   (rust/deny.toml, rust/.cargo/audit.toml)
 #   make cross     → clippy for sutra-cli on windows-msvc and both darwin targets, run by the
 #                    cli-portability job on the systems that have their C toolchains
+#   make scan-deps → Trivy over the tree: lockfiles, secrets, IaC (no build)
+#   make actionlint → actionlint over every workflow
 #
-# `make ci` runs them all locally, cheapest first, plus `make scan-deps`.
+# `make ci` runs them all locally, cheapest first. No job here builds an image: a commit is not a
+# release. The image is built and scanned once, by release.yml, for the tag that ships it.
 #
 # Every `uses:` is pinned to a full commit SHA, with the release it is in a comment; actionlint
 # (the first job) checks every workflow.
@@ -181,6 +184,19 @@ jobs:
           tool: cargo-audit,cargo-deny
       - name: make audit
         run: make audit
+
+  # The filesystem scan (vulnerable dependencies in the lockfiles, leaked secrets, Dockerfile and
+  # OpenTofu misconfiguration) gates every commit, as `make scan-deps` does locally: the same
+  # script, the same Trivy (0.70.0, in Docker), the same triage record. It reads the tree only, no
+  # build. The image is scanned where an image is built: release.yml, before the tag exists.
+  scan-deps:
+    name: dependency, secret and IaC scan (make scan-deps)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - name: make scan-deps
+        run: make scan-deps
 
   # The CLI ships as a release binary for macOS and Windows, so its tests and the loader's run
   # there too. The engine ships only as a Linux image, so the rest of the workspace does not.
