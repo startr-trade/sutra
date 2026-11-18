@@ -4,3 +4,5 @@
 mod handlebars_analyzer_test;
 #[path = "all/handlebars_engine_test.rs"]
 mod handlebars_engine_test;
+#[path = "all/xml_escape_test.rs"]
+mod xml_escape_test;

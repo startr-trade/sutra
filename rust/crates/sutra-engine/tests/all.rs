@@ -70,6 +70,8 @@ mod terminal_retention_it;
 mod time_skipping_it;
 #[path = "all/timer_channel_call_conformance.rs"]
 mod timer_channel_call_conformance;
+#[path = "all/timer_fire_lag_it.rs"]
+mod timer_fire_lag_it;
 #[path = "all/timer_start_conformance.rs"]
 mod timer_start_conformance;
 #[path = "all/transport_audit_it.rs"]

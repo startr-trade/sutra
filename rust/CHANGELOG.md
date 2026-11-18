@@ -13,6 +13,46 @@ This is the changelog for the **Rust-native** engine (`rust/` workspace). It beg
 
 Nothing yet.
 
+## [0.6.25] — 2026-11-19
+
+**2026-11-19.** **Templates gain an `xmlEscape` helper** for free text relayed into XML. **Timers no
+longer fall behind under sustained load:** the engine fired at most about 64 timers a second,
+whatever the shard count. A distribution's same-line build suffix no longer leaks into image tags.
+There is no migration, and no archive format, deploymentId or snapshot format change.
+
+### Added
+
+- Template helper `xmlEscape`: `{{xmlEscape value}}` renders the string form of `value` with
+  `&` `<` `>` `"` `'` replaced by `&amp;` `&lt;` `&gt;` `&quot;` `&apos;`, so relayed free
+  text (names, free-text notes) stays well-formed inside XML element content and attribute
+  values. A null or missing value renders empty; all other characters, including non-Latin
+  scripts, pass through unchanged. Default `{{x}}` interpolation is unchanged and still
+  renders verbatim — escaping is opt-in per value. The template analyzer treats `xmlEscape`
+  as a helper, so its argument is reported as the model reference.
+
+### Fixed
+
+- The timer poller fired at most 32 due timers per deployment per 500 ms tick, about 64 a second
+  for the whole cluster, so above that rate every parked timer fired later than the one before it
+  (follow-up p99 78 s at 400 new instances a second). Each tick now keeps claiming while claims come
+  back full, round-robin across deployments, within a one-second drain budget and the leader gate;
+  up to `max(shards, 16)` timers fire at once. Follow-up p99 0.5 s in the same test. No new
+  configuration key; delivery stays at-least-once. **Deployments expecting timer surges should run
+  more than one shard (`sutra.engine.shards`):** with one shard the drained timer work shares the
+  lane with new work, and new-instance latency rises while a backlog drains.
+- `sutra_cli::product_version()` returned a distribution's first version line verbatim; it now
+  reads the version up to the first ` (`, so `2.0.0-rc.6 (1a2b3c4, built 2026-11-16)` gives
+  `2.0.0-rc.6` for the runtime image tag, the scaffolded release tag and `codecs`.
+
+### Security
+
+- Six advisories published 2026-11-17 against the distroless base, none with a Debian fix, triaged
+  in `.trivyignore.yaml` until 2026-12-16: three glibc iconv converter over-reads
+  (CVE-2026-121757, CVE-2026-121758, CVE-2026-124024; the engine imports no iconv function) and
+  three libssl3 issues (CVE-2026-107493, CVE-2026-124709, CVE-2026-35190; the engine does not
+  load libssl3, and the Kafka client's compiled-in OpenSSL is a TLS client that uses none of the
+  affected paths).
+
 ## [0.6.24] — 2026-11-16
 
 **2026-11-16.** The same code as 0.6.23, released because the 0.6.23 release run stopped at the

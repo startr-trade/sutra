@@ -2,7 +2,8 @@
 //! analyzer. Templates are Handlebars in strict mode: a missing value fails the render.
 //!
 //! - **Escaping — NOOP, deliberate.** Module templates produce plain-text / XML / JSON wire
-//!   payloads, never HTML; `{{x}}` renders verbatim.
+//!   payloads, never HTML; `{{x}}` renders verbatim. Relayed free text that lands in XML
+//!   opts in to escaping per value with `{{xmlEscape x}}`.
 //! - **Strict rendering — missing values fail, engine-enforced.** A variable that
 //!   resolves to nothing — a missing map key, a typo'd nested path, a null mid-path — aborts
 //!   the render. Helper parameters and `#if`/`#unless` conditions stay null-tolerant, so
@@ -11,9 +12,10 @@
 //!   map entries are stripped from the model before render so present-null ≡ absent.
 //! - **Whitespace.** handlebars-rust applies the mustache-spec standalone-line removal by
 //!   default.
-//! - **Helper set (complete — closed, no growth beyond it):** `eq neq gt gte lt lte and or
+//! - **Helper set (closed — a helper is added only by a deliberate design decision):** `eq neq gt gte lt lte and or
 //!   not` (null-tolerant conditional helpers), `let` (block-param binding that always renders
-//!   its body), `substring`, `replace`, `coalesce`. The `uuid`/`now` generators are render
+//!   its body), `substring`, `replace`, `coalesce`, `xmlEscape` (the five XML specials to
+//!   their predefined entities; null renders empty). The `uuid`/`now` generators are render
 //!   -context suppliers injected by the caller (the executor puts them in the model) — never
 //!   wall-clock in the engine.
 #![forbid(unsafe_code)]

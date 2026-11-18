@@ -10,3 +10,6 @@ publish.workspace = true
 handlebars = { workspace = true }
 serde_json = { workspace = true }
 regex = { workspace = true }
+
+[dev-dependencies]
+quick-xml = { workspace = true }

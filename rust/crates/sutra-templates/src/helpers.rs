@@ -1,6 +1,6 @@
-//! The Sutra helper set (R6 — complete, no growth beyond it): the conditional
+//! The Sutra helper set (R6 — closed; grows only by a deliberate design decision): the conditional
 //! helpers (`eq neq gt gte lt lte and or not`), `let`, `substring`,
-//! `replace`, `coalesce`. All helper parameters resolve **null-tolerantly** (a missing path
+//! `replace`, `coalesce`, `xmlEscape`. All helper parameters resolve **null-tolerantly** (a missing path
 //! is a null argument — params are never routed through a missing-helper hook).
 
 use handlebars::{
@@ -23,6 +23,7 @@ pub(crate) fn register(hb: &mut Handlebars<'static>) {
     hb.register_helper("substring", Box::new(Substring));
     hb.register_helper("replace", Box::new(Replace));
     hb.register_helper("coalesce", Box::new(Coalesce));
+    hb.register_helper("xmlEscape", Box::new(XmlEscape));
 }
 
 /// Null-tolerant parameter access: a missing path resolves to `Json::Null`, never an error.
@@ -263,4 +264,47 @@ impl HelperDef for Coalesce {
         }
         Ok(ScopedJson::Derived(Json::Null))
     }
+}
+
+/// `{{xmlEscape value}}` — the string form of `value` with the five XML special characters
+/// replaced by their predefined entities (`&` `<` `>` `"` `'` → `&amp;` `&lt;` `&gt;` `&quot;`
+/// `&apos;`), so relayed free text stays well-formed inside element content and attribute
+/// values. Default interpolation stays verbatim (existing templates depend on raw output);
+/// this helper is the explicit opt-in. A null or missing value renders empty; every other
+/// character, including all non-ASCII UTF-8, passes through unchanged.
+struct XmlEscape;
+
+impl HelperDef for XmlEscape {
+    fn call_inner<'reg: 'rc, 'rc>(
+        &self,
+        h: &Helper<'rc>,
+        _r: &'reg Handlebars<'reg>,
+        _ctx: &'rc Context,
+        _rc: &mut RenderContext<'reg, 'rc>,
+    ) -> Result<ScopedJson<'rc>, RenderError> {
+        let v = param(h, 0);
+        let out = if v.is_null() {
+            String::new()
+        } else {
+            xml_escape(&canonical_string_of(v))
+        };
+        Ok(ScopedJson::Derived(Json::String(out)))
+    }
+}
+
+/// Replace the five XML specials with their predefined entities; all other characters copy
+/// through unchanged.
+fn xml_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            other => out.push(other),
+        }
+    }
+    out
 }

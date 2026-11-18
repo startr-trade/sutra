@@ -28,6 +28,7 @@
 - [Acceptance receipts](building/acceptance-receipts.md)
 - [External tasks: the pull worker surface](building/external-tasks.md)
 - [Retries, history, and schedules](building/retries-history-schedules.md)
+- [Escaping free text in an XML template](building/escaping-xml-in-templates.md)
 - [Testing time: fast-forwarding durable timers](building/testing-time.md)
 - [Coverage: declared routes as the compliance signal](building/coverage.md)
 - [Worked example: money-transfer](building/worked-example.md)
@@ -71,11 +72,13 @@
 - [Upgrading to 0.6.20](operating/upgrading-0-6-20.md)
 - [Upgrading to 0.6.21](operating/upgrading-0-6-21.md)
 - [Upgrading to 0.6.22](operating/upgrading-0-6-22.md)
+- [Upgrading to 0.6.25](operating/upgrading-0-6-25.md)
 
 # Reference
 
 - [BPMN element support](reference/bpmn-elements.md)
 - [`sutra` CLI](reference/cli.md)
+- [Template helpers](reference/template-helpers.md)
 - [Crates: sutra-feel and sutra-dmn](reference/crates.md)
 - [DMN-TCK conformance](reference/dmn-tck.md)
 

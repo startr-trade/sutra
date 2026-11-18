@@ -250,13 +250,29 @@ fn runtime_image_of(declared: Option<&str>, product: &str) -> String {
 
 /// The product version this binary reports: the first line of the version block a distribution
 /// handed [`run_with_version`], which by that function's contract is the product's own version
-/// with the embedded engine described on the lines below it. [`VERSION`] when unset.
+/// with the embedded engine described on the lines below it, read up to the first ` (`. A
+/// distribution that puts its build on the same line (`2.0.0-rc.6 (1a2b3c4, built 2026-11-16)`,
+/// shown as `acme 2.0.0-rc.6 (…)`) reports `2.0.0-rc.6`: this value becomes the runtime image
+/// tag, the scaffolded release tag and the `codecs` version, where the build suffix has no place.
+/// [`VERSION`] when unset.
 pub fn product_version() -> &'static str {
     if reports_engine_build() {
         // `--version` text carries the build suffix; the version itself stays bare.
         return VERSION;
     }
-    version_string().lines().next().unwrap_or(VERSION)
+    product_version_of(version_string())
+}
+
+/// [`product_version`] as a pure function of the version block, so it is testable without
+/// setting the process-wide version.
+fn product_version_of(block: &str) -> &str {
+    let first = block.lines().next().unwrap_or_default();
+    let bare = first.split(" (").next().unwrap_or_default().trim();
+    if bare.is_empty() {
+        VERSION
+    } else {
+        bare
+    }
 }
 
 /// Top-level argument surface of the CLI. The `name` here is only a fallback: [`run`] and
@@ -530,9 +546,25 @@ mod tests {
         // `run_with_version` documents a version BLOCK: product on line one, what it embeds
         // below. Everything downstream of that contract reads line one.
         assert_eq!(
-            "3.1.0\nsutra  0.2.0-rc.1 (engine, f5b2d49)".lines().next(),
-            Some("3.1.0")
+            product_version_of("3.1.0\nsutra  0.2.0-rc.1 (engine, f5b2d49)"),
+            "3.1.0"
         );
+    }
+
+    #[test]
+    fn product_version_stops_at_a_build_suffix_on_the_same_line() {
+        // A distribution that prints its build on the version line must not leak it into the
+        // image tag, the scaffolded release tag or `codecs`.
+        assert_eq!(
+            product_version_of("2.0.0-rc.6 (1a2b3c4, built 2026-11-16)"),
+            "2.0.0-rc.6"
+        );
+        assert_eq!(
+            product_version_of("2.0.0-rc.6 (1a2b3c4)\nsutra  0.6.25 (engine)"),
+            "2.0.0-rc.6"
+        );
+        assert_eq!(product_version_of("2.0.0"), "2.0.0");
+        assert_eq!(product_version_of(""), VERSION);
     }
 
     #[test]

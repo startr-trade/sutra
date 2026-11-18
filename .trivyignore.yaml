@@ -227,3 +227,27 @@ vulnerabilities:
   - id: CVE-2026-95692
     statement: "libssl3 AES-GCM-SIV out-of-bounds read on a short IV via EVP_CipherInit_ex. The engine never loads libssl3 (readelf -d lists no libssl); no TLS cipher suite uses AES-GCM-SIV, and neither the engine nor the Kafka client's compiled-in OpenSSL 3.6.3 calls it directly. Debian ships no fixed package."
     expired_at: 2026-12-09
+
+  # ---- Published 2026-11-17; triaged 2026-11-19 for the 0.6.25 cut --------------------------
+  # Checked on the 0.6.25 binary: `readelf -d` lists libgcc_s, libm, libc and the loader only (no
+  # libssl); `readelf --dyn-syms` imports no iconv or gconv function. The Kafka client's compiled-in
+  # OpenSSL 3.6.3 (openssl-src 300.6.1, librdkafka 2.12.1) is a TLS client over TCP: librdkafka calls
+  # neither PEM_X509_INFO_read_bio_ex nor SSL_CTX_set_cert_flags, and runs no QUIC.
+  - id: CVE-2026-121757
+    statement: "libc6 (glibc) iconv CP949 decoder over-read with //IGNORE. The engine imports no iconv function (readelf --dyn-syms: no iconv, iconv_open or gconv symbol); its text decoding is Rust code compiled into the binary. Debian ships no fixed package."
+    expired_at: 2026-12-16
+  - id: CVE-2026-121758
+    statement: "libc6 (glibc) iconv ISO-2022-CN-EXT decoder over-read. Same position as CVE-2026-121757: the engine imports no iconv function. Debian ships no fixed package."
+    expired_at: 2026-12-16
+  - id: CVE-2026-124024
+    statement: "libc6 (glibc) iconv UCS-4 to IBM1390/IBM1399 encoder over-read. Same position as CVE-2026-121757: the engine imports no iconv function. Debian ships no fixed package."
+    expired_at: 2026-12-16
+  - id: CVE-2026-107493
+    statement: "libssl3 PEM_X509_INFO_read_bio_ex frees entries of a caller-supplied stack on a failed read. The engine never loads libssl3 (readelf -d lists no libssl). The Kafka client's compiled-in OpenSSL 3.6.3 is only reached through librdkafka, which never calls PEM_X509_INFO_read_bio_ex, and the advisory states OpenSSL itself never passes an existing stack. Debian ships no fixed package."
+    expired_at: 2026-12-16
+  - id: CVE-2026-124709
+    statement: "libssl3 QUIC server retains rejected stream state. The engine never loads libssl3 (readelf -d lists no libssl), and the Kafka client's compiled-in OpenSSL 3.6.3 runs TLS over TCP as a client only, never QUIC and never a server. Debian ships no fixed package."
+    expired_at: 2026-12-16
+  - id: CVE-2026-35190
+    statement: "libssl3 TLS 1.3 server with the Suite B certificate flag over-reads a group list. The engine never loads libssl3 (readelf -d lists no libssl), and the Kafka client's compiled-in OpenSSL 3.6.3 is a TLS client only; librdkafka never calls SSL_CTX_set_cert_flags. Debian ships no fixed package."
+    expired_at: 2026-12-16

@@ -35,8 +35,8 @@ use tracing::{debug, warn};
 /// owns the lease; the gate is injected here).
 pub const TIMER_LEADER_ROLE: &str = "timer-leader";
 
-/// Poller knobs. Defaults: 500 ms tick, 32 claims per deployment per tick, 5 s
-/// failure-defer backoff.
+/// Poller knobs. Defaults: 500 ms tick, 32 rows per claim (a tick keeps claiming while claims
+/// come back full — see [`spawn_timer_poller`]), 5 s failure-defer backoff.
 #[derive(Debug, Clone)]
 pub struct TimerPollerConfig {
     pub tick: std::time::Duration,
@@ -66,13 +66,13 @@ impl Default for TimerPollerConfig {
 /// a deployment activation flip is picked up on the next tick. The task runs until aborted
 /// (see `RunningEngine::shutdown`).
 ///
-/// The poller stays ONE per replica, lease-gated; only its per-tick FIRE loop is
-/// shard-aware (execution scale-out §5): claimed due rows are driven with up to S fires
-/// in flight concurrently, S = the engine's shard count — a sequential loop would leave
-/// S−1 lanes idle through a timer storm and cap fired-timer throughput at one lane. Two
-/// due timers for one instance serialize on its shard's queue or bounce on the claim
-/// (defer + backoff) — both existing behaviors. At S = 1 the bound is 1: each fire is
-/// awaited before the next starts, exactly the historic sequential loop.
+/// The poller stays ONE per replica, lease-gated. Each tick DRAINS the due timers: it keeps
+/// claiming `batch` rows per deployment while claims come back full, for up to a drain budget,
+/// so the fire rate follows the due rate instead of being capped at `batch` per tick. Claimed
+/// rows are driven with up to max(S, 16) fires in flight, S = the engine's shard count — a
+/// sequential loop would leave lanes idle through a timer storm and make every fire wait out a
+/// whole lane round trip. Two due timers for one instance serialize on its shard's queue or
+/// bounce on the claim (defer + backoff) — both existing behaviors.
 pub fn spawn_timer_poller(
     pool: PgPool,
     deployments: sutra_channels::LiveDeploymentSet,
@@ -83,7 +83,8 @@ pub fn spawn_timer_poller(
     tokio::spawn(async move {
         let schedules = PgTimerScheduleStore::new(pool.clone());
         let store = PgWaitStateStore::new(pool.clone());
-        let max_in_flight = engine.shard_count().max(1) as usize;
+        let max_in_flight = fire_concurrency(engine.shard_count());
+        let drain_budget = config.tick.max(MIN_DRAIN_BUDGET);
         let mut interval = tokio::time::interval(config.tick);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
@@ -103,53 +104,65 @@ pub fn spawn_timer_poller(
                     }
                 })
                 .collect();
-            for (exec_dep, persist_dep) in &deployments {
-                // TEST-ONLY (P1-7): `config.now_override` is `None` on every production boot.
-                let now = config
-                    .now_override
-                    .as_ref()
-                    .map(sutra_executor::TestClock::now)
-                    .unwrap_or_else(OffsetDateTime::now_utc);
-                let due = match store.claim_due_timers(persist_dep, now, config.batch).await {
-                    Ok(due) => due,
-                    Err(e) => {
-                        warn!(deployment = exec_dep.value(), error = %e, "due-timer claim failed");
-                        continue;
+
+            // DUE TIMERS — drained, not sampled. One claim of `batch` rows per deployment per
+            // round; a deployment whose claim came back FULL has more due rows behind it, so it
+            // gets another round straight away instead of waiting for the next tick. Rounds go
+            // round-robin over the deployments still behind, so one deployment's backlog never
+            // starves another's, and stop once every claim came back short, the drain budget is
+            // spent, or this replica lost the lease. Without this the poller fired at most
+            // `batch` timers per deployment per tick (64/s at the defaults) whatever the arrival
+            // rate, and under sustained load every parked timer fired later than the last.
+            //
+            // Each round's fires are all awaited before the next claim. That is what keeps the
+            // drain at-most-once per row per round: the claim's row locks end with its
+            // transaction, so a re-claim while a fire was still in flight would hand the same row
+            // out twice. After the await every claimed row is RESOLVED (fired or stale) or
+            // deferred into the future, so the next claim sees only rows it has not fired yet.
+            // A row whose resolve/defer itself failed comes back in the next round; the budget
+            // bounds that, exactly as the next tick bounded it before.
+            let drain_started = std::time::Instant::now();
+            let mut behind: Vec<&(sutra_executor::DeploymentId, PersistDeploymentId)> =
+                deployments.iter().collect();
+            while !behind.is_empty() {
+                let mut still_behind = Vec::new();
+                for dep in behind {
+                    let (exec_dep, persist_dep) = dep;
+                    let claimed = fire_due_timers(
+                        &pool,
+                        &store,
+                        &engine,
+                        exec_dep,
+                        persist_dep,
+                        &config,
+                        max_in_flight,
+                    )
+                    .await;
+                    if claimed >= config.batch.max(1) as usize {
+                        still_behind.push(dep);
                     }
-                };
-                // Bounded fan-out (§5): at most `max_in_flight` fires concurrently. The
-                // fires are spawned tasks (each with its own cheap pool-backed store
-                // clone), so a slow fire delays only its window slot, never the claim.
-                let mut in_flight = tokio::task::JoinSet::new();
-                for timer in due {
-                    if in_flight.len() >= max_in_flight {
-                        let _ = in_flight.join_next().await;
-                    }
-                    let store = PgWaitStateStore::new(pool.clone());
-                    let engine = engine.clone();
-                    let exec_dep = exec_dep.clone();
-                    let persist_dep = persist_dep.clone();
-                    let config = config.clone();
-                    in_flight.spawn(async move {
-                        fire_one(
-                            &store,
-                            &engine,
-                            &exec_dep,
-                            &persist_dep,
-                            timer,
-                            now,
-                            &config,
-                        )
-                        .await;
-                    });
                 }
-                while in_flight.join_next().await.is_some() {}
+                behind = still_behind;
+                if drain_started.elapsed() >= drain_budget || !gate.is_leading() {
+                    if !behind.is_empty() {
+                        debug!(
+                            deployments_behind = behind.len(),
+                            "timer drain budget spent with due timers left — next tick resumes"
+                        );
+                    }
+                    break;
+                }
+            }
+
+            for (exec_dep, persist_dep) in &deployments {
+                let now = poll_now(&config);
                 // The SECOND claim on the same tick: due timer-START schedules. Deliberately the
                 // same loop, the same leader gate and the same batch budget — one clock drives
                 // every temporal thing the engine does. A DRAINING deployment is in this id set
                 // (its parked instances must still resume) but has no armed schedules, because
                 // the activation flip resolved them when it stopped being ACTIVE, so this claim
-                // is a cheap no-op for it.
+                // is a cheap no-op for it. One claim per tick is enough here: a schedule row is
+                // one per timer start event, not one per instance.
                 let due_schedules = match schedules.claim_due(persist_dep, now, config.batch).await
                 {
                     Ok(due) => due,
@@ -178,6 +191,84 @@ pub fn spawn_timer_poller(
             }
         }
     })
+}
+
+/// The floor on how long one tick may keep draining due timers before it yields to the next
+/// tick (and re-reads the live deployment set). A tick shorter than this still drains for this
+/// long; a longer tick drains for its own length.
+const MIN_DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The floor on fires in flight at once. The fires of one claim are independent instances, and
+/// each one is a request queued onto the owning shard's lane, which already serializes the
+/// fires of any one instance — so more than one in flight changes nothing about ordering. What
+/// it changes is throughput: with one fire in flight the poller waits out a full queue-and-commit
+/// round trip per timer, behind every new-instance request already in the lane, while inbound
+/// traffic has as many requests in flight as it has callers.
+const MIN_FIRE_CONCURRENCY: usize = 16;
+
+/// Fires in flight at once for an engine with `shards` lanes: at least one per lane, and never
+/// fewer than [`MIN_FIRE_CONCURRENCY`].
+fn fire_concurrency(shards: u32) -> usize {
+    (shards.max(1) as usize).max(MIN_FIRE_CONCURRENCY)
+}
+
+/// The claim `now`. TEST-ONLY (P1-7): `config.now_override` is `None` on every production boot.
+fn poll_now(config: &TimerPollerConfig) -> OffsetDateTime {
+    config
+        .now_override
+        .as_ref()
+        .map(sutra_executor::TestClock::now)
+        .unwrap_or_else(OffsetDateTime::now_utc)
+}
+
+/// One claim of due timer rows for one deployment, every claimed row fired (at most
+/// `max_in_flight` at once) and awaited. Returns how many rows the claim handed out, so the
+/// caller can tell a drained deployment (short claim) from one with more due rows behind it.
+async fn fire_due_timers(
+    pool: &PgPool,
+    store: &PgWaitStateStore,
+    engine: &EngineHandle,
+    exec_dep: &sutra_executor::DeploymentId,
+    persist_dep: &PersistDeploymentId,
+    config: &TimerPollerConfig,
+    max_in_flight: usize,
+) -> usize {
+    let now = poll_now(config);
+    let due = match store.claim_due_timers(persist_dep, now, config.batch).await {
+        Ok(due) => due,
+        Err(e) => {
+            warn!(deployment = exec_dep.value(), error = %e, "due-timer claim failed");
+            return 0;
+        }
+    };
+    let claimed = due.len();
+    // Bounded fan-out: the fires are spawned tasks (each with its own cheap pool-backed store
+    // clone), so a slow fire delays only its window slot, never the claim.
+    let mut in_flight = tokio::task::JoinSet::new();
+    for timer in due {
+        if in_flight.len() >= max_in_flight {
+            let _ = in_flight.join_next().await;
+        }
+        let store = PgWaitStateStore::new(pool.clone());
+        let engine = engine.clone();
+        let exec_dep = exec_dep.clone();
+        let persist_dep = persist_dep.clone();
+        let config = config.clone();
+        in_flight.spawn(async move {
+            fire_one(
+                &store,
+                &engine,
+                &exec_dep,
+                &persist_dep,
+                timer,
+                now,
+                &config,
+            )
+            .await;
+        });
+    }
+    while in_flight.join_next().await.is_some() {}
+    claimed
 }
 
 /// Fire one claimed due timer-START schedule, then move the row to whatever comes next.

@@ -49,6 +49,7 @@ const HELPERS: &[&str] = &[
     "substring",
     "replace",
     "coalesce",
+    "xmlEscape",
     "else",
 ];
 
@@ -80,7 +81,7 @@ fn value_helper() -> &'static Regex {
     static CELL: OnceLock<Regex> = OnceLock::new();
     re(
         &CELL,
-        r"\{\{\s*(?:substring|replace|coalesce|lookup)\s+([^}]*)\}\}",
+        r"\{\{\s*(?:substring|replace|coalesce|xmlEscape|lookup)\s+([^}]*)\}\}",
     )
 }
 
