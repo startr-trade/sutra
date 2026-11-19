@@ -160,6 +160,13 @@ fn emit_audit_log(provider: &SdkLoggerProvider, e: &sutra_channels::AuditEvent) 
 /// no-op, which is why the per-instance seq must stay monotonic across suspend/resume (see
 /// [`sutra_channels::AuditListener::seed`]). Best-effort: a write error is a [`Diagnostic`] the
 /// dispatcher logs, never an execution failure.
+///
+/// The dispatcher hands it everything that queued while its previous write ran
+/// ([`sutra_channels::AuditSink::emit_batch`]); those events go into the table as one transaction
+/// per deployment, a multi-row insert with one commit, instead of a transaction and a commit per
+/// event — on a durable database the commit is most of the cost of an audit row. Should a batch
+/// fail, nothing of it was committed and its events are written again one by one, so one bad row
+/// costs only itself.
 pub struct SqlAuditSink {
     store: sutra_persistence::stores::PgAuditEventStore,
 }
@@ -229,6 +236,56 @@ impl sutra_channels::AuditSink for SqlAuditSink {
                         format!("audit_event insert failed: {err}"),
                     )
                 })
+        })
+    }
+
+    fn emit_batch<'a>(
+        &'a self,
+        events: &'a [sutra_channels::AuditEvent],
+    ) -> sutra_channels::BoxFuture<'a, Vec<(usize, sutra_channels::Diagnostic)>> {
+        Box::pin(async move {
+            let mut failed = Vec::new();
+            // One group per deployment (the RLS scope of a transaction), in first-seen order; each
+            // group keeps the events' order, which is all the per-instance ordering needs.
+            type Group = (Vec<usize>, Vec<sutra_persistence::stores::AuditEventRow>);
+            let mut groups: Vec<Group> = Vec::new();
+            for (i, event) in events.iter().enumerate() {
+                match Self::to_row(event) {
+                    Ok(row) => match groups
+                        .iter_mut()
+                        .find(|(_, rows)| rows[0].deployment == row.deployment)
+                    {
+                        Some((indexes, rows)) => {
+                            indexes.push(i);
+                            rows.push(row);
+                        }
+                        None => groups.push((vec![i], vec![row])),
+                    },
+                    Err(d) => failed.push((i, d)),
+                }
+            }
+            for (indexes, rows) in groups {
+                let Err(err) = self.store.insert_batch(&rows).await else {
+                    continue;
+                };
+                tracing::warn!(
+                    events = rows.len(),
+                    "audit_event batch insert failed, writing its events one by one: {err}"
+                );
+                for (i, row) in indexes.into_iter().zip(&rows) {
+                    if let Err(err) = self.store.insert(row).await {
+                        failed.push((
+                            i,
+                            sutra_channels::Diagnostic::error(
+                                sutra_channels::AUDIT_SINK_WRITE_FAILED,
+                                format!("audit_event insert failed: {err}"),
+                            ),
+                        ));
+                    }
+                }
+            }
+            failed.sort_by_key(|(i, _)| *i);
+            failed
         })
     }
 }

@@ -242,11 +242,14 @@ audit: ## Supply-chain gate: cargo-audit + cargo-deny (licenses/bans/sources/adv
 ## run locally so a finding surfaces before a push. Each FAILS on any finding (the workflows only
 ## report). Tiered by cost: scan-deps with every change, scan-image alongside tier-2, codeql
 ## before a push. See scripts/security-scan.sh.
-scan-deps: ## Trivy over the source tree (lockfiles, secrets); fast, run with every change.
-	scripts/security-scan.sh deps
+## RELEASE=1 refetches Trivy's vulnerability database first (a release gate must not scan with a
+## cached one that predates the latest advisories); without it the cached database is used, so
+## day-to-day runs stay fast. Either way the scan prints the database's UpdatedAt.
+scan-deps: ## Trivy over the source tree (lockfiles, secrets); fast, run with every change. RELEASE=1 refreshes the DB.
+	TRIVY_FRESH_DB=$(if $(filter 1,$(RELEASE)),1,0) scripts/security-scan.sh deps
 
-scan-image: ## Trivy over the engine image (IMAGE=; `make image` first); run alongside tier-2.
-	scripts/security-scan.sh image $(IMAGE)
+scan-image: ## Trivy over the engine image (IMAGE=; `make image` first); run alongside tier-2. RELEASE=1 refreshes the DB.
+	TRIVY_FRESH_DB=$(if $(filter 1,$(RELEASE)),1,0) scripts/security-scan.sh image $(IMAGE)
 
 codeql: ## CodeQL for Rust, as the workflow runs it; several minutes, run before a push.
 	scripts/security-scan.sh codeql

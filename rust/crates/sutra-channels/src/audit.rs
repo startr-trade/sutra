@@ -109,6 +109,27 @@ pub trait AuditSink: Send + Sync {
     fn name(&self) -> &str;
     /// Persist one event. Best-effort; a returned `Err` is logged by the dispatcher.
     fn emit<'a>(&'a self, event: &'a AuditEvent) -> BoxFuture<'a, Result<(), Diagnostic>>;
+
+    /// Persist a run of events, in order. The dispatcher hands a sink everything that queued up
+    /// while its previous write was in flight, so a sink that can write many events for the price
+    /// of one (one database transaction, one commit) overrides this; the default writes them one
+    /// by one through [`AuditSink::emit`]. Returns the failures as `(index into events, why)` —
+    /// each is logged by the dispatcher, exactly as a failed `emit` is, and the events not listed
+    /// were written. An override must keep the per-instance order of `events`.
+    fn emit_batch<'a>(
+        &'a self,
+        events: &'a [AuditEvent],
+    ) -> BoxFuture<'a, Vec<(usize, Diagnostic)>> {
+        Box::pin(async move {
+            let mut failed = Vec::new();
+            for (i, event) in events.iter().enumerate() {
+                if let Err(d) = self.emit(event).await {
+                    failed.push((i, d));
+                }
+            }
+            failed
+        })
+    }
 }
 
 /// Name-keyed audit sinks — the `<q:audit sink="…">` selector resolves against this. Empty
@@ -249,28 +270,52 @@ pub fn audit_channel() -> (UnboundedSender<AuditEvent>, UnboundedReceiver<AuditE
     unbounded_channel()
 }
 
-/// Spawn the audit dispatcher on `handle`: drain the channel and fan each event out to every
-/// configured sink. A sink failure is logged, never propagated (audit is best-effort). The task
-/// ends when every [`AuditListener`] sender has dropped (engine shutdown / flip). Takes a
-/// [`tokio::runtime::Handle`] so it can be spawned from the engine's non-async actor thread.
+/// The most events the dispatcher hands one sink in one [`AuditSink::emit_batch`]. A batch is
+/// only what queued up while the previous write was in flight — the dispatcher never waits to
+/// fill one — so a lightly loaded engine still writes each event as it comes, and under load the
+/// batch grows towards this cap instead of the queue growing without bound. 256 events is about
+/// 25 process instances' worth of metadata-level audit; past that the commit is no longer the
+/// cost that dominates a write.
+pub const AUDIT_BATCH_MAX: usize = 256;
+
+/// Spawn the audit dispatcher on `handle`: drain the channel and fan each event out to the sink it
+/// names. Whatever has queued while the previous write ran goes out together, up to
+/// [`AUDIT_BATCH_MAX`], so a sink that can group-commit ([`AuditSink::emit_batch`]) pays one
+/// commit per batch rather than one per event. Events are delivered in channel order (one task,
+/// one write at a time), so each instance's events reach the sink in the order the engine emitted
+/// them. A sink failure is logged, never propagated (audit is best-effort). The task ends when
+/// every [`AuditListener`] sender has dropped and the queue is drained (engine shutdown / flip).
+/// Takes a [`tokio::runtime::Handle`] so it can be spawned from the engine's non-async actor
+/// thread.
 pub fn spawn_audit_dispatcher(
     handle: &tokio::runtime::Handle,
     mut rx: UnboundedReceiver<AuditEvent>,
     registry: AuditSinkRegistry,
 ) -> tokio::task::JoinHandle<()> {
     handle.spawn(async move {
-        while let Some(event) = rx.recv().await {
-            deliver_audit_event(&registry, &event).await;
+        let mut batch = Vec::with_capacity(AUDIT_BATCH_MAX);
+        while let Some(first) = rx.recv().await {
+            batch.push(first);
+            while batch.len() < AUDIT_BATCH_MAX {
+                match rx.try_recv() {
+                    Ok(event) => batch.push(event),
+                    Err(_) => break,
+                }
+            }
+            deliver_audit_events(&registry, &batch).await;
+            batch.clear();
         }
     })
 }
 
-/// Deliver one event to the ONE sink it names, logging a failure (audit is best-effort). If that
-/// sink is not registered, the first registered sink (deterministic — sorted names) takes it, so
-/// the trail is never silently dropped on a typo. Shared by the execution-event dispatcher and
-/// the transport-event journal, so both route alike.
-pub async fn deliver_audit_event(registry: &AuditSinkRegistry, event: &AuditEvent) {
-    let sink = match registry.get(&event.sink) {
+/// The sink an event goes to: the ONE sink it names, or — when that sink is not registered — the
+/// first registered sink (deterministic: sorted names), so the trail is never silently dropped on
+/// a typo. `None` only when no sink is registered at all.
+fn resolve_audit_sink(
+    registry: &AuditSinkRegistry,
+    event: &AuditEvent,
+) -> Option<Arc<dyn AuditSink>> {
+    match registry.get(&event.sink) {
         Some(s) => Some(s),
         None => {
             let fallback = registry.all().into_iter().next();
@@ -285,18 +330,61 @@ pub async fn deliver_audit_event(registry: &AuditSinkRegistry, event: &AuditEven
             }
             fallback
         }
-    };
-    if let Some(sink) = sink {
+    }
+}
+
+fn log_audit_failure(sink: &dyn AuditSink, event: &AuditEvent, d: &Diagnostic) {
+    tracing::warn!(
+        code = %d.code,
+        sink = sink.name(),
+        instance = %event.instance_id,
+        event_type = %event.event_type,
+        "audit sink write failed (best-effort): {}",
+        d.message
+    );
+}
+
+/// Deliver one event to the ONE sink it names, logging a failure (audit is best-effort). If that
+/// sink is not registered, the first registered sink (deterministic — sorted names) takes it, so
+/// the trail is never silently dropped on a typo. Shared by the execution-event dispatcher and
+/// the transport-event journal, so both route alike.
+pub async fn deliver_audit_event(registry: &AuditSinkRegistry, event: &AuditEvent) {
+    if let Some(sink) = resolve_audit_sink(registry, event) {
         if let Err(d) = sink.emit(event).await {
-            tracing::warn!(
-                code = %d.code,
-                sink = sink.name(),
-                instance = %event.instance_id,
-                event_type = %event.event_type,
-                "audit sink write failed (best-effort): {}",
-                d.message
-            );
+            log_audit_failure(sink.as_ref(), event, &d);
         }
+    }
+}
+
+/// Deliver a run of events, routed per event exactly as [`deliver_audit_event`] routes one: each
+/// maximal stretch of consecutive events bound for the same sink goes to that sink as one
+/// [`AuditSink::emit_batch`], so the sink sees them in channel order. Failures are logged per
+/// event (audit is best-effort).
+pub async fn deliver_audit_events(registry: &AuditSinkRegistry, events: &[AuditEvent]) {
+    let sinks: Vec<Option<Arc<dyn AuditSink>>> = events
+        .iter()
+        .map(|e| resolve_audit_sink(registry, e))
+        .collect();
+    let same_sink = |a: &Option<Arc<dyn AuditSink>>, b: &Option<Arc<dyn AuditSink>>| match (a, b) {
+        (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+        (None, None) => true,
+        _ => false,
+    };
+    let mut start = 0;
+    while start < events.len() {
+        let mut end = start + 1;
+        while end < events.len() && same_sink(&sinks[start], &sinks[end]) {
+            end += 1;
+        }
+        if let Some(sink) = &sinks[start] {
+            let run = &events[start..end];
+            for (i, d) in sink.emit_batch(run).await {
+                if let Some(event) = run.get(i) {
+                    log_audit_failure(sink.as_ref(), event, &d);
+                }
+            }
+        }
+        start = end;
     }
 }
 
@@ -937,5 +1025,129 @@ mod tests {
                 ("otel".to_string(), "C".to_string())
             ]
         );
+    }
+
+    /// A sink that records each `emit_batch` it is handed (the event types, in order) and fails
+    /// every event whose type is `"BAD"`.
+    struct BatchRecordingSink {
+        name: String,
+        batches: Arc<Mutex<Vec<Vec<String>>>>,
+    }
+
+    impl AuditSink for BatchRecordingSink {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn emit<'a>(&'a self, _e: &'a AuditEvent) -> BoxFuture<'a, Result<(), Diagnostic>> {
+            Box::pin(async { panic!("the dispatcher writes through emit_batch") })
+        }
+        fn emit_batch<'a>(
+            &'a self,
+            events: &'a [AuditEvent],
+        ) -> BoxFuture<'a, Vec<(usize, Diagnostic)>> {
+            self.batches
+                .lock()
+                .unwrap()
+                .push(events.iter().map(|e| e.event_type.clone()).collect());
+            let failed = events
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| e.event_type == "BAD")
+                .map(|(i, _)| (i, Diagnostic::error(AUDIT_SINK_WRITE_FAILED, "bad")))
+                .collect();
+            Box::pin(async move { failed })
+        }
+    }
+
+    fn numbered(sink: &str, seq: u32, event_type: &str) -> AuditEvent {
+        AuditEvent {
+            sink: sink.into(),
+            deployment_id: "dep-000000000000000000000001".into(),
+            tenant: "acme".into(),
+            instance_id: "i-1".into(),
+            seq,
+            at: "t".into(),
+            event_type: event_type.into(),
+            node_id: None,
+            diagnostic_code: None,
+            diagnostic_json: None,
+            payload_json: "{}".into(),
+            correlation: Default::default(),
+        }
+    }
+
+    /// What queued while the dispatcher was busy goes out as batches of at most
+    /// [`AUDIT_BATCH_MAX`], every event exactly once and in channel order; a failed event is
+    /// logged and the rest of its batch and the batches after it still go out.
+    #[tokio::test]
+    async fn dispatcher_batches_the_backlog_in_order_up_to_the_cap() {
+        let batches = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = AuditSinkRegistry::new();
+        registry.register(Arc::new(BatchRecordingSink {
+            name: "sql".into(),
+            batches: Arc::clone(&batches),
+        }));
+        let (tx, rx) = audit_channel();
+        let total = AUDIT_BATCH_MAX * 2 + 7;
+        for i in 0..total {
+            let kind = if i == 3 {
+                "BAD".to_string()
+            } else {
+                format!("E{i}")
+            };
+            tx.send(numbered("sql", i as u32 + 1, &kind)).unwrap();
+        }
+        drop(tx);
+        // Spawned after the backlog is queued, so the first receive sees all of it.
+        spawn_audit_dispatcher(&tokio::runtime::Handle::current(), rx, registry)
+            .await
+            .unwrap();
+
+        let batches = batches.lock().unwrap().clone();
+        let sizes: Vec<usize> = batches.iter().map(Vec::len).collect();
+        assert_eq!(sizes, vec![AUDIT_BATCH_MAX, AUDIT_BATCH_MAX, 7]);
+        let flat: Vec<String> = batches.into_iter().flatten().collect();
+        let expected: Vec<String> = (0..total)
+            .map(|i| {
+                if i == 3 {
+                    "BAD".to_string()
+                } else {
+                    format!("E{i}")
+                }
+            })
+            .collect();
+        assert_eq!(flat, expected);
+    }
+
+    /// A batch never mixes sinks: consecutive events for one sink travel together, and a change of
+    /// sink starts a new run, so each sink still sees its own events in channel order.
+    #[tokio::test]
+    async fn deliver_audit_events_splits_a_batch_into_runs_per_sink() {
+        let sql = Arc::new(Mutex::new(Vec::new()));
+        let jsonl = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = AuditSinkRegistry::new();
+        registry.register(Arc::new(BatchRecordingSink {
+            name: "sql".into(),
+            batches: Arc::clone(&sql),
+        }));
+        registry.register(Arc::new(BatchRecordingSink {
+            name: "jsonl".into(),
+            batches: Arc::clone(&jsonl),
+        }));
+        let events = vec![
+            numbered("sql", 1, "A"),
+            numbered("sql", 2, "B"),
+            numbered("jsonl", 3, "C"),
+            // Unregistered → the fallback ("jsonl", first sorted), so it joins C's run.
+            numbered("otel", 4, "D"),
+            numbered("sql", 5, "E"),
+        ];
+        deliver_audit_events(&registry, &events).await;
+        let owned = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            *sql.lock().unwrap(),
+            vec![owned(&["A", "B"]), owned(&["E"])]
+        );
+        assert_eq!(*jsonl.lock().unwrap(), vec![owned(&["C", "D"])]);
     }
 }

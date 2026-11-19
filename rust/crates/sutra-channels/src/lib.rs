@@ -95,9 +95,9 @@ pub use sutra_executor::DeploymentId;
 pub use ack::{DeferredAckListener, DeferredAckRegistry};
 #[cfg(feature = "transport")]
 pub use audit::{
-    audit_channel, deliver_audit_event, spawn_audit_dispatcher, AuditEvent, AuditListener,
-    AuditSink, AuditSinkRegistry, JsonlAuditSink, AUDIT_CAPTURE_HEADER, AUDIT_CAPTURE_MEDIA,
-    AUDIT_SINK_WRITE_FAILED,
+    audit_channel, deliver_audit_event, deliver_audit_events, spawn_audit_dispatcher, AuditEvent,
+    AuditListener, AuditSink, AuditSinkRegistry, JsonlAuditSink, AUDIT_BATCH_MAX,
+    AUDIT_CAPTURE_HEADER, AUDIT_CAPTURE_MEDIA, AUDIT_SINK_WRITE_FAILED,
 };
 #[cfg(feature = "transport")]
 pub use bridge::replica_id;

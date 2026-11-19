@@ -30,6 +30,10 @@
 #   PG_COMMIT_SIBLINGS (4)   PG_MAX_CONNECTIONS (200)
 #   ENGINE_ENV   extra "KEY=VALUE ..." for the engine (e.g. pool, outbox and cache knobs)
 #   CACHE_TTL    turn on the `refdata` store's read cache with this ttl (e.g. PT0S, PT5S)
+#   AUDIT        audit both processes at this capture level (metadata, payload) into the SQL sink
+#                (`<q:audit capture="$AUDIT"/>` + SUTRA_AUDIT_SQL=true); the block then also reports
+#                the audit rows written and how long the journal took to catch up after the last
+#                settle (the SQL sink writes behind execution, so a slow sink shows up as lag)
 #   KEEP=1       leave the cluster and engine running after the run (prints how to stop them)
 #   OUT          write the markdown block to this file as well as stdout
 #   PG_EXTRA_CONF  extra postgresql.conf lines (e.g. "session_preload_libraries = 'auto_explain'")
@@ -166,6 +170,24 @@ if [ -n "${CACHE_TTL:-}" ]; then
         >>"$WORK/pkg-src/datastores.yaml"
     PKG_SRC="$WORK/pkg-src"
 fi
+if [ -n "${AUDIT:-}" ]; then
+    [ "$PKG_SRC" = "$WORK/pkg-src" ] || cp -r "$PKG_SRC" "$WORK/pkg-src"
+    PKG_SRC="$WORK/pkg-src"
+    # The first <bpmn:extensionElements> after <bpmn:process ...> is the process's own.
+    for f in "$PKG_SRC"/bpmn/*.bpmn; do
+        python3 - "$f" "$AUDIT" <<'PY' || die "could not add q:audit to $f"
+import re, sys
+path, level = sys.argv[1:]
+src = open(path).read()
+out, n = re.subn(r'(<bpmn:process\b[^>]*>\s*<bpmn:extensionElements>)',
+                 r'\1\n      <q:audit capture="%s"/>' % level, src, count=1)
+if n != 1:
+    sys.exit(1)
+open(path, "w").write(out)
+PY
+    done
+    ENGINE_ENV="SUTRA_AUDIT_SQL=true $ENGINE_ENV"
+fi
 "$SUTRA_CLI" package "$PKG_SRC" --out "$WORK/deployments" >"$WORK/package.log" 2>&1 \
     || die "packaging failed ($WORK/package.log)"
 log "engine on :$ENGINE_PORT ($ENGINE_ENV)"
@@ -251,10 +273,31 @@ if [ -n "${PERF_DIR:-}" ]; then
     perf record -F 499 -g -p "$PG_PIDS" -o "$PERF_DIR/postgres.perf.data" >"$PERF_DIR/postgres.perf.log" 2>&1 &
     PERF_PIDS+=($!)
 fi
+[ -n "${AUDIT:-}" ] && A_BASE="$("${PSQL[@]}" -d sutra -c "SELECT count(*) FROM audit_event")"
 log "measured run ${RATE}/s x $DURATION"
 run_k6 "$RATE" "$DURATION" run "$K6DIR/run.json"
 SENT="$(jq -r '.metrics.iterations.count // 0' "$K6DIR/run.json")"
 if wait_settled "$SENT"; then drained=yes; else drained=no; fi
+AUDIT_LINE=""
+if [ -n "${AUDIT:-}" ]; then
+    # The SQL sink writes behind execution: count the journal at the last settle, then wait until
+    # it stops growing (3 s without a new row) to see how far behind it ran.
+    audit_rows() { "${PSQL[@]}" -d sutra -c "SELECT count(*) FROM audit_event"; }
+    A_SETTLED="$(audit_rows)"; A_T0="$(date +%s.%N)"; a_last="$A_SETTLED"; a_idle=0; a_lastgrow="$A_T0"
+    while [ "$a_idle" -lt 3 ]; do
+        sleep 1
+        a_now="$(audit_rows)"
+        if [ "$a_now" = "$a_last" ]; then a_idle=$((a_idle + 1)); else a_idle=0; a_last="$a_now"; a_lastgrow="$(date +%s.%N)"; fi
+    done
+    AUDIT_LINE="$(python3 -c '
+import sys
+level, base, at_settle, final, t0, t1, sent = sys.argv[1:]
+rows = int(final) - int(base)
+behind = int(final) - int(at_settle)
+print(f"Audit (capture={level}): {rows} rows over the run ({rows / max(int(sent), 1):.1f} per order), "
+      f"{behind} still unwritten at the last settle, journal caught up {float(t1) - float(t0):.1f} s after it")
+' "$AUDIT" "$A_BASE" "$A_SETTLED" "$a_last" "$A_T0" "$a_lastgrow" "$SENT")"
+fi
 
 for pid in "${PERF_PIDS[@]}"; do kill -INT "$pid" 2>/dev/null; done
 for pid in "${PERF_PIDS[@]}"; do wait "$pid" 2>/dev/null; done
@@ -300,6 +343,7 @@ outbox="$("${PSQL[@]}" -d sutra -F ' | ' -c "SELECT calls, rows, round(mean_exec
   ORDER BY total_exec_time DESC")"
 DL1="$("${PSQL[@]}" -d sutra -c "SELECT deadlocks FROM pg_stat_database WHERE datname = 'sutra'")"
 {
+    [ -n "$AUDIT_LINE" ] && printf '%s\n\n' "$AUDIT_LINE"
     printf '%s\n\n%s\n\nTop statements by calls (calls | total ms | query):\n\n```\n%s\n```\n' "$report" "$(sm_report "$WORK/sm-before" "$WORK/sm-after" "relay ${RATE}/s x $DURATION")" "$top"
     printf '\nOutbox lease renewals and deletes (calls | rows | mean ms | max ms | total ms | query), deadlocks %s:\n\n```\n%s\n```\n' \
         "$((DL1 - DL0))" "$outbox"

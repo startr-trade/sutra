@@ -11,6 +11,42 @@ This is the changelog for the **Rust-native** engine (`rust/` workspace). It beg
 
 ## [Unreleased]
 
+## [0.8.1] — 2026-11-19
+
+**2026-11-19.** A patch release. **The SQL audit sink writes in batches**, so on a durable
+PostgreSQL the audit journal keeps up with a busy engine instead of falling minutes behind. Audit
+stays best-effort and behind execution, as before. No configuration, `q:`, migration, archive or
+snapshot change.
+
+### Changed
+
+- **The SQL audit sink writes in batches, one commit per batch.** With `sutra.audit.sql` on, the
+  audit writer used to give every event its own transaction and commit (about sixteen per process
+  instance), one at a time; on a durable PostgreSQL it topped out near 280 events a second and
+  fell ever further behind a busy engine. It now writes whatever queued while its previous write
+  ran (up to 256 events) as one multi-row insert per deployment in one transaction. Audit is still
+  written behind execution, best-effort, in each instance's order, deduplicated per
+  `(deployment, instance, seq)`, with dense journal ordinals; a failed batch is written again
+  event by event, so a bad row costs only itself. Measured on the relay workload (durable
+  PostgreSQL, metadata capture, 50 orders/s): rows still unwritten at the last settle 85,770 →
+  0 (the journal was 303 s behind), commits per order 47.9 → 18.3 (15.0 with audit off), engine +
+  database CPU per order 21.3 → 8.8 ms, settle p99 156 → 54 ms. `AuditSink::emit_batch` (with a
+  one-by-one default) is the new seam; `tools/sutra-load-test/relay-bench.sh` takes `AUDIT=<capture>`
+  and reports the audit backlog.
+- **The local Trivy scans can refresh their vulnerability database first.** `make scan-deps
+  RELEASE=1` and `make scan-image RELEASE=1` (`TRIVY_FRESH_DB=1` for `scripts/security-scan.sh`)
+  replace the cached database with the latest published one before scanning; a database fetched
+  in the last 15 minutes (`TRIVY_FRESH_DB_MAX_AGE_S`) is reused, so the two scans of one release
+  gate download it once. Without the flag the cached database is used, as before. Every scan now
+  prints the database's `UpdatedAt`, so a gate's output says how current it was. A local green
+  had predated the advisory the hosted image scan then found.
+
+### Security
+
+- **CVE-2026-84786 (libssl3, DANE client NULL dereference) is triaged in `.trivyignore.yaml`**
+  until 2026-12-16: no fixed Debian package; the engine never loads libssl3 (re-checked with
+  `readelf -d` on the 0.8.1 binary) and nothing in it enables DANE.
+
 ## [0.8.0] — 2026-11-19
 
 **2026-11-19.** **A synchronous HTTP answer sets its own status and headers**

@@ -10,6 +10,15 @@
 #                                   suite, scripts/codeql-config.yml. Several minutes; run it
 #                                   before anything goes to the public repository.
 #
+# Trivy keeps its vulnerability database cached under ~/.cache/trivy and only fetches a new one
+# when the cached copy's NextUpdate has passed, so a day-to-day scan can run on a database up to a
+# day old and miss an advisory published since. A release gate must not: with TRIVY_FRESH_DB=1
+# (what `make scan-deps RELEASE=1` / `make scan-image RELEASE=1` set) the cached database is
+# replaced with the latest published one before the scan. A database fetched in the last
+# TRIVY_FRESH_DB_MAX_AGE_S seconds (default 900) counts as fresh, so scan-deps then scan-image in
+# one release session download it once. Every Trivy scan prints the database's UpdatedAt, so the
+# gate's output says how current the scan was.
+#
 # Unlike the workflows, which only report, every subcommand exits non-zero on any finding. A
 # Trivy finding with no reachable fix belongs in .trivyignore.yaml, time-boxed and with its
 # justification written out, and nowhere else.
@@ -52,8 +61,42 @@ trivy() {
     docker run --rm -v "$cache/trivy:/root/.cache/trivy" "$@"
 }
 
+# The cached database's metadata as one line (UpdatedAt / NextUpdate / DownloadedAt), or a note
+# that there is none yet.
+trivy_db_line() {
+    local meta="$cache/trivy/db/metadata.json"
+    if [ -f "$meta" ]; then
+        jq -r '"Trivy DB UpdatedAt \(.UpdatedAt) (NextUpdate \(.NextUpdate), downloaded \(.DownloadedAt))"' "$meta"
+    else
+        echo "Trivy DB: none cached yet (the scan downloads it)"
+    fi
+}
+
+# With TRIVY_FRESH_DB=1, replace the cached database with the latest published one, unless it was
+# downloaded within TRIVY_FRESH_DB_MAX_AGE_S. Then print which database the scan will use.
+trivy_db_prepare() {
+    local meta="$cache/trivy/db/metadata.json" max_age=${TRIVY_FRESH_DB_MAX_AGE_S:-900}
+    if [ "${TRIVY_FRESH_DB:-0}" = 1 ]; then
+        local age=-1 downloaded
+        if [ -f "$meta" ]; then
+            downloaded=$(jq -r '.DownloadedAt // empty' "$meta")
+            [ -n "$downloaded" ] && age=$(( $(date +%s) - $(date -d "$downloaded" +%s) ))
+        fi
+        if [ "$age" -ge 0 ] && [ "$age" -le "$max_age" ]; then
+            echo "security-scan: Trivy DB downloaded ${age}s ago, within ${max_age}s; not refetching" >&2
+        else
+            echo "security-scan: TRIVY_FRESH_DB=1, fetching the latest Trivy DB" >&2
+            # The container writes the cache as root, so the container removes it too.
+            trivy "aquasec/trivy:$TRIVY_VERSION" clean --vuln-db
+            trivy "aquasec/trivy:$TRIVY_VERSION" image --download-db-only --quiet
+        fi
+    fi
+    echo "security-scan: $(trivy_db_line)"
+}
+
 scan_deps() {
     local tree
+    trivy_db_prepare
     new_scratch; tree=$scratch_dir
     checkout_copy "$tree"
     trivy -v "$tree:/src:ro" -w /src "aquasec/trivy:$TRIVY_VERSION" fs \
@@ -66,6 +109,7 @@ scan_image() {
         echo "security-scan: no image '$image'; build it first (make image)" >&2
         exit 2
     }
+    trivy_db_prepare
     trivy -v /var/run/docker.sock:/var/run/docker.sock \
         -v "$root/.trivyignore.yaml:/trivyignore.yaml:ro" "aquasec/trivy:$TRIVY_VERSION" image \
         --severity "$SEVERITY" --ignorefile /trivyignore.yaml --exit-code 1 "$image"

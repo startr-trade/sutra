@@ -283,6 +283,14 @@ so keep such an engine where only operators can reach it. See [Upgrading to
 | `sutra.audit.otel.service-name` | `SUTRA_AUDIT_OTEL_SERVICE_NAME` (default `sutra-audit`, 0.6.12) |
 | `sutra.audit.sql` | `SUTRA_AUDIT_SQL` |
 
+The SQL sink writes the audit journal behind execution and best-effort: an event is queued and
+written by the audit writer, not inside the transaction of the step that produced it, so a crash
+can lose events not yet written. *Since 0.8.1* the writer takes whatever queued while its previous
+write ran, up to 256 events, and writes it as one multi-row insert per deployment in one
+transaction, where it used to commit every event on its own. On a durable PostgreSQL that is what
+lets the journal keep up with a busy engine. The journal is the same: each instance's events in
+order, deduplicated, and a batch that fails is written again event by event. Nothing to configure.
+
 See [Logging and audit](logging.md).
 
 ## Telemetry (OTel)

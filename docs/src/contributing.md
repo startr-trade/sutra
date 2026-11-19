@@ -55,7 +55,8 @@ cargo build --release -p sutra-dist    # the `sutra-engine` binary (the composit
 The CI workflow (`.github/workflows/ci.yml`) mirrors the local gate chain exactly. `make ci` runs
 the same jobs locally, cheapest first: `make actionlint`, `make fmt-check`, `make lint`,
 `make cross`, `make test`, `make audit` and `make scan-deps` (Trivy over the lockfiles, secrets and
-IaC files). A contributor who is green locally is green in CI. No CI job builds an image: the
+IaC files). Every Trivy scan prints its vulnerability database's `UpdatedAt`; `make scan-deps
+RELEASE=1` and `make scan-image RELEASE=1` fetch the latest database first, as a release gate should. A contributor who is green locally is green in CI. No CI job builds an image: the
 release builds the image it ships, once, and scans it before tagging it. Tier-2 runs nightly rather than per-PR (a Docker-heavy suite is slow and
 resource-flaky on a small hosted runner for signal tier-1 already covers on most changes); tier-3
 stays a local/milestone gate, since it needs a provisioned `kind` cluster CI doesn't have.

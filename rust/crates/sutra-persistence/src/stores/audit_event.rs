@@ -90,6 +90,24 @@ const SQL_INSERT: &str = "INSERT INTO audit_event \
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
      ON CONFLICT (deployment_id, instance_id, seq) WHERE event_type NOT LIKE '%.%' DO NOTHING";
 
+/// A run of engine events in one statement (the batch form of [`SQL_INSERT`]): `$1` is the
+/// deployment, `$2..$9` are parallel arrays, one element per row. `WITH ORDINALITY` + `ORDER BY`
+/// insert the rows in array order, and the V203 ordinal trigger (a row-level BEFORE trigger whose
+/// query sees the rows the same statement already inserted) numbers them in that order. A replayed
+/// `(deployment, instance, seq)` is skipped exactly as in the single-row form; `DO NOTHING` also
+/// tolerates two rows with one key in the same statement.
+const SQL_INSERT_BATCH: &str = "INSERT INTO audit_event \
+     (deployment_id, instance_id, seq, at, event_type, node_id, diagnostic_code, \
+      diagnostic_json, payload_json) \
+     SELECT $1, u.instance_id, u.seq, u.at, u.event_type, u.node_id, u.diagnostic_code, \
+            u.diagnostic_json, u.payload_json \
+     FROM UNNEST($2::uuid[], $3::int4[], $4::timestamptz[], $5::text[], $6::text[], \
+                 $7::text[], $8::text[], $9::text[]) \
+          WITH ORDINALITY AS u(instance_id, seq, at, event_type, node_id, diagnostic_code, \
+                               diagnostic_json, payload_json, ord) \
+     ORDER BY u.ord \
+     ON CONFLICT (deployment_id, instance_id, seq) WHERE event_type NOT LIKE '%.%' DO NOTHING";
+
 /// A transport event in an instance's journal: numbered with the instance's current high-water
 /// seq over the ENGINE's events (1 before the first, so a read from the start of the journal —
 /// `seq > 0` — sees it), so it sorts right after the event it followed and never takes a number
@@ -250,6 +268,92 @@ impl PgAuditEventStore {
             .await
             .map_err(PersistenceError::db("audit_event insert commit"))?;
         Ok(first)
+    }
+
+    /// Persist a run of rows of ONE deployment in a single deployment-scoped transaction — one
+    /// commit for the lot, which is what lets the audit writer keep up with an engine emitting
+    /// thousands of events a second on a durable database. Returns the number of first-writes
+    /// (replayed `(deployment, instance, seq)` rows are skipped, as in [`Self::insert`]).
+    ///
+    /// Each instance's rows are written in the order given, so their journal ordinals follow it.
+    /// Rows of different instances are grouped by instance first (a stable sort, so per-instance
+    /// order is untouched): the ordinal trigger takes a per-instance advisory lock that is held
+    /// to commit, and taking those locks in one global order means two batches touching the same
+    /// instances wait for each other instead of deadlocking. A transport event keeps its place
+    /// among its instance's engine events (it is numbered from the engine events before it).
+    ///
+    /// All or nothing: on `Err` nothing of the batch was committed, so the caller may write the
+    /// rows again (one by one, to isolate a bad row) without duplicating any. A row of another
+    /// deployment is a caller error, refused before anything is written.
+    pub async fn insert_batch(&self, rows: &[AuditEventRow]) -> Result<u64> {
+        let Some(first) = rows.first() else {
+            return Ok(0);
+        };
+        let deployment = &first.deployment;
+        if let Some(other) = rows.iter().find(|r| &r.deployment != deployment) {
+            return Err(PersistenceError::InvalidArgument(format!(
+                "audit_event batch mixes deployments '{}' and '{}'",
+                deployment.as_str(),
+                other.deployment.as_str()
+            )));
+        }
+        let mut ordered: Vec<&AuditEventRow> = rows.iter().collect();
+        ordered.sort_by_key(|r| r.instance_id);
+
+        let mut tx = begin_deployment_tx(&self.pool, deployment).await?;
+        let mut inserted = 0u64;
+        let mut start = 0;
+        while start < ordered.len() {
+            if is_transport_audit_event_type(&ordered[start].event_type) {
+                if Self::insert_in(&mut tx, ordered[start]).await? {
+                    inserted += 1;
+                }
+                start += 1;
+                continue;
+            }
+            let mut end = start + 1;
+            while end < ordered.len() && !is_transport_audit_event_type(&ordered[end].event_type) {
+                end += 1;
+            }
+            inserted +=
+                Self::insert_engine_run_in(&mut tx, deployment, &ordered[start..end]).await?;
+            start = end;
+        }
+        tx.commit()
+            .await
+            .map_err(PersistenceError::db("audit_event batch commit"))?;
+        Ok(inserted)
+    }
+
+    /// One multi-row INSERT of engine events ([`SQL_INSERT_BATCH`]); returns the rows written.
+    async fn insert_engine_run_in(
+        conn: &mut PgConnection,
+        deployment: &DeploymentId,
+        rows: &[&AuditEventRow],
+    ) -> Result<u64> {
+        let instance_ids: Vec<Option<Uuid>> = rows.iter().map(|r| r.instance_id).collect();
+        let seqs: Vec<i32> = rows.iter().map(|r| r.seq).collect();
+        let ats: Vec<OffsetDateTime> = rows.iter().map(|r| r.at).collect();
+        let event_types: Vec<&str> = rows.iter().map(|r| r.event_type.as_str()).collect();
+        let node_ids: Vec<Option<&str>> = rows.iter().map(|r| r.node_id.as_deref()).collect();
+        let codes: Vec<Option<&str>> = rows.iter().map(|r| r.diagnostic_code.as_deref()).collect();
+        let diagnostics: Vec<Option<&str>> =
+            rows.iter().map(|r| r.diagnostic_json.as_deref()).collect();
+        let payloads: Vec<&str> = rows.iter().map(|r| r.payload_json.as_str()).collect();
+        let done = sqlx::query(SQL_INSERT_BATCH)
+            .bind(deployment.as_str())
+            .bind(instance_ids)
+            .bind(seqs)
+            .bind(ats)
+            .bind(event_types)
+            .bind(node_ids)
+            .bind(codes)
+            .bind(diagnostics)
+            .bind(payloads)
+            .execute(conn)
+            .await
+            .map_err(PersistenceError::db("audit_event batch insert"))?;
+        Ok(done.rows_affected())
     }
 
     /// One seq-ordered PAGE of an instance's audit journal — the read side of the trail this store

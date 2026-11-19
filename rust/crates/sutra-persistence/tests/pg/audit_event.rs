@@ -522,3 +522,125 @@ async fn concurrent_writers_of_one_instance_get_dense_ordinals() {
         (1..=20).collect::<Vec<i64>>()
     );
 }
+
+/// A batch of several instances' events, interleaved as the engine emits them, lands in ONE
+/// transaction with each instance's journal in emission order: dense ordinals 1..=N per instance
+/// in the order given, a transport event numbered from the engine events before it, a replayed
+/// row skipped (also inside the same batch), and the whole batch counted as first-writes only.
+#[ignore = "docker"]
+#[tokio::test]
+async fn insert_batch_keeps_each_instance_journal_in_order_with_dense_ordinals() {
+    let pool = fresh_pool().await;
+    let store = PgAuditEventStore::new(pool.clone());
+    let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+    // Already written one by one: a's seq 1. The batch's copy of it must be a no-op.
+    assert!(store
+        .insert(&row(&dep_a(), a, 1, "INSTANCE_STARTED"))
+        .await
+        .unwrap());
+
+    let batch = vec![
+        row(&dep_a(), a, 1, "INSTANCE_STARTED"), // replay
+        row(&dep_a(), b, 1, "INSTANCE_STARTED"),
+        row(&dep_a(), a, 2, "NODE_ENTERED"),
+        row(&dep_a(), b, 2, "NODE_ENTERED"),
+        row(&dep_a(), a, 0, "http.REQUEST_SENT"), // transport: numbered from a's seq 2
+        row(&dep_a(), a, 3, "NODE_LEFT"),
+        row(&dep_a(), b, 3, "NODE_LEFT"),
+        row(&dep_a(), b, 3, "NODE_LEFT"), // the same key twice in one batch
+        row(&dep_a(), a, 4, "INSTANCE_COMPLETED"),
+    ];
+    assert_eq!(store.insert_batch(&batch).await.unwrap(), 7);
+
+    let journal = |instance| {
+        let store = store.clone();
+        async move {
+            store
+                .list_for_instance_after_ordinal(&dep_a(), instance, 0, 100)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|r| (r.ordinal.unwrap(), r.seq, r.event_type))
+                .collect::<Vec<_>>()
+        }
+    };
+    let s = |v: &str| v.to_string();
+    assert_eq!(
+        journal(a).await,
+        vec![
+            (1, 1, s("INSTANCE_STARTED")),
+            (2, 2, s("NODE_ENTERED")),
+            (3, 2, s("http.REQUEST_SENT")),
+            (4, 3, s("NODE_LEFT")),
+            (5, 4, s("INSTANCE_COMPLETED")),
+        ]
+    );
+    assert_eq!(
+        journal(b).await,
+        vec![
+            (1, 1, s("INSTANCE_STARTED")),
+            (2, 2, s("NODE_ENTERED")),
+            (3, 3, s("NODE_LEFT")),
+        ]
+    );
+    // Replaying the whole batch writes nothing but the transport row (never deduplicated).
+    assert_eq!(store.insert_batch(&batch).await.unwrap(), 1);
+    assert_eq!(store.insert_batch(&[]).await.unwrap(), 0);
+}
+
+/// A batch is one deployment's: a row of another deployment is refused before anything is
+/// written, and nothing of the batch is committed.
+#[ignore = "docker"]
+#[tokio::test]
+async fn insert_batch_refuses_mixed_deployments_and_writes_nothing() {
+    let pool = fresh_pool().await;
+    let store = PgAuditEventStore::new(pool.clone());
+    let instance = Uuid::new_v4();
+    let batch = vec![
+        row(&dep_a(), instance, 1, "INSTANCE_STARTED"),
+        row(&dep_b(), instance, 2, "NODE_ENTERED"),
+    ];
+    assert!(store.insert_batch(&batch).await.is_err());
+    assert_eq!(count(&pool, &dep_a(), instance).await, 0);
+    assert_eq!(count(&pool, &dep_b(), instance).await, 0);
+}
+
+/// Two batches of the same instances, written concurrently with their instances in opposite
+/// orders, never deadlock (the batch takes the per-instance ordinal locks in one global order)
+/// and leave each journal dense.
+#[ignore = "docker"]
+#[tokio::test]
+async fn concurrent_batches_over_the_same_instances_neither_deadlock_nor_gap() {
+    let pool = fresh_pool().await;
+    let store = PgAuditEventStore::new(pool);
+    let instances: Vec<Uuid> = (0..8).map(|_| Uuid::new_v4()).collect();
+    let writers: Vec<_> = (0..8)
+        .map(|w| {
+            let store = store.clone();
+            let mut order = instances.clone();
+            if w % 2 == 1 {
+                order.reverse();
+            }
+            tokio::spawn(async move {
+                let batch: Vec<AuditEventRow> = order
+                    .iter()
+                    .map(|i| row(&dep_a(), *i, w + 1, "NODE_ENTERED"))
+                    .collect();
+                store.insert_batch(&batch).await.unwrap()
+            })
+        })
+        .collect();
+    for writer in writers {
+        assert_eq!(writer.await.unwrap(), 8);
+    }
+    for instance in instances {
+        let all = store
+            .list_for_instance_after_ordinal(&dep_a(), instance, 0, 100)
+            .await
+            .unwrap();
+        assert_eq!(
+            all.iter().map(|r| r.ordinal.unwrap()).collect::<Vec<_>>(),
+            (1..=8).collect::<Vec<i64>>()
+        );
+    }
+}

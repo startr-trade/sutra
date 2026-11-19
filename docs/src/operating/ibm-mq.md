@@ -346,7 +346,7 @@ docker run -d --name mqdemo-engine --network mqdemo-net -p 127.0.0.1::8080 \
   -e SUTRA_SINK_AMQP_USERNAME=app \
   -e SUTRA_SINK_AMQP_PASSWORD="$MQ_PASSWORD" \
   -e SUTRA_SINK_AMQP_TLS_CA_FILE=/etc/sutra/mq-ca.pem \
-  ghcr.io/startr-trade/sutra:0.8.0
+  ghcr.io/startr-trade/sutra:0.8.1
 PORT=$(docker port mqdemo-engine 8080 | head -1 | cut -d: -f2)
 until curl -sf "http://127.0.0.1:$PORT/sutra/health/ready"; do sleep 1; done
 ```
