@@ -1,0 +1,60 @@
+# Channels for the reply-status conformance suite. All synchronous (ack-mode on-complete, the
+# HTTP default), json, one process each.
+#
+#   POST /channels/items    create   { id }           201 + Location + X-Request-Id + body
+#   POST /channels/lookup   lookup   { id }           200 for id "42", else 404
+#   POST /channels/check    check    { token, user }  200 + identity headers, or 401 + challenge
+#   POST /channels/bad      bad      { code }         the status is whatever code says
+#   POST /channels/later    later    { id }           201 + Location now, the rest detached
+
+channels:
+  - name: items
+    transport: http
+    bind: "POST /channels/items"
+    codec: json
+    cloudevents-mode: none
+    auth:
+      scheme: apikey
+      apikey:
+        value: env:REPLIES_API_KEY
+        header: X-Api-Key
+  - name: lookup
+    transport: http
+    bind: "POST /channels/lookup"
+    codec: json
+    cloudevents-mode: none
+    auth:
+      scheme: apikey
+      apikey:
+        value: env:REPLIES_API_KEY
+        header: X-Api-Key
+  - name: check
+    transport: http
+    bind: "POST /channels/check"
+    codec: json
+    cloudevents-mode: none
+    auth:
+      scheme: apikey
+      apikey:
+        value: env:REPLIES_API_KEY
+        header: X-Api-Key
+  - name: bad
+    transport: http
+    bind: "POST /channels/bad"
+    codec: json
+    cloudevents-mode: none
+    auth:
+      scheme: apikey
+      apikey:
+        value: env:REPLIES_API_KEY
+        header: X-Api-Key
+  - name: later
+    transport: http
+    bind: "POST /channels/later"
+    codec: json
+    cloudevents-mode: none
+    auth:
+      scheme: apikey
+      apikey:
+        value: env:REPLIES_API_KEY
+        header: X-Api-Key

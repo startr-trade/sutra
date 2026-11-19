@@ -32,6 +32,8 @@ mod call_log_load_it;
 mod channel_call_retry_it;
 #[path = "all/concurrency_cluster_it.rs"]
 mod concurrency_cluster_it;
+#[path = "all/connectivity_events_it.rs"]
+mod connectivity_events_it;
 #[path = "all/draining_version_it.rs"]
 mod draining_version_it;
 #[path = "all/endpoint_claims_it.rs"]

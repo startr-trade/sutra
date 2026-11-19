@@ -256,6 +256,10 @@ pub mod codes {
     pub const CHANNEL_NO_SCHEMA: &str = "SUTRA.CHANNEL.NO_SCHEMA";
     pub const CHANNEL_REPLY_NOT_EMITTABLE: &str = "SUTRA.CHANNEL.REPLY_NOT_EMITTABLE";
     pub const CHANNEL_REPLY_SCHEMALESS: &str = "SUTRA.CHANNEL.REPLY_SCHEMALESS";
+    /// A `<q:reply status>` on a process none of whose intakes is a synchronous HTTP channel
+    /// (`transport: http`, `ack-mode: on-complete`): a broker has no status to set, and an
+    /// asynchronous HTTP ack always answers 202, so the status is never sent. A warning.
+    pub const CHANNEL_REPLY_STATUS_IGNORED: &str = "SUTRA.CHANNEL.REPLY_STATUS_IGNORED";
     pub const INBOUND_CODEC_NOT_FOUND: &str = "SUTRA.INBOUND.CODEC_NOT_FOUND";
     pub const RESOLVE_TEMPLATE_UNKNOWN: &str = "SUTRA.RESOLVE.TEMPLATE.UNKNOWN";
     pub const CONFIG_CHANNEL_OUTBOUND_UNKNOWN: &str = "SUTRA.CONFIG.CHANNEL.OUTBOUND_UNKNOWN";

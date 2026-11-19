@@ -304,6 +304,7 @@ async fn a_parked_task_is_fetched_completed_and_resumes_through_the_inbound_path
         capacity_pools: Vec::new(),
         object_stores: Vec::new(),
         now_override: None,
+        connectivity_events_channel: None,
     })
     .await
     .expect("engine boots");

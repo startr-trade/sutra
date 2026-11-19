@@ -165,6 +165,7 @@ fn config_for(deployments_dir: PathBuf, url: &str) -> EngineConfig {
         capacity_pools: Vec::new(),
         object_stores: Vec::new(),
         now_override: None,
+        connectivity_events_channel: None,
     }
 }
 

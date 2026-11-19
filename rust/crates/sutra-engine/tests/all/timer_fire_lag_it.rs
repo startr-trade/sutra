@@ -247,6 +247,7 @@ async fn timer_fire_lag_stays_bounded_under_a_steady_arrival_rate() {
         capacity_pools: Vec::new(),
         object_stores: Vec::new(),
         now_override: None,
+        connectivity_events_channel: None,
     })
     .await
     .expect("engine boots");

@@ -62,10 +62,16 @@ fn strip_zone(s: &str) -> &str {
     }
 }
 
-/// ISO-8601 duration `[-]P[nY][nM][nW][nD][T[nH][nM][nS]]`. Classified by which unit *letters*
-/// were present in the date part (`Y`/`M` vs `W`/`D`), not by whether the parsed numbers happen to
-/// be zero — `P0Y`/`P0M` are still years-and-months durations (DMN-TCK 1121-feel-years-and-
-/// months-duration-function `#012`/`#013`, 0100-arithmetic cluster 2).
+/// ISO-8601 duration `[-]P[nY][nM][nW][nD][T[nH][nM][n[.f]S]]`. Classified by which unit
+/// *letters* were present in the date part (`Y`/`M` vs `W`/`D`), not by whether the parsed numbers
+/// happen to be zero — `P0Y`/`P0M` are still years-and-months durations (DMN-TCK
+/// 1121-feel-years-and-months-duration-function `#012`/`#013`, 0100-arithmetic cluster 2).
+///
+/// Seconds may carry a decimal fraction (`PT0.001S`, `PT4.123456789S`), as in the XML Schema
+/// `duration` type FEEL adopts. It is kept exactly to the nanosecond, which is the precision a
+/// days-and-time duration holds; digits past the ninth are truncated. A fraction on any other
+/// unit (`PT1.5H`) is not a FEEL duration and is refused, rather than silently cut to its
+/// integer part.
 pub fn parse_duration(s: &str) -> Option<FeelDuration> {
     let (neg, body) = match s.strip_prefix('-') {
         Some(r) => (true, r),
@@ -84,7 +90,10 @@ pub fn parse_duration(s: &str) -> Option<FeelDuration> {
     }
     let (mut years, mut months, mut days) = (0i64, 0i64, 0i64);
     let (mut has_ym, mut has_day) = (false, false);
-    for (num, unit) in date_pairs {
+    for (num, nanos, unit) in date_pairs {
+        if nanos.is_some() {
+            return None; // only seconds may be fractional
+        }
         match unit {
             'Y' => {
                 years = num;
@@ -95,34 +104,47 @@ pub fn parse_duration(s: &str) -> Option<FeelDuration> {
                 has_ym = true;
             }
             'W' => {
-                days += num * 7;
+                days = days.checked_add(num.checked_mul(7)?)?;
                 has_day = true;
             }
             'D' => {
-                days += num;
+                days = days.checked_add(num)?;
                 has_day = true;
             }
             _ => return None,
         }
     }
-    let (mut hours, mut mins, mut secs, mut has_time) = (0i64, 0i64, 0i64, false);
-    for (num, unit) in time_pairs {
+    let (mut hours, mut mins, mut secs, mut sub_nanos, mut has_time) =
+        (0i64, 0i64, 0i64, 0u32, false);
+    for (num, nanos, unit) in time_pairs {
         has_time = true;
-        match unit {
-            'H' => hours = num,
-            'M' => mins = num,
-            'S' => secs = num,
+        match (unit, nanos) {
+            ('H', None) => hours = num,
+            ('M', None) => mins = num,
+            ('S', frac) => {
+                secs = num;
+                sub_nanos = frac.unwrap_or(0);
+            }
             _ => return None,
         }
     }
     if has_ym && !has_day && !has_time {
-        let total = years * 12 + months;
-        Some(FeelDuration::YearsMonths(sign(neg, total) as i32))
+        let total = years.checked_mul(12)?.checked_add(months)?;
+        Some(FeelDuration::YearsMonths(
+            i32::try_from(sign(neg, total)).ok()?,
+        ))
     } else {
-        let total = days * 86_400 + hours * 3_600 + mins * 60 + secs;
-        Some(FeelDuration::DaysTime(time::Duration::seconds(sign(
-            neg, total,
-        ))))
+        let total = days
+            .checked_mul(86_400)?
+            .checked_add(hours.checked_mul(3_600)?)?
+            .checked_add(mins.checked_mul(60)?)?
+            .checked_add(secs)?;
+        let magnitude = time::Duration::new(total, sub_nanos as i32);
+        Some(FeelDuration::DaysTime(if neg {
+            -magnitude
+        } else {
+            magnitude
+        }))
     }
 }
 
@@ -134,26 +156,34 @@ fn sign(neg: bool, v: i64) -> i64 {
     }
 }
 
-/// Consecutive `<integer><letter>` pairs (`1Y`, `2M`, …). `None` on any stray character or a
-/// number with no trailing unit.
-fn iso_pairs(s: &str) -> Option<Vec<(i64, char)>> {
+/// Consecutive `<integer>[.<fraction>]<letter>` pairs (`1Y`, `2M`, `0.001S`, …), each with its
+/// fraction as whole nanoseconds when one was written. `None` on any stray character, a number
+/// with no trailing unit, or a malformed number (`.S`, `1.2.3S`).
+fn iso_pairs(s: &str) -> Option<Vec<(i64, Option<u32>, char)>> {
     let mut out = Vec::new();
     let mut num = String::new();
     for c in s.chars() {
         if c.is_ascii_digit() || c == '.' {
-            num.push(c); // `.` allows a fractional smallest unit (e.g. `0.000S`)
+            num.push(c);
         } else if c.is_ascii_alphabetic() {
-            if num.is_empty() {
+            let (int_part, frac) = match num.split_once('.') {
+                Some((i, f)) => (i, Some(f)),
+                None => (num.as_str(), None),
+            };
+            // XML Schema's decimal numerals: `5`, `5.`, `5.25` and `.25`, but not a lone `.`.
+            let frac_digits = frac.unwrap_or("");
+            if (int_part.is_empty() && frac_digits.is_empty())
+                || !frac_digits.bytes().all(|b| b.is_ascii_digit())
+            {
                 return None;
             }
-            // Integer part only — sub-second precision is truncated.
-            let int_part = num.split('.').next().unwrap_or("");
             let n: i64 = if int_part.is_empty() {
                 0
             } else {
                 int_part.parse().ok()?
             };
-            out.push((n, c));
+            let nanos = frac.map(fraction_nanos);
+            out.push((n, nanos, c));
             num.clear();
         } else {
             return None;
@@ -164,6 +194,16 @@ fn iso_pairs(s: &str) -> Option<Vec<(i64, char)>> {
     } else {
         None // trailing digits with no unit
     }
+}
+
+/// The decimal fraction digits `f` (all ASCII digits) as nanoseconds: right-padded to nine
+/// digits, truncated past the ninth.
+fn fraction_nanos(f: &str) -> u32 {
+    let mut digits: String = f.chars().take(9).collect();
+    while digits.len() < 9 {
+        digits.push('0');
+    }
+    digits.parse().unwrap_or(0)
 }
 
 fn parse_date(s: &str) -> Option<Date> {
@@ -431,6 +471,7 @@ pub fn format_duration(d: &FeelDuration) -> String {
                 out.push('-');
             }
             let secs = dur.whole_seconds().unsigned_abs();
+            let nanos = dur.subsec_nanoseconds().unsigned_abs();
             let (days, h, mi, se) = (
                 secs / 86_400,
                 (secs % 86_400) / 3_600,
@@ -441,7 +482,7 @@ pub fn format_duration(d: &FeelDuration) -> String {
             if days > 0 {
                 out.push_str(&format!("{days}D"));
             }
-            if h > 0 || mi > 0 || se > 0 || days == 0 {
+            if h > 0 || mi > 0 || se > 0 || nanos > 0 || days == 0 {
                 out.push('T');
                 if h > 0 {
                     out.push_str(&format!("{h}H"));
@@ -449,7 +490,11 @@ pub fn format_duration(d: &FeelDuration) -> String {
                 if mi > 0 {
                     out.push_str(&format!("{mi}M"));
                 }
-                if se > 0 || (h == 0 && mi == 0) {
+                if nanos > 0 {
+                    // The fraction as written by XML Schema: no trailing zeros.
+                    let frac = format!("{nanos:09}");
+                    out.push_str(&format!("{se}.{}S", frac.trim_end_matches('0')));
+                } else if se > 0 || (h == 0 && mi == 0) {
                     out.push_str(&format!("{se}S"));
                 }
             }

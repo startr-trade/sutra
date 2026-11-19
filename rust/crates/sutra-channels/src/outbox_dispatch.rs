@@ -391,6 +391,8 @@ pub fn encode_wire_message(
     for (name, value) in resolve_auth_headers(row, secret_env) {
         headers.insert(name, value);
     }
+    // Engine bookkeeping read from the row by the dispatcher, never a wire header.
+    headers.remove(crate::connectivity::SEND_CHANNEL_HEADER);
 
     OutboundMessage {
         destination: row.destination.clone(),
@@ -807,6 +809,9 @@ pub struct OutboxDispatcher {
     /// store the dispatcher lanes admit through. `None` = no pool declared: a request carrying
     /// a pool marker is sent without one (and the marker is still stripped).
     capacity: Option<Arc<dyn CapacityPoolStore>>,
+    /// Where a sink reports the connection changes it sees while sending, with the channel of
+    /// the row it is sending ([`crate::connectivity::current_send`]). Empty by default.
+    connectivity: crate::connectivity::ConnectivityReporter,
 }
 
 /// The call a pooled request's slot is held for: its declared call key, else the entry's id.
@@ -854,6 +859,7 @@ impl OutboxDispatcher {
             incidents: None,
             poison_notify: None,
             capacity: None,
+            connectivity: Default::default(),
         }
     }
 
@@ -863,6 +869,36 @@ impl OutboxDispatcher {
     pub fn with_capacity_pools(mut self, store: Arc<dyn CapacityPoolStore>) -> OutboxDispatcher {
         self.capacity = Some(store);
         self
+    }
+
+    /// Report the connection changes sinks see while sending through `reporter` (the engine's
+    /// [`crate::http::EngineHandle::connectivity`]).
+    #[must_use]
+    pub fn with_connectivity(
+        mut self,
+        reporter: crate::connectivity::ConnectivityReporter,
+    ) -> OutboxDispatcher {
+        self.connectivity = reporter;
+        self
+    }
+
+    /// The channel and deployment a row is sent for, when a connectivity sink is installed
+    /// and the row names its channel ([`crate::connectivity::SEND_CHANNEL_HEADER`]).
+    fn send_context(&self, row: &ClaimedOutboxRow) -> Option<crate::connectivity::SendContext> {
+        if !self.connectivity.is_enabled() {
+            return None;
+        }
+        let channel = row
+            .headers
+            .get(crate::connectivity::SEND_CHANNEL_HEADER)?
+            .clone();
+        let module_key = crate::connectivity::module_key_of_labels(&row.labels)?;
+        Some(crate::connectivity::SendContext {
+            tenant: crate::connectivity::tenant_of(&module_key).to_string(),
+            module_key,
+            channel,
+            reporter: self.connectivity.clone(),
+        })
     }
 
     /// Wire the terminal-poison notifier — the channel-call `<q:retry>` wake prompt (see the
@@ -1211,7 +1247,13 @@ impl OutboxDispatcher {
                 row.instance_id.clone(),
             );
         }
-        match sink.send(&message).await {
+        let outcome = match self.send_context(row) {
+            Some(context) => {
+                crate::connectivity::with_send_context(context, sink.send(&message)).await
+            }
+            None => sink.send(&message).await,
+        };
+        match outcome {
             SendOutcome::Delivered => true,
             // A sink that bounds its own retries: past the bound, the row takes the poison
             // posture instead of growing the backoff further.
@@ -2947,6 +2989,21 @@ mod tests {
     }
 
     // ---- wire encode (HTTP sink mode branches + m9 assertions) ------------------------------
+
+    #[test]
+    fn the_send_channel_marker_never_reaches_the_wire() {
+        let mut r = row("e1", "http://cb/", 0);
+        r.headers.insert(
+            crate::connectivity::SEND_CHANNEL_HEADER.to_string(),
+            "orders-out".to_string(),
+        );
+        r.headers.insert("x-kept".to_string(), "1".to_string());
+        let m = encode_wire_message(&r, "2026-05-20T10:00:00Z", &|_| None);
+        assert!(!m
+            .headers
+            .contains_key(crate::connectivity::SEND_CHANNEL_HEADER));
+        assert_eq!(m.headers.get("x-kept").map(String::as_str), Some("1"));
+    }
 
     #[test]
     fn native_mode_keeps_body_and_resolves_content_type() {

@@ -1,0 +1,88 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Synchronous answers with their own status and headers.
+
+    create : template body, status 201, Location + X-Request-Id
+    lookup : template body, status from FEEL (200 for id "42", else 404)
+    check  : no body; 200 with identity headers for the right token, else 401 with a challenge
+    bad    : status from the payload, so an out-of-range code is refused with a coded 500
+    later  : respond-and-continue: 201 + Location at the reply, then a detached template task
+-->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0"
+                  id="Definitions_reply_status"
+                  targetNamespace="urn:sutra:module:replies:1.0.0">
+  <bpmn:process id="create" isExecutable="true">
+    <bpmn:startEvent id="CreateStart">
+      <bpmn:extensionElements><q:source channel="items" name="req"/></bpmn:extensionElements>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="C1" sourceRef="CreateStart" targetRef="Create"/>
+    <bpmn:serviceTask id="Create" implementation="item.hbs">
+      <bpmn:extensionElements>
+        <q:reply contentType="application/json" status="201">
+          <q:header name="Location" value="'/items/' + req.id"/>
+          <q:header name="X-Request-Id" value="req.id"/>
+        </q:reply>
+      </bpmn:extensionElements>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="C2" sourceRef="Create" targetRef="CreateDone"/>
+    <bpmn:endEvent id="CreateDone"/>
+  </bpmn:process>
+
+  <bpmn:process id="lookup" isExecutable="true">
+    <bpmn:startEvent id="LookupStart">
+      <bpmn:extensionElements><q:source channel="lookup" name="req"/></bpmn:extensionElements>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="L1" sourceRef="LookupStart" targetRef="Lookup"/>
+    <bpmn:serviceTask id="Lookup" implementation="item.hbs">
+      <bpmn:extensionElements>
+        <q:reply contentType="application/json" status="if req.id = '42' then 200 else 404"/>
+      </bpmn:extensionElements>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="L2" sourceRef="Lookup" targetRef="LookupDone"/>
+    <bpmn:endEvent id="LookupDone"/>
+  </bpmn:process>
+
+  <bpmn:process id="check" isExecutable="true">
+    <bpmn:startEvent id="CheckStart">
+      <bpmn:extensionElements><q:source channel="check" name="req"/></bpmn:extensionElements>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="K1" sourceRef="CheckStart" targetRef="CheckDone"/>
+    <bpmn:endEvent id="CheckDone">
+      <bpmn:extensionElements>
+        <q:reply status="if req.token = 'good' then 200 else 401">
+          <q:header name="X-User-Id" value="if req.token = 'good' then req.user else null"/>
+          <q:header name="WWW-Authenticate" value="if req.token = 'good' then null else 'Bearer realm=&quot;sim&quot;'"/>
+        </q:reply>
+      </bpmn:extensionElements>
+    </bpmn:endEvent>
+  </bpmn:process>
+
+  <bpmn:process id="bad" isExecutable="true">
+    <bpmn:startEvent id="BadStart">
+      <bpmn:extensionElements><q:source channel="bad" name="req"/></bpmn:extensionElements>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="B1" sourceRef="BadStart" targetRef="BadDone"/>
+    <bpmn:endEvent id="BadDone">
+      <bpmn:extensionElements><q:reply status="req.code"/></bpmn:extensionElements>
+    </bpmn:endEvent>
+  </bpmn:process>
+
+  <bpmn:process id="later" isExecutable="true">
+    <bpmn:startEvent id="LaterStart">
+      <bpmn:extensionElements><q:source channel="later" name="req"/></bpmn:extensionElements>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="T1" sourceRef="LaterStart" targetRef="Accept"/>
+    <bpmn:serviceTask id="Accept" implementation="item.hbs">
+      <bpmn:extensionElements>
+        <q:reply continue="true" contentType="application/json" status="201">
+          <q:header name="Location" value="'/items/' + req.id"/>
+        </q:reply>
+      </bpmn:extensionElements>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="T2" sourceRef="Accept" targetRef="Tail"/>
+    <bpmn:serviceTask id="Tail" implementation="item.hbs"/>
+    <bpmn:sequenceFlow id="T3" sourceRef="Tail" targetRef="LaterDone"/>
+    <bpmn:endEvent id="LaterDone"/>
+  </bpmn:process>
+</bpmn:definitions>

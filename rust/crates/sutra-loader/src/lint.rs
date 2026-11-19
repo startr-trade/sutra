@@ -539,6 +539,7 @@ pub fn validate_deployment_with_manifests(
     check_start_and_wait(deployment, &definitions, &dep_label, out);
     check_feel_sites(deployment, &dep_label, out);
     check_receipt_attributes(deployment, &dep_label, out);
+    check_reply_heads(deployment, &definitions, &dep_label, out);
     check_timer_config_keys(deployment, &dep_label, out);
     out.extend(timer_expression_name_faults(deployment, &dep_label));
     check_template_inputs(deployment, &definitions, &dep_label, out);
@@ -4003,6 +4004,124 @@ fn check_receipt_attributes(
                         );
                     }
                 }
+            }
+        }
+    }
+}
+
+/// `<q:reply status>` and the response headers of a destination-less `<q:reply>`: what can be
+/// known before anything runs. A literal status must be 200–599, and a literal 3xx needs a
+/// declared `Location`; a status expression must parse; each header name must be an HTTP token
+/// the flow may set. The same codes as the refusals at the answer, which catch what only an
+/// evaluated value shows. A status on a process with no synchronous HTTP intake is pointed out,
+/// because nothing would send it.
+fn check_reply_heads(
+    deployment: &LoadedDeployment,
+    definitions: &[ChannelDefinition],
+    dep_label: &str,
+    out: &mut Vec<LintDiagnostic>,
+) {
+    use sutra_channels::codes::{OUTBOUND_REPLY_HEADER_INVALID, OUTBOUND_REPLY_STATUS_INVALID};
+    use sutra_channels::reply_head as head;
+    let mut seen = BTreeSet::new();
+    for module in deployment.processes.values() {
+        for process in module.processes() {
+            if !seen.insert(process.id.clone()) {
+                continue;
+            }
+            let mut status_nodes = Vec::new();
+            visit_nodes(process, &mut |owner, node| {
+                let Some(reply) = &owner.bindings_for(node.id()).reply else {
+                    return;
+                };
+                if reply.destination.is_some() {
+                    return;
+                }
+                let site = format!("process '{}' node '{}' <q:reply>", process.id, node.id());
+                let anchor = || DiagnosticAnchor::BpmnNode {
+                    process: process.id.clone(),
+                    node: node.id().to_string(),
+                };
+                for header in &reply.headers {
+                    if let Some(fault) = head::reply_header_name_fault(&header.name) {
+                        out.push(
+                            LintDiagnostic::error(
+                                OUTBOUND_REPLY_HEADER_INVALID,
+                                format!("deployment {dep_label}: {site}: {fault}."),
+                            )
+                            .at_anchor(anchor()),
+                        );
+                    }
+                }
+                let Some(spec) = &reply.status else {
+                    return;
+                };
+                status_nodes.push(node.id().to_string());
+                match head::parse_reply_status_spec(spec) {
+                    head::ReplyStatusSpec::Literal(status) => {
+                        let has_location = reply
+                            .headers
+                            .iter()
+                            .any(|h| h.name.eq_ignore_ascii_case("location"));
+                        if let Some(fault) = head::reply_status_fault(status, has_location) {
+                            out.push(
+                                LintDiagnostic::error(
+                                    OUTBOUND_REPLY_STATUS_INVALID,
+                                    format!("deployment {dep_label}: {site}: {fault}."),
+                                )
+                                .at_anchor(anchor()),
+                            );
+                        }
+                    }
+                    head::ReplyStatusSpec::Expression(expr) => check_feel_parses(
+                        expr,
+                        &format!("{site} status=\"{expr}\""),
+                        anchor(),
+                        dep_label,
+                        out,
+                    ),
+                }
+            });
+            if status_nodes.is_empty() {
+                continue;
+            }
+            let inbound: Vec<&ChannelDefinition> = process
+                .start_events()
+                .into_iter()
+                .filter_map(|node| match node {
+                    Node::StartEvent { channels, .. } => Some(channels),
+                    _ => None,
+                })
+                .flatten()
+                .filter_map(|channel| {
+                    definitions
+                        .iter()
+                        .find(|d| &d.binding.channel_name == channel)
+                })
+                .collect();
+            // A process with no resolvable intake (a callee, a timer start) says nothing either way.
+            if inbound.is_empty() {
+                continue;
+            }
+            let answers_synchronously = inbound.iter().any(|def| {
+                def.transport.as_deref() == Some("http")
+                    && def.effective_ack_mode().eq_ignore_ascii_case("on-complete")
+            });
+            if !answers_synchronously {
+                out.push(
+                    LintDiagnostic::warning(
+                        codes::CHANNEL_REPLY_STATUS_IGNORED,
+                        format!(
+                            "deployment {dep_label}: process '{}' sets a reply status (node {}), \
+                             but none of its intakes is a synchronous HTTP channel (transport: \
+                             http, ack-mode: on-complete). A broker has no status, and an \
+                             asynchronous ack always answers 202, so the status is never sent.",
+                            process.id,
+                            status_nodes.join(", ")
+                        ),
+                    )
+                    .at_process(&process.id),
+                );
             }
         }
     }

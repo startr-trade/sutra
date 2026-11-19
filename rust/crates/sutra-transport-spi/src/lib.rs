@@ -26,6 +26,13 @@ pub mod intake;
 pub mod leadership;
 
 pub use intake::EngineIntake;
+/// The connectivity-event seam a transport reports broker outages through: an inbound source
+/// reports via its intake's [`sutra_channels::source::InboundIntake::connectivity`], an outbound
+/// sink via [`current_send`] while the outbox dispatcher runs its `send`.
+pub use sutra_channels::connectivity::{
+    current_send, ConnectivityDirection, ConnectivityEvent, ConnectivityReporter, ConnectivitySink,
+    SendContext,
+};
 pub use sutra_channels::{EndpointClaim, EndpointSharing};
 
 /// A resolver for `env:` / `secret:` / `vault:` references + `${…}` placeholders — the

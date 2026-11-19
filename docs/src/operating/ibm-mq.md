@@ -112,6 +112,11 @@ when it starts and once when it ends, with its start, end and length:
 
 The walkthrough below shows both lines from a real restart.
 
+The same outage can also reach the package as messages, so a deployment can record its own
+outage windows: set `SUTRA_CONNECTIVITY_EVENTS_CHANNEL` and declare that channel
+(see [Broker connectivity events](configuration.md#broker-connectivity-events) and
+[Broker outages as messages](connectivity-events.md)).
+
 An AMQP channel that was running when the queue manager stopped starts again with it. What MQ keeps
 across the restart is MQ's rule, not the engine's: persistent messages (`durable=true`) are kept, and
 so are non-persistent ones on a queue defined with `NPMCLASS(HIGH)` after a normal shutdown; other
@@ -341,7 +346,7 @@ docker run -d --name mqdemo-engine --network mqdemo-net -p 127.0.0.1::8080 \
   -e SUTRA_SINK_AMQP_USERNAME=app \
   -e SUTRA_SINK_AMQP_PASSWORD="$MQ_PASSWORD" \
   -e SUTRA_SINK_AMQP_TLS_CA_FILE=/etc/sutra/mq-ca.pem \
-  ghcr.io/startr-trade/sutra:0.7.0
+  ghcr.io/startr-trade/sutra:0.8.0
 PORT=$(docker port mqdemo-engine 8080 | head -1 | cut -d: -f2)
 until curl -sf "http://127.0.0.1:$PORT/sutra/health/ready"; do sleep 1; done
 ```

@@ -31,6 +31,8 @@ mod lint_raw_body_test;
 mod lint_receipt_attribute_test;
 #[path = "all/lint_relay_channel_test.rs"]
 mod lint_relay_channel_test;
+#[path = "all/lint_reply_head_test.rs"]
+mod lint_reply_head_test;
 #[path = "all/lint_selector_test.rs"]
 mod lint_selector_test;
 #[path = "all/lint_start_and_wait_test.rs"]

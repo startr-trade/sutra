@@ -246,6 +246,13 @@ pub struct EngineConfig {
     /// Rust code that holds a `TestClock` — see `sutra_engine::fast_forward_until` for the paired
     /// test helper.
     pub now_override: Option<sutra_executor::TestClock>,
+    /// The channel broker connectivity events are delivered on
+    /// (`sutra.engine.connectivity-events.channel`, env `SUTRA_CONNECTIVITY_EVENTS_CHANNEL`).
+    /// When set, each outage start and end a transport reports for one of a deployment's
+    /// channels is delivered to that deployment as an inbound JSON message on this channel, if
+    /// the deployment declares it (normally as `transport: local`). Unset (the default): no
+    /// events are collected.
+    pub connectivity_events_channel: Option<String>,
 }
 
 impl Default for EngineConfig {
@@ -280,6 +287,7 @@ impl Default for EngineConfig {
             capacity_pools: Vec::new(),
             object_stores: Vec::new(),
             now_override: None,
+            connectivity_events_channel: None,
         }
     }
 }
@@ -993,6 +1001,12 @@ impl EngineConfig {
         };
         let capacity_pools = parse_capacity_pools(file, &value)?;
         let object_stores = parse_object_stores(file, &value)?;
+        let connectivity_events_channel = value(
+            "sutra.engine.connectivity-events.channel",
+            "SUTRA_CONNECTIVITY_EVENTS_CHANNEL",
+        )?
+        .map(|raw| raw.trim().to_string())
+        .filter(|name| !name.is_empty());
 
         Ok(EngineConfig {
             deployment_source,
@@ -1080,6 +1094,7 @@ impl EngineConfig {
             // Deliberately not read from `file`/`env` — see the field doc: the ONLY way to set
             // this is constructing an `EngineConfig` from Rust code, never config-driven.
             now_override: None,
+            connectivity_events_channel,
         })
     }
 }

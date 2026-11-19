@@ -230,6 +230,7 @@ async fn boot_soak(package_dir: PathBuf, datasource_url: &str) -> RunningEngine 
         capacity_pools: Vec::new(),
         object_stores: Vec::new(),
         now_override: None,
+        connectivity_events_channel: None,
     })
     .await
     .expect("the engine boots at sutra.engine.shards = 4")

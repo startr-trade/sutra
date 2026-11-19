@@ -367,6 +367,29 @@ fn duration_results() {
     );
 }
 
+/// A FEEL duration with a fraction of a second schedules exactly that long: neither the FEEL
+/// result nor the persisted definition drops the milliseconds.
+#[test]
+fn sub_second_duration_results_keep_their_fraction() {
+    let value =
+        sutra_feel::expressions::eval(r#"duration("PT0.001S")"#, &Default::default()).unwrap();
+    assert_eq!(
+        duration_from_feel_value(&value).unwrap(),
+        std::time::Duration::from_millis(1)
+    );
+    let def = resolve_timer_expression_value(TimerExpressionForm::Duration, &value).unwrap();
+    assert_eq!(def, TimerDefinition::Duration("PT0.001S".into()));
+    let now = time::macros::datetime!(2026-11-19 10:00:00 UTC);
+    assert_eq!(
+        def.first_due_at(now).unwrap(),
+        time::macros::datetime!(2026-11-19 10:00:00.001 UTC)
+    );
+    assert_eq!(
+        duration_from_feel_value(&FeelValue::String("PT1.25S".into())).unwrap(),
+        std::time::Duration::from_millis(1_250)
+    );
+}
+
 #[test]
 fn instant_and_cycle_results() {
     let at =

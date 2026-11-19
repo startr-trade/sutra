@@ -267,6 +267,7 @@ async fn boot(deployments_dir: PathBuf, datasource_url: String) -> RunningEngine
         capacity_pools: Vec::new(),
         object_stores: Vec::new(),
         now_override: None,
+        connectivity_events_channel: None,
     })
     .await
     .expect("engine boots")

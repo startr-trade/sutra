@@ -56,6 +56,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, info, warn};
 
 use sutra_channels::auth::{BrokerInboundAuth, InboundScheme, InboundVerdict};
+use sutra_channels::connectivity::{ConnectivityDirection, ConnectivityEvent};
 use sutra_channels::diag::Diagnostic;
 use sutra_channels::dispatch::InboundMessage;
 use sutra_channels::sink::BoxFuture;
@@ -350,6 +351,14 @@ async fn supervise(
     // The outage in progress, from the first failed connect or the lost connection until the
     // next attach. Both ends are logged, so the window can be read from the log.
     let mut outage: Option<OutageWindow> = None;
+    // The same two ends, reported to the engine for the owning deployment (a no-op unless the
+    // engine has connectivity events configured).
+    let connectivity = intake.connectivity();
+    let report = |code: &str, started: String, ended: Option<(String, u64)>| {
+        if connectivity.is_enabled() {
+            connectivity.report(inbound_connectivity_event(&config, code, started, ended));
+        }
+    };
     loop {
         if stop.is_requested() {
             return;
@@ -371,6 +380,7 @@ async fn supervise(
                         outage_started = %window.started(),
                         "amqp consumer has no broker connection; retrying"
                     );
+                    report(codes::INBOUND_BROKER_OUTAGE_STARTED, window.started(), None);
                     outage = Some(window);
                 }
                 // NON-FATAL: WARN + retry in the background; readiness unaffected.
@@ -403,6 +413,11 @@ async fn supervise(
                         outage_ms = ended.millis as u64,
                         "amqp consumer reconnected after an outage"
                     );
+                    report(
+                        codes::INBOUND_BROKER_OUTAGE_ENDED,
+                        ended.started,
+                        Some((ended.ended, ended.millis as u64)),
+                    );
                 }
                 // First successful attach: release anyone blocked in `start()`. Fired once; later
                 // reconnects find the receiver already taken and simply skip it.
@@ -425,11 +440,40 @@ async fn supervise(
                             outage_started = %window.started(),
                             "amqp consumer stream failed — reconnecting"
                         );
+                        report(codes::INBOUND_BROKER_OUTAGE_STARTED, window.started(), None);
                         outage = Some(window);
                     }
                 }
             }
         }
+    }
+}
+
+/// The connectivity event for one end of an inbound outage: `ended` carries the end time and
+/// the length once the consumer is attached again.
+fn inbound_connectivity_event(
+    config: &AmqpSourceConfig,
+    code: &str,
+    started_at: String,
+    ended: Option<(String, u64)>,
+) -> ConnectivityEvent {
+    let (ended_at, millis) = match ended {
+        Some((at, ms)) => (Some(at), Some(ms)),
+        None => (None, None),
+    };
+    ConnectivityEvent {
+        tenant: config.tenant.clone(),
+        module_key: config.module_key.clone(),
+        code: code.to_string(),
+        channel: config.channel.clone(),
+        direction: ConnectivityDirection::Inbound,
+        started_at,
+        ended_at,
+        millis,
+        detail: format!(
+            "amqp broker {}:{}",
+            config.properties.host, config.properties.port
+        ),
     }
 }
 

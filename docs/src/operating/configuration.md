@@ -205,6 +205,47 @@ configuration.
 
 Full picture: [Execution lanes](../architecture/execution-lanes.md).
 
+## Broker connectivity events
+
+| Key | Default | Meaning |
+|---|---|---|
+| `sutra.engine.connectivity-events.channel` (env `SUTRA_CONNECTIVITY_EVENTS_CHANNEL`) | unset | *(0.8.0)* A channel name. When set, every broker outage a transport sees on one of a deployment's channels is delivered to that deployment as an inbound JSON message on the channel of this name, if the deployment declares one. Unset: nothing is collected. |
+
+Declare the channel in the package as an in-process intake and start a process on it:
+
+```yaml
+channels:
+  - name: connectivity-in
+    transport: local
+    codec: json
+```
+
+Each outage produces two messages, one when it starts and one when it ends:
+
+```json
+{"code":"SUTRA.INBOUND.AMQP.OUTAGE_ENDED","channel":"orders-in","direction":"inbound","state":"up",
+ "startedAt":"2026-11-19T10:00:00.120Z","endedAt":"2026-11-19T10:01:00.420Z","ms":60300,
+ "detail":"amqp broker mq.example:5672"}
+```
+
+- `state` is `down` when the outage starts (no `endedAt` or `ms`) and `up` when it ends.
+- `code` is the transport's own log code for the change, so the message and the engine log line
+  match.
+- `direction: inbound` is an intake losing its connection. `direction: outbound` is a send
+  channel whose send could not reach its broker; each send channel that sent during the outage
+  reports its own window, ending on its first send that reaches the broker again. A send
+  channel that sent nothing during the outage reports nothing.
+- A deployment only receives events for its own channels. One that declares no channel of the
+  configured name receives nothing.
+- Delivery is best effort: up to 1024 events wait per deployment; past that the oldest is
+  dropped and `SUTRA.CONNECTIVITY.EVENTS_DROPPED` is logged. An event the deployment refuses is
+  logged as `SUTRA.CONNECTIVITY.EVENT_UNDELIVERED` and never retried.
+- The AMQP 1.0 transport reports these events. Transports without a long-lived broker
+  connection (HTTP, for example) report none.
+
+[Broker outages as messages](connectivity-events.md) runs it against a broker that is stopped and
+started.
+
 ## Limits
 
 | `sutra.*` key | env |

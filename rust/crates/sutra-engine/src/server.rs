@@ -532,6 +532,7 @@ pub async fn serve(config: EngineConfig) -> Result<RunningEngine, Box<dyn std::e
         config.outbox_tuning,
         outbox_signal.clone(),
         dispatch_pool.clone(),
+        config.connectivity_events_channel.clone(),
     )?;
     let crate::assembly::EngineRuntime {
         router: channel_routes,

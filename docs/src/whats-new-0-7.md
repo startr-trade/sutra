@@ -3,6 +3,8 @@
 Engine 0.7.0 adds one attribute to the `q:` namespace, so a process can delete a data-store row.
 The addition is backward compatible: a package written for 0.6 loads and runs unchanged. What
 changes on upgrade is listed in [Upgrading to 0.7.0](operating/upgrading-0-7-0.md).
+0.7.0 published its CLI and crates but no engine image; the first image with these features is
+0.8.0 (see [Upgrading to 0.8.0](operating/upgrading-0-8-0.md)).
 
 | Feature | What it gives you | Try it |
 |---|---|---|

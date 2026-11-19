@@ -298,9 +298,17 @@ pub struct EngineHandle {
     /// claim bounces — execution scale-out §6.1). Router-lifetime: it survives
     /// activation flips, so the exporter reads one stable registry.
     metrics: Arc<ShardRouterMetrics>,
+    /// Where transports report broker connectivity changes: empty (a no-op) until the engine
+    /// installs a sink, which every clone of the handle then shares.
+    connectivity: crate::connectivity::ConnectivityReporter,
 }
 
 impl EngineHandle {
+    /// The reporter the transports wired to this engine report connectivity changes through.
+    pub fn connectivity(&self) -> crate::connectivity::ConnectivityReporter {
+        self.connectivity.clone()
+    }
+
     fn arrival_shard(&self) -> &ShardSender {
         let count = self.shards.len();
         let index = if count == 1 {
@@ -983,6 +991,7 @@ where
         shards: Arc::from(lanes),
         arrival: Arc::new(AtomicUsize::new(0)),
         metrics,
+        connectivity: Default::default(),
     }
 }
 
@@ -1380,14 +1389,22 @@ fn accepted_response(
         duplicate,
         facts,
     };
-    let mut response = match reply {
-        Some(r) => response_with(StatusCode::ACCEPTED, &r.content_type, r.body.into_inner()),
+    // The status stays 202 whatever the reply declares: on an asynchronous channel it is the
+    // acceptance the caller relies on, not the outcome of the work. The reply's headers ride along.
+    let (body, reply_headers) = match reply {
+        Some(r) if r.has_body => (Some((r.content_type, r.body.into_inner())), r.headers),
+        Some(r) => (None, r.headers),
+        None => (None, Vec::new()),
+    };
+    let mut response = match body {
+        Some((content_type, bytes)) => response_with(StatusCode::ACCEPTED, &content_type, bytes),
         None => response_with(
             StatusCode::ACCEPTED,
             "application/json",
             receipt.to_json().to_string().into_bytes(),
         ),
     };
+    append_reply_headers(&mut response, reply_headers);
     let headers = response.headers_mut();
     if let Some(value) = receipt
         .instance_id
@@ -1415,9 +1432,42 @@ fn render_ok(
         _ => "application/octet-stream".to_string(),
     };
     if let Some(reply) = reply {
-        return response_with(StatusCode::OK, &reply.content_type, reply.body.into_inner());
+        // Range-checked when the reply rendered, so it is a valid status; OK is a fallback that
+        // cannot be reached.
+        let status = reply
+            .status
+            .and_then(|s| StatusCode::from_u16(s).ok())
+            .unwrap_or(StatusCode::OK);
+        // A 204 or 304 carries no content, so neither a body nor its type is sent.
+        let mut response = if status == StatusCode::NO_CONTENT || status == StatusCode::NOT_MODIFIED
+        {
+            status.into_response()
+        } else {
+            response_with(status, &reply.content_type, reply.body.into_inner())
+        };
+        append_reply_headers(&mut response, reply.headers);
+        return response;
     }
     response_with(StatusCode::OK, &symmetric, Vec::new())
+}
+
+/// Add the reply's declared headers to `response`, in order, a repeated name as another field
+/// line. Names and values were checked when the reply rendered; one that still does not convert
+/// is skipped rather than answered malformed.
+fn append_reply_headers(
+    response: &mut Response,
+    headers: Vec<(String, sutra_executor::Sensitive<String>)>,
+) {
+    let map = response.headers_mut();
+    for (name, value) in headers {
+        let (Ok(name), Ok(value)) = (
+            axum::http::HeaderName::from_bytes(name.as_bytes()),
+            axum::http::HeaderValue::from_bytes(value.get().as_bytes()),
+        ) else {
+            continue;
+        };
+        map.append(name, value);
+    }
 }
 
 /// A `text/event-stream` response over the remaining frames of a streamed chain: `chunk`

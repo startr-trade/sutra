@@ -113,6 +113,16 @@ pub struct SyncReply {
     /// The synchronous reply payload — wrapped [`Sensitive`] (see [`InboundMessage::body`]).
     pub body: sutra_executor::Sensitive<Vec<u8>>,
     pub content_type: String,
+    /// The status `<q:reply status>` resolved to, already range-checked; `None` keeps the
+    /// transport's default.
+    pub status: Option<u16>,
+    /// The response headers the reply's `<q:header>`s resolved to, in declaration order (a
+    /// repeated name is a second field line). Names are checked; values are wrapped so a logged
+    /// reply never shows them.
+    pub headers: Vec<(String, sutra_executor::Sensitive<String>)>,
+    /// Whether the flow rendered a body. `false` for a reply that answers only with a status or
+    /// headers: its `body` is empty, and an asynchronous ack keeps its receipt as the body.
+    pub has_body: bool,
 }
 
 /// Outcome of a dispatch — plain data (Send) so transports can cross threads with it.
@@ -1886,6 +1896,7 @@ impl ChannelEngine {
         for emission in emissions.iter_mut() {
             self.validate_emission(module_key, deployment, host_channel, process, emission)?;
             self.stamp_capacity_pool(module_key, process, emission);
+            stamp_send_channel(process, emission);
             stamp_media_capture(process, emission);
             if self.audit_listener.is_some() {
                 stamp_audit_journal(process, emission);
@@ -4648,9 +4659,13 @@ impl ChannelEngine {
                     &format!("The reply of process '{}'", process.id),
                 )?
                 .unwrap_or(bytes);
+            let (status, headers) = self.reply_head(process, exec)?;
             return Ok(Some(SyncReply {
                 body: bytes.into(),
                 content_type,
+                status,
+                headers,
+                has_body: true,
             }));
         }
         if let Some(reply_object) = exec.output("responseObject") {
@@ -4674,6 +4689,7 @@ impl ChannelEngine {
                         &format!("The reply of process '{}'", process.id),
                     )?
                     .unwrap_or(bytes);
+                let (status, headers) = self.reply_head(process, exec)?;
                 // Native reply: the wire content-type mirrors the inbound.
                 return Ok(Some(SyncReply {
                     body: bytes.into(),
@@ -4681,10 +4697,139 @@ impl ChannelEngine {
                         .content_type
                         .clone()
                         .unwrap_or_else(|| "application/octet-stream".to_string()),
+                    status,
+                    headers,
+                    has_body: true,
                 }));
             }
         }
+        // No body, but a status or headers to answer with: a 401 with its challenge, a 204, an
+        // auth check's 200 with identity headers.
+        if declares_reply_head(process, exec) {
+            let (status, headers) = self.reply_head(process, exec)?;
+            return Ok(Some(SyncReply {
+                body: Vec::new().into(),
+                content_type,
+                status,
+                headers,
+                has_body: false,
+            }));
+        }
         Ok(None)
+    }
+
+    /// The status and headers of the synchronous reply: `<q:reply status>` and the `<q:header>`s
+    /// of the reply that speaks (the visited destination-less `<q:reply>`, the same one whose
+    /// `contentType` applies), evaluated against the variables the reply renders with.
+    ///
+    /// A value that cannot answer is refused here, before anything reaches the caller, and the
+    /// caller gets a 500 naming the code. Diagnostics name the header, never its value: a
+    /// response header is often an identity or a challenge.
+    #[allow(clippy::type_complexity)]
+    fn reply_head(
+        &self,
+        process: &ProcessDefinition,
+        exec: &sutra_executor::ExecResult,
+    ) -> Result<
+        (
+            Option<u16>,
+            Vec<(String, sutra_executor::Sensitive<String>)>,
+        ),
+        Diagnostic,
+    > {
+        use crate::reply_head as head;
+        let Some((node_id, reply)) = speaking_sync_reply(process, exec) else {
+            return Ok((None, Vec::new()));
+        };
+        let refuse = |code: &str, message: String| {
+            Diagnostic::error(code, message)
+                .with_attribute("processId", &process.id)
+                .with_attribute("nodeId", node_id)
+        };
+        let ctx = exec.outputs.to_feel_context();
+        let mut headers = Vec::new();
+        for header in &reply.headers {
+            if let Some(fault) = head::reply_header_name_fault(&header.name) {
+                return Err(refuse(
+                    codes::OUTBOUND_REPLY_HEADER_INVALID,
+                    format!(
+                        "The reply of process '{}' at node '{node_id}': {fault}.",
+                        process.id
+                    ),
+                ));
+            }
+            let value = sutra_feel::expressions::eval(&header.value, &ctx).map_err(|e| {
+                refuse(
+                    codes::OUTBOUND_REPLY_HEADER_INVALID,
+                    format!(
+                        "The reply of process '{}' at node '{node_id}': header '{}' could not \
+                         be evaluated: {}",
+                        process.id, header.name, e.code
+                    ),
+                )
+            })?;
+            if value.is_null() {
+                continue;
+            }
+            let text = sutra_feel::value::canonical_string_of(&value);
+            if !head::reply_header_value_ok(&text) {
+                return Err(refuse(
+                    codes::OUTBOUND_REPLY_HEADER_INVALID,
+                    format!(
+                        "The reply of process '{}' at node '{node_id}': header '{}' resolved to \
+                         a value with a control character (CR, LF, NUL, ...), which cannot be \
+                         written as a header.",
+                        process.id, header.name
+                    ),
+                ));
+            }
+            headers.push((header.name.clone(), text.into()));
+        }
+        let Some(spec) = reply.status.as_deref() else {
+            return Ok((None, headers));
+        };
+        let status = match head::parse_reply_status_spec(spec) {
+            head::ReplyStatusSpec::Literal(status) => Some(status),
+            head::ReplyStatusSpec::Expression(expr) => {
+                let value = sutra_feel::expressions::eval(expr, &ctx).map_err(|e| {
+                    refuse(
+                        codes::OUTBOUND_REPLY_STATUS_INVALID,
+                        format!(
+                            "The reply of process '{}' at node '{node_id}': its status could not \
+                             be evaluated: {}",
+                            process.id, e.code
+                        ),
+                    )
+                })?;
+                head::reply_status_of_value(&value).map_err(|kind| {
+                    refuse(
+                        codes::OUTBOUND_REPLY_STATUS_INVALID,
+                        format!(
+                            "The reply of process '{}' at node '{node_id}': its status \
+                             evaluated to {kind}, not a whole number.",
+                            process.id
+                        ),
+                    )
+                })?
+            }
+        };
+        let Some(status) = status else {
+            return Ok((None, headers));
+        };
+        let has_location = headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("location"));
+        if let Some(fault) = head::reply_status_fault(status, has_location) {
+            return Err(refuse(
+                codes::OUTBOUND_REPLY_STATUS_INVALID,
+                format!(
+                    "The reply of process '{}' at node '{node_id}': {fault}.",
+                    process.id
+                ),
+            ));
+        }
+        // In range, so it fits.
+        Ok((Some(status as u16), headers))
     }
 
     /// Mint the per-dispatch intake id — the owner key in the (per-lane) in-memory alias
@@ -7654,6 +7799,32 @@ fn visited_reply_content_type(
     None
 }
 
+/// The `<q:reply>` whose status and headers answer the request: the first VISITED one with no
+/// destination, found the same way as [`visited_reply_content_type`] so the two never disagree
+/// about which reply is speaking.
+fn speaking_sync_reply<'p>(
+    process: &'p ProcessDefinition,
+    exec: &sutra_executor::ExecResult,
+) -> Option<(&'p str, &'p sutra_bpmn::qbindings::ReplyBinding)> {
+    process.nodes().iter().find_map(|node| {
+        if !exec.visited_nodes.contains(node.id()) {
+            return None;
+        }
+        match &process.bindings_for(node.id()).reply {
+            Some(reply) if reply.destination.is_none() => Some((node.id(), reply)),
+            _ => None,
+        }
+    })
+}
+
+/// Whether the speaking reply declares a status or headers at all — so a reply whose status
+/// resolved `null` and whose headers all resolved `null` still answers as a declared head (an
+/// empty 200), exactly as it would with values.
+fn declares_reply_head(process: &ProcessDefinition, exec: &sutra_executor::ExecResult) -> bool {
+    speaking_sync_reply(process, exec)
+        .is_some_and(|(_, reply)| reply.status.is_some() || !reply.headers.is_empty())
+}
+
 /// A reply infers no codec: it is validated only against one stated on the `<q:reply>` itself.
 ///
 /// The tempting fallback is the inbound channel's codec, since a destination-less reply rides
@@ -7744,6 +7915,31 @@ fn audit_journal_policy(process: &ProcessDefinition) -> String {
             sutra_bpmn::qbindings::AuditCapture::Metadata,
             None,
         ),
+    }
+}
+
+/// Name the channel a send goes out on ([`crate::connectivity::SEND_CHANNEL_HEADER`]), so the
+/// outbox dispatcher can tell the sink which channel's connection it is using. A send to a bare
+/// destination names no channel and is left unmarked. Removed again before the wire.
+fn stamp_send_channel(process: &ProcessDefinition, emission: &mut sutra_executor::Emission) {
+    if emission.kind != sutra_executor::EmissionKind::Send {
+        return;
+    }
+    let channel = channel_call_name(process, &emission.node_id).or_else(|| {
+        process
+            .bindings_for(&emission.node_id)
+            .send
+            .as_ref()
+            .and_then(|send| send.channel.clone())
+    });
+    if let Some(channel) = channel
+        .map(|c| c.trim().to_string())
+        .filter(|c| !c.is_empty())
+    {
+        emission.headers.insert(
+            crate::connectivity::SEND_CHANNEL_HEADER.to_string(),
+            channel,
+        );
     }
 }
 

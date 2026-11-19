@@ -223,9 +223,15 @@ pub struct ReplyBinding {
     /// park + self-resume the remaining nodes asynchronously. Meaningful on a non-terminal
     /// `serviceTask`; `false` is the synchronous reply (caller waits for completion).
     pub continue_after: bool,
+    /// `@status` — the status a synchronous HTTP answer carries, as written: digits are a literal,
+    /// any other text is a FEEL expression over the variables the reply renders against. `None`
+    /// keeps the transport's default (200, or 202 on an asynchronous-ack channel). Held as source
+    /// text; `sutra-channels` parses, evaluates and range-checks it.
+    pub status: Option<String>,
     /// Author-declared `<q:header>` attributes; each `value` is FEEL over the
     /// sending process context, resolved at dispatch and carried as a transport header. A reply leg
-    /// is itself a coverage hop, so header carriage lands here symmetrically with `<q:send>`.
+    /// is itself a coverage hop, so header carriage lands here symmetrically with `<q:send>`. On a
+    /// destination-less reply that answers an HTTP request they are the response's headers.
     pub headers: Vec<HeaderAttr>,
 }
 

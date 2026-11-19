@@ -3111,6 +3111,7 @@ fn parse_reply(ext: &XmlElement, host_id: &str) -> Result<Option<ReplyBinding>, 
         auth_header: opt_attr(r, "authHeader"),
         message_type: opt_attr(r, "messageType"),
         continue_after: r.attr_or_empty("continue") == "true",
+        status: opt_attr(r, "status"),
         headers: parse_headers(r, host_id, "q:reply")?,
     }))
 }

@@ -1,0 +1,8 @@
+# Deployment package for the reply-status conformance suite: synchronous HTTP answers that set
+# their own status and response headers with <q:reply status> and <q:header>.
+labels:
+  "module": "replies"
+  "tenant": "default"
+  "version": "1.0.0"
+engine:
+  minContract: 1

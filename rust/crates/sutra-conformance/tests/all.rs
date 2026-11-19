@@ -54,6 +54,8 @@ mod tc_outbox_relay;
 mod tc_password_sign_in;
 #[path = "all/tc_raw_message.rs"]
 mod tc_raw_message;
+#[path = "all/tc_reply_status.rs"]
+mod tc_reply_status;
 #[path = "all/tc_shard_lanes.rs"]
 mod tc_shard_lanes;
 #[path = "all/tc_snapshot_upgrade.rs"]

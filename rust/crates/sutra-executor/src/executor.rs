@@ -2150,6 +2150,7 @@ impl TokenExecutor {
             auth_header: None,
             message_type: None,
             continue_after: false,
+            status: None,
             headers: Vec::new(),
         };
         let cloud_event = if resolved.mode == ReplyMode::Native {
@@ -6120,6 +6121,7 @@ fn send_as_reply(sb: &SendBinding, destination: Option<String>) -> ReplyBinding 
         auth_header: sb.auth_header.clone(),
         message_type: sb.message_type.clone(),
         continue_after: false,
+        status: None,
         headers: sb.headers.clone(),
     }
 }

@@ -227,6 +227,7 @@ async fn the_first_delivery_after_start_is_as_prompt_as_the_next() {
         capacity_pools: Vec::new(),
         object_stores: Vec::new(),
         now_override: None,
+        connectivity_events_channel: None,
     })
     .await
     .expect("engine boots");

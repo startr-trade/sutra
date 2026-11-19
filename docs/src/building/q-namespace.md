@@ -19,9 +19,9 @@ and the same XSD drives the `sutra-modeler-plugin` property panels.
 | `q:source` | start events, wait-capable nodes | The inbound trigger: channel, message type, ack mode, dedup, data class. |
 | `q:validators` / `q:redactors` | `q:source` | The validation and redaction chains over the decoded payload. |
 | `q:alias` | wait-capable nodes | A correlation key derived by FEEL — how a later inbound finds the parked instance. |
-| `q:reply` | tasks | An outbound reply on the inbound's own channel; `continue="true"` is respond-and-continue. |
+| `q:reply` | tasks, end events | An outbound reply on the inbound's own channel; `continue="true"` is respond-and-continue (reply now, keep executing detached); `status` (0.8.0) sets the HTTP status of a synchronous answer. |
 | `q:send` | throw events, send tasks | An unsolicited outbound message to a channel destination. |
-| `q:header` | `q:send` / `q:reply` | An author-declared outbound header. |
+| `q:header` | `q:send` / `q:reply` | An author-declared outbound header; on a synchronous `q:reply`, an HTTP response header (0.8.0). |
 | `q:decode` | data task (`bpmn:serviceTask` with no `@implementation`) | Parses text the flow holds, such as a message kept in a typed store column, with a registered codec, and binds the result (0.6.19). |
 | `q:param` | `bpmn:serviceTask` | A scoped, per-invocation input to a registered task or template. |
 | `q:retry` | registered-task **and** channel-call `bpmn:serviceTask` | Per-task retry policy — attempts, backoff, non-retryable codes. |
@@ -195,6 +195,46 @@ gets its answer without waiting on the tail of the flow.
 
 A flow with no `<q:reply>` answers a synchronous HTTP call with `200` and an empty body; see
 [Upgrading to 0.6.18](../operating/upgrading-0-6-18.md).
+
+### Status and response headers (0.8.0)
+
+On a synchronous HTTP channel (`ack-mode: on-complete`, the HTTP default), a `<q:reply>` with no
+`destination` can set the status, and its `<q:header>` children become the response's headers:
+
+```xml
+<q:reply contentType="application/json" status="201">
+  <q:header name="Location" value="'/items/' + req.id"/>
+  <q:header name="X-Request-Id" value="req.id"/>
+</q:reply>
+```
+
+`status` is literal first, else FEEL. Digits alone (`"201"`) are the status. Any other text is a
+FEEL expression over the variables the reply renders against (`"if found then 200 else 404"`). It
+must give a whole number or a string of digits, and `null` keeps the default. Without the attribute
+the answer is 200, as before. Headers are evaluated like a `<q:send>`'s: a `null` value leaves the
+header out, and a repeated name adds another field line. A reply that declares a status or headers
+answers with them even when the flow rendered no body, so a 401 with its challenge needs no
+template.
+
+| Rule | At deploy (`sutra lint`) | At the answer |
+|---|---|---|
+| The status is 200–599. A 1xx is not a final answer. | A literal outside is refused. | A value outside, a fraction, or a non-number is a 500. |
+| A 3xx needs a `Location` header. | A literal 3xx with no `Location` header is refused. | A 3xx whose `Location` is `null` is a 500. |
+| A 204 or 304 carries no body. | — | Body and `Content-Type` are not sent. |
+| A header name is an HTTP token. | Refused otherwise. | — |
+| The flow may not set `Connection`, `Keep-Alive`, `Proxy-Connection`, `Transfer-Encoding`, `TE`, `Trailer`, `Upgrade`, `Content-Length`, `Content-Type` (use `contentType`) or any `Sutra-*` name. | Refused. | — |
+| A header value has no control character (CR, LF, NUL, …). | — | A 500. |
+
+The status refusals use `SUTRA.OUTBOUND.REPLY_STATUS_INVALID`, the header ones
+`SUTRA.OUTBOUND.REPLY_HEADER_INVALID`. The 500 is the usual `application/problem+json`. It names
+the header, never its value.
+
+The status applies at the end of the flow, at a `<q:reply continue="true">`, and on the answer to a
+relayed message. An `ack-mode: on-persist` channel always answers 202, and adds the reply's headers
+next to its receipt. A broker intake has no status. `sutra lint` warns about both
+(`SUTRA.CHANNEL.REPLY_STATUS_IGNORED`). A `<q:reply>` with a `destination` goes out of band, and its
+headers travel with it as before. [Answering with a status and headers](reply-status-and-headers.md)
+walks through it.
 
 ```mermaid
 sequenceDiagram

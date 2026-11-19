@@ -322,6 +322,7 @@ async fn one_sync_post_exports_traces_metrics_and_logs_over_otlp() {
         capacity_pools: Vec::new(),
         object_stores: Vec::new(),
         now_override: None,
+        connectivity_events_channel: None,
     })
     .await
     .expect("engine boots");

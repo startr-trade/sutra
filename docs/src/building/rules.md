@@ -35,6 +35,37 @@ gateway condition or a `q:alias` expression without deploying anything. See
 [Crates: sutra-feel and sutra-dmn](../reference/crates.md) if you want FEEL evaluation embedded in
 your own Rust project, independent of the engine.
 
+### Durations with fractional seconds
+
+*Since 0.8.0.* A days-and-time duration holds its seconds to the nanosecond (digits past the ninth
+are cut off), through parsing, `string()`, comparison, arithmetic with dates, times and other
+durations, multiplication and division by a number, and the `seconds` accessor. Seconds take XML
+Schema's decimal forms (`PT0.5S`, `PT.5S`, `PT0.S`). From `sutra explain`:
+
+```text
+$ sutra explain 'duration("PT0.001S")'
+duration("PT0.001S")  =>  PT0.001S
+$ sutra explain 'duration("PT4.5S").seconds'
+duration("PT4.5S").seconds  =>  4.5
+$ sutra explain 'string(duration("P1DT2H3M4.123456789S"))'
+string(duration("P1DT2H3M4.123456789S"))  =>  P1DT2H3M4.123456789S
+$ sutra explain 'duration("PT1.5S") * 3'
+duration("PT1.5S") * 3  =>  PT4.5S
+$ sutra explain 'date and time("2026-11-19T10:00:00Z") + duration("PT0.250S")'
+date and time("2026-11-19T10:00:00Z") + duration("PT0.250S")  =>  2026-11-19T10:00:00.25Z
+```
+
+Only seconds take a fraction. Until 0.7.0 the parser dropped everything after the decimal point, so
+`duration("PT0.001S")` was zero and `duration("PT1.5H")` was one hour; now the second is refused:
+
+```text
+$ sutra explain 'duration("PT1.5H")'
+[ERROR] SUTRA.FEEL.COMPILE.TYPE_MISMATCH — duration() cannot parse the string (feel:inline:1:1)
+```
+
+Write `PT1H30M` instead. A [timer whose FEEL expression](retries-history-schedules.md#timer-intervals-from-feel)
+returns `duration("PT0.001S")` now waits 1 ms instead of firing at once.
+
 ### Password hashing
 
 Two builtins let a flow check a password against a stored hash without ever storing the password

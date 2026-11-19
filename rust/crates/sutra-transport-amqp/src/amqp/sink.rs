@@ -50,6 +50,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use sutra_channels::connectivity::{ConnectivityDirection, ConnectivityEvent, SendContext};
 
 use fe2o3_amqp::types::messaging::{ApplicationProperties, Header, Message, Properties, Target};
 use fe2o3_amqp::types::primitives::{Binary, Symbol};
@@ -96,6 +97,10 @@ pub struct AmqpMessageSink {
     /// Brokers (`host:port`) that the last send could not reach, with when that started. The
     /// first send that reaches one again logs the window and removes it.
     outages: Mutex<HashMap<String, OutageWindow>>,
+    /// The same windows per sending channel, `(broker, module key, channel)`, kept only while
+    /// the engine collects connectivity events: each channel that sends during an outage
+    /// reports its own down, and its own up on its first send that reaches the broker again.
+    channel_outages: Mutex<HashMap<(String, String, String), OutageWindow>>,
 }
 
 impl AmqpMessageSink {
@@ -113,6 +118,7 @@ impl AmqpMessageSink {
             tls_config: Mutex::new(None),
             operation_timeout: DEFAULT_OPERATION_TIMEOUT,
             outages: Mutex::new(HashMap::new()),
+            channel_outages: Mutex::new(HashMap::new()),
         }
     }
 
@@ -216,6 +222,9 @@ impl AmqpMessageSink {
         if reach == Reach::Unknown {
             return;
         }
+        if let Some(context) = sutra_channels::connectivity::current_send() {
+            self.report_channel_outage(&broker, unreachable, context);
+        }
         let mut outages = self
             .outages
             .lock()
@@ -243,6 +252,57 @@ impl AmqpMessageSink {
                 outage_ms = ended.millis as u64,
                 "amqp sink reached the broker again"
             );
+        }
+    }
+}
+
+impl AmqpMessageSink {
+    /// The per-channel half of [`Self::record_outage`]: report the sending channel's outage
+    /// start and end to the engine for the deployment that sent.
+    fn report_channel_outage(&self, broker: &str, unreachable: bool, context: SendContext) {
+        let key = (
+            broker.to_string(),
+            context.module_key.clone(),
+            context.channel.clone(),
+        );
+        let mut outages = self
+            .channel_outages
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let event = |code: &str, started_at: String, ended: Option<(String, u64)>| {
+            let (ended_at, millis) = match ended {
+                Some((at, ms)) => (Some(at), Some(ms)),
+                None => (None, None),
+            };
+            ConnectivityEvent {
+                tenant: context.tenant.clone(),
+                module_key: context.module_key.clone(),
+                code: code.to_string(),
+                channel: context.channel.clone(),
+                direction: ConnectivityDirection::Outbound,
+                started_at,
+                ended_at,
+                millis,
+                detail: format!("amqp broker {broker}"),
+            }
+        };
+        if unreachable {
+            if let std::collections::hash_map::Entry::Vacant(slot) = outages.entry(key) {
+                let window = OutageWindow::begin();
+                context.reporter.report(event(
+                    codes::OUTBOUND_BROKER_OUTAGE_STARTED,
+                    window.started(),
+                    None,
+                ));
+                slot.insert(window);
+            }
+        } else if let Some(window) = outages.remove(&key) {
+            let ended = window.end();
+            context.reporter.report(event(
+                codes::OUTBOUND_BROKER_OUTAGE_ENDED,
+                ended.started,
+                Some((ended.ended, ended.millis as u64)),
+            ));
         }
     }
 }

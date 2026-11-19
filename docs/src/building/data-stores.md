@@ -982,7 +982,7 @@ for r in a b; do
     -e SUTRA_ADMIN_OIDC_DEV_DISABLED=true \
     -e ITEMS_DB_URL=postgres://items-db:5432/postgres \
     -e ITEMS_DB_USER=sutra_engine -e ITEMS_DB_PASSWORD=dev-only \
-    -e ITEMS_API_KEY=dev-only-items-key ghcr.io/startr-trade/sutra:0.7.0
+    -e ITEMS_API_KEY=dev-only-items-key ghcr.io/startr-trade/sutra:0.8.0
   until curl -sf -o /dev/null "http://127.0.0.1:$(docker port items-$r 8080 | head -1 | cut -d: -f2)/sutra/health/ready"; do
     sleep 1
   done

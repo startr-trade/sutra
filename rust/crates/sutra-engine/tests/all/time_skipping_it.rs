@@ -353,6 +353,7 @@ async fn boot(deployments_dir: PathBuf, datasource_url: String, clock: TestClock
         capacity_pools: Vec::new(),
         object_stores: Vec::new(),
         now_override: Some(clock),
+        connectivity_events_channel: None,
     })
     .await
     .expect("engine boots")

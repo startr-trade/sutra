@@ -365,7 +365,7 @@ fn parse_local_destination(destination: &str) -> Option<(String, String, String)
 /// `sutra_transport_spi::EngineIntake`): the engine actor being gone. Everything else under
 /// `SUTRA.RUNTIME.UNEXPECTED` is a dispatch crash and stays a permanent reject.
 #[cfg(feature = "transport")]
-fn is_engine_unavailable(diagnostic: &Diagnostic) -> bool {
+pub(crate) fn is_engine_unavailable(diagnostic: &Diagnostic) -> bool {
     diagnostic.code == crate::codes::RUNTIME_UNEXPECTED
         && diagnostic.message == "engine actor is not running"
 }

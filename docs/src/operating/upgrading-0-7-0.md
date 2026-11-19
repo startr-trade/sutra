@@ -9,6 +9,9 @@ to a process instead of refusing it. **The AMQP 1.0 transport works with IBM MQ.
 what they send** and resolve secret references in their own bundle files. One migration, V103, runs
 at first boot on PostgreSQL. There is no archive or snapshot format change.
 
+**0.7.0 has no engine image.** Its CLI archives and crates were published; its image was not (see
+[Upgrading to 0.8.0](upgrading-0-8-0.md)). Engine image users take these changes with 0.8.0.
+
 ## Before you upgrade
 
 **Check these against what you run:**

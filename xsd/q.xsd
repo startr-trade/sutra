@@ -323,6 +323,26 @@
     <xsd:attribute name="auth" type="q:OutboundAuthScheme"/>
     <xsd:attribute name="authSecretRef" type="xsd:string"/>
     <xsd:attribute name="authHeader" type="xsd:string"/>
+    <xsd:attribute name="status" type="xsd:string">
+      <xsd:annotation>
+        <xsd:documentation>
+          The HTTP status of the synchronous answer (since 0.8.0). Literal first, else FEEL: digits
+          only are the status ("201"); any other text is a FEEL expression over the variables the
+          reply renders against ("if found then 200 else 404"), giving a whole number or a string
+          of digits. null keeps the default (200). Absent = 200, as before.
+
+          A status is 200-599 (a 1xx is not a final answer). A 3xx needs a Location
+          &lt;q:header&gt;. A 204 or 304 is sent without a body. A literal that breaks these rules
+          is refused at deploy; an expression that evaluates to one is refused at the answer with
+          a 500 (SUTRA.OUTBOUND.REPLY_STATUS_INVALID).
+
+          Applies where the reply answers a synchronous HTTP request (ack-mode: on-complete),
+          including continue="true" and a relayed turn's answer. An ack-mode: on-persist channel
+          always answers 202, and a broker has no status: there it is ignored, with a lint warning
+          (SUTRA.CHANNEL.REPLY_STATUS_IGNORED).
+        </xsd:documentation>
+      </xsd:annotation>
+    </xsd:attribute>
     <xsd:attribute name="continue" type="xsd:boolean" default="false">
       <xsd:annotation>
         <xsd:documentation>
@@ -411,6 +431,13 @@
         attribute / Pub-Sub attribute — one concept across transports (the traceparent /
         sutra-outbox-key carriage). Enables header-carried hop correlation keys; a null result is
         omitted. Hop key ≠ idempotencyKey — this is correlation, not delivery dedup.
+
+        On a &lt;q:reply&gt; with no @destination that answers an HTTP request, each header is a
+        response header (since 0.8.0); a repeated @name adds another field line. @name must be an
+        HTTP token, and may not be one the HTTP layer or the engine sets itself: Connection,
+        Keep-Alive, Proxy-Connection, Transfer-Encoding, TE, Trailer, Upgrade, Content-Length,
+        Content-Type (use @contentType) or any Sutra-* name. A value with a control character
+        (CR, LF, NUL, ...) is refused with a 500. Both use SUTRA.OUTBOUND.REPLY_HEADER_INVALID.
       </xsd:documentation>
     </xsd:annotation>
   </xsd:element>

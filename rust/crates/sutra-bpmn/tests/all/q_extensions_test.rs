@@ -737,6 +737,40 @@ fn reply_with_headers_defaults_to_empty_when_absent() {
 }
 
 #[test]
+fn reply_status_is_kept_as_written_and_absent_by_default() {
+    let bpmn = |reply: &str| {
+        format!(
+            r#"<?xml version="1.0"?>
+        <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                          xmlns:q="urn:sutra:q:1.0">
+          <bpmn:process id="p1">
+            <bpmn:startEvent id="S"/>
+            <bpmn:endEvent id="E">
+              <bpmn:extensionElements>{reply}</bpmn:extensionElements>
+            </bpmn:endEvent>
+            <bpmn:sequenceFlow id="f1" sourceRef="S" targetRef="E"/>
+          </bpmn:process>
+        </bpmn:definitions>"#
+        )
+    };
+    let status_of = |reply: &str| {
+        let module = load(&bpmn(reply)).unwrap();
+        let process = module.process("p1").unwrap();
+        process.bindings_for("E").reply.clone().unwrap().status
+    };
+    assert_eq!(
+        status_of(r#"<q:reply status="201"/>"#).as_deref(),
+        Some("201")
+    );
+    assert_eq!(
+        status_of(r#"<q:reply status="if found then 200 else 404"/>"#).as_deref(),
+        Some("if found then 200 else 404")
+    );
+    assert_eq!(status_of("<q:reply/>"), None);
+    assert_eq!(status_of(r#"<q:reply status="  "/>"#), None);
+}
+
+#[test]
 fn header_without_name_emits_diagnostic() {
     let bpmn = r#"<?xml version="1.0"?>
         <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"

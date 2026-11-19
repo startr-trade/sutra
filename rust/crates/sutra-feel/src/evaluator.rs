@@ -2712,7 +2712,14 @@ fn field_access(v: &FeelValue, field: &str) -> FeelValue {
                 "days" => num(signed(mag / 86_400)),
                 "hours" => num(signed((mag % 86_400) / 3_600)),
                 "minutes" => num(signed((mag % 3_600) / 60)),
-                "seconds" => num(signed(mag % 60)),
+                // The seconds component keeps its fraction (`PT4.5S` → 4.5): a days-and-time
+                // duration holds nanoseconds, and the accessor must not hide them.
+                "seconds" => {
+                    let nanos = (mag % 60) * 1_000_000_000
+                        + i64::from(d.subsec_nanoseconds().unsigned_abs());
+                    let nanos = if d.is_negative() { -nanos } else { nanos };
+                    FeelValue::Number(BigDecimal::new(BigInt::from(nanos), 9).normalized())
+                }
                 _ => FeelValue::Null,
             }
         }
@@ -3252,7 +3259,7 @@ fn add_durations(a: &FeelDuration, b: &FeelDuration, sub: bool) -> Option<FeelVa
 }
 
 /// `duration * number` / `number * duration` — the multiplier is a general (possibly fractional)
-/// FEEL number; the exact product of the duration's base-unit count (months / seconds) against
+/// FEEL number; the exact product of the duration's base-unit count (months / nanoseconds) against
 /// the full-precision multiplier is computed first, and only THEN truncated to the integer count
 /// the duration type requires (DMN-TCK 0100-arithmetic cluster 1 — the previous implementation
 /// truncated the multiplier itself to an integer *before* multiplying).
@@ -3263,10 +3270,22 @@ fn scale_duration(a: &FeelDuration, n: &BigDecimal) -> Option<FeelValue> {
             FeelDuration::YearsMonths(total.to_i64()?.try_into().ok()?)
         }
         FeelDuration::DaysTime(d) => {
-            let total = crate::numeric::mul(&BigDecimal::from(d.whole_seconds()), n);
-            FeelDuration::DaysTime(time::Duration::seconds(total.to_i64()?))
+            let total = crate::numeric::mul(&nanos_of(d), n);
+            FeelDuration::DaysTime(duration_from_nanos(total.to_i128()?)?)
         }
     }))
+}
+
+/// A days-and-time duration as an exact count of nanoseconds, its full precision.
+fn nanos_of(d: &time::Duration) -> BigDecimal {
+    BigDecimal::new(BigInt::from(d.whole_nanoseconds()), 0)
+}
+
+/// The days-and-time duration of `nanos` nanoseconds; `None` past the range a duration holds.
+fn duration_from_nanos(nanos: i128) -> Option<time::Duration> {
+    let secs = i64::try_from(nanos / 1_000_000_000).ok()?;
+    let sub = (nanos % 1_000_000_000) as i32;
+    Some(time::Duration::new(secs, sub))
 }
 
 /// `duration / number` — same exact-product-then-truncate fix as [`scale_duration`]; the
@@ -3281,8 +3300,8 @@ fn div_duration(a: &FeelDuration, n: &BigDecimal) -> Option<FeelValue> {
             FeelDuration::YearsMonths(q.to_i64()?.try_into().ok()?)
         }
         FeelDuration::DaysTime(d) => {
-            let q = crate::numeric::div(&BigDecimal::from(d.whole_seconds()), n);
-            FeelDuration::DaysTime(time::Duration::seconds(q.to_i64()?))
+            let q = crate::numeric::div(&nanos_of(d), n);
+            FeelDuration::DaysTime(duration_from_nanos(q.to_i128()?)?)
         }
     }))
 }

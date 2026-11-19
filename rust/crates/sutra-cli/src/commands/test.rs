@@ -352,6 +352,7 @@ async fn run_inner(
         datasource_password: args.datasource.password.clone(),
         rls_bypass_check_enabled: rls_bypass_check_enabled_from_env(),
         now_override: Some(clock.clone()),
+        connectivity_events_channel: None,
         ..EngineConfig::default()
     };
     // `--timeout` bounds the boot too: a boot that never completes (an unreachable store, a

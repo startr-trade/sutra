@@ -455,6 +455,9 @@ pub(crate) fn build_engine_runtime(
     // The DISPATCH pool (`sutra.datasource.dispatch-max-connections`) the outbox dispatcher
     // draws from, so it never waits behind the lanes for a connection. `None` = use `pool`.
     dispatch_pool: Option<PgPool>,
+    // `sutra.engine.connectivity-events.channel`: where broker connectivity events go, if
+    // anywhere.
+    connectivity_events_channel: Option<String>,
 ) -> Result<EngineRuntime, Box<dyn std::error::Error>> {
     // Channel topology comes from the ACTIVE plans, plus the channels a superseded DRAINING plan
     // keeps because nothing newer declares them. Any other draining definition claims no route: it
@@ -520,6 +523,21 @@ pub(crate) fn build_engine_runtime(
             )
         },
     );
+
+    // Broker connectivity events, when configured: installed before any transport is wired, so
+    // an outage that starts at boot is reported too. Each event goes to the deployment owning
+    // the channel, on the configured channel of that deployment.
+    if let Some(channel) = connectivity_events_channel.as_deref() {
+        sutra_channels::connectivity::ChannelConnectivityDelivery::install(
+            &engine_handle,
+            channel,
+            &handle,
+        );
+        tracing::info!(
+            channel = %channel,
+            "broker connectivity events are delivered to each deployment's '{channel}' channel"
+        );
+    }
 
     // Broker consumers for every registered vendor transport, wired GENERICALLY
     // (domain-neutrality refactor). Each `sutra-transport-<vendor>` crate self-registers a
@@ -687,6 +705,9 @@ pub(crate) fn build_engine_runtime(
         if let Some(incidents) = outbox_incidents {
             dispatcher_build = dispatcher_build.with_incident_sink(incidents);
         }
+        // A sink that sees its broker connection drop or return reports it for the channel of
+        // the row it is sending (a no-op unless connectivity events are configured).
+        dispatcher_build = dispatcher_build.with_connectivity(engine_handle.connectivity());
         // A request on a pooled outbound channel waits here until its call holds a slot.
         if let Some(capacity) = capacity.clone() {
             dispatcher_build = dispatcher_build.with_capacity_pools(capacity);

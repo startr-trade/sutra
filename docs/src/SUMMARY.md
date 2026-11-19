@@ -1,6 +1,7 @@
 # Summary
 
 [Introduction](introduction.md)
+[What's new in 0.8](whats-new-0-8.md)
 [What's new in 0.7](whats-new-0-7.md)
 [What's new in 0.6](whats-new-0-6.md)
 
@@ -27,6 +28,7 @@
 - [A reply answers the instance waiting for it](building/waits-first.md)
 - [Upgrading a deployment in place](building/upgrading-in-place.md)
 - [Acceptance receipts](building/acceptance-receipts.md)
+- [Answering with a status and headers](building/reply-status-and-headers.md)
 - [External tasks: the pull worker surface](building/external-tasks.md)
 - [Retries, history, and schedules](building/retries-history-schedules.md)
 - [Escaping free text in an XML template](building/escaping-xml-in-templates.md)
@@ -62,6 +64,7 @@
 - [References in connection properties](operating/connection-references.md)
 - [Connecting to a TLS and SASL broker](operating/broker-tls-sasl.md)
 - [Connecting the engine to IBM MQ](operating/ibm-mq.md)
+- [Broker outages as messages](operating/connectivity-events.md)
 - [Tuning for throughput](operating/throughput-tuning.md)
 - [Limits and quotas](operating/limits.md)
 - [Capacity pools and sessions](operating/capacity-pools.md)
@@ -75,6 +78,7 @@
 - [Upgrading to 0.6.21](operating/upgrading-0-6-21.md)
 - [Upgrading to 0.6.22](operating/upgrading-0-6-22.md)
 - [Upgrading to 0.6.25](operating/upgrading-0-6-25.md)
+- [Upgrading to 0.8.0](operating/upgrading-0-8-0.md)
 - [Upgrading to 0.7.0](operating/upgrading-0-7-0.md)
 
 # Reference

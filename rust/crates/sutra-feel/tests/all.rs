@@ -6,6 +6,8 @@ mod feel_determinism;
 mod feel_expressions;
 #[path = "all/feel_external_functions.rs"]
 mod feel_external_functions;
+#[path = "all/feel_fractional_durations.rs"]
+mod feel_fractional_durations;
 #[path = "all/feel_intervals.rs"]
 mod feel_intervals;
 #[path = "all/feel_parse_spaced_builtins.rs"]

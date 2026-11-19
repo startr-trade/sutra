@@ -68,6 +68,12 @@ impl InboundIntake for EngineIntake {
             }
         })
     }
+
+    /// The engine's reporter: connectivity changes a source reports reach the deployment that
+    /// owns its channel when the engine has connectivity events configured.
+    fn connectivity(&self) -> sutra_channels::connectivity::ConnectivityReporter {
+        self.handle.connectivity()
+    }
 }
 
 /// The decision for a dispatch that answered. All of them are the engine's to own. A dead letter

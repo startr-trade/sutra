@@ -238,6 +238,15 @@ pub const OUTBOUND_VALIDATION_REJECT: &str = "SUTRA.OUTBOUND.VALIDATION_REJECT";
 /// was valid, and the codec could not apply its last transform (a signature, for example, when
 /// its key is unusable). Fail-closed for the same reason as a validation reject.
 pub const OUTBOUND_SEAL_FAILED: &str = "SUTRA.OUTBOUND.SEAL_FAILED";
+/// A `<q:reply status>` cannot answer: outside 200–599, a redirect with no `Location` header, or
+/// an expression whose value is not a whole number. Refused by the deploy-time lint when the
+/// status is a literal, and at the answer (a 500) when an expression gives a bad value.
+pub const OUTBOUND_REPLY_STATUS_INVALID: &str = "SUTRA.OUTBOUND.REPLY_STATUS_INVALID";
+/// A `<q:header>` on a synchronous `<q:reply>` cannot be a response header: its name is not an
+/// HTTP token or is one the HTTP layer or the engine sets itself, or its value holds a control
+/// character. Refused by the lint for the name, and at the answer (a 500) for the value. The
+/// diagnostic names the header, never its value.
+pub const OUTBOUND_REPLY_HEADER_INVALID: &str = "SUTRA.OUTBOUND.REPLY_HEADER_INVALID";
 /// A deployment's codec could not resolve the references its own configuration names (its
 /// `PayloadCodec::bind_refs` returned an error), so the deployment is refused rather than
 /// started with a codec that would fail every message. The diagnostic names the codec and the

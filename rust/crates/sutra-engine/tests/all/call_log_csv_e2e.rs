@@ -72,6 +72,7 @@ fn config_for(deployments_dir: PathBuf) -> EngineConfig {
         capacity_pools: Vec::new(),
         object_stores: Vec::new(),
         now_override: None,
+        connectivity_events_channel: None,
     }
 }
 

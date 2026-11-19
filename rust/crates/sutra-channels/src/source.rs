@@ -209,6 +209,12 @@ pub trait InboundIntake: Send + Sync {
             DeliveryDisposition::Settle(self.deliver(message).await)
         })
     }
+
+    /// Where the source reports its broker connectivity changes (connection lost, connection
+    /// back). The default reports nowhere; the engine's intake answers the engine's reporter.
+    fn connectivity(&self) -> crate::connectivity::ConnectivityReporter {
+        crate::connectivity::ConnectivityReporter::default()
+    }
 }
 
 /// One inbound transport consumer serving ONE channel binding — the singleton unit the

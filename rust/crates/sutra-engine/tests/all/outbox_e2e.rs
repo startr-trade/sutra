@@ -269,6 +269,7 @@ async fn three_emissions_from_one_instance_all_deliver() {
         capacity_pools: Vec::new(),
         object_stores: Vec::new(),
         now_override: None,
+        connectivity_events_channel: None,
     })
     .await
     .expect("engine boots");

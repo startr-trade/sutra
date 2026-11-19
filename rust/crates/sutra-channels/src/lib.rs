@@ -55,6 +55,7 @@ pub mod policy;
 pub mod receipt;
 pub mod redaction;
 pub mod registry;
+pub mod reply_head;
 pub mod shard_metrics;
 pub mod sink;
 pub mod stores;
@@ -64,6 +65,8 @@ pub mod validators;
 // --- async TRANSPORT spine (feature `transport`, on by default; tokio/axum/hyper) ---
 #[cfg(feature = "transport")]
 pub mod audit;
+#[cfg(feature = "transport")]
+pub mod connectivity;
 #[cfg(feature = "transport")]
 pub mod dispatch;
 #[cfg(feature = "transport")]

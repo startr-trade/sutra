@@ -1,0 +1,14 @@
+# What's new in 0.8
+
+Engine 0.8.0 adds one attribute to the `q:` namespace, so a flow can choose the status and headers
+of a synchronous HTTP answer. The addition is backward compatible: a package written for 0.7 or 0.6
+loads and runs unchanged. What changes on upgrade is listed in
+[Upgrading to 0.8.0](operating/upgrading-0-8-0.md). 0.8.0 is also the first engine image since
+0.6.25: 0.7.0 published no image, so everything in [What's new in 0.7](whats-new-0-7.md) arrives
+with it.
+
+| Feature | What it gives you | Try it |
+|---|---|---|
+| **Status and headers on a synchronous answer** | `<q:reply status="201">` (digits or FEEL) and the reply's `<q:header>` children set the HTTP status and response headers, so a flow can answer like a REST API or an auth check. | [Answering with a status and headers](building/reply-status-and-headers.md) |
+| **Broker outages as messages** | With `sutra.engine.connectivity-events.channel` set, each outage start and end the AMQP transport sees on a deployment's channel reaches that deployment as a JSON message. | [Broker outages as messages](operating/connectivity-events.md) |
+| **FEEL durations keep fractional seconds** | `duration("PT0.001S")` is one millisecond, not zero, through parsing, `string()`, arithmetic, comparison and `.seconds`. | [Durations with fractional seconds](building/rules.md#durations-with-fractional-seconds) |

@@ -11,6 +11,73 @@ This is the changelog for the **Rust-native** engine (`rust/` workspace). It beg
 
 ## [Unreleased]
 
+## [0.8.0] — 2026-11-19
+
+**2026-11-19.** **A synchronous HTTP answer sets its own status and headers**
+(`<q:reply status>` and the reply's `<q:header>` children). It adds an attribute to the frozen
+`q:` namespace (`xsd/q.xsd`, `urn:sutra:q:1.0`), which is why this is 0.8.0; the addition is
+backward compatible and existing packages load and run unchanged. **Broker outages can reach the
+deployment as messages.** **FEEL durations keep fractional seconds** (a fraction on any other unit
+is now refused, and `.seconds` returns the fraction). No migration, no archive or snapshot format
+change. **There is no 0.7.0 engine image or GitHub Release:** the 0.7.0 release run stopped at the
+image scan on CVE-2026-95690, so 0.7.0 image users move straight to 0.8.0, which carries every
+0.7.0 change.
+
+### Added
+
+- **A synchronous HTTP answer sets its own status and headers** (`q:` namespace addition;
+  backward compatible). `<q:reply status="201">` takes digits or a FEEL
+  expression (`"if found then 200 else 404"`); `null` keeps 200. The `<q:header>` children of a
+  `<q:reply>` with no `destination` become the response's headers, and a reply that declares
+  either answers with them even with no body, so a flow can answer 201 with `Location`, 401 with
+  `WWW-Authenticate`, or an auth check's 200 with identity headers. A status is 200–599, a 3xx
+  needs a `Location`, and a 204 or 304 is sent with no body. The flow may not set
+  `Connection`, `Keep-Alive`, `Proxy-Connection`, `Transfer-Encoding`, `TE`, `Trailer`,
+  `Upgrade`, `Content-Length`, `Content-Type` or any `Sutra-*` header. `sutra lint` refuses a bad
+  literal status or header name (`SUTRA.OUTBOUND.REPLY_STATUS_INVALID`,
+  `SUTRA.OUTBOUND.REPLY_HEADER_INVALID`). An expression that evaluates to an invalid status, or a
+  header value with a control character, is a 500 with the same codes, naming the header and
+  never its value. Applies at the end of a flow, at `<q:reply continue="true">` and on a relayed
+  turn's answer. An `ack-mode: on-persist` channel still answers 202 (the headers are added), and a
+  non-HTTP intake has no status. `sutra lint` warns about either
+  (`SUTRA.CHANNEL.REPLY_STATUS_IGNORED`). Without the attribute and headers, answers are
+  unchanged.
+- `sutra_channels::reply_head` (the status and header rules, shared by the lint and the HTTP
+  answer); `SyncReply` gains `status`, `headers` and `has_body`; `ReplyBinding` gains `status`.
+
+- **Broker connectivity events reach the deployment.** With
+  `sutra.engine.connectivity-events.channel` (env `SUTRA_CONNECTIVITY_EVENTS_CHANNEL`) set, each
+  broker outage start and end a transport sees on a deployment's channel is delivered to that
+  deployment as a JSON message on the channel of that name (declare it `transport: local`,
+  `codec: json`): `code`, `channel`, `direction`, `state` (`down`/`up`), `startedAt`, and on `up`
+  also `endedAt` and `ms`, plus `detail`. The AMQP transport reports its intakes and each send
+  channel that sent during an outage. Best effort: 1024 events queue per deployment, the oldest
+  dropped past that (`SUTRA.CONNECTIVITY.EVENTS_DROPPED`). No change to the `q:` namespace or to
+  any stored format.
+- Transport SPI: `ConnectivityReporter`, `ConnectivityEvent` and `current_send()` in
+  `sutra_channels::connectivity` (re-exported by `sutra-transport-spi`), plus the default
+  method `InboundIntake::connectivity()`, a no-op unless the engine installs a sink. Existing
+  transports compile unchanged and report nothing.
+
+### Fixed
+
+- **FEEL durations keep fractional seconds.** `duration("PT0.001S")` evaluated to zero, since the
+  parser dropped everything after the decimal point. A days-and-time duration now holds its seconds
+  to the nanosecond (digits past the ninth are truncated) through parsing, `string()`
+  (`PT0.001S`, `P1DT2H3M4.123456789S`), comparison, arithmetic with dates, times and other
+  durations, multiplication and division by a number, and the `seconds` accessor, which now returns
+  the fraction (`duration("PT4.5S").seconds` is `4.5`). Seconds accept XML Schema's decimal forms
+  (`PT0.5S`, `PT.5S`, `PT0.S`). A fraction on any other unit (`PT1.5H`) is refused instead of being
+  cut to its integer part. Duration timers already kept sub-second precision; a FEEL timer
+  expression that returns `duration("PT0.001S")` now schedules 1 ms instead of 0.
+
+### Security
+
+- CVE-2026-95690 (libssl3, DTLS, in the distroless base; no fixed Debian package) is time-boxed in
+  `.trivyignore.yaml` to 2026-12-16: the engine never loads libssl3 (`readelf -d` on the 0.8.0
+  binary lists libgcc_s, libm, libc and the loader only, and the binary names no libssl to load)
+  and speaks no DTLS.
+
 ## [0.7.0] — 2026-11-19
 
 **2026-11-19.** **A data task can delete a store row** with `<q:store key="…" delete="true"/>`. It

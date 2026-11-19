@@ -240,7 +240,17 @@ pub(crate) async fn boot_archive_engine(
     deployments_dir: PathBuf,
     datasource_url: Option<String>,
 ) -> RunningEngine {
-    serve(EngineConfig {
+    serve(archive_engine_config(deployments_dir, datasource_url))
+        .await
+        .expect("engine boots")
+}
+
+/// The configuration [`boot_archive_engine`] boots, for a test that changes one key first.
+pub(crate) fn archive_engine_config(
+    deployments_dir: PathBuf,
+    datasource_url: Option<String>,
+) -> EngineConfig {
+    EngineConfig {
         deployment_source: DeploymentSourceKind::Dir,
         crypto_master_key: None,
         crypto_envelope: Default::default(),
@@ -270,9 +280,8 @@ pub(crate) async fn boot_archive_engine(
         capacity_pools: Vec::new(),
         object_stores: Vec::new(),
         now_override: None,
-    })
-    .await
-    .expect("engine boots")
+        connectivity_events_channel: None,
+    }
 }
 
 // ---- tiny blocking HTTP client -------------------------------------------------------------
@@ -622,6 +631,17 @@ pub(crate) struct Capture {
 }
 
 impl Capture {
+    /// The bodies delivered to `path`, in arrival order.
+    pub(crate) fn bodies(&self, path: &str) -> Vec<Vec<u8>> {
+        self.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(p, _)| p == path)
+            .map(|(_, body)| body.clone())
+            .collect()
+    }
+
     pub(crate) fn delivered(&self, path: &str) -> usize {
         self.requests
             .lock()
@@ -788,6 +808,7 @@ pub(crate) async fn boot_db_engine_with_pools(
         capacity_pools: Vec::new(),
         object_stores: Vec::new(),
         now_override: None,
+        connectivity_events_channel: None,
     })
     .await
     .expect("engine boots on the db deployment source")
