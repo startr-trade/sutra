@@ -97,7 +97,10 @@ The engine marks such a refusal *wait-pending* (`sutra.waitPending=true` on the 
 milliseconds (155 ms in all, about one step), and then retried with the outbox backoff for up to
 8 attempts — about four minutes. If the instance still has not parked by then, the delivery takes
 the outbox's usual poison posture: kept with its last error and redelivered at the poison horizon,
-so nothing is lost. An answer for an instance that has finished is never wait-pending. *Since 0.6.7* a
+so nothing is lost. *Since 0.7.0* an answer for an instance that has finished is not wait-pending: when every
+instance that carried the answer's key has ended, the refusal carries no `sutra.waitPending`
+and its detail says the instance has ended. The engine can tell while the finished instance is
+retained (`sutra.instance.retention`, seven days by default). *Since 0.6.7* a
 `local://` delivery whose step failed because the database was unreachable (a reset connection, a
 restart) is retried the same way, without the bound, instead of being parked at the poison horizon. A message
 from outside the engine (HTTP, a broker) keeps the transport's own handling, because the engine
@@ -120,6 +123,54 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 46 filtered out; fin
 All 20 answers arrive while their instances sit at the timer, and all 20 instances complete, each
 called back once. On a 0.6.5 engine the same test fails after 90 seconds with every answer still in
 the outbox, refused with `SUTRA.RUNTIME.RELAY.CORRELATION_NOT_FOUND` and parked at the poison horizon.
+
+### An answer no instance waits for
+
+*Since 0.7.0.* An answer that correlates to no live instance (a reply after its instance ended,
+a key nothing ever carried) is refused with `SUTRA.RUNTIME.RELAY.CORRELATION_NOT_FOUND`, and
+recorded whatever transport carried it:
+
+- a WARN log line with the code `SUTRA.INBOUND.RELAY_UNCORRELATED`, naming the channel, the
+  message type, the dedup key and the correlation keys looked for (`keys=orderKey=B-9`); never
+  the body or the headers;
+- an `inbound.RELAY_UNCORRELATED` record in the deployment's audit journal, with no instance id.
+  Its `diagnostic_json` holds `channel`, `deployment`, `messageType`, `dedupKey`, `keys` (each
+  with `process`, `node`, `alias`, `value`, `ended`), `ended` and `outcome`.
+
+A key value is masked in both when the alias, or a variable its expression reads, is `sensitive`,
+or when a redactor masks its input.
+
+A package can take such an answer instead of refusing it, with no BPMN change, by naming a
+process on the channel in `channels.yaml`:
+
+```yaml
+channels:
+  - name: order-confirm
+    transport: http
+    bind: "POST /orders/confirm"
+    codec: json
+    uncorrelated:
+      start: late-confirmation   # a process of this package with a start event on order-confirm
+```
+
+That process's start events on the channel are reserved for answers no wait correlates:
+ordinary start resolution passes them over, so an answer that correlates still resumes its
+instance and starts nothing. Its `<q:source>` still decides which uncorrelated answers it takes.
+The started instance reads `event.uncorrelated`: `code`, `keys` (alias name to the raw value
+looked for) and `ended`. The audit record then says `outcome: started`, with `startedProcess`
+and `instanceId`.
+
+To watch both, run the conformance suite (Docker, and the engine image built from your checkout
+with `make image`):
+
+```bash
+cd rust && cargo test -p sutra-conformance --test all tc_uncorrelated_relay -- --ignored --nocapture
+```
+
+```text
+test tc_uncorrelated_relay::tc_uncorrelated_relay_a_refused_answer_is_recorded_and_wait_pending_only_while_it_may_park ... ok
+test tc_uncorrelated_relay::tc_uncorrelated_relay_a_routed_answer_starts_the_named_process_and_correlation_is_unaffected ... ok
+```
 
 ## Variables survive the wait **typed**
 

@@ -192,3 +192,86 @@ async fn delete_hard_removes_the_row_unlike_retire() {
         "delete must remove the row entirely, not just flag it live=false"
     );
 }
+
+/// The relay path's "has every instance that carried this key ended?": only a retired row whose
+/// instance is terminal or gone, with no live row, answers yes.
+#[ignore = "docker"]
+#[tokio::test]
+async fn owned_only_by_ended_needs_a_retired_row_of_a_finished_instance_and_no_live_one() {
+    let pool = fresh_pool().await;
+    let store = PgAliasStore::new(pool.clone());
+    let running = Uuid::new_v4();
+    let finished = Uuid::new_v4();
+    let gone = Uuid::new_v4();
+    let dep = dep_a();
+
+    // A key nothing ever carried: cannot tell.
+    assert!(!store
+        .owned_only_by_ended(&dep, "orderId", "NEVER")
+        .await
+        .unwrap());
+
+    // A live key.
+    store
+        .record(&dep, gone, "orderId", "GONE", true)
+        .await
+        .unwrap();
+    assert!(!store
+        .owned_only_by_ended(&dep, "orderId", "GONE")
+        .await
+        .unwrap());
+    // Retired, and its instance has no row (retention 0 deleted it): ended.
+    store.retire(&dep, gone).await.unwrap();
+    assert!(store
+        .owned_only_by_ended(&dep, "orderId", "GONE")
+        .await
+        .unwrap());
+
+    // Retired while its instance still runs (a loop that left the wait): not ended.
+    for (instance, terminal) in [(running, false), (finished, true)] {
+        sqlx::query(
+            "INSERT INTO instance_state (deployment_id, instance_id, serialised, terminal_at) \
+             VALUES ($1, $2, '\\x00', CASE WHEN $3 THEN now() ELSE NULL END)",
+        )
+        .bind(dep.as_str())
+        .bind(instance)
+        .bind(terminal)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    store
+        .record(&dep, running, "orderId", "LOOP", false)
+        .await
+        .unwrap();
+    store.retire(&dep, running).await.unwrap();
+    assert!(!store
+        .owned_only_by_ended(&dep, "orderId", "LOOP")
+        .await
+        .unwrap());
+
+    // Retired, its instance terminal: ended — unless another instance carries it live.
+    store
+        .record(&dep, finished, "orderId", "DONE", false)
+        .await
+        .unwrap();
+    store.retire(&dep, finished).await.unwrap();
+    assert!(store
+        .owned_only_by_ended(&dep, "orderId", "DONE")
+        .await
+        .unwrap());
+    store
+        .record(&dep, Uuid::new_v4(), "orderId", "DONE", false)
+        .await
+        .unwrap();
+    assert!(!store
+        .owned_only_by_ended(&dep, "orderId", "DONE")
+        .await
+        .unwrap());
+
+    // Another deployment's rows are not consulted.
+    assert!(!store
+        .owned_only_by_ended(&crate::fixture::dep_b(), "orderId", "GONE")
+        .await
+        .unwrap());
+}

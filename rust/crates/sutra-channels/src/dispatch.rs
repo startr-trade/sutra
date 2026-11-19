@@ -50,6 +50,7 @@ use crate::source::DeferredSettle;
 use crate::stores::{
     AliasStore, CollectingOutbox, InboundIncident, InboxStore, IncidentSink, OutboxSink,
 };
+use crate::uncorrelated::{TriedCorrelationKey, UncorrelatedOutcome, UncorrelatedRelayRecord};
 
 /// A [`Diagnostic`] attribute the dispatcher stamps on an execution-failure diagnostic to
 /// tell the transport ack-decision mapper (`sutra-transport-spi::EngineIntake`) the failure is
@@ -848,6 +849,18 @@ impl ChannelEngine {
         };
         let predicate_faults = resolution.predicate_faults;
         let mut handlers = resolution.handlers;
+        // `uncorrelated: start`: that process's start events on this channel are reserved for a
+        // message no wait correlates — ordinary start resolution passes them over.
+        let reserved: Vec<HandlerMatch> = match binding.uncorrelated_start() {
+            Some(process_id) => {
+                let (reserved, ordinary) = handlers
+                    .into_iter()
+                    .partition(|h| h.process.id == process_id);
+                handlers = ordinary;
+                reserved
+            }
+            None => Vec::new(),
+        };
         if let Some((outcome, process_id)) = resumed_process {
             // Broadcast, after a resume: the other processes' starts, and the resume's outcome when
             // there are none.
@@ -877,11 +890,26 @@ impl ChannelEngine {
             // this channel, so the inbound resumes a WAITING instance rather than minting
             // one. Same two-tier intake (validators run against the wait node's
             // `<q:source>`), then correlate by the process's `<q:alias>` and resume.
-            if let Some(outcome) = self
-                .resolve_relay(&binding, &deployment, &decoded, message)
+            match self
+                .resolve_relay_detailed(&binding, &deployment, &decoded, message)
                 .await?
             {
-                return Ok(outcome);
+                RelayAttempt::Resolved(outcome) => return Ok(outcome),
+                RelayAttempt::Uncorrelated { diagnostic, tried } => {
+                    return self
+                        .on_uncorrelated(
+                            &binding,
+                            &start_deployment,
+                            message,
+                            &decoded,
+                            message_type.as_deref(),
+                            diagnostic,
+                            tried,
+                            &reserved,
+                        )
+                        .await;
+                }
+                RelayAttempt::NotRelay => {}
             }
             if !self.processes.has_module(&deployment) {
                 return Err(Diagnostic::error(
@@ -959,6 +987,79 @@ impl ChannelEngine {
         Ok(last.expect("at least one handler"))
     }
 
+    /// A message a wait subscribes to that correlates to no live instance. Recorded (a WARN and
+    /// the deployment's `inbound.RELAY_UNCORRELATED` audit record) whatever happens next; then,
+    /// when the channel's `uncorrelated: start` process has a start event that takes the
+    /// message, that start runs with `event.uncorrelated` set, and otherwise the relay's refusal
+    /// stands.
+    #[allow(clippy::too_many_arguments)]
+    async fn on_uncorrelated(
+        &self,
+        binding: &ChannelBinding,
+        deployment: &DeploymentId,
+        message: &InboundMessage,
+        decoded: &Option<DecodeResult>,
+        message_type: Option<&str>,
+        diagnostic: Diagnostic,
+        tried: Vec<TriedCorrelationKey>,
+        reserved: &[HandlerMatch],
+    ) -> Result<DispatchOutcome, Diagnostic> {
+        let marker = uncorrelated_marker(&diagnostic.code, &tried);
+        let record = UncorrelatedRelayRecord::of(
+            message,
+            deployment.value(),
+            message_type,
+            &diagnostic.code,
+            tried,
+        );
+        let Some(handler) = reserved.first() else {
+            record.report(&UncorrelatedOutcome::Refused);
+            return Err(diagnostic);
+        };
+        if !binding.broadcast && reserved.len() > 1 {
+            record.report(&UncorrelatedOutcome::Refused);
+            let starts: Vec<String> = reserved
+                .iter()
+                .map(|h| format!("{}/{}", h.process.id, h.start_event_id))
+                .collect();
+            return Err(Diagnostic::error(
+                codes::INBOUND_AMBIGUOUS_HANDLER,
+                format!(
+                    "Uncorrelated inbound on non-broadcast channel '{}' (message type '{}') \
+                     resolved to {} start events {starts:?} of its `uncorrelated: start` \
+                     process; it must resolve to exactly one.",
+                    message.channel,
+                    message_type.unwrap_or("(none)"),
+                    reserved.len()
+                ),
+            ));
+        }
+        let process_id = handler.process.id.clone();
+        let result = self
+            .drive_one_marked(handler, binding, deployment, message, decoded, Some(marker))
+            .await;
+        let outcome = match &result {
+            Ok(DispatchOutcome::Completed { instance_id, .. }) => UncorrelatedOutcome::Started {
+                process_id,
+                instance_id: instance_id.clone(),
+            },
+            Ok(DispatchOutcome::InlineCalls(handoff)) => UncorrelatedOutcome::Started {
+                process_id,
+                instance_id: handoff.instance_id().unwrap_or_default(),
+            },
+            Ok(_) => UncorrelatedOutcome::Started {
+                process_id,
+                instance_id: String::new(),
+            },
+            Err(refusal) => UncorrelatedOutcome::StartFailed {
+                process_id,
+                code: refusal.code.clone(),
+            },
+        };
+        record.report(&outcome);
+        result
+    }
+
     async fn drive_one(
         &self,
         handler: &HandlerMatch,
@@ -967,9 +1068,30 @@ impl ChannelEngine {
         message: &InboundMessage,
         decoded: &Option<DecodeResult>,
     ) -> Result<DispatchOutcome, Diagnostic> {
+        self.drive_one_marked(handler, binding, deployment, message, decoded, None)
+            .await
+    }
+
+    /// [`Self::drive_one`], with `event.uncorrelated` set to `marker` when one is given.
+    async fn drive_one_marked(
+        &self,
+        handler: &HandlerMatch,
+        binding: &ChannelBinding,
+        deployment: &DeploymentId,
+        message: &InboundMessage,
+        decoded: &Option<DecodeResult>,
+        marker: Option<FeelValue>,
+    ) -> Result<DispatchOutcome, Diagnostic> {
         let process = &handler.process;
         let start_id = handler.start_event_id.as_str();
         let mut variables = project_variables(message);
+        if let Some(marker) = marker {
+            if let Some(FeelValue::Map(event)) = variables.get("event") {
+                let mut event = event.clone();
+                event.insert("uncorrelated".to_string(), marker);
+                variables.insert("event", FeelValue::Map(event));
+            }
+        }
 
         // ---- tier-1/tier-2 validation, frozen summary, policy ----------------------------
         let mut routed_start: Option<String> = Some(start_id.to_string());
@@ -1690,7 +1812,7 @@ impl ChannelEngine {
         deployment: &DeploymentId,
         host_channel: &str,
         process: &ProcessDefinition,
-        emission: &sutra_executor::Emission,
+        emission: &mut sutra_executor::Emission,
     ) -> Result<(), Diagnostic> {
         let bindings = process.bindings_for(&emission.node_id);
         let (declared, channel, fallback) = match emission.kind {
@@ -1723,7 +1845,9 @@ impl ChannelEngine {
             .as_deref()
             .or(Some(host_channel).filter(|h| !h.is_empty()))
             .unwrap_or(&emission.destination);
-        self.chain.validate_outbound(
+        // Validate, then let the governing codec seal what it admitted. This runs before the
+        // outbox commit, so a redelivery resends the sealed bytes rather than sealing again.
+        let sealed = self.chain.seal_outbound(
             deployment,
             label,
             declared.as_deref(),
@@ -1731,7 +1855,11 @@ impl ChannelEngine {
             &emission.body,
             emission.content_type.as_deref(),
             &format!("Node '{}' of process '{}'", emission.node_id, process.id),
-        )
+        )?;
+        if let Some(bytes) = sealed {
+            emission.body = bytes.into();
+        }
+        Ok(())
     }
 
     /// Hold every emission of one quiescent step to its destination's contract, BEFORE the
@@ -2461,8 +2589,28 @@ impl ChannelEngine {
         decoded: &Option<DecodeResult>,
         message: &InboundMessage,
     ) -> Result<Option<DispatchOutcome>, Diagnostic> {
+        match self
+            .resolve_relay_detailed(binding, deployment, decoded, message)
+            .await?
+        {
+            RelayAttempt::NotRelay => Ok(None),
+            RelayAttempt::Resolved(outcome) => Ok(Some(outcome)),
+            RelayAttempt::Uncorrelated { diagnostic, .. } => Err(diagnostic),
+        }
+    }
+
+    /// [`Self::resolve_relay`], with "nothing correlated" reported as data: the refusal to
+    /// surface and every correlation key that was tried, so the caller can record it and, on a
+    /// channel with `uncorrelated: start`, route the message instead.
+    async fn resolve_relay_detailed(
+        &self,
+        binding: &ChannelBinding,
+        deployment: &DeploymentId,
+        decoded: &Option<DecodeResult>,
+        message: &InboundMessage,
+    ) -> Result<RelayAttempt, Diagnostic> {
         let Some(bridge) = self.bridge.clone() else {
-            return Ok(None);
+            return Ok(RelayAttempt::NotRelay);
         };
         // Scope order: the channel's LIVE deployment first, then its owner's DRAINING
         // prior deployments (most recently drained first). An instance parked under a
@@ -2470,22 +2618,31 @@ impl ChannelEngine {
         // and snapshot are deployment-scoped, so correlation must look where it parked.
         let scopes = self.session_scopes(deployment);
         let mut first_failure: Option<Diagnostic> = None;
+        let mut tried: Vec<TriedCorrelationKey> = Vec::new();
+        // Wait-pending only while EVERY scope's refusal is: one scope that knows the key's
+        // instance has ended (or that nothing can compute a key) settles it.
+        let mut all_pending = true;
         for scope in &scopes {
             match self
                 .resolve_relay_in(&bridge, binding, scope, decoded, message)
                 .await?
             {
                 RelayResolution::NoTargets => {}
-                RelayResolution::NotCorrelated(diagnostic) => {
+                RelayResolution::NotCorrelated(diagnostic, key) => {
+                    all_pending &= diagnostic
+                        .attributes
+                        .get(WAIT_PENDING_ATTR)
+                        .is_some_and(|v| v == "true");
+                    tried.extend(key);
                     // Remember the primary scope's diagnostic — it names the alias the
                     // operator should look for — and keep trying older scopes.
                     first_failure.get_or_insert(diagnostic);
                 }
-                RelayResolution::Resumed(outcome) => return Ok(Some(outcome)),
+                RelayResolution::Resumed(outcome) => return Ok(RelayAttempt::Resolved(outcome)),
                 // Surface the handoff to the router side of the handle, which re-enqueues
                 // it on the owner shard — never executed here. Dead at `shard-count = 1`.
                 RelayResolution::Handoff(resolved) => {
-                    return Ok(Some(DispatchOutcome::Handoff {
+                    return Ok(RelayAttempt::Resolved(DispatchOutcome::Handoff {
                         shard: crate::http::shard_index_of(&resolved.instance_id, self.shard.count),
                         resolved,
                     }))
@@ -2495,9 +2652,14 @@ impl ChannelEngine {
         match first_failure {
             // Some scope had a subscribing wait node but nothing correlated — the
             // fail-closed posture this path has always had.
-            Some(diagnostic) => Err(diagnostic),
+            Some(mut diagnostic) => {
+                if !all_pending {
+                    diagnostic.attributes.remove(WAIT_PENDING_ATTR);
+                }
+                Ok(RelayAttempt::Uncorrelated { diagnostic, tried })
+            }
             // No wait node subscribes to this channel anywhere — not a relay.
-            None => Ok(None),
+            None => Ok(RelayAttempt::NotRelay),
         }
     }
 
@@ -2786,7 +2948,7 @@ impl ChannelEngine {
                 resolved,
             },
             // `relay_tail` only resumes or hands off.
-            RelayResolution::NoTargets | RelayResolution::NotCorrelated(_) => {
+            RelayResolution::NoTargets | RelayResolution::NotCorrelated(..) => {
                 unreachable!("relay_tail resolves to a resume or a handoff")
             }
         }
@@ -2869,32 +3031,71 @@ impl ChannelEngine {
                 correlation_for(process, &relay_vars, relay_payload)
             })
         else {
-            return Ok(RelayResolution::NotCorrelated(Diagnostic::error(
-                codes::RUNTIME_RELAY_CORRELATION_NOT_FOUND,
-                format!(
-                    "Relay on channel '{}' cannot correlate: process '{}' declares no \
+            return Ok(RelayResolution::NotCorrelated(
+                Diagnostic::error(
+                    codes::RUNTIME_RELAY_CORRELATION_NOT_FOUND,
+                    format!(
+                        "Relay on channel '{}' cannot correlate: process '{}' declares no \
                      <q:alias onConflict=\"correlate\"> whose expression resolves against \
                      the relayed payload — nothing identifies which waiting instance to \
                      resume.",
-                    message.channel, process.id
+                        message.channel, process.id
+                    ),
                 ),
-            )));
+                None,
+            ));
         };
         let Some(instance_id) = bridge
             .find_live_alias(deployment, &alias_name, &alias_value)
             .await?
         else {
-            return Ok(RelayResolution::NotCorrelated(
+            // No live instance carries the key. Either its instance has ENDED — nothing will
+            // ever wait for this message — or it has not recorded the key yet (it is a step
+            // short of the wait). Only the second is worth offering again, so the refusal is
+            // marked wait-pending unless the store knows the key's instances have all ended. A
+            // failed lookup keeps the mark: it only costs a bounded retry.
+            let ended = bridge
+                .alias_ended(deployment, &alias_name, &alias_value)
+                .await
+                .unwrap_or(false);
+            let expression = alias_expression(process, &target.wait_node_id, &alias_name);
+            let key = TriedCorrelationKey {
+                process_id: process.id.clone(),
+                wait_node_id: target.wait_node_id.clone(),
+                shown_value: sutra_executor::audit_correlation::shown_alias_value(
+                    process,
+                    &alias_name,
+                    expression.unwrap_or(""),
+                    &alias_value,
+                    &relay_vars,
+                ),
+                alias_name: alias_name.clone(),
+                alias_value: alias_value.clone(),
+                deployment_id: deployment.value().to_string(),
+                ended,
+            };
+            let diagnostic = if ended {
                 Diagnostic::error(
                     codes::RUNTIME_RELAY_CORRELATION_NOT_FOUND,
                     format!(
                         "No live instance carries alias {alias_name}={alias_value} for \
-                     deployment {}; the relay cannot be correlated to a waiting instance.",
+                         deployment {}: the instance that carried it has ended, so no \
+                         instance waits for this relay.",
                         deployment.value()
                     ),
                 )
-                .with_attribute(WAIT_PENDING_ATTR, "true"),
-            ));
+            } else {
+                Diagnostic::error(
+                    codes::RUNTIME_RELAY_CORRELATION_NOT_FOUND,
+                    format!(
+                        "No live instance carries alias {alias_name}={alias_value} for \
+                         deployment {}; the relay cannot be correlated to a waiting instance.",
+                        deployment.value()
+                    ),
+                )
+                .with_attribute(WAIT_PENDING_ATTR, "true")
+            };
+            return Ok(RelayResolution::NotCorrelated(diagnostic, Some(key)));
         };
 
         self.relay_tail(
@@ -4435,15 +4636,18 @@ impl ChannelEngine {
             // A template render reaches the wire without passing through a codec, so this is
             // the ONLY point at which the channel's contract can still see it.
             let bytes = body.clone().into_bytes();
-            self.chain.validate_outbound(
-                &binding.deployment_id(),
-                &binding.channel_name,
-                declared_reply_codec(process, exec).as_deref(),
-                NO_INFERRED_REPLY_CODEC,
-                &bytes,
-                Some(content_type.as_str()),
-                &format!("The reply of process '{}'", process.id),
-            )?;
+            let bytes = self
+                .chain
+                .seal_outbound(
+                    &binding.deployment_id(),
+                    &binding.channel_name,
+                    declared_reply_codec(process, exec).as_deref(),
+                    NO_INFERRED_REPLY_CODEC,
+                    &bytes,
+                    Some(content_type.as_str()),
+                    &format!("The reply of process '{}'", process.id),
+                )?
+                .unwrap_or(bytes);
             return Ok(Some(SyncReply {
                 body: bytes.into(),
                 content_type,
@@ -4458,15 +4662,18 @@ impl ChannelEngine {
                 // Encoding projects; it does not validate (`project_to_tree` is the
                 // non-validating half of the schema pair), so the contract check is this call,
                 // not the one above.
-                self.chain.validate_outbound(
-                    &binding.deployment_id(),
-                    &binding.channel_name,
-                    declared_reply_codec(process, exec).as_deref(),
-                    NO_INFERRED_REPLY_CODEC,
-                    &bytes,
-                    message.content_type.as_deref(),
-                    &format!("The reply of process '{}'", process.id),
-                )?;
+                let bytes = self
+                    .chain
+                    .seal_outbound(
+                        &binding.deployment_id(),
+                        &binding.channel_name,
+                        declared_reply_codec(process, exec).as_deref(),
+                        NO_INFERRED_REPLY_CODEC,
+                        &bytes,
+                        message.content_type.as_deref(),
+                        &format!("The reply of process '{}'", process.id),
+                    )?
+                    .unwrap_or(bytes);
                 // Native reply: the wire content-type mirrors the inbound.
                 return Ok(Some(SyncReply {
                     body: bytes.into(),
@@ -6162,12 +6369,69 @@ fn correlation_variables(
     variables
 }
 
+/// What [`ChannelEngine::resolve_relay_detailed`] found, over every scope.
+enum RelayAttempt {
+    /// No wait node subscribes to the channel anywhere: not a relay.
+    NotRelay,
+    /// Resumed here, or handed to the owner shard.
+    Resolved(DispatchOutcome),
+    /// A wait subscribes but no live instance correlates: the refusal, and the keys tried.
+    Uncorrelated {
+        diagnostic: Diagnostic,
+        tried: Vec<TriedCorrelationKey>,
+    },
+}
+
+/// The `event.uncorrelated` a start routed by `uncorrelated: start` sees: the refusal's `code`
+/// and the correlation `keys` the engine looked for (`alias name -> value`; the raw values —
+/// the started process holds the message anyway).
+fn uncorrelated_marker(code: &str, tried: &[TriedCorrelationKey]) -> FeelValue {
+    let keys: BTreeMap<String, FeelValue> = tried
+        .iter()
+        .map(|k| {
+            (
+                k.alias_name.clone(),
+                FeelValue::String(k.alias_value.clone()),
+            )
+        })
+        .collect();
+    let mut marker = BTreeMap::new();
+    marker.insert("code".to_string(), FeelValue::String(code.to_string()));
+    marker.insert("keys".to_string(), FeelValue::Map(keys));
+    marker.insert(
+        "ended".to_string(),
+        FeelValue::Boolean(!tried.is_empty() && tried.iter().all(|k| k.ended)),
+    );
+    FeelValue::Map(marker)
+}
+
+/// The expression of the `<q:alias>` named `alias_name` the relay path correlates on: the wait
+/// node's own first, then a start event's.
+fn alias_expression<'p>(
+    process: &'p ProcessDefinition,
+    wait_node_id: &str,
+    alias_name: &str,
+) -> Option<&'p str> {
+    process
+        .bindings_for(wait_node_id)
+        .aliases
+        .iter()
+        .chain(
+            process
+                .start_events()
+                .into_iter()
+                .flat_map(|start| process.bindings_for(start.id()).aliases.iter()),
+        )
+        .find(|alias| alias.name == alias_name)
+        .map(|alias| alias.expression.as_str())
+}
+
 enum RelayResolution {
     /// No wait node in this scope subscribes to the channel.
     NoTargets,
     /// A wait node subscribes but nothing correlated — the diagnostic to surface if no
     /// other scope resolves either.
-    NotCorrelated(Diagnostic),
+    NotCorrelated(Diagnostic, Option<TriedCorrelationKey>),
     /// Correlated, resumed and committed.
     Resumed(DispatchOutcome),
     /// Correlated to an instance ANOTHER shard's lane owns — nothing was claimed or

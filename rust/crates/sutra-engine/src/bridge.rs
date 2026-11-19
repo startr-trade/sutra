@@ -650,6 +650,20 @@ impl InstanceBridge for PersistenceBridge {
         Ok(owner.map(|u| u.to_string()))
     }
 
+    async fn alias_ended(
+        &self,
+        deployment: &sutra_executor::DeploymentId,
+        name: &str,
+        value: &str,
+    ) -> Result<bool, Diagnostic> {
+        let dep = persist_dep(deployment)?;
+        let store = sutra_persistence::stores::PgAliasStore::new(self.pool.clone());
+        store
+            .owned_only_by_ended(&dep, name, value)
+            .await
+            .map_err(|e| persistence_diag("alias ended lookup failed", &e))
+    }
+
     async fn commit_complete(
         &self,
         deployment: &sutra_executor::DeploymentId,

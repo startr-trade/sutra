@@ -96,10 +96,50 @@ const SQL_LIST_FOR: &str = "SELECT alias_name, alias_value, unique_alias, live F
 
 const SQL_DELETE: &str = "DELETE FROM alias_index WHERE deployment_id = $1 AND instance_id = $2";
 
+/// A retired row of `(name, value)` whose instance is no longer running — its `instance_state`
+/// row is terminal or gone — and no live row: the key belonged only to instances that ended.
+/// Served by `alias_index_retired_lookup` (V103); `instance_state` is probed by primary key.
+const SQL_OWNED_ONLY_BY_ENDED: &str = "SELECT EXISTS ( \
+       SELECT 1 FROM alias_index a \
+        WHERE a.deployment_id = $1 AND a.alias_name = $2 AND a.alias_value = $3 \
+          AND a.live = FALSE \
+          AND NOT EXISTS (SELECT 1 FROM instance_state s \
+                           WHERE s.deployment_id = a.deployment_id \
+                             AND s.instance_id = a.instance_id \
+                             AND s.terminal_at IS NULL)) \
+     AND NOT EXISTS ( \
+       SELECT 1 FROM alias_index l \
+        WHERE l.deployment_id = $1 AND l.alias_name = $2 AND l.alias_value = $3 \
+          AND l.live = TRUE)";
+
 impl PgAliasStore {
     /// Wraps a connection pool.
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
+    }
+
+    /// Whether the key `(alias_name, alias_value)` belonged only to instances that have ended:
+    /// some retired row whose instance's `instance_state` row is terminal or gone, and no live
+    /// row. `false` for a key no row records at all (never carried, or purged with its instance
+    /// after retention) — the caller cannot tell that from a key an instance has yet to record.
+    pub async fn owned_only_by_ended(
+        &self,
+        deployment: &DeploymentId,
+        alias_name: &str,
+        alias_value: &str,
+    ) -> Result<bool> {
+        let mut tx = begin_deployment_tx(&self.pool, deployment).await?;
+        let ended: bool = sqlx::query_scalar(SQL_OWNED_ONLY_BY_ENDED)
+            .bind(deployment.as_str())
+            .bind(alias_name)
+            .bind(alias_value)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(PersistenceError::db("alias ownedOnlyByEnded"))?;
+        tx.commit()
+            .await
+            .map_err(PersistenceError::db("alias ownedOnlyByEnded commit"))?;
+        Ok(ended)
     }
 
     /// Record on a caller-supplied connection (the transactional-step building block).

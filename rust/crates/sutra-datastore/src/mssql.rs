@@ -318,6 +318,21 @@ impl MssqlDataStore {
         Box::pin(async move { Ok((value.await?, revision.await?)) })
     }
 
+    /// Autocommit conditional delete (`<q:store delete="true" expect="unchanged">`): `expected_rev
+    /// <= 0` applies only while the key is absent (deleting nothing); otherwise the row is deleted
+    /// only while its revision is `expected_rev`. `false` = conflict.
+    pub fn delete_if_revision(
+        &self,
+        key: &str,
+        expected_rev: i64,
+    ) -> SendFuture<'static, Result<bool, DataStoreError>> {
+        Box::pin(store_delete_if_revision(
+            Arc::clone(&self.inner),
+            key.to_string(),
+            expected_rev,
+        ))
+    }
+
     /// Autocommit compare-and-set (`<q:store expect="unchanged">`); `false` = conflict.
     pub fn put_if_revision(
         &self,
@@ -885,6 +900,17 @@ async fn store_delete(inner: Arc<StoreInner>, key: String) -> Result<(), DataSto
     tx.commit().await
 }
 
+async fn store_delete_if_revision(
+    inner: Arc<StoreInner>,
+    key: String,
+    expected_rev: i64,
+) -> Result<bool, DataStoreError> {
+    let mut tx = store_begin(inner).await?;
+    let applied = tx_delete_if_revision(&mut tx, &key, expected_rev).await?;
+    tx.commit().await?;
+    Ok(applied)
+}
+
 async fn store_revision(inner: Arc<StoreInner>, key: String) -> Result<i64, DataStoreError> {
     let mut tx = store_begin(inner).await?;
     let rev = tx_revision(&mut tx, &key).await?;
@@ -1321,6 +1347,20 @@ impl MssqlDataStoreTx {
         Box::pin(tx_revision_owned(self, key.to_string()))
     }
 
+    /// Conditional delete within the transaction — the contract of the store-level
+    /// `delete_if_revision`.
+    pub fn delete_if_revision<'a>(
+        &'a mut self,
+        key: &str,
+        expected_rev: i64,
+    ) -> SendFuture<'a, Result<bool, DataStoreError>> {
+        Box::pin(tx_delete_if_revision_owned(
+            self,
+            key.to_string(),
+            expected_rev,
+        ))
+    }
+
     /// Compare-and-set (`<q:store expect="unchanged">`).
     pub fn put_if_revision<'a>(
         &'a mut self,
@@ -1542,6 +1582,48 @@ async fn tx_delete(tx: &mut MssqlDataStoreTx, key: &str) -> Result<(), DataStore
     Ok(())
 }
 
+async fn tx_delete_if_revision_owned(
+    tx: &mut MssqlDataStoreTx,
+    key: String,
+    expected_rev: i64,
+) -> Result<bool, DataStoreError> {
+    tx_delete_if_revision(tx, &key, expected_rev).await
+}
+
+/// The conditional delete: expected `<= 0` applies only while the key is absent (nothing to
+/// delete, nothing written); otherwise `DELETE … AND rev = expected`, applied iff it removed a row.
+async fn tx_delete_if_revision(
+    tx: &mut MssqlDataStoreTx,
+    key: &str,
+    expected_rev: i64,
+) -> Result<bool, DataStoreError> {
+    if expected_rev <= 0 {
+        return Ok(tx_revision(tx, key).await? == 0);
+    }
+    let store = tx.store.clone();
+    let deleted = match tx.projected.clone() {
+        Some(projected) => {
+            let sql = projected.delete_if_revision_sql(DIALECT);
+            tx.conn
+                .client()
+                .execute(sql.as_str(), &[&key, &expected_rev])
+                .await
+                .map_err(|e| op_err(&store, key, "conditional delete", e))?
+                .total()
+        }
+        None => {
+            let sql = format!("DELETE FROM data_store{WHERE_KEY} AND rev = @P3");
+            tx.conn
+                .client()
+                .execute(sql.as_str(), &[&store, &key, &expected_rev])
+                .await
+                .map_err(|e| op_err(&store, key, "conditional delete", e))?
+                .total()
+        }
+    };
+    Ok(deleted > 0)
+}
+
 async fn tx_revision(tx: &mut MssqlDataStoreTx, key: &str) -> Result<i64, DataStoreError> {
     let store = tx.store.clone();
     let row = match tx.projected.clone() {
@@ -1694,9 +1776,13 @@ async fn tx_insert(
             tx.conn
                 .client()
                 .execute(
-                    "INSERT INTO data_store (tenant_id, module_id, module_version, store_name, \
+                    format!(
+"INSERT INTO data_store (tenant_id, module_id, module_version, store_name, \
                      store_key, store_value, rev, updated_at) \
-                     VALUES (@P1, @P2, @P3, @P4, @P5, @P6, 1, SYSUTCDATETIME())",
+                     VALUES (@P1, @P2, @P3, @P4, @P5, @P6, {seed}, SYSUTCDATETIME())",
+ seed = DIALECT.revision_seed()
+)
+                    .as_str(),
                     &[&tenant, &module, &version, &store, &key, &json],
                 )
                 .await?;
@@ -1705,8 +1791,12 @@ async fn tx_insert(
             tx.conn
                 .client()
                 .execute(
-                    "INSERT INTO data_store (store_name, store_key, store_value, rev, updated_at) \
-                     VALUES (@P1, @P2, @P3, 1, SYSUTCDATETIME())",
+                    format!(
+"INSERT INTO data_store (store_name, store_key, store_value, rev, updated_at) \
+                     VALUES (@P1, @P2, @P3, {seed}, SYSUTCDATETIME())",
+ seed = DIALECT.revision_seed()
+)
+                    .as_str(),
                     &[&store, &key, &json],
                 )
                 .await?;

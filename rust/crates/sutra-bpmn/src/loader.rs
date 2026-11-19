@@ -44,6 +44,9 @@ struct StoreBinding {
     expect_unchanged: bool,
     expect_absent: bool,
     query: Option<Result<StoreQuery, String>>,
+    /// `@delete`: `Ok(true)` for a row delete; `Err(reason)` when the binding declares a delete
+    /// that cannot run (an attribute that makes no sense on a delete, or a non-boolean value).
+    delete: Result<bool, String>,
 }
 
 /// The lexical surroundings one `assemble_process` call works within: the element whose flow
@@ -2001,6 +2004,18 @@ fn build_data_mapping(
                 ));
             };
             validate_store(sb, id)?;
+            match &sb.delete {
+                Ok(false) => {}
+                Ok(true) => {
+                    return Err(store_delete_invalid(
+                        id,
+                        sb,
+                        "a delete is a write; the reference cannot be the source of a data \
+                         input association",
+                    ))
+                }
+                Err(reason) => return Err(store_delete_invalid(id, sb, reason)),
+            }
             let query = match &sb.query {
                 None => None,
                 Some(Ok(query)) => {
@@ -2052,13 +2067,23 @@ fn build_data_mapping(
             .filter(|t| !t.is_empty());
         let sb = target_ref.and_then(|r| store_bindings.get(r));
         if let Some(sb) = sb {
+            let delete = match &sb.delete {
+                Ok(delete) => *delete,
+                Err(reason) => return Err(store_delete_invalid(id, sb, reason)),
+            };
             let value_var = first_source_ref(a).map(|r| resolve_var(r, var_name_by_data_id));
-            let Some(value_var) = value_var else {
-                return Err(data_association_unsupported(
-                    "serviceTask",
-                    id,
-                    "a data-store write whose <sourceRef> names no variable to write",
-                ));
+            // A delete writes nothing, so its association needs no <sourceRef> (one given is
+            // ignored).
+            let value_var = match (value_var, delete) {
+                (_, true) => String::new(),
+                (Some(value_var), false) => value_var,
+                (None, false) => {
+                    return Err(data_association_unsupported(
+                        "serviceTask",
+                        id,
+                        "a data-store write whose <sourceRef> names no variable to write",
+                    ))
+                }
             };
             validate_store(sb, id)?;
             if sb.query.is_some() {
@@ -2075,6 +2100,7 @@ fn build_data_mapping(
                 value_var,
                 expect_unchanged: sb.expect_unchanged,
                 expect_absent: sb.expect_absent,
+                delete,
             });
             continue;
         }
@@ -2212,6 +2238,62 @@ fn validate_store(sb: &StoreBinding, node_id: &str) -> Result<(), SutraError> {
         ));
     }
     Ok(())
+}
+
+fn store_delete_invalid(node_id: &str, sb: &StoreBinding, reason: &str) -> SutraError {
+    err(
+        codes::PARSE_STORE_DELETE_INVALID,
+        format!(
+            "<serviceTask> '{node_id}' declares a delete on data store '{}' that cannot run: \
+             {reason}.",
+            sb.store_name.as_deref().unwrap_or("")
+        ),
+    )
+}
+
+/// Parse `@delete` and refuse what makes no sense on a delete: `@field` (nothing is written),
+/// `@forUpdate` (the DELETE takes the row lock itself), `@expect="absent"` (an absent row has
+/// nothing to delete) and every key-query attribute (a query is a read).
+fn parse_store_delete(q: &XmlElement) -> Result<bool, String> {
+    match q.attr_or_empty("delete").trim() {
+        "" | "false" | "0" => return Ok(false),
+        "true" | "1" => {}
+        other => return Err(format!("@delete=\"{other}\" is not a boolean")),
+    }
+    if trim_to_none(q.attr_or_empty("field")).is_some() {
+        return Err("@field replaces one field of a written value; a delete writes nothing".into());
+    }
+    if q.attr_or_empty("forUpdate")
+        .trim()
+        .eq_ignore_ascii_case("true")
+    {
+        return Err(
+            "@forUpdate locks a row for a read; a delete takes the row lock itself (lock it \
+             with a forUpdate read through another reference)"
+                .into(),
+        );
+    }
+    if q.attr_or_empty("expect")
+        .trim()
+        .eq_ignore_ascii_case("absent")
+    {
+        return Err(
+            "@expect=\"absent\" inserts a missing key; a delete of a missing key is already \
+             a no-op (use expect=\"unchanged\" for a conditional delete)"
+                .into(),
+        );
+    }
+    for attribute in ["query", "to", "rows", "limit", "after"] {
+        if trim_to_none(q.attr_or_empty(attribute)).is_some() {
+            return Err(format!(
+                "@{attribute} belongs to a key query, which is a read; a delete removes one key"
+            ));
+        }
+    }
+    if q.children_ns(Q_NS, "aggregate").next().is_some() {
+        return Err("<q:aggregate> belongs to a key query; a delete removes one key".into());
+    }
+    Ok(true)
 }
 
 fn store_query_invalid(node_id: &str, sb: &StoreBinding, reason: &str) -> SutraError {
@@ -2404,7 +2486,9 @@ fn collect_store_bindings(root: &XmlElement) -> HashMap<String, StoreBinding> {
         let mut expect_unchanged = false;
         let mut expect_absent = false;
         let mut query = None;
+        let mut delete = Ok(false);
         if let Some(q) = r.collect_descendants_ns(Q_NS, "store").first() {
+            delete = parse_store_delete(q);
             key = trim_to_none(q.attr_or_empty("key"));
             for_update = q.attr_or_empty("forUpdate").eq_ignore_ascii_case("true");
             field = trim_to_none(q.attr_or_empty("field"));
@@ -2427,6 +2511,7 @@ fn collect_store_bindings(root: &XmlElement) -> HashMap<String, StoreBinding> {
                 expect_unchanged,
                 expect_absent,
                 query,
+                delete,
             },
         );
     }

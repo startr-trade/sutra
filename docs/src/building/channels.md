@@ -157,6 +157,13 @@ deploy-time error unless the channel opts into broadcast.
 admission cap on simultaneously active instances from that channel (a suspended instance still
 holds its slot). Absent, the channel is unbounded.
 
+**Uncorrelated answers.** `uncorrelated: { start: <processId> }` on an inbound channel that a wait
+subscribes to sends a message that correlates to no live instance to that process, instead of
+refusing it. The process's start events on the channel are reserved for such messages. See
+[An answer no instance waits for](wait-states.md#an-answer-no-instance-waits-for). A malformed
+block fails to load, and `sutra lint` reports a `start` naming no process of the package, or one
+with no start event on the channel, both as `SUTRA.CONFIG.CHANNEL.UNCORRELATED_INVALID`.
+
 Each exclusive endpoint (route, queue, subscription, consumer group, spool directory) belongs to one
 deployment; see [One endpoint, one deployment](endpoint-claims.md).
 

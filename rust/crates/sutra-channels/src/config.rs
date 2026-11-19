@@ -91,6 +91,10 @@ pub struct ChannelBinding {
     /// holds, releasing its slot before the instance reaches End. `None` = only End (or a
     /// failure) releases.
     pub session_end: Option<SessionEnd>,
+    /// `uncorrelated:` (inbound channels only) — what a message on this channel that a wait
+    /// subscribes to, but that correlates to no live instance, does instead of being refused.
+    /// `None` = it is refused (`SUTRA.RUNTIME.RELAY.CORRELATION_NOT_FOUND`), as always.
+    pub uncorrelated: Option<UncorrelatedRoute>,
     /// An HTTP channel with `ack-mode: on-persist`: its 202 carries an acceptance receipt, so a
     /// dispatch on it collects the receipt's facts. No other channel has a reader for them.
     pub answers_with_receipt: bool,
@@ -109,6 +113,25 @@ pub struct SessionEnd {
     /// `on-reply: true` — the flow's destination-less reply on this channel ends the replying
     /// instance's inbound call: its channel slot and the pool slot that call took.
     pub on_reply: bool,
+}
+
+/// An inbound channel's `uncorrelated:` block.
+///
+/// ```yaml
+/// uncorrelated:
+///   start: late-answer      # the id of a process of the same deployment
+/// ```
+///
+/// The named process's start events on this channel are RESERVED for uncorrelated messages:
+/// ordinary start resolution passes them over, so a message on the channel first answers the
+/// wait it correlates to and only a message that correlates to none starts the process. Its
+/// `<q:source>` (message type, `filterExpression`, validators) still selects which uncorrelated
+/// messages it takes; one it does not take is refused as before. The started instance sees
+/// `event.uncorrelated` — `{ code, keys }`, the correlation keys the engine looked for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UncorrelatedRoute {
+    /// `start: <processId>` — the process an uncorrelated message starts.
+    pub start: String,
 }
 
 impl ChannelBinding {
@@ -134,8 +157,15 @@ impl ChannelBinding {
             pool: None,
             pool_call_key: None,
             session_end: None,
+            uncorrelated: None,
             answers_with_receipt: false,
         }
+    }
+
+    /// The process an uncorrelated message on this channel starts, when `uncorrelated:` names
+    /// one: its start events on this channel are reserved for such messages.
+    pub fn uncorrelated_start(&self) -> Option<&str> {
+        self.uncorrelated.as_ref().map(|route| route.start.as_str())
     }
 
     /// The call key a message (or request) with `headers` carries on this channel: the value of
@@ -323,6 +353,8 @@ const RESERVED_IN_FLIGHT_KEY: &str = "use-only-in-flight-for-concurrency-cap";
 const POOL_KEY: &str = "pool";
 const POOL_CALL_KEY_KEY: &str = "pool-call-key";
 const SESSION_END_KEY: &str = "session-end";
+/// The `uncorrelated:` block, consumed as a first-class binding field.
+const UNCORRELATED_KEY: &str = "uncorrelated";
 
 fn is_reserved(key: &str) -> bool {
     RESERVED_KEYS.contains(&key)
@@ -330,6 +362,7 @@ fn is_reserved(key: &str) -> bool {
         || key == POOL_KEY
         || key == POOL_CALL_KEY_KEY
         || key == SESSION_END_KEY
+        || key == UNCORRELATED_KEY
 }
 
 /// Load a tenant channel YAML into [`ChannelDefinition`]s. The `(tenant, module,
@@ -389,6 +422,7 @@ pub fn load_channel_definitions(
         let pool = optional_string(entry, POOL_KEY).map(|p| p.trim().to_string());
         let pool_call_key = parse_pool_call_key(entry, &name, pool.is_some(), source_for_errors)?;
         let session_end = parse_session_end(entry, &name, source_for_errors)?;
+        let uncorrelated = parse_uncorrelated(entry, &name, source_for_errors)?;
 
         let namespace = Namespace::new(tenant, module, version);
         let binding = ChannelBinding {
@@ -403,6 +437,7 @@ pub fn load_channel_definitions(
             pool,
             pool_call_key,
             session_end,
+            uncorrelated,
             answers_with_receipt: false,
         };
         let mut definition = ChannelDefinition {
@@ -423,6 +458,7 @@ pub fn load_channel_definitions(
         out.push(definition);
     }
     validate_session_ends(&out, source_for_errors)?;
+    validate_uncorrelated(&out, source_for_errors)?;
     Ok(out)
 }
 
@@ -508,6 +544,75 @@ fn parse_session_end(
         ));
     }
     Ok(Some(session_end))
+}
+
+/// Parse an entry's optional `uncorrelated:` mapping (`start: <processId>`).
+fn parse_uncorrelated(
+    entry: &serde_yaml_ng::Mapping,
+    channel: &str,
+    source: &str,
+) -> Result<Option<UncorrelatedRoute>, Diagnostic> {
+    let invalid = |detail: String| {
+        Diagnostic::error(
+            codes::CONFIG_CHANNEL_UNCORRELATED_INVALID,
+            format!("Channel YAML {source}: channel '{channel}' uncorrelated {detail}"),
+        )
+        .with_attribute("channel", channel)
+    };
+    let block = match get(entry, UNCORRELATED_KEY) {
+        None | Some(serde_yaml_ng::Value::Null) => return Ok(None),
+        Some(serde_yaml_ng::Value::Mapping(block)) => block,
+        Some(_) => {
+            return Err(invalid(
+                "must be a mapping (start: <processId>)".to_string(),
+            ))
+        }
+    };
+    let mut start = None;
+    for (key, value) in block {
+        let serde_yaml_ng::Value::String(key) = key else {
+            return Err(invalid("keys must be strings".to_string()));
+        };
+        match (key.as_str(), value) {
+            ("start", serde_yaml_ng::Value::String(id)) if !id.trim().is_empty() => {
+                start = Some(id.trim().to_string());
+            }
+            ("start", _) => return Err(invalid("start must name a process id".to_string())),
+            (other, _) => {
+                return Err(invalid(format!(
+                    "has unknown key '{other}' (expected start)"
+                )))
+            }
+        }
+    }
+    match start {
+        Some(start) => Ok(Some(UncorrelatedRoute { start })),
+        None => Err(invalid(
+            "declares nothing to do with an uncorrelated message (set start: <processId>)"
+                .to_string(),
+        )),
+    }
+}
+
+/// Cross-entry `uncorrelated:` rule: only an inbound channel declares one.
+fn validate_uncorrelated(
+    definitions: &[ChannelDefinition],
+    source: &str,
+) -> Result<(), Diagnostic> {
+    for def in definitions {
+        if def.binding.uncorrelated.is_some() && def.is_outbound() {
+            let channel = &def.binding.channel_name;
+            return Err(Diagnostic::error(
+                codes::CONFIG_CHANNEL_UNCORRELATED_INVALID,
+                format!(
+                    "Channel YAML {source}: channel '{channel}' uncorrelated is declared on an \
+                     outbound channel; only an inbound channel receives relays"
+                ),
+            )
+            .with_attribute("channel", channel));
+        }
+    }
+    Ok(())
 }
 
 /// Cross-entry `session-end:` rules: only an inbound channel declares one, and its

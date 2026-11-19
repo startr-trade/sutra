@@ -1256,13 +1256,31 @@ pub(crate) fn plan_deployment(
         .iter()
         .map(|bundle| bundle.local_id.clone())
         .collect();
+    // Each bundle codec is minted ONCE here, on the runtime host, and handed the engine's envref
+    // resolver: a codec whose bundle files name references (`secret:…`) resolves them now, at
+    // the moment and through the resolver a channel binding's credentials use. A reference it
+    // cannot resolve refuses the deploy (`SUTRA.CODEC.BIND_REFS_FAILED`) instead of starting a
+    // codec that would fail every message. Every activation then shares the bound instance
+    // (codecs are immutable `Send + Sync`), so the references are resolved once per deploy.
     let codec_bundles: Vec<(String, sutra_codec_schema::bundle::BundleFactory)> = planned_bundles
         .into_iter()
         .map(|bundle| {
             let logical = logical_urn("codec", &bundle.local_id);
-            (archive_key(&logical, &dep), bundle.make)
+            let codec = (bundle.make)();
+            codec.bind_refs(envref_resolver).map_err(|e| {
+                format!(
+                    "[{}] codec '{}' of deployment {dep} could not resolve the references its \
+                     configuration names: {}",
+                    sutra_channels::codes::CODEC_BIND_REFS_FAILED,
+                    bundle.local_id,
+                    sutra_codec_spi::codec::sanitize(&e)
+                )
+            })?;
+            let make: sutra_codec_schema::bundle::BundleFactory =
+                std::sync::Arc::new(move || codec.clone());
+            Ok((archive_key(&logical, &dep), make))
         })
-        .collect();
+        .collect::<Result<_, String>>()?;
 
     // User codec schemas → the canonical `urn:<path-derived name>` reference (the codec map
     // is keyed by the path-derived name; the engine registers each under that URN and
@@ -3409,5 +3427,125 @@ mod master_key_tests {
         assert!(err.contains("did not resolve"), "{err}");
         let err = resolve_master_key("env:EMPTY", resolver).unwrap_err();
         assert!(err.contains("empty secret"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod bind_refs_tests {
+    //! A bundle codec's `bind_refs` runs once at plan time, on the runtime host, and a reference
+    //! it cannot resolve refuses the deploy.
+    use super::*;
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, OnceLock};
+    use sutra_codec_schema::bundle::{BundleCodecKind, BundleError, BundleFactory, BundleSource};
+    use sutra_codec_spi::{CodecRefResolver, CodecValue, DecodeResult, PayloadCodec};
+    use sutra_loader::LoadedArtifact;
+
+    /// A codec whose bundle names one reference in `ref.txt`.
+    struct RefProbeCodec {
+        reference: String,
+        resolved: OnceLock<String>,
+    }
+
+    impl PayloadCodec for RefProbeCodec {
+        fn name(&self) -> &str {
+            "ref-probe"
+        }
+        fn accepted_content_types(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn decode(&self, body: &[u8], content_type: Option<&str>) -> DecodeResult {
+            DecodeResult::ok(
+                CodecValue::Bytes(body.to_vec()),
+                content_type.unwrap_or("application/octet-stream"),
+            )
+        }
+        fn encode(&self, _: &CodecValue, _: Option<&str>) -> Result<Vec<u8>, String> {
+            Ok(Vec::new())
+        }
+        fn bind_refs(&self, resolve: CodecRefResolver) -> Result<(), String> {
+            let value = resolve(&self.reference)
+                .map_err(|e| format!("reference '{}': {e}", self.reference))?;
+            let _ = self.resolved.set(value);
+            Ok(())
+        }
+    }
+
+    fn build(source: &BundleSource<'_>) -> Result<BundleFactory, BundleError> {
+        let reference = source
+            .file("ref.txt")
+            .map(|b| String::from_utf8_lossy(b).trim().to_string())
+            .ok_or_else(|| BundleError::manifest("ref.txt is missing"))?;
+        Ok(Arc::new(move || {
+            Arc::new(RefProbeCodec {
+                reference: reference.clone(),
+                resolved: OnceLock::new(),
+            }) as Arc<dyn PayloadCodec>
+        }))
+    }
+
+    inventory::submit! {
+        BundleCodecKind { kind: "bind-refs-probe", build }
+    }
+
+    fn deployment(reference: &str) -> LoadedDeployment {
+        let artifact = |path: &str, content: &str| LoadedArtifact {
+            path: std::path::PathBuf::from(format!("schemas/{path}")),
+            content: content.to_string(),
+        };
+        let mut schema_files = BTreeMap::new();
+        schema_files.insert(
+            "probe/codec-manifest.yaml".to_string(),
+            artifact("probe/codec-manifest.yaml", "schemaKind: bind-refs-probe\n"),
+        );
+        schema_files.insert(
+            "probe/ref.txt".to_string(),
+            artifact("probe/ref.txt", reference),
+        );
+        LoadedDeployment {
+            id: DeploymentId::of("dep-0000000000000000000000d9").expect("valid deployment id"),
+            tenant: "t".to_string(),
+            module: "m".to_string(),
+            version: "1.0.0".to_string(),
+            namespace: "urn:sutra:module:m:1.0.0".to_string(),
+            processes: BTreeMap::new(),
+            process_files: BTreeMap::new(),
+            rules: BTreeMap::new(),
+            templates: BTreeMap::new(),
+            scripts: BTreeMap::new(),
+            redactors: BTreeMap::new(),
+            codecs: BTreeMap::new(),
+            schema_files,
+            migrations: BTreeMap::new(),
+            coverage_files: BTreeMap::new(),
+            coverages: Vec::new(),
+            channels_yaml: None,
+            datastores_yaml: None,
+            properties: Default::default(),
+            binding_dir: std::path::PathBuf::new(),
+        }
+    }
+
+    #[test]
+    fn codec_bind_refs_failure_refuses_deployment() {
+        let err = match plan_deployment(&deployment("env:SUTRA_BIND_REFS_PROBE_NEVER_SET_7F3A")) {
+            Ok(_) => panic!("an unresolvable reference must refuse the deploy"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("SUTRA.CODEC.BIND_REFS_FAILED"), "{err}");
+        assert!(
+            err.contains("SUTRA_BIND_REFS_PROBE_NEVER_SET_7F3A"),
+            "{err}"
+        );
+        assert!(err.contains("'probe'"), "the codec is named: {err}");
+    }
+
+    #[test]
+    fn a_resolvable_configuration_binds_once_and_plans() {
+        let plan = plan_deployment(&deployment("plain-text")).expect("plans");
+        assert_eq!(plan.codec_bundles.len(), 1);
+        // Every activation shares the one bound instance.
+        let (_, make) = &plan.codec_bundles[0];
+        assert!(Arc::ptr_eq(&make(), &make()));
     }
 }

@@ -1,6 +1,7 @@
 # Summary
 
 [Introduction](introduction.md)
+[What's new in 0.7](whats-new-0-7.md)
 [What's new in 0.6](whats-new-0-6.md)
 
 # Getting Started
@@ -60,6 +61,7 @@
 - [Refused deliveries and connection references](operating/inbound-refusals.md)
 - [References in connection properties](operating/connection-references.md)
 - [Connecting to a TLS and SASL broker](operating/broker-tls-sasl.md)
+- [Connecting the engine to IBM MQ](operating/ibm-mq.md)
 - [Tuning for throughput](operating/throughput-tuning.md)
 - [Limits and quotas](operating/limits.md)
 - [Capacity pools and sessions](operating/capacity-pools.md)
@@ -73,6 +75,7 @@
 - [Upgrading to 0.6.21](operating/upgrading-0-6-21.md)
 - [Upgrading to 0.6.22](operating/upgrading-0-6-22.md)
 - [Upgrading to 0.6.25](operating/upgrading-0-6-25.md)
+- [Upgrading to 0.7.0](operating/upgrading-0-7-0.md)
 
 # Reference
 

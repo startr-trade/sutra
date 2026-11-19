@@ -238,8 +238,8 @@ below.
 access: `key` is a FEEL expression producing the row key, `forUpdate="true"` takes a pessimistic
 row lock so concurrent writers on the same key serialize, `field` narrows a write to one field of a
 stored map value, and `expect="unchanged"` is an optimistic compare-and-set alternative to a lock.
-`expect="absent"` and `query` are covered in [Claiming a key once](#claiming-a-key-once) and
-[Querying rows by key](#querying-rows-by-key).
+`expect="absent"`, `delete` and `query` are covered in [Claiming a key once](#claiming-a-key-once),
+[Deleting a row](#deleting-a-row) and [Querying rows by key](#querying-rows-by-key).
 A data task — a `serviceTask` with no `implementation` — reads and writes through its data
 associations exactly like it would a data object, except the source/target is a store reference
 instead of a variable.
@@ -861,6 +861,222 @@ With `"after":"m-7|2026-10-30|0002"` the keys are `0003` and `0004` (next `…|0
 page, and the 2026-10-31 reading is never counted. Clean up with
 `docker rm -f readings-engine readings-db && docker network rm readings-net`.
 
+## Deleting a row {#deleting-a-row}
+
+*Since 0.7.0.* `delete="true"` on a write removes the key's row instead of writing a value. The
+reference is the `targetRef` of the data task's `dataOutputAssociation`, as for any write. The
+association needs no `<sourceRef>`, and one that is given is ignored.
+
+```xml
+<bpmn:dataStoreReference id="refRemove" dataStoreRef="itemsStore">
+  <bpmn:extensionElements><q:store key="payload.itemId" delete="true"/></bpmn:extensionElements>
+</bpmn:dataStoreReference>
+
+<bpmn:serviceTask id="Remove">
+  <bpmn:dataOutputAssociation><bpmn:targetRef>refRemove</bpmn:targetRef></bpmn:dataOutputAssociation>
+</bpmn:serviceTask>
+```
+
+| Form | Row present | Row missing |
+|---|---|---|
+| `delete="true"` | deleted | no-op |
+| `delete="true" expect="unchanged"`, key read earlier in the instance | deleted while its revision is still the one read, otherwise a conflict | a conflict (the row is gone) |
+| `delete="true" expect="unchanged"`, key never read, or read as missing | a conflict (the row appeared) | no-op |
+
+The conflict is `SUTRA.RUNTIME.DATASTORE.CONFLICT`. An error boundary on the data task catches it, as
+it catches a lost [claim](#claiming-a-key-once).
+
+**Read, check, delete.** A data task runs its reads before its writes. So one task can read a key
+through one reference and delete it through another with `expect="unchanged"`. If anything changes
+the row between the read and the delete, the delete does not apply.
+
+```xml
+<bpmn:dataStoreReference id="refItem" dataStoreRef="itemsStore">
+  <bpmn:extensionElements><q:store key="payload.itemId"/></bpmn:extensionElements>
+</bpmn:dataStoreReference>
+<bpmn:dataStoreReference id="refRemove" dataStoreRef="itemsStore">
+  <bpmn:extensionElements><q:store key="payload.itemId" delete="true" expect="unchanged"/></bpmn:extensionElements>
+</bpmn:dataStoreReference>
+
+<bpmn:serviceTask id="Remove">
+  <bpmn:dataInputAssociation><bpmn:sourceRef>refItem</bpmn:sourceRef><bpmn:targetRef>item</bpmn:targetRef></bpmn:dataInputAssociation>
+  <bpmn:dataOutputAssociation><bpmn:targetRef>refRemove</bpmn:targetRef></bpmn:dataOutputAssociation>
+</bpmn:serviceTask>
+```
+
+A delete follows the same rules as a write of the same key:
+
+- **Transactions.** Inside a `<bpmn:transaction>` the delete runs on the scope's store transaction,
+  so it commits or rolls back with the scope. Outside one it commits on its own.
+- **Locks.** The `DELETE` takes the row lock itself. It waits behind a `forUpdate` read of the same
+  key in another instance until that instance commits.
+- **The read cache.** A delete through the engine invalidates the key at once. Other replicas see
+  the row gone on their next read, because a deleted row no longer has the revision they cached.
+- **Store shapes and databases.** Deletes work on key/value and typed-column stores, on
+  PostgreSQL, MySQL, MariaDB and SQL Server.
+
+`delete` cannot be combined with `field`, `forUpdate`, `expect="absent"`, `query`, `to`, `rows`,
+`limit`, `after` or a `<q:aggregate>`. A delete reference cannot be the source of a read either.
+`sutra lint`, sealing and deploy all refuse these with `SUTRA.PARSE.STORE.DELETE_INVALID`.
+
+> **A re-created row never reuses a revision.** A row's revision starts at the database's own
+> clock (microseconds since the epoch, read in the insert itself, so all replicas share one clock)
+> and goes up by one with each write. Revisions are strictly increasing per row but not dense. A
+> key that is deleted and created again therefore starts above every revision the old row had. A
+> replica that cached the old row reads the new one, and an `expect="unchanged"` write or delete
+> that read the old row is refused. This relies on the database clock moving forward: if it is
+> stepped backwards between the delete and the re-create, the guarantee can break.
+
+### Walkthrough: removing an item seen through two replicas
+
+A package with an `items` store that keeps a read cache, a `results` store, and three processes,
+each started over HTTP: `item-write` writes a row, `item-copy` reads one row and copies it into
+`results`, and `item-delete` runs the read-check-delete above. Two engines share one database, so
+one can delete a row the other has cached. The files:
+
+```text
+items/
+├── package.yaml            # labels: default / items / 1.0.0
+├── datastores.yaml         # stores `items` (cache: {enabled: true}) and `results`, env-indirected
+├── migrations/items/V001__data_store.sql     # the key/value table, as in Querying rows by key
+├── migrations/results/V001__data_store.sql   # the same table
+├── channels.yaml           # item-in, copy-in, delete-in: HTTP + json + apikey
+└── bpmn/items.bpmn
+```
+
+`item-copy` copies the row into `results` under `copy|<key>|<tag>`:
+
+```xml
+<bpmn:dataStoreReference id="refItem" dataStoreRef="itemsStore">
+  <bpmn:extensionElements><q:store key="payload.key"/></bpmn:extensionElements>
+</bpmn:dataStoreReference>
+<bpmn:dataStoreReference id="refCopy" dataStoreRef="resultsStore">
+  <bpmn:extensionElements><q:store key="'copy|' + payload.key + '|' + payload.tag"/></bpmn:extensionElements>
+</bpmn:dataStoreReference>
+
+<bpmn:serviceTask id="Copy" name="Copy the item">
+  <bpmn:dataInputAssociation>
+    <bpmn:sourceRef>refItem</bpmn:sourceRef><bpmn:targetRef>copied</bpmn:targetRef>
+  </bpmn:dataInputAssociation>
+  <bpmn:dataOutputAssociation>
+    <bpmn:sourceRef>copied</bpmn:sourceRef><bpmn:targetRef>refCopy</bpmn:targetRef>
+  </bpmn:dataOutputAssociation>
+</bpmn:serviceTask>
+```
+
+Package it, then start PostgreSQL and two engines, `items-a` and `items-b`:
+
+```sh
+sutra package items --out deployments
+docker network create items-net
+docker run -d --name items-db --network items-net -e POSTGRES_PASSWORD=dev-only postgres:16-alpine
+until docker exec items-db pg_isready -U postgres -h 127.0.0.1; do sleep 1; done; sleep 2
+docker exec items-db psql -U postgres \
+  -c "CREATE ROLE sutra_engine LOGIN PASSWORD 'dev-only' NOSUPERUSER NOBYPASSRLS" \
+  -c "ALTER SCHEMA public OWNER TO sutra_engine"
+for r in a b; do
+  docker run -d --name items-$r --network items-net -p 127.0.0.1::8080 \
+    -v "$PWD/deployments:/deployments:ro" -e SUTRA_DEPLOYMENTS_DIR=/deployments \
+    -e SUTRA_DATASOURCE_URL=postgres://items-db:5432/postgres \
+    -e SUTRA_DATASOURCE_USERNAME=sutra_engine -e SUTRA_DATASOURCE_PASSWORD=dev-only \
+    -e SUTRA_ADMIN_OIDC_DEV_DISABLED=true \
+    -e ITEMS_DB_URL=postgres://items-db:5432/postgres \
+    -e ITEMS_DB_USER=sutra_engine -e ITEMS_DB_PASSWORD=dev-only \
+    -e ITEMS_API_KEY=dev-only-items-key ghcr.io/startr-trade/sutra:0.7.0
+  until curl -sf -o /dev/null "http://127.0.0.1:$(docker port items-$r 8080 | head -1 | cut -d: -f2)/sutra/health/ready"; do
+    sleep 1
+  done
+done
+A=http://127.0.0.1:$(docker port items-a 8080 | head -1 | cut -d: -f2)
+B=http://127.0.0.1:$(docker port items-b 8080 | head -1 | cut -d: -f2)
+C=(-s -o /dev/null -w "%{http_code}\n" -H 'Content-Type: application/json' -H 'X-Api-Key: dev-only-items-key')
+sql() { docker exec items-db psql -U postgres -tAc "$1"; }
+```
+
+1. Write an item through `items-a`. Its revision is the database clock at the insert:
+
+   ```sh
+   curl "${C[@]}" -X POST "$A/channels/item-in" -d '{"key":"item-0001","entry":{"amount":"12.50"}}'
+   sql "SELECT store_value, rev FROM data_store WHERE store_name='items' AND store_key='item-0001'"
+   ```
+
+   ```text
+   200
+   {"amount":"12.50"}|1795060962963065
+   ```
+
+2. Read it through `items-b`, which now holds it in its cache:
+
+   ```sh
+   curl "${C[@]}" -X POST "$B/channels/copy-in" -d '{"key":"item-0001","tag":"before"}'
+   sql "SELECT store_value FROM data_store WHERE store_name='results' AND store_key='copy|item-0001|before'"
+   ```
+
+   ```text
+   200
+   {"amount":"12.50"}
+   ```
+
+3. Delete it through `items-a`:
+
+   ```sh
+   curl "${C[@]}" -X POST "$A/channels/delete-in" -d '{"key":"item-0001"}'
+   sql "SELECT count(*) FROM data_store WHERE store_name='items' AND store_key='item-0001'"
+   ```
+
+   ```text
+   200
+   0
+   ```
+
+4. Read it through `items-b` again. Its cached entry's revision no longer matches (the row is
+   gone), so it serves nothing stale:
+
+   ```sh
+   curl "${C[@]}" -X POST "$B/channels/copy-in" -d '{"key":"item-0001","tag":"after"}'
+   sql "SELECT store_value FROM data_store WHERE store_name='results' AND store_key='copy|item-0001|after'"
+   ```
+
+   ```text
+   200
+   null
+   ```
+
+5. Create the item again with another value through `items-a`, and read it through `items-b`. The
+   new row starts above every revision the old one had, so `items-b` reads the new value:
+
+   ```sh
+   curl "${C[@]}" -X POST "$A/channels/item-in" -d '{"key":"item-0001","entry":{"amount":"2.00"}}'
+   sql "SELECT store_value, rev FROM data_store WHERE store_name='items' AND store_key='item-0001'"
+   curl "${C[@]}" -X POST "$B/channels/copy-in" -d '{"key":"item-0001","tag":"again"}'
+   sql "SELECT store_value FROM data_store WHERE store_name='results' AND store_key='copy|item-0001|again'"
+   ```
+
+   ```text
+   200
+   {"amount":"2.00"}|1795060963446990
+   200
+   {"amount":"2.00"}
+   ```
+
+6. Delete it twice, once through each engine. Both answer `200`: the second delete is of a missing
+   key, a no-op.
+
+   ```sh
+   curl "${C[@]}" -X POST "$A/channels/delete-in" -d '{"key":"item-0001"}'
+   curl "${C[@]}" -X POST "$B/channels/delete-in" -d '{"key":"item-0001"}'
+   ```
+
+7. Change the delete reference to `<q:store key="payload.key" delete="true" forUpdate="true"/>` and
+   lint the package with `sutra lint items`. It is refused before anything runs:
+
+   ```text
+   [ERROR] SUTRA.DEPLOY.PACKAGE.CONFIG_INVALID — BPMN bpmn/items.bpmn fails to parse: [SUTRA.PARSE.STORE.DELETE_INVALID] <serviceTask> 'Remove' declares a delete on data store 'items' that cannot run: @forUpdate locks a row for a read; a delete takes the row lock itself (lock it with a forUpdate read through another reference). (items/bpmn/items.bpmn)
+   ```
+
+Revisions differ on every run. Clean up with
+`docker rm -f items-a items-b items-db && docker network rm items-net`.
+
 ## Caching reads {#caching-reads}
 
 *Since 0.6.5.* A data task reads a value and its revision in one round trip. A store that is read
@@ -885,9 +1101,10 @@ datastores:
 | `PT0S` (default) | one revision check (`SELECT rev`) instead of a full read | seen by the next read on every replica: each write bumps the row's revision | seen by the next read if the SQL bumps `rev`, otherwise only once the key is evicted |
 | positive, e.g. `PT5S` | no query at all while the key was checked less than `ttl` ago | through this engine: seen at once; through another replica: within `ttl` | within `ttl` |
 
-The cache is shared by every lane of the engine process and is per deployment. A write made
-through the engine — a data task's write, or one inside a `<bpmn:transaction>` — invalidates its
-key at once. Reads inside a transaction always go to the database, because they must see the
+The cache is shared by every lane of the engine process and is per deployment. A write or delete
+made through the engine — a data task's, or one inside a `<bpmn:transaction>` — invalidates its
+key at once. Every other replica sees it on its next read, a key deleted and created again
+included: the re-created row never reuses a revision (see [Deleting a row](#deleting-a-row)). Reads inside a transaction always go to the database, because they must see the
 transaction's own snapshot and locks. Keep `ttl` at `PT0S` unless a few seconds of staleness
 after an operator's edit is acceptable. When you change rows by hand, bump `rev` with them:
 

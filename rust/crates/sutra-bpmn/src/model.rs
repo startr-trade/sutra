@@ -220,15 +220,20 @@ pub struct Assignment {
 /// field of the stored (map) value is replaced. [`Self::expect_unchanged`] makes the write a
 /// compare-and-set (data-store optimistic concurrency, `<q:store expect="unchanged">`);
 /// [`Self::expect_absent`] makes it an insert that applies only when the key does not exist yet
-/// (`<q:store expect="absent">`).
+/// (`<q:store expect="absent">`). [`Self::delete`] makes it a row delete (`<q:store
+/// delete="true">`): nothing is written, the key's row is removed, and combined with
+/// [`Self::expect_unchanged`] it applies only while the row's revision is the one read earlier.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoreWrite {
     pub store: String,
     pub key_expression: String,
     pub field: Option<String>,
+    /// The variable written; empty for a delete whose association names no `<sourceRef>`.
     pub value_var: String,
     pub expect_unchanged: bool,
     pub expect_absent: bool,
+    /// `<q:store delete="true">`: remove the row instead of writing `value_var`.
+    pub delete: bool,
 }
 
 /// Explicit BPMN data-flow mapping for an activity: variable scoping

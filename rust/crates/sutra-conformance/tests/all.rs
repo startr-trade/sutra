@@ -64,6 +64,8 @@ mod tc_store_features;
 mod tc_suite_release;
 #[path = "all/tc_timer_expressions.rs"]
 mod tc_timer_expressions;
+#[path = "all/tc_uncorrelated_relay.rs"]
+mod tc_uncorrelated_relay;
 #[path = "all/tc_wait_race.rs"]
 mod tc_wait_race;
 

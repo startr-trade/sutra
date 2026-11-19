@@ -1,0 +1,50 @@
+* The first queue manager of the IBM MQ suite: the one the engine talks to over AMQP 1.0.
+*
+* Two AMQP channels: SUTRA.AMQP in plain text on 5672 and SUTRA.AMQPS with TLS on 5671. Both
+* require a user and password (SASL PLAIN), checked against the queue manager's connection
+* authentication; the developer image's `app` user is the one the tests log in as.
+DEFINE CHANNEL('SUTRA.AMQP') CHLTYPE(AMQP) PORT(5672) MCAUSER('app') REPLACE
+DEFINE CHANNEL('SUTRA.AMQPS') CHLTYPE(AMQP) PORT(5671) MCAUSER('app') +
+       SSLCIPH('ANY_TLS12_OR_HIGHER') SSLCAUTH(OPTIONAL) REPLACE
+SET CHLAUTH('SUTRA.AMQP*') TYPE(ADDRESSMAP) ADDRESS('*') USERSRC(CHANNEL) CHCKCLNT(REQUIRED) +
+    ACTION(REPLACE)
+
+* The queue manager's certificate and its CA, in a PKCS#12 key repository. The AMQP service
+* (Java) reads the repository named by SSLKEYR with the KEYRPWD password when it starts, so this
+* comes before the service starts; it cannot read the CMS repository with a stash file that the
+* image builds from /etc/mqm/pki.
+ALTER QMGR SSLKEYR('/sutra-tls/qm.p12') KEYRPWD('@KEYRPWD@') CERTLABL('qm')
+REFRESH SECURITY TYPE(SSL)
+
+* Local queues. APP.DURABLE keeps its messages by default (DEFPSIST) for the restart test.
+DEFINE QLOCAL('APP.P2P') REPLACE
+DEFINE QLOCAL('APP.CONCURRENT') REPLACE
+* APP.MAPPING gives its readers no message properties (no MQRFH2), as a queue read by an
+* application that wants none would; APP.P2P.PROPS keeps the default.
+DEFINE QLOCAL('APP.MAPPING') PROPCTL(NONE) REPLACE
+DEFINE QLOCAL('APP.P2P.PROPS') REPLACE
+DEFINE QLOCAL('APP.UNTYPED') REPLACE
+DEFINE QLOCAL('APP.INBOUND') REPLACE
+DEFINE QLOCAL('APP.DURABLE') DEFPSIST(YES) REPLACE
+DEFINE QLOCAL('APP.NOTIFY.LOCAL') REPLACE
+
+* A remote queue definition: APP.TO.QM2 names QM2.IN on QM2, through the transmission queue QM2
+* and the sender channel QM1.TO.QM2 (TLS, started by a trigger when a message arrives).
+DEFINE QLOCAL('QM2') USAGE(XMITQ) TRIGGER TRIGTYPE(FIRST) INITQ('SYSTEM.CHANNEL.INITQ') +
+       TRIGDATA('QM1.TO.QM2') REPLACE
+DEFINE QREMOTE('APP.TO.QM2') RNAME('QM2.IN') RQMNAME('QM2') XMITQ('QM2') REPLACE
+DEFINE CHANNEL('QM1.TO.QM2') CHLTYPE(SDR) TRPTYPE(TCP) CONNAME('qm2(1414)') XMITQ('QM2') +
+       SSLCIPH('ANY_TLS12_OR_HIGHER') REPLACE
+
+* A topic and two administrative (durable) subscriptions: one delivering to a local queue, one
+* to a queue on QM2 through the same channel.
+DEFINE TOPIC('APP.NOTIFY') TOPICSTR('app/notify') REPLACE
+DEFINE SUB('APP.NOTIFY.LOCAL') TOPICSTR('app/notify') DEST('APP.NOTIFY.LOCAL') REPLACE
+DEFINE SUB('APP.NOTIFY.QM2') TOPICSTR('app/notify') DEST('QM2.NOTIFY') DESTQMGR('QM2') REPLACE
+
+SET AUTHREC PROFILE('APP.**') PRINCIPAL('app') OBJTYPE(QUEUE) AUTHADD(BROWSE,GET,INQ,PUT)
+SET AUTHREC PROFILE('APP.**') PRINCIPAL('app') OBJTYPE(TOPIC) AUTHADD(PUB,SUB)
+
+* AMQP runs as a queue manager service; start it with the queue manager.
+ALTER SERVICE(SYSTEM.AMQP.SERVICE) CONTROL(QMGR)
+START SERVICE(SYSTEM.AMQP.SERVICE)

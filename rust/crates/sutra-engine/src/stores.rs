@@ -168,6 +168,17 @@ macro_rules! async_dialect_store {
                     .map_err(to_store_err)
             }
 
+            async fn delete_if_revision(
+                &self,
+                key: &str,
+                expected_rev: i64,
+            ) -> Result<bool, StoreError> {
+                self.inner
+                    .delete_if_revision(key, expected_rev)
+                    .await
+                    .map_err(to_store_err)
+            }
+
             async fn query(&self, query: &StoreKeyQuery) -> Result<StoreQueryResult, StoreError> {
                 let page = self
                     .inner
@@ -251,6 +262,17 @@ macro_rules! async_dialect_store {
                 let json = feel_to_json(&value);
                 let mut tx = self.tx.borrow_mut().take().ok_or_else(|| self.released())?;
                 let r = tx.put_if_revision(key, &json, expected_rev).await;
+                *self.tx.borrow_mut() = Some(tx);
+                r.map_err(to_store_err)
+            }
+
+            async fn delete_if_revision(
+                &self,
+                key: &str,
+                expected_rev: i64,
+            ) -> Result<bool, StoreError> {
+                let mut tx = self.tx.borrow_mut().take().ok_or_else(|| self.released())?;
+                let r = tx.delete_if_revision(key, expected_rev).await;
                 *self.tx.borrow_mut() = Some(tx);
                 r.map_err(to_store_err)
             }
@@ -669,6 +691,13 @@ impl DataStore for CachedStore {
         result
     }
 
+    async fn delete_if_revision(&self, key: &str, expected_rev: i64) -> Result<bool, StoreError> {
+        self.cache.invalidate(key);
+        let result = self.inner.delete_if_revision(key, expected_rev).await;
+        self.cache.invalidate(key);
+        result
+    }
+
     /// A key query is never served from (or stored in) the cache: it reads the store itself.
     async fn query(&self, query: &StoreKeyQuery) -> Result<StoreQueryResult, StoreError> {
         self.inner.query(query).await
@@ -741,6 +770,11 @@ impl DataStoreTx for CachedTx {
         self.inner.put_if_revision(key, value, expected_rev).await
     }
 
+    async fn delete_if_revision(&self, key: &str, expected_rev: i64) -> Result<bool, StoreError> {
+        self.wrote(key);
+        self.inner.delete_if_revision(key, expected_rev).await
+    }
+
     async fn commit(&self) -> Result<(), StoreError> {
         let result = self.inner.commit().await;
         self.end();
@@ -794,6 +828,13 @@ mod cache_tests {
             expected_rev: i64,
         ) -> Result<bool, StoreError> {
             self.inner.put_if_revision(key, value, expected_rev).await
+        }
+        async fn delete_if_revision(
+            &self,
+            key: &str,
+            expected_rev: i64,
+        ) -> Result<bool, StoreError> {
+            self.inner.delete_if_revision(key, expected_rev).await
         }
         async fn begin(&self) -> Result<Option<Rc<dyn DataStoreTx>>, StoreError> {
             self.inner.begin().await
@@ -877,6 +918,46 @@ mod cache_tests {
         );
         tokio::time::sleep(std::time::Duration::from_millis(60)).await;
         assert_eq!(store.get("k").await.unwrap(), Some(s("outside")));
+    }
+
+    /// A delete through the engine invalidates the key at once, even with a long ttl — plain,
+    /// conditional, and inside a transaction — so the next read sees the row gone.
+    #[tokio::test]
+    async fn a_delete_through_the_engine_applies_to_the_next_read_even_with_a_ttl() {
+        let (_, store, _) = cached("delete", std::time::Duration::from_secs(3600));
+        store.put("k", s("v1")).await.unwrap();
+        assert_eq!(store.get("k").await.unwrap(), Some(s("v1")));
+        store.delete("k").await.unwrap();
+        assert_eq!(store.get("k").await.unwrap(), None);
+
+        store.put("k", s("v2")).await.unwrap();
+        let (value, rev) = store.get_with_revision("k").await.unwrap();
+        assert_eq!(value, Some(s("v2")));
+        assert!(
+            !store.delete_if_revision("k", rev + 1).await.unwrap(),
+            "stale"
+        );
+        assert_eq!(store.get("k").await.unwrap(), Some(s("v2")));
+        assert!(store.delete_if_revision("k", rev).await.unwrap());
+        assert_eq!(store.get("k").await.unwrap(), None);
+
+        store.put("k", s("v3")).await.unwrap();
+        assert_eq!(store.get("k").await.unwrap(), Some(s("v3")));
+        let tx = store.begin().await.unwrap().expect("transactions");
+        tx.delete("k").await.unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(store.get("k").await.unwrap(), None);
+    }
+
+    /// A delete made behind the cache's back (another replica) is seen on the next read: the
+    /// deleted row's revision no longer matches the cached one.
+    #[tokio::test]
+    async fn a_delete_on_another_replica_is_seen_by_revision() {
+        let (_, store, backing) = cached("delete-outside", std::time::Duration::ZERO);
+        backing.put("k", s("v1")).await.unwrap();
+        assert_eq!(store.get("k").await.unwrap(), Some(s("v1")));
+        backing.delete("k").await.unwrap();
+        assert_eq!(store.get("k").await.unwrap(), None);
     }
 
     /// The cache never holds more than maxEntries keys.

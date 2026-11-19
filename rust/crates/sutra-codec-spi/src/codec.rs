@@ -4,6 +4,13 @@
 use crate::result::{AttributeSpec, CodecValue, DecodeResult};
 use crate::shape::SchemaShape;
 
+/// Resolves one environment reference (`env:NAME`, `secret:NAME`, `vault:…`, `${NAME}`) through
+/// the engine's own registry, the one channel bindings resolve their credentials through. Text that
+/// carries no reference is returned unchanged, so a codec that requires a reference (a private
+/// key, say) checks the spelling itself before resolving. Errors carry a human-readable message
+/// that never includes a resolved value.
+pub type CodecRefResolver = fn(&str) -> Result<String, String>;
+
 /// A payload codec: name + accepted content types + total decode + encode (the inverse).
 ///
 /// **`Send + Sync` is required** (execution scale-out §2 row 10): a compiled codec is
@@ -62,6 +69,34 @@ pub trait PayloadCodec: Send + Sync {
     /// Encode a reply payload to wire bytes (the inverse of decode). Errors carry a
     /// human-readable message; the engine wraps them as `SUTRA.OUTBOUND.ENCODE_FAILED`.
     fn encode(&self, payload: &CodecValue, content_type: Option<&str>) -> Result<Vec<u8>, String>;
+
+    /// Resolve the references this codec's own configuration names, once, when a deployment's
+    /// codec instance is minted on the runtime host. A codec built from package files holds no
+    /// secret: its files name references (`secret:…`), and this is where they become values, at
+    /// the same moment and through the same resolver as a channel binding's credentials. The
+    /// codec keeps what it resolved itself (an `OnceLock` is enough, since `&self`).
+    ///
+    /// The default resolves nothing. An `Err` refuses the deployment
+    /// (`SUTRA.CODEC.BIND_REFS_FAILED`): a codec that cannot obtain what its configuration asks
+    /// for would otherwise fail every message at run time. The message must name the reference
+    /// that failed, never a value.
+    fn bind_refs(&self, resolve: CodecRefResolver) -> Result<(), String> {
+        let _ = resolve;
+        Ok(())
+    }
+
+    /// The governing codec's last transform of bytes it is about to put on the wire, called after
+    /// its own read-back of those bytes passed (`SUTRA.OUTBOUND.VALIDATION_REJECT` otherwise) and
+    /// before the message is committed to the outbox, so a redelivery resends the same bytes. It
+    /// covers every way a flow produces bytes, a template render included, which is why it is
+    /// separate from [`Self::encode`]: a render never reaches `encode`.
+    ///
+    /// `Ok(None)`, the default, sends the bytes as they are. `Ok(Some(bytes))` sends `bytes`
+    /// instead. An `Err` refuses the message (`SUTRA.OUTBOUND.SEAL_FAILED`): nothing is sent.
+    fn seal(&self, body: &[u8], content_type: Option<&str>) -> Result<Option<Vec<u8>>, String> {
+        let _ = (body, content_type);
+        Ok(None)
+    }
 }
 
 /// Collapse newlines so a parser's error text stays a single log/diagnostic line. `pub` so the

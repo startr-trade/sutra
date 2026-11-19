@@ -1,6 +1,6 @@
 # Deployment package for the store-features conformance suite (0.6.10): key queries on a data
 # store, the insert-if-absent claim raced across two replicas, and relays that two waits on one
-# channel tell apart by message type. Labels are opaque selectors.
+# channel tell apart by message type, and a row delete seen through another replica's read cache. Labels are opaque selectors.
 labels:
   "tenant": "default"
   "module": "storefeat"

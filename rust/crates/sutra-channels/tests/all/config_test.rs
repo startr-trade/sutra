@@ -545,3 +545,40 @@ fn a_malformed_pool_call_key_fails_to_load() {
         assert_eq!(err.code, CODE, "{yaml}: {err:?}");
     }
 }
+
+#[test]
+fn an_uncorrelated_block_loads_as_a_first_class_field() {
+    let defs = load(
+        "channels:\n- name: answers\n  transport: http\n  bind: \"POST /answers\"\n  uncorrelated:\n    start: \" late-answer \"\n- name: plain\n  transport: http\n  bind: \"POST /plain\"\n",
+    )
+    .expect("loads");
+    assert_eq!(defs[0].binding.uncorrelated_start(), Some("late-answer"));
+    assert!(!defs[0]
+        .properties
+        .keys()
+        .any(|k| k.starts_with("uncorrelated")));
+    assert_eq!(defs[1].binding.uncorrelated, None);
+    assert_eq!(defs[1].binding.uncorrelated_start(), None);
+}
+
+#[test]
+fn a_malformed_uncorrelated_block_fails_to_load() {
+    const CODE: &str = "SUTRA.CONFIG.CHANNEL.UNCORRELATED_INVALID";
+    let cases = [
+        // not a mapping
+        "channels:\n- name: a\n  uncorrelated: late\n",
+        // start names no process
+        "channels:\n- name: a\n  uncorrelated:\n    start: \"  \"\n",
+        "channels:\n- name: a\n  uncorrelated:\n    start: 3\n",
+        // unknown key
+        "channels:\n- name: a\n  uncorrelated:\n    begin: late\n",
+        // nothing declared
+        "channels:\n- name: a\n  uncorrelated: {}\n",
+        // declared on an outbound channel
+        "channels:\n- name: b\n  direction: outbound\n  transport: http\n  bind: https://x.test/\n  uncorrelated:\n    start: late\n",
+    ];
+    for yaml in cases {
+        let err = load(yaml).expect_err(yaml);
+        assert_eq!(err.code, CODE, "{yaml}: {err:?}");
+    }
+}

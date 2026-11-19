@@ -63,9 +63,14 @@ COPY --from=planner /build/recipe.json recipe.json
 # The BuildKit cache mounts (crate registry + git + the target dir) go further: a DEPENDENCY
 # change recompiles only the changed crates incrementally across builds, instead of the whole
 # tree — the local-iteration win. (CI without a warm cache still gets cargo-chef's layer cache.)
+#
+# The target mount is `sharing=locked`: two builds compiling into one target dir at once would
+# race. The cook step drops the source manifest (see the build step), so the build after a
+# dependency change rebuilds every workspace crate.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,target=/build/target \
+    --mount=type=cache,target=/build/target,sharing=locked \
+    rm -f /build/target/.sutra-source-sums && \
     if [ "$TARGETARCH" = arm64 ]; then export JEMALLOC_SYS_WITH_LG_PAGE=16; fi && \
     cargo chef cook --profile ${CARGO_PROFILE} --recipe-path recipe.json
 COPY Cargo.toml Cargo.lock ./
@@ -82,12 +87,34 @@ ARG SUTRA_BUILD_COMMIT
 ARG SOURCE_DATE_EPOCH
 # The target dir is a cache mount (not part of the image), so copy the finished binary OUT of it
 # to a normal path for the runtime stage's COPY --from.
+#
+# Freshness is decided by CONTENT, not by the copied file times. Cargo treats a workspace crate as
+# fresh when no source file is newer than its last build. The target mount outlives any one build
+# and is shared by every tree built on this host (worktrees, a downstream checkout), while BuildKit
+# reuses a cached `COPY crates` layer whenever the content matches one it built before, with that
+# layer's old file times. So a tree whose files are older than the target dir's last build of the
+# same paths (another tree's code) is taken as fresh, and the image ships the other tree's code.
+# The fix: the mount keeps a manifest of the sha256 of every source file as of its last good build;
+# each file whose content differs from it (or every file, when there is no manifest) is touched
+# before cargo runs, so cargo rebuilds exactly the crates whose sources changed. The manifest is
+# removed before the build and written only after it succeeds, so a failed or interrupted build
+# makes the next one touch everything.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,target=/build/target \
-    if [ "$TARGETARCH" = arm64 ]; then export JEMALLOC_SYS_WITH_LG_PAGE=16; fi && \
-    cargo build --profile ${CARGO_PROFILE} -p sutra-dist \
-    && cp target/${CARGO_PROFILE}/sutra-engine /build/sutra-engine
+    --mount=type=cache,target=/build/target,sharing=locked \
+    set -eu; \
+    sums=/build/target/.sutra-source-sums; \
+    find Cargo.toml Cargo.lock crates -type f -print0 | sort -z | xargs -0 sha256sum > /tmp/source-sums; \
+    if [ -s "$sums" ]; then \
+        { grep -vxF -f "$sums" /tmp/source-sums || true; } | cut -c67- | tr '\n' '\0' | xargs -0 -r touch; \
+    else \
+        find Cargo.toml Cargo.lock crates -type f -exec touch {} +; \
+    fi; \
+    rm -f "$sums"; \
+    if [ "$TARGETARCH" = arm64 ]; then export JEMALLOC_SYS_WITH_LG_PAGE=16; fi; \
+    cargo build --profile ${CARGO_PROFILE} -p sutra-dist; \
+    cp target/${CARGO_PROFILE}/sutra-engine /build/sutra-engine; \
+    mv /tmp/source-sums "$sums"
 
 # ---- CA trust store ------------------------------------------------------------
 # The engine trusts /etc/ssl/certs/ca-certificates.crt for TLS (postgres, brokers, HTTP

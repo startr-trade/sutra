@@ -1,0 +1,68 @@
+# Channels for the uncorrelated-relay conformance suite.
+#
+#   POST /channels/plain           plain-start     { id }   starts a plain order
+#   POST /channels/plain/answer    plain-answer    { id }   answers it; an uncorrelated answer is refused
+#   POST /channels/routed          routed-start    { id }   starts a routed order
+#   POST /channels/routed/answer   routed-answer   { id }   answers it; an uncorrelated answer starts late-answer
+#   POST /channels/late/ack        late-ack        { id }   lets a late-answer instance finish
+#
+# Every answer is correlated to its order by the start event's <q:alias> on id.
+
+channels:
+  - name: plain-start
+    transport: http
+    bind: "POST /channels/plain"
+    codec: json
+    cloudevents-mode: none
+    auth:
+      scheme: apikey
+      apikey:
+        value: env:UNCORRELATED_API_KEY
+        header: X-Api-Key
+
+  - name: plain-answer
+    transport: http
+    bind: "POST /channels/plain/answer"
+    codec: json
+    cloudevents-mode: none
+    auth:
+      scheme: apikey
+      apikey:
+        value: env:UNCORRELATED_API_KEY
+        header: X-Api-Key
+
+  - name: routed-start
+    transport: http
+    bind: "POST /channels/routed"
+    codec: json
+    cloudevents-mode: none
+    auth:
+      scheme: apikey
+      apikey:
+        value: env:UNCORRELATED_API_KEY
+        header: X-Api-Key
+
+  - name: routed-answer
+    transport: http
+    bind: "POST /channels/routed/answer"
+    codec: json
+    cloudevents-mode: none
+    # An answer no waiting order takes starts late-answer instead of being refused.
+    uncorrelated:
+      start: late-answer
+    auth:
+      scheme: apikey
+      apikey:
+        value: env:UNCORRELATED_API_KEY
+        header: X-Api-Key
+
+  - name: late-ack
+    transport: http
+    bind: "POST /channels/late/ack"
+    codec: json
+    cloudevents-mode: none
+    auth:
+      scheme: apikey
+      apikey:
+        value: env:UNCORRELATED_API_KEY
+        header: X-Api-Key

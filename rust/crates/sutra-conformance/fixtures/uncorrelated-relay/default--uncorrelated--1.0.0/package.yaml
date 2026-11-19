@@ -1,0 +1,9 @@
+# Deployment package for the uncorrelated-relay conformance suite: two orders that each wait for
+# one answer, one of whose answer channels routes an answer that correlates to no live order to a
+# process of its own. `sutra package <this dir>` seals it into one .sutra archive.
+labels:
+  "module": "uncorrelated"
+  "tenant": "default"
+  "version": "1.0.0"
+engine:
+  minContract: 1

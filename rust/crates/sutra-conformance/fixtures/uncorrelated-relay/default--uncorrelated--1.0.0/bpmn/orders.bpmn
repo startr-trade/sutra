@@ -1,0 +1,82 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Two orders that each wait for one answer, and the process an uncorrelated answer starts.
+    plain-order  : start on `plain-start` { id }, wait on `plain-answer`, end
+    routed-order : start on `routed-start` { id }, wait on `routed-answer`, end
+    late-answer  : start on `routed-answer` (reserved by the channel's `uncorrelated: start`),
+                   keep event.uncorrelated as variables, wait on `late-ack`, end
+-->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0"
+                  id="Definitions_uncorrelated"
+                  targetNamespace="urn:sutra:module:uncorrelated:1.0.0">
+  <bpmn:process id="plain-order" name="Plain order" isExecutable="true">
+    <bpmn:extensionElements><q:audit capture="metadata"/></bpmn:extensionElements>
+    <bpmn:startEvent id="PlainStart">
+      <bpmn:extensionElements>
+        <q:source channel="plain-start"/>
+        <q:alias name="plainId" expression="payload.id" unique="true" onConflict="correlate"/>
+      </bpmn:extensionElements>
+      <bpmn:outgoing>P1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="P1" sourceRef="PlainStart" targetRef="PlainWait"/>
+    <bpmn:receiveTask id="PlainWait" name="Wait for the answer">
+      <bpmn:extensionElements><q:source channel="plain-answer" name="answer"/></bpmn:extensionElements>
+      <bpmn:incoming>P1</bpmn:incoming><bpmn:outgoing>P2</bpmn:outgoing>
+    </bpmn:receiveTask>
+    <bpmn:sequenceFlow id="P2" sourceRef="PlainWait" targetRef="PlainDone"/>
+    <bpmn:endEvent id="PlainDone"><bpmn:incoming>P2</bpmn:incoming></bpmn:endEvent>
+  </bpmn:process>
+
+  <bpmn:process id="routed-order" name="Routed order" isExecutable="true">
+    <bpmn:extensionElements><q:audit capture="metadata"/></bpmn:extensionElements>
+    <bpmn:startEvent id="RoutedStart">
+      <bpmn:extensionElements>
+        <q:source channel="routed-start"/>
+        <q:alias name="routedId" expression="payload.id" unique="true" onConflict="correlate"/>
+      </bpmn:extensionElements>
+      <bpmn:outgoing>R1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="R1" sourceRef="RoutedStart" targetRef="RoutedWait"/>
+    <bpmn:receiveTask id="RoutedWait" name="Wait for the answer">
+      <bpmn:extensionElements><q:source channel="routed-answer" name="answer"/></bpmn:extensionElements>
+      <bpmn:incoming>R1</bpmn:incoming><bpmn:outgoing>R2</bpmn:outgoing>
+    </bpmn:receiveTask>
+    <bpmn:sequenceFlow id="R2" sourceRef="RoutedWait" targetRef="RoutedDone"/>
+    <bpmn:endEvent id="RoutedDone"><bpmn:incoming>R2</bpmn:incoming></bpmn:endEvent>
+  </bpmn:process>
+
+  <bpmn:process id="late-answer" name="An answer for no waiting order" isExecutable="true">
+    <bpmn:extensionElements>
+      <q:audit capture="metadata"/>
+      <q:variables>
+        <q:variable name="lateKey" type="string"/>
+        <q:variable name="lateEnded" type="boolean"/>
+        <q:variable name="lateCode" type="string"/>
+      </q:variables>
+    </bpmn:extensionElements>
+    <bpmn:startEvent id="LateStart">
+      <bpmn:extensionElements>
+        <q:source channel="routed-answer" name="late"/>
+        <q:alias name="lateId" expression="late.id" unique="true" onConflict="correlate"/>
+      </bpmn:extensionElements>
+      <bpmn:outgoing>L1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="L1" sourceRef="LateStart" targetRef="Keep"/>
+    <bpmn:serviceTask id="Keep" name="Keep what the engine tried (FEEL)">
+      <bpmn:incoming>L1</bpmn:incoming><bpmn:outgoing>L2</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>event.uncorrelated.keys.routedId</bpmn:from><bpmn:to>lateKey</bpmn:to></bpmn:assignment>
+        <bpmn:assignment><bpmn:from>event.uncorrelated.ended</bpmn:from><bpmn:to>lateEnded</bpmn:to></bpmn:assignment>
+        <bpmn:assignment><bpmn:from>event.uncorrelated.code</bpmn:from><bpmn:to>lateCode</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="L2" sourceRef="Keep" targetRef="LateWait"/>
+    <bpmn:receiveTask id="LateWait" name="Wait for an acknowledgement">
+      <bpmn:extensionElements><q:source channel="late-ack" name="ack"/></bpmn:extensionElements>
+      <bpmn:incoming>L2</bpmn:incoming><bpmn:outgoing>L3</bpmn:outgoing>
+    </bpmn:receiveTask>
+    <bpmn:sequenceFlow id="L3" sourceRef="LateWait" targetRef="LateDone"/>
+    <bpmn:endEvent id="LateDone"><bpmn:incoming>L3</bpmn:incoming></bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>

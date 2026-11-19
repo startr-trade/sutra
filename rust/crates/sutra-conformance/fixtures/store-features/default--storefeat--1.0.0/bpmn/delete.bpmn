@@ -1,0 +1,76 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  events-copy: read one events row (through the store's read cache) and copy it into results
+  "copy|<key>|<tag>" (null when the row is gone).
+  events-delete: delete one events row, read-check-delete in one data task: the read records the
+  row's revision, and the delete with expect="unchanged" applies only while that revision holds.
+  The outcome is recorded in results "deleted|<key>".
+-->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0"
+                  id="Definitions_delete"
+                  targetNamespace="urn:sutra:module:storefeat:1.0.0">
+  <bpmn:dataStore id="eventsStore" name="events"/>
+  <bpmn:dataStore id="resultsStore" name="results"/>
+
+  <bpmn:process id="events-copy" isExecutable="true">
+    <bpmn:extensionElements>
+      <q:variables><q:variable name="copied" type="object"/></q:variables>
+    </bpmn:extensionElements>
+    <bpmn:dataStoreReference id="refSource" dataStoreRef="eventsStore">
+      <bpmn:extensionElements><q:store key="payload.key"/></bpmn:extensionElements>
+    </bpmn:dataStoreReference>
+    <bpmn:dataStoreReference id="refCopy" dataStoreRef="resultsStore">
+      <bpmn:extensionElements><q:store key="'copy|' + payload.key + '|' + payload.tag"/></bpmn:extensionElements>
+    </bpmn:dataStoreReference>
+    <bpmn:startEvent id="StartCopy"><bpmn:extensionElements><q:source channel="copy-in"/></bpmn:extensionElements></bpmn:startEvent>
+    <bpmn:serviceTask id="Copy" name="Copy the row">
+      <bpmn:dataInputAssociation>
+        <bpmn:sourceRef>refSource</bpmn:sourceRef><bpmn:targetRef>copied</bpmn:targetRef>
+      </bpmn:dataInputAssociation>
+      <bpmn:dataOutputAssociation>
+        <bpmn:sourceRef>copied</bpmn:sourceRef><bpmn:targetRef>refCopy</bpmn:targetRef>
+      </bpmn:dataOutputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="EndCopy"/>
+    <bpmn:sequenceFlow id="C1" sourceRef="StartCopy" targetRef="Copy"/>
+    <bpmn:sequenceFlow id="C2" sourceRef="Copy" targetRef="EndCopy"/>
+  </bpmn:process>
+
+  <bpmn:process id="events-delete" isExecutable="true">
+    <bpmn:extensionElements>
+      <q:variables>
+        <q:variable name="current" type="object"/>
+        <q:variable name="outcome" type="string"/>
+      </q:variables>
+    </bpmn:extensionElements>
+    <bpmn:dataStoreReference id="refCheck" dataStoreRef="eventsStore">
+      <bpmn:extensionElements><q:store key="payload.key"/></bpmn:extensionElements>
+    </bpmn:dataStoreReference>
+    <bpmn:dataStoreReference id="refRow" dataStoreRef="eventsStore">
+      <bpmn:extensionElements><q:store key="payload.key" delete="true" expect="unchanged"/></bpmn:extensionElements>
+    </bpmn:dataStoreReference>
+    <bpmn:dataStoreReference id="refOutcome" dataStoreRef="resultsStore">
+      <bpmn:extensionElements><q:store key="'deleted|' + payload.key"/></bpmn:extensionElements>
+    </bpmn:dataStoreReference>
+    <bpmn:startEvent id="StartDelete"><bpmn:extensionElements><q:source channel="delete-in"/></bpmn:extensionElements></bpmn:startEvent>
+    <bpmn:serviceTask id="Delete" name="Delete the row">
+      <bpmn:dataInputAssociation>
+        <bpmn:sourceRef>refCheck</bpmn:sourceRef><bpmn:targetRef>current</bpmn:targetRef>
+      </bpmn:dataInputAssociation>
+      <bpmn:dataOutputAssociation><bpmn:targetRef>refRow</bpmn:targetRef></bpmn:dataOutputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:serviceTask id="Record" name="Record the outcome">
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>"deleted"</bpmn:from><bpmn:to>outcome</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+      <bpmn:dataOutputAssociation>
+        <bpmn:sourceRef>outcome</bpmn:sourceRef><bpmn:targetRef>refOutcome</bpmn:targetRef>
+      </bpmn:dataOutputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="EndDelete"/>
+    <bpmn:sequenceFlow id="D1" sourceRef="StartDelete" targetRef="Delete"/>
+    <bpmn:sequenceFlow id="D2" sourceRef="Delete" targetRef="Record"/>
+    <bpmn:sequenceFlow id="D3" sourceRef="Record" targetRef="EndDelete"/>
+  </bpmn:process>
+</bpmn:definitions>

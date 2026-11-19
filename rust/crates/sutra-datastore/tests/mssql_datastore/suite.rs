@@ -11,6 +11,10 @@ use serde_json::json;
 
 use crate::fixture;
 
+/// Any revision an insert seeds is the database clock in µs since the epoch, so it is above this
+/// (2020-09-13, in µs) on any machine with a sane clock.
+const CLOCK_SEEDED: i64 = 1_600_000_000_000_000;
+
 #[ignore = "docker"]
 #[tokio::test(flavor = "multi_thread")]
 async fn cutover_model_crud_revision_cas_and_transactions() {
@@ -22,13 +26,17 @@ async fn cutover_model_crud_revision_cas_and_transactions() {
     assert_eq!(store.revision("k1").await.unwrap(), 0);
     store.delete("k1").await.unwrap();
 
-    // insert-or-replace + revision bumps (insert = 1, each update +1)
+    // insert-or-replace + revision bumps (insert = the database clock in µs, each update +1)
     let precise = json!({"balance": 100.25_f64, "frozen": false});
     store.put("k1", &precise).await.unwrap();
-    assert_eq!(store.revision("k1").await.unwrap(), 1);
+    let seed = store.revision("k1").await.unwrap();
+    assert!(
+        seed > CLOCK_SEEDED,
+        "an insert seeds rev from the clock: {seed}"
+    );
     assert_eq!(store.get("k1").await.unwrap().unwrap(), precise);
     store.put("k1", &json!({"balance": 50})).await.unwrap();
-    assert_eq!(store.revision("k1").await.unwrap(), 2);
+    assert_eq!(store.revision("k1").await.unwrap(), seed + 1);
 
     // arbitrary-precision round-trip: a value beyond f64 precision stays exact as text
     let exact: serde_json::Value =
@@ -43,9 +51,16 @@ async fn cutover_model_crud_revision_cas_and_transactions() {
         "expect-absent conflict"
     );
     // expect-specific-rev: correct rev wins, stale rev is a detected conflict
-    assert!(store.put_if_revision("cas", &json!(2), 1).await.unwrap());
+    let cas_rev = store.revision("cas").await.unwrap();
+    assert!(store
+        .put_if_revision("cas", &json!(2), cas_rev)
+        .await
+        .unwrap());
     assert!(
-        !store.put_if_revision("cas", &json!(3), 1).await.unwrap(),
+        !store
+            .put_if_revision("cas", &json!(3), cas_rev)
+            .await
+            .unwrap(),
         "stale rev conflict"
     );
     assert_eq!(store.get("cas").await.unwrap().unwrap(), json!(2));
@@ -176,7 +191,11 @@ async fn projected_store_round_trips_upserts_cas_locks_and_deletes() {
     assert_eq!(read.to_string(), written.to_string(), "byte-equal");
     assert_eq!(read["balance"].to_string(), "100.50", "the written scale");
     assert!(read.get("openedAt").is_none(), "absent stays absent");
-    assert_eq!(store.revision("a1").await.unwrap(), 1);
+    let a1 = store.revision("a1").await.unwrap();
+    assert!(
+        a1 > CLOCK_SEEDED,
+        "an insert seeds rev from the clock: {a1}"
+    );
 
     // every declared class, including the optional one, present
     let full: serde_json::Value = serde_json::from_str(
@@ -197,7 +216,7 @@ async fn projected_store_round_trips_upserts_cas_locks_and_deletes() {
     )
     .unwrap();
     store.put("a1", &changed).await.unwrap();
-    assert_eq!(store.revision("a1").await.unwrap(), 2);
+    assert_eq!(store.revision("a1").await.unwrap(), a1 + 1);
     assert_eq!(
         store.get("a1").await.unwrap().unwrap().to_string(),
         changed.to_string()
@@ -216,15 +235,19 @@ async fn projected_store_round_trips_upserts_cas_locks_and_deletes() {
         "{message}"
     );
     assert!(message.contains("nickname"), "{message}");
-    assert_eq!(store.revision("a1").await.unwrap(), 2, "no write happened");
+    assert_eq!(
+        store.revision("a1").await.unwrap(),
+        a1 + 1,
+        "no write happened"
+    );
 
     // a non-record value has nowhere to go in a projected row
     assert!(store.put("a1", &json!("scalar")).await.is_err());
 
     // CAS: stale rev conflicts, current rev applies, expect-absent inserts exactly once
-    assert!(!store.put_if_revision("a1", &written, 1).await.unwrap());
-    assert!(store.put_if_revision("a1", &written, 2).await.unwrap());
-    assert_eq!(store.revision("a1").await.unwrap(), 3);
+    assert!(!store.put_if_revision("a1", &written, a1).await.unwrap());
+    assert!(store.put_if_revision("a1", &written, a1 + 1).await.unwrap());
+    assert_eq!(store.revision("a1").await.unwrap(), a1 + 2);
     assert!(store.put_if_revision("a3", &written, 0).await.unwrap());
     assert!(
         !store.put_if_revision("a3", &changed, 0).await.unwrap(),
@@ -317,7 +340,7 @@ async fn a_constraint_failure_is_reported_not_retried_as_a_duplicate() {
     assert_eq!(store.get("a1").await.unwrap(), None);
     assert_eq!(store.revision("a1").await.unwrap(), 0);
     store.put("a1", &fixture::account_record()).await.unwrap();
-    assert_eq!(store.revision("a1").await.unwrap(), 1);
+    assert!(store.revision("a1").await.unwrap() > CLOCK_SEEDED);
 
     // Same discipline on the CAS create path: `expect="unchanged"` against an absent key does
     // not get to report "conflict" for a write that could never have applied.
@@ -981,4 +1004,140 @@ async fn coverage_cycles_upgrade_a_database_that_predates_them() {
         .await;
     let store = fixture::coverage_store(&db);
     crate::coverage_cycle_contract::assert_upgraded(&store).await;
+}
+
+// ---- `<q:store delete="true">`: plain and conditional deletes ---------------------------
+
+/// A delete on one store, key/value or typed: a delete and a delete of the now-missing key (a
+/// no-op), the conditional delete (stale, current, already gone, expected absent), a
+/// transaction's delete rolled back and then committed, a delete waiting behind a `forUpdate`
+/// holder, revision 0 after every delete, and no revision reused by a key deleted and created
+/// again — the signal another replica's read cache
+/// revalidates on.
+async fn exercise_delete(
+    store: &sutra_datastore::MssqlDataStore,
+    v1: &serde_json::Value,
+    v2: &serde_json::Value,
+) {
+    store.put("d1", v1).await.unwrap();
+    store.put("d2", v1).await.unwrap();
+    store.delete("d1").await.unwrap();
+    assert_eq!(store.get("d1").await.unwrap(), None);
+    assert_eq!(
+        store.revision("d1").await.unwrap(),
+        0,
+        "a deleted row has revision 0"
+    );
+    store.delete("d1").await.unwrap();
+    assert!(
+        store.get("d2").await.unwrap().is_some(),
+        "a delete is scoped to its key"
+    );
+
+    let rev = store.revision("d2").await.unwrap();
+    store.put("d2", v2).await.unwrap();
+    assert!(
+        !store.delete_if_revision("d2", rev).await.unwrap(),
+        "stale revision"
+    );
+    assert!(
+        store.get("d2").await.unwrap().is_some(),
+        "a conflict deletes nothing"
+    );
+    assert!(
+        store.delete_if_revision("d2", rev + 1).await.unwrap(),
+        "current revision"
+    );
+    assert_eq!(store.get("d2").await.unwrap(), None);
+    assert!(
+        !store.delete_if_revision("d2", rev + 1).await.unwrap(),
+        "already gone"
+    );
+    assert!(
+        store.delete_if_revision("d2", 0).await.unwrap(),
+        "expected absent, still absent"
+    );
+    store.put("d3", v1).await.unwrap();
+    assert!(
+        !store.delete_if_revision("d3", 0).await.unwrap(),
+        "expected absent, present"
+    );
+    assert!(store.get("d3").await.unwrap().is_some());
+
+    let mut tx = store.begin().await.unwrap();
+    tx.delete("d3").await.unwrap();
+    assert_eq!(
+        tx.get("d3").await.unwrap(),
+        None,
+        "the transaction sees its own delete"
+    );
+    tx.rollback().await.unwrap();
+    assert!(store.get("d3").await.unwrap().is_some(), "rolled back");
+    let mut tx = store.begin().await.unwrap();
+    let rev = tx.revision("d3").await.unwrap();
+    assert!(!tx.delete_if_revision("d3", rev + 7).await.unwrap());
+    assert!(tx.delete_if_revision("d3", rev).await.unwrap());
+    tx.commit().await.unwrap();
+    assert_eq!(store.get("d3").await.unwrap(), None);
+    assert_eq!(store.revision("d3").await.unwrap(), 0);
+
+    // A forUpdate holder blocks the delete until it commits.
+    store.put("d4", v1).await.unwrap();
+    let mut holder = store.begin().await.unwrap();
+    holder.get_for_update("d4").await.unwrap().expect("row");
+    let deleter = store.clone();
+    let delete = tokio::spawn(async move { deleter.delete("d4").await });
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    assert!(!delete.is_finished(), "the delete waits for the row lock");
+    holder.commit().await.unwrap();
+    delete.await.unwrap().unwrap();
+    assert_eq!(store.get("d4").await.unwrap(), None);
+
+    // Deleted and created again, a key never reuses a revision: the re-created row's revision is
+    // above every revision the old row had, so a compare-and-set or a conditional delete that
+    // read the old row is refused, and a cached revision of the old row no longer matches.
+    store.put("d5", v1).await.unwrap();
+    let first = store.revision("d5").await.unwrap();
+    assert!(first > CLOCK_SEEDED, "seeded from the clock: {first}");
+    for _ in 0..3 {
+        store.put("d5", v1).await.unwrap();
+    }
+    let old = store.revision("d5").await.unwrap();
+    assert_eq!(old, first + 3, "each write adds one");
+    store.delete("d5").await.unwrap();
+    store.put("d5", v2).await.unwrap();
+    let recreated = store.revision("d5").await.unwrap();
+    assert!(
+        recreated > old,
+        "re-created at {recreated}, old row reached {old}"
+    );
+    for stale in [first, old] {
+        assert!(
+            !store.put_if_revision("d5", v1, stale).await.unwrap(),
+            "CAS read before"
+        );
+        assert!(
+            !store.delete_if_revision("d5", stale).await.unwrap(),
+            "delete read before"
+        );
+    }
+    assert!(store.get("d5").await.unwrap().is_some());
+    assert!(store.delete_if_revision("d5", recreated).await.unwrap());
+}
+
+#[ignore = "docker"]
+#[tokio::test(flavor = "multi_thread")]
+async fn delete_and_conditional_delete_on_key_value_and_typed_stores() {
+    let db = fixture::fresh_db().await;
+    let kv = fixture::store(&db, "ledger");
+    exercise_delete(&kv, &json!({"n": 1}), &json!({"n": 2})).await;
+    let typed = fixture::projected_store(&db, "accounts", "accounts", fixture::PROJECTED_DDL);
+    let mut changed = fixture::account_record().as_object().unwrap().clone();
+    changed.insert("seqNo".into(), json!(8));
+    exercise_delete(
+        &typed,
+        &fixture::account_record(),
+        &serde_json::Value::Object(changed),
+    )
+    .await;
 }

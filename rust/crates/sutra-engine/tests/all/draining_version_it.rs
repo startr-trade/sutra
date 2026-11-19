@@ -3110,3 +3110,51 @@ async fn a_changed_sync_to_async_channel_still_sends_as_v1() {
     assert_eq!(capture.delivered("/2.0.0-sync"), 0);
     engine.shutdown().await;
 }
+
+/// Upgrades back to back, each request sent the moment the deploy API answers: every request is
+/// served (never `RESOLVE.CHANNEL.UNKNOWN`) and runs on the version just deployed, never on the
+/// one before it. A deploy re-activates on the API's task, and its own `NOTIFY` re-activates
+/// again on the convergence loop. Those two flips must not interleave (the routes would name a
+/// version the lanes no longer hold) and an older one must not land last (the new routes would
+/// be replaced by the previous version's).
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "docker"]
+async fn back_to_back_upgrades_serve_every_request_on_the_version_just_deployed() {
+    const UPGRADES: usize = 8;
+    const REQUESTS: usize = 12;
+    let (_pool, url) = fresh_db().await;
+    let (sink, capture) = capture_server().await;
+    let versions: Vec<String> = (1..=UPGRADES).map(|v| format!("{v}.0.0")).collect();
+    let archives: Vec<Vec<u8>> = versions
+        .iter()
+        .map(|v| package(&internal_package(v, sink)))
+        .collect();
+    let engine = boot_db_engine(url).await;
+    let addr = engine.local_addr;
+    for (i, (version, archive)) in versions.iter().zip(&archives).enumerate() {
+        let (status, body) = post(addr, "/admin/deployments", archive).await;
+        assert_eq!(status, 200, "deploy {version}: {body}");
+        for n in 0..REQUESTS {
+            let (status, body) = post(addr, "/d/quick-start", br#"{"n":1}"#).await;
+            assert_eq!(
+                status, 200,
+                "request {n} right after deploying {version}: {body}"
+            );
+        }
+        let done = format!("/{version}-quick-done");
+        assert!(
+            wait_until(30, || async { capture.delivered(&done) >= REQUESTS }).await,
+            "{version} ran its {REQUESTS} requests ({} did)",
+            capture.delivered(&done)
+        );
+        if i > 0 {
+            let before = format!("/{}-quick-done", versions[i - 1]);
+            assert_eq!(
+                capture.delivered(&before),
+                REQUESTS,
+                "no request sent after deploying {version} ran on the version before it"
+            );
+        }
+    }
+    engine.shutdown().await;
+}

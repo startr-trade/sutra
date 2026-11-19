@@ -177,6 +177,21 @@ impl PostgresDataStore {
         ))
     }
 
+    /// Autocommit conditional delete (`<q:store delete="true" expect="unchanged">`): `expected_rev
+    /// <= 0` applies only while the key is absent (deleting nothing); otherwise the row is deleted
+    /// only while its revision is `expected_rev`. `false` = conflict.
+    pub fn delete_if_revision(
+        &self,
+        key: &str,
+        expected_rev: i64,
+    ) -> SendFuture<'static, Result<bool, DataStoreError>> {
+        Box::pin(store_delete_if_revision(
+            Arc::clone(&self.inner),
+            key.to_string(),
+            expected_rev,
+        ))
+    }
+
     /// Autocommit compare-and-set (`<q:store expect="unchanged">`); `false` = conflict.
     pub fn put_if_revision(
         &self,
@@ -769,6 +784,17 @@ async fn store_get_with_revision(
     Ok(result)
 }
 
+async fn store_delete_if_revision(
+    inner: Arc<StoreInner>,
+    key: String,
+    expected_rev: i64,
+) -> Result<bool, DataStoreError> {
+    let mut tx = store_begin(inner).await?;
+    let applied = tx_delete_if_revision(&mut tx, &key, expected_rev).await?;
+    tx.commit().await?;
+    Ok(applied)
+}
+
 async fn store_revision(inner: Arc<StoreInner>, key: String) -> Result<i64, DataStoreError> {
     let mut tx = store_begin(inner).await?;
     let rev = tx_revision(&mut tx, &key).await?;
@@ -1189,6 +1215,20 @@ impl PostgresDataStoreTx {
         Box::pin(tx_revision_owned(self, key))
     }
 
+    /// Conditional delete within the transaction — the contract of the store-level
+    /// `delete_if_revision`.
+    pub fn delete_if_revision<'a>(
+        &'a mut self,
+        key: &str,
+        expected_rev: i64,
+    ) -> SendFuture<'a, Result<bool, DataStoreError>> {
+        Box::pin(tx_delete_if_revision_owned(
+            self,
+            key.to_string(),
+            expected_rev,
+        ))
+    }
+
     /// Compare-and-set (`<q:store expect="unchanged">`): `expected_rev <= 0` expects
     /// ABSENT — insert-only, a unique/PK violation means a concurrent writer created the
     /// key first (conflict, `false`); otherwise the conditional `UPDATE … AND rev = $n`
@@ -1412,6 +1452,51 @@ async fn tx_delete(tx: &mut PostgresDataStoreTx, key: &str) -> Result<(), DataSt
     Ok(())
 }
 
+async fn tx_delete_if_revision_owned(
+    tx: &mut PostgresDataStoreTx,
+    key: String,
+    expected_rev: i64,
+) -> Result<bool, DataStoreError> {
+    tx_delete_if_revision(tx, &key, expected_rev).await
+}
+
+/// The conditional delete: expected `<= 0` applies only while the key is absent (nothing to
+/// delete, nothing written); otherwise `DELETE … AND rev = expected`, applied iff it removed a row.
+async fn tx_delete_if_revision(
+    tx: &mut PostgresDataStoreTx,
+    key: &str,
+    expected_rev: i64,
+) -> Result<bool, DataStoreError> {
+    if expected_rev <= 0 {
+        return Ok(tx_revision(tx, key).await? == 0);
+    }
+    let store = tx.store.clone();
+    let deleted = match tx.projected.clone() {
+        Some(projected) => {
+            let sql = projected.delete_if_revision_sql(DIALECT);
+            sqlx::query(&sql)
+                .bind(key)
+                .bind(expected_rev)
+                .execute(&mut **tx.conn()?)
+                .await
+                .map_err(|e| op_err(&store, key, "conditional delete", e))?
+                .rows_affected()
+        }
+        None => {
+            let sql = format!("DELETE FROM data_store{WHERE_KEY} AND rev = $3");
+            sqlx::query(&sql)
+                .bind(&store)
+                .bind(key)
+                .bind(expected_rev)
+                .execute(&mut **tx.conn()?)
+                .await
+                .map_err(|e| op_err(&store, key, "conditional delete", e))?
+                .rows_affected()
+        }
+    };
+    Ok(deleted > 0)
+}
+
 async fn tx_revision(tx: &mut PostgresDataStoreTx, key: &str) -> Result<i64, DataStoreError> {
     let store = tx.store.clone();
     let row = match tx.projected.clone() {
@@ -1580,11 +1665,12 @@ async fn tx_insert(tx: &mut PostgresDataStoreTx, key: &str, json: &str) -> Resul
     let conn = tx.conn().map_err(|_| sqlx::Error::PoolClosed)?;
     match legacy {
         Some((tenant, module, version)) => {
-            sqlx::query(
+            sqlx::query(&format!(
                 "INSERT INTO data_store (tenant_id, module_id, module_version, store_name, \
                  store_key, store_value, rev, updated_at) \
-                 VALUES ($1, $2, $3, $4, $5, $6, 1, CURRENT_TIMESTAMP)",
-            )
+                 VALUES ($1, $2, $3, $4, $5, $6, {seed}, CURRENT_TIMESTAMP)",
+                seed = DIALECT.revision_seed()
+            ))
             .bind(&tenant)
             .bind(&module)
             .bind(&version)
@@ -1595,10 +1681,11 @@ async fn tx_insert(tx: &mut PostgresDataStoreTx, key: &str, json: &str) -> Resul
             .await?;
         }
         None => {
-            sqlx::query(
+            sqlx::query(&format!(
                 "INSERT INTO data_store (store_name, store_key, store_value, rev, updated_at) \
-                 VALUES ($1, $2, $3, 1, CURRENT_TIMESTAMP)",
-            )
+                 VALUES ($1, $2, $3, {seed}, CURRENT_TIMESTAMP)",
+                seed = DIALECT.revision_seed()
+            ))
             .bind(&store)
             .bind(key)
             .bind(json)

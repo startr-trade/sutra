@@ -343,11 +343,81 @@ impl InboundChain {
         content_type: Option<&str>,
         site: &str,
     ) -> Result<(), Diagnostic> {
+        self.outbound_contract(
+            deployment,
+            channel_label,
+            declared_codec,
+            channel_codec,
+            body,
+            content_type,
+            site,
+        )
+        .map(|_| ())
+    }
+
+    /// [`Self::validate_outbound`], then the governing codec's [`PayloadCodec::seal`]: the bytes
+    /// to put on the wire. `Ok(None)` sends `body` unchanged (schema-less egress, or a codec that
+    /// does not seal); `Ok(Some(bytes))` sends `bytes`. A seal error is the fail-closed
+    /// [`codes::OUTBOUND_SEAL_FAILED`]: the message is not sent.
+    ///
+    /// The codec that seals is the one that just validated, so a message is sealed by exactly the
+    /// contract that admitted it, and only after that contract admitted it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn seal_outbound(
+        &self,
+        deployment: &DeploymentId,
+        channel_label: &str,
+        declared_codec: Option<&str>,
+        channel_codec: &str,
+        body: &[u8],
+        content_type: Option<&str>,
+        site: &str,
+    ) -> Result<Option<Vec<u8>>, Diagnostic> {
+        let Some(codec) = self.outbound_contract(
+            deployment,
+            channel_label,
+            declared_codec,
+            channel_codec,
+            body,
+            content_type,
+            site,
+        )?
+        else {
+            return Ok(None);
+        };
+        codec.seal(body, content_type).map_err(|e| {
+            Diagnostic::error(
+                codes::OUTBOUND_SEAL_FAILED,
+                format!(
+                    "{site}: codec '{}' could not seal the message for '{channel_label}': {}. \
+                     The message was NOT sent.",
+                    codec.name(),
+                    sutra_codec_spi::codec::sanitize(&e)
+                ),
+            )
+            .with_attribute("channel", channel_label)
+            .with_attribute("codec", codec.name())
+        })
+    }
+
+    /// The shared half of [`Self::validate_outbound`] and [`Self::seal_outbound`]: the codec that
+    /// governs the egress when its read-back is clean, `None` when no contract governs it.
+    #[allow(clippy::too_many_arguments)]
+    fn outbound_contract(
+        &self,
+        deployment: &DeploymentId,
+        channel_label: &str,
+        declared_codec: Option<&str>,
+        channel_codec: &str,
+        body: &[u8],
+        content_type: Option<&str>,
+        site: &str,
+    ) -> Result<Option<Arc<dyn PayloadCodec>>, Diagnostic> {
         let declared = declared_codec.map(str::trim).filter(|c| !c.is_empty());
         let name = declared.unwrap_or_else(|| channel_codec.trim());
         // Schema-less egress: no contract to fail. Mirrors the inbound R5 carve-out exactly.
         if name.is_empty() || self.formats.contract(name).is_some() {
-            return Ok(());
+            return Ok(None);
         }
         let codec = match declared {
             // An author who NAMED the governing codec gets a hard answer: a name that resolves
@@ -368,7 +438,7 @@ impl InboundChain {
             // refusal from this check would only misdirect.
             None => match self.codecs.resolve(name, deployment) {
                 Some(codec) => codec,
-                None => return Ok(()),
+                None => return Ok(None),
             },
         };
         let decoded = codec.decode(body, content_type);
@@ -378,7 +448,7 @@ impl InboundChain {
             .filter(|i| i.severity == IssueSeverity::Error)
             .collect();
         if errors.is_empty() {
-            return Ok(());
+            return Ok(Some(codec));
         }
         let shown = errors
             .iter()

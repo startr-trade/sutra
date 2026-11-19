@@ -160,6 +160,16 @@ pub trait DataStore {
         Ok(true)
     }
 
+    /// Conditional delete (`<q:store delete="true" expect="unchanged">`), returning whether it
+    /// applied. `expected_rev <= 0` expects the key ABSENT: it applies (deleting nothing) only
+    /// when no row exists. Otherwise it deletes the row only while its revision equals
+    /// `expected_rev`; a changed or already-deleted row is `Ok(false)`, the conflict. A store that
+    /// does not track revisions deletes unconditionally and returns `Ok(true)`.
+    async fn delete_if_revision(&self, key: &str, _expected_rev: i64) -> Result<bool, StoreError> {
+        self.delete(key).await?;
+        Ok(true)
+    }
+
     /// Opens a caller-managed transaction; `Ok(None)` when this store does not support
     /// transactions (the executor then fails closed with `SUTRA.RUNTIME.UNEXPECTED`). An `Err`
     /// means the BEGIN itself failed.
@@ -367,6 +377,13 @@ pub trait DataStoreTx {
         Ok(true)
     }
 
+    /// Conditional delete inside the transaction — the same contract as
+    /// [`DataStore::delete_if_revision`].
+    async fn delete_if_revision(&self, key: &str, _expected_rev: i64) -> Result<bool, StoreError> {
+        self.delete(key).await?;
+        Ok(true)
+    }
+
     /// Commits and releases the transaction.
     async fn commit(&self) -> Result<(), StoreError>;
 
@@ -432,7 +449,10 @@ impl DataStore for InMemoryDataStore {
     }
 
     async fn delete(&self, key: &str) -> Result<(), StoreError> {
-        self.cell.borrow_mut().data.remove(key);
+        let mut cell = self.cell.borrow_mut();
+        if cell.data.remove(key).is_some() {
+            cell.rev += 1;
+        }
         Ok(())
     }
 
@@ -457,6 +477,20 @@ impl DataStore for InMemoryDataStore {
             return Ok(false);
         }
         cell.data.insert(key.to_string(), value);
+        cell.rev += 1;
+        Ok(true)
+    }
+
+    async fn delete_if_revision(&self, key: &str, expected_rev: i64) -> Result<bool, StoreError> {
+        let mut cell = self.cell.borrow_mut();
+        let present = cell.data.contains_key(key);
+        if expected_rev <= 0 {
+            return Ok(!present);
+        }
+        if !present || expected_rev != cell.rev {
+            return Ok(false);
+        }
+        cell.data.remove(key);
         cell.rev += 1;
         Ok(true)
     }
@@ -519,6 +553,18 @@ impl DataStoreTx for InMemoryTx {
             return Ok(false);
         }
         self.put(key, value).await?;
+        Ok(true)
+    }
+
+    async fn delete_if_revision(&self, key: &str, expected_rev: i64) -> Result<bool, StoreError> {
+        let present = self.pending.borrow().contains_key(key);
+        if expected_rev <= 0 {
+            return Ok(!present);
+        }
+        if !present || expected_rev != self.store.borrow().rev {
+            return Ok(false);
+        }
+        self.pending.borrow_mut().remove(key);
         Ok(true)
     }
 

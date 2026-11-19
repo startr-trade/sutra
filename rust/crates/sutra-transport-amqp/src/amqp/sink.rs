@@ -12,7 +12,20 @@
 //!   CloudEvents `ce-*` binary projection happens upstream, [`sutra_channels::outbox_dispatch`]
 //!   `CeBinding::Amqp10` — the `ce-` DASH prefix); a present `traceparent` rides as a
 //!   `traceparent` application property (trace-context bridge);
-//! - the body is a single AMQP `Data` section (the raw reply bytes).
+//! - the body is a single AMQP `Data` section (the raw reply bytes);
+//! - the `message-id` property is the outbox key, unless an `x-amqp-message-id` header names
+//!   another; the `x-amqp-correlation-id`, `x-amqp-reply-to` and `x-amqp-subject` headers fill
+//!   the `correlation-id`, `reply-to` and `subject` properties instead of riding as application
+//!   properties (the source writes those fields back under the same names).
+//!
+//! The destination query adds per-destination options, all off by default (see
+//! [`super::AmqpSendOptions`]): `type=queue|topic` (the target capability), `durable`, `ttl-ms`,
+//! `body=binary|text` (one `amqp-value` holding binary or a string instead of a `data` section) and
+//! `property-names=identifier`.
+//!
+//! A send that cannot reach its broker starts an outage window for that broker, logged once as
+//! `SUTRA.OUTBOUND.AMQP.OUTAGE_STARTED`; the next send that reaches it logs
+//! `SUTRA.OUTBOUND.AMQP.OUTAGE_ENDED` with the start, the end and the length.
 //!
 //! Unlike Kafka the broker host rides the URI (per-authority); the
 //! sink opens a fresh connection per send (the outbox delivery loop is a background spine,
@@ -33,24 +46,30 @@
 //! have been accepted, so the retry can deliver it twice; the `sutra-outbox-key` property is what a
 //! receiver dedupes that on. Closing after the outcome is bounded the same way and never changes it.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use fe2o3_amqp::types::messaging::{ApplicationProperties, Message};
+use fe2o3_amqp::types::messaging::{ApplicationProperties, Header, Message, Properties, Target};
+use fe2o3_amqp::types::primitives::{Binary, Symbol};
 use fe2o3_amqp::{Connection, Sender, Session};
 
 use sutra_channels::diag::Diagnostic;
 use sutra_channels::sink::{BoxFuture, MessageSink, OutboundMessage, SendOutcome};
 use sutra_channels::telemetry::TRACEPARENT_HEADER;
 
+use tracing::{info, warn};
+
+use super::outage::OutageWindow;
 use super::tls::{
     classify_open_error, open_tls_connection, AmqpBrokerTarget, AmqpConnectFailure,
     AmqpTlsProperties,
 };
 use super::{
-    codes, parse_destination, redact_destination, AmqpDestination, PROPERTY_CONTENT_TYPE,
-    PROPERTY_OUTBOX_KEY,
+    codes, parse_destination, redact_destination, unique_container_id, AmqpDestination,
+    AmqpSendOptions, BodySection, HEADER_CORRELATION_ID, HEADER_MESSAGE_ID, HEADER_REPLY_TO,
+    HEADER_SUBJECT, PROPERTY_CONTENT_TYPE, PROPERTY_FIELD_HEADERS, PROPERTY_OUTBOX_KEY,
 };
 use super::{SCHEME, SCHEME_TLS};
 
@@ -74,6 +93,9 @@ pub struct AmqpMessageSink {
     tls_config: Mutex<Option<Arc<rustls::ClientConfig>>>,
     /// The bound on each broker round trip of a send.
     operation_timeout: Duration,
+    /// Brokers (`host:port`) that the last send could not reach, with when that started. The
+    /// first send that reaches one again logs the window and removes it.
+    outages: Mutex<HashMap<String, OutageWindow>>,
 }
 
 impl AmqpMessageSink {
@@ -90,6 +112,7 @@ impl AmqpMessageSink {
             tls_settings: Ok(AmqpTlsProperties::default()),
             tls_config: Mutex::new(None),
             operation_timeout: DEFAULT_OPERATION_TIMEOUT,
+            outages: Mutex::new(HashMap::new()),
         }
     }
 
@@ -161,6 +184,11 @@ impl MessageSink for AmqpMessageSink {
                 Ok(d) => self.apply_default_credentials(d),
                 Err(diagnostic) => return SendOutcome::PermanentFailure(diagnostic),
             };
+            if destination.options.body == BodySection::Text
+                && std::str::from_utf8(&message.body).is_err()
+            {
+                return SendOutcome::PermanentFailure(not_text(&message.destination));
+            }
             let tls_config = if destination.tls {
                 match self.tls_client_config() {
                     Ok(config) => Some(config),
@@ -169,8 +197,53 @@ impl MessageSink for AmqpMessageSink {
             } else {
                 None
             };
-            deliver(&destination, message, tls_config, self.operation_timeout).await
+            let (outcome, reach) =
+                deliver(&destination, message, tls_config, self.operation_timeout).await;
+            self.record_outage(&destination, &message.destination, reach);
+            outcome
         })
+    }
+}
+
+impl AmqpMessageSink {
+    /// Track the outage window per broker: a send that could not open a connection starts one
+    /// (logged once), the next send that opens one ends it (logged with start, end and length),
+    /// whatever the broker then does with the message. A refused handshake or login leaves the
+    /// window as it is.
+    fn record_outage(&self, destination: &AmqpDestination, uri: &str, reach: Reach) {
+        let broker = format!("{}:{}", destination.host, destination.port);
+        let unreachable = reach == Reach::Unreachable;
+        if reach == Reach::Unknown {
+            return;
+        }
+        let mut outages = self
+            .outages
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if unreachable {
+            if let std::collections::hash_map::Entry::Vacant(slot) = outages.entry(broker) {
+                let window = OutageWindow::begin();
+                warn!(
+                    code = codes::OUTBOUND_BROKER_OUTAGE_STARTED,
+                    broker = %slot.key(),
+                    destination = %redact_destination(uri),
+                    outage_started = %window.started(),
+                    "amqp sink cannot reach the broker; the outbox keeps sending"
+                );
+                slot.insert(window);
+            }
+        } else if let Some(window) = outages.remove(&broker) {
+            let ended = window.end();
+            info!(
+                code = codes::OUTBOUND_BROKER_OUTAGE_ENDED,
+                broker = %broker,
+                destination = %redact_destination(uri),
+                outage_started = %ended.started,
+                outage_ended = %ended.ended,
+                outage_ms = ended.millis as u64,
+                "amqp sink reached the broker again"
+            );
+        }
     }
 }
 
@@ -202,8 +275,9 @@ async fn deliver(
     message: &OutboundMessage,
     tls_config: Option<Arc<rustls::ClientConfig>>,
     timeout: Duration,
-) -> SendOutcome {
+) -> (SendOutcome, Reach) {
     let redacted = redact_destination(&message.destination);
+    let container_id = unique_container_id(CONTAINER_ID);
     let open = async {
         match tls_config {
             Some(config) => {
@@ -213,29 +287,36 @@ async fn deliver(
                     username: destination.username.as_deref(),
                     password: destination.password.as_deref(),
                 };
-                open_tls_connection(CONTAINER_ID, &target, config).await
+                open_tls_connection(&container_id, &target, config).await
             }
-            None => Connection::open(CONTAINER_ID, destination.connection_uri().as_str())
+            None => Connection::open(container_id.as_str(), destination.connection_uri().as_str())
                 .await
                 .map_err(classify_open_error),
         }
     };
     let opened = match bounded(timeout, "opened the connection", &redacted, open).await {
         Ok(opened) => opened,
-        Err(timed_out) => return timed_out,
+        Err(timed_out) => return (timed_out, Reach::Unreachable),
     };
     let mut connection = match opened {
         Ok(c) => c,
         Err(failure) => {
-            let (code, detail) = match failure {
-                AmqpConnectFailure::Tls(detail) => (codes::OUTBOUND_BROKER_TLS_FAILED, detail),
-                AmqpConnectFailure::Auth(detail) => (codes::OUTBOUND_BROKER_AUTH_FAILED, detail),
-                AmqpConnectFailure::Connection(detail) => (codes::OUTBOUND_SEND_FAILED, detail),
+            let (code, detail, reach) = match failure {
+                AmqpConnectFailure::Tls(detail) => {
+                    (codes::OUTBOUND_BROKER_TLS_FAILED, detail, Reach::Unknown)
+                }
+                AmqpConnectFailure::Auth(detail) => {
+                    (codes::OUTBOUND_BROKER_AUTH_FAILED, detail, Reach::Unknown)
+                }
+                AmqpConnectFailure::Connection(detail) => {
+                    (codes::OUTBOUND_SEND_FAILED, detail, Reach::Unreachable)
+                }
             };
-            return SendOutcome::RetryableFailure(Diagnostic::error(
+            let outcome = SendOutcome::RetryableFailure(Diagnostic::error(
                 code,
                 format!("amqp sink could not connect to {redacted}: {detail}"),
             ));
+            return (outcome, reach);
         }
     };
     let outcome =
@@ -248,7 +329,18 @@ async fn deliver(
         connection.close(),
     )
     .await;
-    outcome
+    (outcome, Reach::Reached)
+}
+
+/// Whether a send reached its broker, for the outage window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reach {
+    /// The connection opened: the broker is there, whatever it then did with the message.
+    Reached,
+    /// The connection could not be opened, or opening it timed out.
+    Unreachable,
+    /// The broker answered but refused the TLS handshake or the login: says nothing either way.
+    Unknown,
 }
 
 async fn deliver_on_connection(
@@ -279,11 +371,10 @@ async fn deliver_on_connection(
         timeout,
         "attached a sender",
         redacted,
-        Sender::attach(
-            &mut session,
-            format!("{CONTAINER_ID}-{}", destination.address),
-            destination.address.as_str(),
-        ),
+        Sender::builder()
+            .name(format!("{CONTAINER_ID}-{}", destination.address))
+            .target(target_for(destination))
+            .attach(&mut session),
     )
     .await;
     let mut sender = match attached {
@@ -305,11 +396,16 @@ async fn deliver_on_connection(
         timeout,
         "waited for the broker to settle the message",
         redacted,
-        sender.send(build_message(message)),
+        send_projected(&mut sender, destination, message),
     )
     .await;
     let outcome = match sent {
         Err(timed_out) => timed_out,
+        Ok(Err(SendError::Permanent(diagnostic))) => SendOutcome::PermanentFailure(diagnostic),
+        Ok(Err(SendError::Broker(e))) => SendOutcome::RetryableFailure(Diagnostic::error(
+            codes::OUTBOUND_SEND_FAILED,
+            format!("amqp publish to {redacted} failed: {e}"),
+        )),
         Ok(Ok(outcome)) => {
             if outcome.is_accepted() {
                 SendOutcome::Delivered
@@ -322,10 +418,6 @@ async fn deliver_on_connection(
                 ))
             }
         }
-        Ok(Err(e)) => SendOutcome::RetryableFailure(Diagnostic::error(
-            codes::OUTBOUND_SEND_FAILED,
-            format!("amqp publish to {redacted} failed: {e}"),
-        )),
     };
 
     let _ = bounded(timeout, "closed the sender", redacted, sender.close()).await;
@@ -333,34 +425,144 @@ async fn deliver_on_connection(
     outcome
 }
 
-/// Build the AMQP 1.0 message (the sink's application-property lift): `sutra-outbox-key` =
-/// the outbox key, `content-type` = the resolved content type, every other reply header
-/// verbatim (the two owned properties de-duplicated case-insensitively), plus `traceparent`
-/// when present. Body = a single `Data` section.
-fn build_message(message: &OutboundMessage) -> Message<fe2o3_amqp::types::messaging::Data> {
-    Message::builder()
-        .application_properties(build_application_properties(message))
-        .data(message.body.clone())
-        .build()
+/// The target terminus for a destination: its address, plus the `queue` / `topic` capability
+/// when the destination names its type (`?type=`).
+fn target_for(destination: &AmqpDestination) -> Target {
+    let builder = Target::builder().address(destination.address.clone());
+    match destination.options.address_type {
+        Some(kind) => builder
+            .capabilities(vec![Symbol::from(kind.capability())])
+            .build(),
+        None => builder.build(),
+    }
 }
 
-/// The FROZEN application-property table (unit-tested independently of a broker).
-fn build_application_properties(message: &OutboundMessage) -> ApplicationProperties {
+/// Why a projected send did not get a disposition.
+enum SendError {
+    /// The message cannot be built under the destination's options; a retry cannot fix it.
+    Permanent(Diagnostic),
+    /// The broker or the link failed the send.
+    Broker(fe2o3_amqp::link::SendError),
+}
+
+/// Build the message under the destination's options and send it.
+async fn send_projected(
+    sender: &mut Sender,
+    destination: &AmqpDestination,
+    message: &OutboundMessage,
+) -> Result<fe2o3_amqp::types::messaging::Outcome, SendError> {
+    let options = &destination.options;
+    let application_properties = (!options.omit_application_properties)
+        .then(|| build_application_properties(message, options));
+    let builder = Message::builder()
+        .header(build_header(options))
+        .properties(build_properties(message, &destination.address))
+        .application_properties(application_properties);
+    match options.body {
+        BodySection::Data => sender
+            .send(builder.data(message.body.clone()).build())
+            .await
+            .map_err(SendError::Broker),
+        BodySection::Binary => sender
+            .send(builder.value(Binary::from(message.body.clone())).build())
+            .await
+            .map_err(SendError::Broker),
+        BodySection::Text => {
+            let text = String::from_utf8(message.body.clone())
+                .map_err(|_| SendError::Permanent(not_text(&message.destination)))?;
+            sender
+                .send(builder.value(text).build())
+                .await
+                .map_err(SendError::Broker)
+        }
+    }
+}
+
+/// The refusal of a `body=text` send whose payload is not UTF-8. A retry cannot fix it.
+fn not_text(destination: &str) -> Diagnostic {
+    Diagnostic::error(
+        codes::OUTBOUND_CONFIG_INVALID,
+        format!(
+            "amqp destination '{}' sends its body as text (body=text), but the payload is not \
+             UTF-8",
+            redact_destination(destination)
+        ),
+    )
+}
+
+/// The message header, present only when an option sets one of its fields.
+fn build_header(options: &AmqpSendOptions) -> Option<Header> {
+    if options.durable.is_none() && options.ttl_ms.is_none() {
+        return None;
+    }
+    Some(
+        Header::builder()
+            .durable(options.durable.unwrap_or(false))
+            .ttl(options.ttl_ms)
+            .build(),
+    )
+}
+
+/// The message properties: `to` is the destination address, `message-id` is the outbox key unless
+/// the message names its own with the `x-amqp-message-id` header; `x-amqp-correlation-id`,
+/// `x-amqp-reply-to` and
+/// `x-amqp-subject` fill the fields of the same name. The same names are what the source writes
+/// those fields into, so a received message's ids can be passed on as they are.
+fn build_properties(message: &OutboundMessage, address: &str) -> Properties {
+    let header = |name: &str| {
+        message
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
+    let message_id = header(HEADER_MESSAGE_ID).unwrap_or_else(|| message.outbox_key.clone());
+    // `to` repeats the link's target address: some brokers take the destination from the message
+    // rather than the link (IBM MQ refuses a message without it, AMQXR0032E).
+    let mut builder = Properties::builder()
+        .message_id(message_id)
+        .to(address.to_string());
+    if let Some(correlation_id) = header(HEADER_CORRELATION_ID) {
+        builder = builder.correlation_id(correlation_id);
+    }
+    if let Some(reply_to) = header(HEADER_REPLY_TO) {
+        builder = builder.reply_to(reply_to);
+    }
+    if let Some(subject) = header(HEADER_SUBJECT) {
+        builder = builder.subject(subject);
+    }
+    builder.build()
+}
+
+/// The FROZEN application-property table (unit-tested independently of a broker):
+/// `sutra-outbox-key` = the outbox key, `content-type` = the resolved content type, every other
+/// header verbatim (the two owned properties de-duplicated case-insensitively, the
+/// [`PROPERTY_FIELD_HEADERS`] left to the message properties), plus `traceparent` when present.
+/// Under `property-names=identifier` every name is written as an identifier.
+fn build_application_properties(
+    message: &OutboundMessage,
+    options: &AmqpSendOptions,
+) -> ApplicationProperties {
     let content_type = resolve_content_type(message);
+    let name = |n: &str| options.property_name(n);
     let mut builder = ApplicationProperties::builder()
-        .insert(PROPERTY_OUTBOX_KEY, message.outbox_key.as_str())
-        .insert(PROPERTY_CONTENT_TYPE, content_type.as_str());
+        .insert(name(PROPERTY_OUTBOX_KEY), message.outbox_key.as_str())
+        .insert(name(PROPERTY_CONTENT_TYPE), content_type.as_str());
     for (key, value) in &message.headers {
         if key.eq_ignore_ascii_case(PROPERTY_OUTBOX_KEY)
             || key.eq_ignore_ascii_case(PROPERTY_CONTENT_TYPE)
+            || PROPERTY_FIELD_HEADERS
+                .iter()
+                .any(|h| key.eq_ignore_ascii_case(h))
         {
             continue;
         }
-        builder = builder.insert(key.as_str(), value.as_str());
+        builder = builder.insert(name(key), value.as_str());
     }
     if let Some(traceparent) = &message.traceparent {
         if !message.headers.contains_key(TRACEPARENT_HEADER) {
-            builder = builder.insert(TRACEPARENT_HEADER, traceparent.as_str());
+            builder = builder.insert(name(TRACEPARENT_HEADER), traceparent.as_str());
         }
     }
     builder.build()
@@ -424,7 +626,10 @@ mod tests {
     #[test]
     fn outbox_key_rides_the_sutra_outbox_key_property_and_content_type_is_set() {
         // The m9 outbox-key sharing invariant — the AMQP 1.0 sink carries `sutra-outbox-key`.
-        let ap = build_application_properties(&message("amqp10://broker:5672/payment-replies"));
+        let ap = build_application_properties(
+            &message("amqp10://broker:5672/payment-replies"),
+            &AmqpSendOptions::default(),
+        );
         assert_eq!(
             prop(&ap, PROPERTY_OUTBOX_KEY).as_deref(),
             Some("outbox-abc-123")
@@ -436,6 +641,110 @@ mod tests {
     }
 
     #[test]
+    fn identifier_property_names_rewrite_every_application_property() {
+        let mut m = message("amqp10://broker/replies?property-names=identifier");
+        m.headers.insert("ce-type".to_string(), "t".to_string());
+        m.traceparent = Some("tp".to_string());
+        let options = parse_destination(&m.destination).unwrap().options;
+        let ap = build_application_properties(&m, &options);
+        let names: Vec<&str> = ap.0.keys().map(String::as_str).collect();
+        for name in ["sutra_outbox_key", "content_type", "ce_type", "traceparent"] {
+            assert!(names.contains(&name), "{name} in {names:?}");
+        }
+        assert!(names.iter().all(|n| !n.contains('-')), "{names:?}");
+    }
+
+    #[test]
+    fn message_properties_carry_the_outbox_key_and_the_lifted_headers() {
+        use fe2o3_amqp::types::messaging::MessageId;
+        let mut m = message("amqp10://broker/replies");
+        let p = build_properties(&m, "replies");
+        assert_eq!(p.to.as_deref(), Some("replies"));
+        assert_eq!(
+            p.message_id,
+            Some(MessageId::String("outbox-abc-123".to_string()))
+        );
+        assert_eq!(p.correlation_id, None);
+        m.headers
+            .insert("X-AMQP-Correlation-Id".to_string(), "corr-7".to_string());
+        m.headers
+            .insert(HEADER_REPLY_TO.to_string(), "REPLY.Q".to_string());
+        m.headers
+            .insert(HEADER_SUBJECT.to_string(), "subj".to_string());
+        m.headers
+            .insert(HEADER_MESSAGE_ID.to_string(), "own-id".to_string());
+        let p = build_properties(&m, "replies");
+        assert_eq!(p.message_id, Some(MessageId::String("own-id".to_string())));
+        assert_eq!(
+            p.correlation_id,
+            Some(MessageId::String("corr-7".to_string()))
+        );
+        assert_eq!(p.reply_to.as_deref(), Some("REPLY.Q"));
+        assert_eq!(p.subject.as_deref(), Some("subj"));
+        // The lifted headers do not also ride as application properties.
+        let ap = build_application_properties(&m, &AmqpSendOptions::default());
+        for name in PROPERTY_FIELD_HEADERS {
+            assert_eq!(count(&ap, name), 0, "{name}");
+        }
+    }
+
+    #[test]
+    fn the_header_is_sent_only_when_an_option_sets_it() {
+        assert!(build_header(&AmqpSendOptions::default()).is_none());
+        let options = AmqpSendOptions::from_query(Some("durable=true&ttl-ms=1500")).unwrap();
+        let header = build_header(&options).expect("header");
+        assert!(header.durable);
+        assert_eq!(header.ttl, Some(1500));
+        let options = AmqpSendOptions::from_query(Some("ttl-ms=10")).unwrap();
+        assert!(!build_header(&options).expect("header").durable);
+    }
+
+    #[test]
+    fn the_target_names_its_capability_only_when_the_type_is_given() {
+        let plain = target_for(&parse_destination("amqp10://b/APP.Q").unwrap());
+        assert_eq!(plain.capabilities, None);
+        let queue = target_for(&parse_destination("amqp10://b/APP.Q?type=queue").unwrap());
+        let caps: Vec<String> = queue
+            .capabilities
+            .expect("capabilities")
+            .0
+            .into_iter()
+            .map(|s| s.0)
+            .collect();
+        assert_eq!(caps, vec!["queue".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_text_body_that_is_not_utf8_is_a_permanent_failure() {
+        // Refused before any connection: the port refuses at once, so a connection attempt would
+        // show as a retryable failure instead.
+        let sink = AmqpMessageSink::new(None, None);
+        let mut m = message("amqp10://127.0.0.1:1/q?body=text");
+        m.body = vec![0xff, 0xfe];
+        match sink.send(&m).await {
+            SendOutcome::PermanentFailure(d) => assert_eq!(d.code, codes::OUTBOUND_CONFIG_INVALID),
+            other => panic!("expected a permanent failure, got {other:?}"),
+        }
+        let bad = message("amqp10://127.0.0.1:1/q?body=xml");
+        match sink.send(&bad).await {
+            SendOutcome::PermanentFailure(d) => assert_eq!(d.code, codes::OUTBOUND_CONFIG_INVALID),
+            other => panic!("expected a permanent failure, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_broker_opens_one_outage_window() {
+        let sink = AmqpMessageSink::new(None, None);
+        let m = message("amqp10://127.0.0.1:1/q");
+        for _ in 0..2 {
+            let _ = sink.send(&m).await;
+        }
+        let outages = sink.outages.lock().unwrap();
+        assert_eq!(outages.len(), 1);
+        assert!(outages.contains_key("127.0.0.1:1"));
+    }
+
+    #[test]
     fn ce_dash_attributes_and_headers_ride_verbatim_and_traceparent_bridges() {
         let mut m = message("amqp10://broker/replies");
         m.headers.insert("x-tenant".to_string(), "acme".to_string());
@@ -444,7 +753,7 @@ mod tests {
             .insert("ce-type".to_string(), "payment.reply".to_string());
         m.headers.insert("ce-id".to_string(), "evt-9".to_string());
         m.traceparent = Some("00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01".to_string());
-        let ap = build_application_properties(&m);
+        let ap = build_application_properties(&m, &AmqpSendOptions::default());
         assert_eq!(prop(&ap, "x-tenant").as_deref(), Some("acme"));
         assert_eq!(prop(&ap, "ce-type").as_deref(), Some("payment.reply"));
         assert_eq!(prop(&ap, "ce-id").as_deref(), Some("evt-9"));
@@ -460,7 +769,7 @@ mod tests {
         m.headers
             .insert("traceparent".to_string(), "explicit".to_string());
         m.traceparent = Some("from-field".to_string());
-        let ap = build_application_properties(&m);
+        let ap = build_application_properties(&m, &AmqpSendOptions::default());
         assert_eq!(prop(&ap, "traceparent").as_deref(), Some("explicit"));
         assert_eq!(count(&ap, "traceparent"), 1);
     }
@@ -472,7 +781,7 @@ mod tests {
             .insert("Sutra-Outbox-Key".to_string(), "stale".to_string());
         m.headers
             .insert("Content-Type".to_string(), "text/plain".to_string());
-        let ap = build_application_properties(&m);
+        let ap = build_application_properties(&m, &AmqpSendOptions::default());
         assert_eq!(
             count(&ap, PROPERTY_OUTBOX_KEY),
             1,

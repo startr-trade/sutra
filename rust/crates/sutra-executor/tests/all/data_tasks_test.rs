@@ -105,6 +105,7 @@ fn no_impl_service_tasks_with_data_ops_parse_to_data_tasks() {
                 value_var: "newBal".to_string(),
                 expect_unchanged: false,
                 expect_absent: false,
+                delete: false,
             }]
         ),
         other => panic!("expected DataTask, got {other:?}"),

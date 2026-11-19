@@ -101,6 +101,15 @@ pub const CONFIG_CHANNEL_POOL_TENANT_NOT_ALLOWED: &str =
 /// key, a non-boolean `on-reply`, or an `on-message` that does not name another inbound channel
 /// of the same file.
 pub const CONFIG_CHANNEL_SESSION_END_INVALID: &str = "SUTRA.CONFIG.CHANNEL.SESSION_END_INVALID";
+/// A channel's `uncorrelated:` block is malformed (not a mapping, an unknown key, a `start` that
+/// names no process id, nothing declared) or is declared on an outbound channel. At package lint
+/// the same code also reports a `start` that names no process of the deployment, or a process
+/// with no start event on the channel.
+pub const CONFIG_CHANNEL_UNCORRELATED_INVALID: &str = "SUTRA.CONFIG.CHANNEL.UNCORRELATED_INVALID";
+/// A message a wait subscribes to correlated to no live instance. Logged at WARN, and recorded in
+/// the deployment's audit journal as `inbound.RELAY_UNCORRELATED`, on every transport, whether the
+/// message is refused or starts the channel's `uncorrelated: start` process.
+pub const INBOUND_RELAY_UNCORRELATED: &str = "SUTRA.INBOUND.RELAY_UNCORRELATED";
 /// A channel's `pool-call-key:` is malformed (not `header.<name>`) or is declared on a channel
 /// that draws from no capacity pool (`pool:`).
 pub const CONFIG_CHANNEL_POOL_CALL_KEY_INVALID: &str = "SUTRA.CONFIG.CHANNEL.POOL_CALL_KEY_INVALID";
@@ -224,6 +233,16 @@ pub const OUTBOUND_ENCODE_FAILED: &str = "SUTRA.OUTBOUND.ENCODE_FAILED";
 /// Schema-less egress is untouched — a bare format never rejects, so there is no contract to
 /// fail.
 pub const OUTBOUND_VALIDATION_REJECT: &str = "SUTRA.OUTBOUND.VALIDATION_REJECT";
+/// The codec governing an outbound message refused to seal it (its `PayloadCodec::seal`
+/// returned an error), so it was not sent. Sealing runs after the read-back passed: the message
+/// was valid, and the codec could not apply its last transform (a signature, for example, when
+/// its key is unusable). Fail-closed for the same reason as a validation reject.
+pub const OUTBOUND_SEAL_FAILED: &str = "SUTRA.OUTBOUND.SEAL_FAILED";
+/// A deployment's codec could not resolve the references its own configuration names (its
+/// `PayloadCodec::bind_refs` returned an error), so the deployment is refused rather than
+/// started with a codec that would fail every message. The diagnostic names the codec and the
+/// reference, never a resolved value.
+pub const CODEC_BIND_REFS_FAILED: &str = "SUTRA.CODEC.BIND_REFS_FAILED";
 pub const OUTBOUND_SEND_FAILED: &str = "SUTRA.OUTBOUND.SEND.FAILED";
 pub const OUTBOUND_HTTP_AUTH_REF_UNRESOLVED: &str = "SUTRA.OUTBOUND.HTTP.AUTH_REF_UNRESOLVED";
 pub const OUTBOUND_HTTP_MTLS_UNSUPPORTED: &str = "SUTRA.OUTBOUND.HTTP.MTLS_UNSUPPORTED";

@@ -11,6 +11,8 @@ mod channel_call_timer_test;
 mod continue_reply_test;
 #[path = "all/coverage_test.rs"]
 mod coverage_test;
+#[path = "all/data_store_delete_test.rs"]
+mod data_store_delete_test;
 #[path = "all/data_store_query_test.rs"]
 mod data_store_query_test;
 #[path = "all/data_tasks_test.rs"]

@@ -3010,6 +3010,10 @@ impl TokenExecutor {
                 (key_value, value)
             };
             let key = as_store_key(&key_value, &write.key_expression, id)?;
+            if write.delete {
+                self.run_store_delete(id, write, &key, state).await?;
+                continue;
+            }
             if state.store_tx.is_some() {
                 let tx = self.tx_for(&write.store, id, state).await?;
                 let current = tx
@@ -3058,6 +3062,51 @@ impl TokenExecutor {
                         .map_err(|e| store_op_failed(&write.store, &key, id, "write", &e))?;
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// One `<q:store delete="true">` write: remove the key's row, inside the enclosing
+    /// transaction scope's store transaction when there is one (so it commits or rolls back with
+    /// the scope), else autocommit — exactly where a write of the same key would go. With
+    /// `expect="unchanged"` it applies only while the row's revision is the one this instance read
+    /// (expected `0`: only while the key is still absent); otherwise it is the data-store conflict.
+    /// A plain delete of a missing key is a no-op.
+    async fn run_store_delete(
+        &self,
+        id: &str,
+        write: &StoreWrite,
+        key: &str,
+        state: &mut ExecutionState<'_>,
+    ) -> Result<(), Signal> {
+        let failed = |e: &StoreError| store_op_failed(&write.store, key, id, "delete", e);
+        let applied = if state.store_tx.is_some() {
+            let tx = self.tx_for(&write.store, id, state).await?;
+            if write.expect_unchanged {
+                let expected = expected_revision(write, key, state);
+                tx.delete_if_revision(key, expected)
+                    .await
+                    .map_err(|e| failed(&e))?
+            } else {
+                tx.delete(key).await.map_err(|e| failed(&e))?;
+                true
+            }
+        } else {
+            let store = self.resolve_store(&write.store, id, state)?;
+            if write.expect_unchanged {
+                let expected = expected_revision(write, key, state);
+                store
+                    .delete_if_revision(key, expected)
+                    .await
+                    .map_err(|e| failed(&e))?
+            } else {
+                store.delete(key).await.map_err(|e| failed(&e))?;
+                true
+            }
+        };
+        if !applied {
+            let expected = expected_revision(write, key, state);
+            return Err(store_conflict(write, key, expected, id, state.process));
         }
         Ok(())
     }
@@ -5769,14 +5818,26 @@ fn store_conflict(
     }
     let detail = if write.expect_absent {
         "the key already exists (expect=\"absent\")".to_string()
+    } else if write.delete && expected_rev <= 0 {
+        "the key was absent when read and exists now (delete with expect=\"unchanged\")".to_string()
+    } else if write.delete {
+        format!(
+            "the row changed or was deleted since it was read (expected revision {expected_rev}; \
+             delete with expect=\"unchanged\")"
+        )
     } else {
         format!("the value changed since it was read (expected revision {expected_rev})")
     };
     fatal_diag(
         code,
         format!(
-            "Optimistic-concurrency conflict writing data store '{}' key '{key}' at data task \
+            "Optimistic-concurrency conflict {} data store '{}' key '{key}' at data task \
              '{node_id}': {detail}. Retry the operation, or catch {code} with an error boundary.",
+            if write.delete {
+                "deleting from"
+            } else {
+                "writing"
+            },
             write.store
         ),
     )

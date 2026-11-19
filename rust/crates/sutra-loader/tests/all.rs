@@ -49,6 +49,8 @@ mod lint_timer_config_test;
 mod lint_timer_names_test;
 #[path = "all/lint_transient_test.rs"]
 mod lint_transient_test;
+#[path = "all/lint_uncorrelated_test.rs"]
+mod lint_uncorrelated_test;
 #[path = "all/lint_variable_nav_test.rs"]
 mod lint_variable_nav_test;
 #[path = "all/lint_variable_schema_test.rs"]

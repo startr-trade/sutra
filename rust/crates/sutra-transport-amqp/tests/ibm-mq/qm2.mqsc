@@ -1,0 +1,14 @@
+* The second queue manager of the IBM MQ suite: the far end of a sender/receiver channel pair.
+* It owns the queues the first queue manager writes to through a remote queue definition and an
+* administrative subscription, and it requires a client certificate on the channel (mutual TLS).
+
+* The queue manager's certificate and its CA, in a PKCS#12 key repository (see qm1.mqsc).
+ALTER QMGR SSLKEYR('/sutra-tls/qm.p12') KEYRPWD('@KEYRPWD@') CERTLABL('qm')
+REFRESH SECURITY TYPE(SSL)
+DEFINE QLOCAL('QM2.IN') REPLACE
+DEFINE QLOCAL('QM2.NOTIFY') REPLACE
+DEFINE CHANNEL('QM1.TO.QM2') CHLTYPE(RCVR) TRPTYPE(TCP) +
+       SSLCIPH('ANY_TLS12_OR_HIGHER') SSLCAUTH(REQUIRED) REPLACE
+* The developer configuration blocks every channel by default; let the receiver in.
+SET CHLAUTH('QM1.TO.QM2') TYPE(ADDRESSMAP) ADDRESS('*') USERSRC(CHANNEL) ACTION(REPLACE)
+SET CHLAUTH('QM1.TO.QM2') TYPE(BLOCKUSER) USERLIST('nobody') ACTION(REPLACE)

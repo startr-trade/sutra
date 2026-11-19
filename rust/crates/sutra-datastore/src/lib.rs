@@ -12,7 +12,9 @@
 //!   analog — a balance never becomes a lossy double);
 //! - `get_for_update` takes its row lock via a rev-bumping `UPDATE` (the portable
 //!   `SELECT … FOR UPDATE` substitute; a no-op on an absent key);
-//! - `revision` is `0` for an absent key, bumped on every write;
+//! - `revision` is `0` for an absent key; an insert seeds it from the database clock (µs since
+//!   the epoch, never below 1) and every write adds 1, so a row's revisions strictly increase
+//!   (not densely) and a key deleted and created again never reuses one;
 //! - `put_if_revision` is the compare-and-set behind `<q:store expect="unchanged">`:
 //!   `expected_rev <= 0` expects ABSENT (insert-only; a unique violation = conflict), else a
 //!   conditional `UPDATE … AND rev = ?` (0 rows = conflict);

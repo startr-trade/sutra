@@ -2316,6 +2316,17 @@ pub(crate) struct DeployController {
     draining_instances: std::sync::Mutex<BTreeMap<String, u64>>,
     /// Rows this replica's sweep retired lately, rechecked until quiet twice in a row.
     recently_retired: std::sync::Mutex<RecentlyRetired>,
+    /// Held across one whole [`Self::reactivate_from_store`]: the store read, the flip and the
+    /// projection refresh. Three callers re-activate on their own tasks — the sync deploy API,
+    /// the `LISTEN` convergence loop (which also hears this replica's own deploys) and the
+    /// quiescence sweep — and a flip is two stages, the lanes' registry swap and then the
+    /// transports' route rewire. Unserialized, one caller's flip could run between the other's
+    /// two stages (routes naming a version the lanes no longer hold answer
+    /// `RESOLVE.CHANNEL.UNKNOWN`), and a caller that read the store before a newer deploy
+    /// committed could flip AFTER that deploy and serve the older set until the next notify.
+    /// Under the lock every flip reads the store afresh and runs whole, so the last one serves
+    /// the latest committed set.
+    flip: tokio::sync::Mutex<()>,
 }
 
 impl DeployController {
@@ -2328,6 +2339,7 @@ impl DeployController {
             hooks,
             draining_instances: std::sync::Mutex::new(BTreeMap::new()),
             recently_retired: std::sync::Mutex::new(RecentlyRetired::default()),
+            flip: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -2768,6 +2780,7 @@ impl DeployController {
     /// rather than from a resident plan is deliberate — it is what lets a fresh pod, or a peer
     /// replica that never saw the deploy, serve the pinned definition too.
     pub(crate) async fn reactivate_from_store(&self) -> Result<(), String> {
+        let _flip = self.flip.lock().await;
         let SettledStoreSet {
             active: plans,
             draining: draining_plans,

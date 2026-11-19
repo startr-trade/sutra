@@ -318,6 +318,22 @@ pub trait InstanceBridge {
         value: &str,
     ) -> Result<Option<String>, Diagnostic>;
 
+    /// Whether the correlation key `(name, value)` is one only FINISHED instances carried: a
+    /// retired alias row whose instance has ended (or is gone), and no live row. The relay path
+    /// asks when no live instance carries a key, to tell a message for an instance that already
+    /// ended (nothing will ever wait for it) from one that may simply have beaten its instance
+    /// to the wait. `Ok(false)` means "cannot tell", the posture of a bridge that keeps no alias
+    /// history (the default, and the in-memory doubles).
+    async fn alias_ended(
+        &self,
+        deployment: &DeploymentId,
+        name: &str,
+        value: &str,
+    ) -> Result<bool, Diagnostic> {
+        let _ = (deployment, name, value);
+        Ok(false)
+    }
+
     /// **Terminal step (wait→end).** Resolve every wait row, retire every live alias, enqueue the
     /// step's emissions, and record the instance as finished — ONE transaction, commit or nothing.
     ///

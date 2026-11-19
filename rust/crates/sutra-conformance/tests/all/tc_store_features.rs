@@ -6,7 +6,10 @@
 //! - the insert-if-absent claim (`expect="absent"`) raced by both replicas: exactly one claim per
 //!   day wins, every loser takes the error-boundary path, nothing fails;
 //! - two waits on one channel that differ only by `messageTypeValue`: each is resumed by its own
-//!   message type and never by the other's.
+//!   message type and never by the other's;
+//! - a row delete (`<q:store delete="true" expect="unchanged">`, 0.7.0) on one replica, seen by
+//!   the other replica's next read through its read cache, including a key deleted and created
+//!   again (its revision is never reused, so the cached old row is not served).
 
 use std::collections::BTreeMap;
 use std::process::Command;
@@ -482,4 +485,159 @@ async fn tc_store_features_two_waits_on_one_channel_each_take_only_their_message
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "docker"]
+async fn tc_store_features_a_delete_on_one_replica_is_seen_through_the_other_replicas_cache() {
+    let _suite = sutra_testkit::hold_suite!("storefeat");
+    let client = reqwest::Client::new();
+    let key = "del|0001";
+    let entry = serde_json::json!({"amount": "12.50", "dir": "IN", "tag": "OPEN"});
+    post_json(
+        &client,
+        0,
+        "events-in",
+        serde_json::json!({"key": key, "entry": entry}),
+    )
+    .await;
+    assert!(stored("events", key, Duration::from_secs(30))
+        .await
+        .is_some());
+
+    // Replica 1 reads the row through its cache (the cache now holds it).
+    post_json(
+        &client,
+        1,
+        "copy-in",
+        serde_json::json!({"key": key, "tag": "before"}),
+    )
+    .await;
+    let before = stored(
+        "results",
+        &format!("copy|{key}|before"),
+        Duration::from_secs(30),
+    )
+    .await
+    .expect("copy before the delete");
+    assert_eq!(before, entry);
+
+    // Replica 0 deletes it: read-check-delete in one data task.
+    post_json(&client, 0, "delete-in", serde_json::json!({"key": key})).await;
+    let outcome = stored(
+        "results",
+        &format!("deleted|{key}"),
+        Duration::from_secs(30),
+    )
+    .await
+    .expect("delete outcome");
+    assert_eq!(outcome, serde_json::json!("deleted"));
+    assert_eq!(
+        sql(&format!(
+            "SELECT count(*) FROM data_store WHERE store_name = 'events' AND store_key = '{key}'"
+        )),
+        "0",
+        "the row is gone"
+    );
+
+    // Replica 1's next read revalidates its cached entry by revision and sees the row gone.
+    post_json(
+        &client,
+        1,
+        "copy-in",
+        serde_json::json!({"key": key, "tag": "after"}),
+    )
+    .await;
+    let after = stored(
+        "results",
+        &format!("copy|{key}|after"),
+        Duration::from_secs(30),
+    )
+    .await
+    .expect("copy after the delete");
+    assert_eq!(
+        after,
+        serde_json::Value::Null,
+        "replica 1 served no stale row"
+    );
+
+    // Deleted and created again with another value: replica 1's cached entry is of the old row,
+    // whose revision the re-created row never reuses, so replica 1 reads the new value.
+    let again = "del|0002";
+    let (v1, v2) = (
+        serde_json::json!({"amount": "1.00", "dir": "IN", "tag": "OPEN"}),
+        serde_json::json!({"amount": "2.00", "dir": "OUT", "tag": "CLOSE"}),
+    );
+    post_json(
+        &client,
+        0,
+        "events-in",
+        serde_json::json!({"key": again, "entry": v1}),
+    )
+    .await;
+    post_json(
+        &client,
+        1,
+        "copy-in",
+        serde_json::json!({"key": again, "tag": "v1"}),
+    )
+    .await;
+    let cached = stored(
+        "results",
+        &format!("copy|{again}|v1"),
+        Duration::from_secs(30),
+    )
+    .await
+    .expect("first copy");
+    assert_eq!(cached, v1);
+    post_json(&client, 0, "delete-in", serde_json::json!({"key": again})).await;
+    assert!(stored(
+        "results",
+        &format!("deleted|{again}"),
+        Duration::from_secs(30)
+    )
+    .await
+    .is_some());
+    post_json(
+        &client,
+        0,
+        "events-in",
+        serde_json::json!({"key": again, "entry": v2}),
+    )
+    .await;
+    assert_eq!(
+        stored("events", again, Duration::from_secs(30)).await,
+        Some(v2.clone())
+    );
+    post_json(
+        &client,
+        1,
+        "copy-in",
+        serde_json::json!({"key": again, "tag": "v2"}),
+    )
+    .await;
+    let fresh = stored(
+        "results",
+        &format!("copy|{again}|v2"),
+        Duration::from_secs(30),
+    )
+    .await
+    .expect("second copy");
+    assert_eq!(
+        fresh, v2,
+        "replica 1 served the re-created row, not its cached old one"
+    );
+
+    // Deleting the missing key again is a no-op, recorded the same way.
+    sql(&format!(
+        "DELETE FROM data_store WHERE store_name = 'results' AND store_key = 'deleted|{key}'"
+    ));
+    post_json(&client, 1, "delete-in", serde_json::json!({"key": key})).await;
+    assert!(stored(
+        "results",
+        &format!("deleted|{key}"),
+        Duration::from_secs(30)
+    )
+    .await
+    .is_some());
 }

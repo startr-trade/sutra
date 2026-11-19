@@ -11,6 +11,8 @@ mod async_lane_loop_test;
 mod capacity_pool_test;
 #[path = "all/channel_call_retry_dispatch_test.rs"]
 mod channel_call_retry_dispatch_test;
+#[path = "all/codec_seal_test.rs"]
+mod codec_seal_test;
 #[path = "all/config_test.rs"]
 mod config_test;
 #[path = "all/declared_dedup_test.rs"]
@@ -49,6 +51,8 @@ mod select_predicate_test;
 mod shard_router_pin_test;
 #[path = "all/shard_scale_out_test.rs"]
 mod shard_scale_out_test;
+#[path = "all/uncorrelated_relay_test.rs"]
+mod uncorrelated_relay_test;
 #[path = "all/wait_index_test.rs"]
 mod wait_index_test;
 #[path = "all/wait_loop_dispatch_test.rs"]

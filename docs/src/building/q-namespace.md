@@ -27,7 +27,7 @@ and the same XSD drives the `sutra-modeler-plugin` property panels.
 | `q:retry` | registered-task **and** channel-call `bpmn:serviceTask` | Per-task retry policy — attempts, backoff, non-retryable codes. |
 | `q:timeout` | channel-call `bpmn:serviceTask` | Synthesizes a timer boundary on the call. |
 | `q:stream` (attribute) | channel-call `bpmn:serviceTask` | `q:stream="true"` streams a synchronous model answer to the original caller. Default `false`. |
-| `q:store` | `bpmn:dataStoreReference` | Binds the reference to a durable key in a declared data store. |
+| `q:store` | `bpmn:dataStoreReference` | Binds the reference to a durable key in a declared data store; reads, writes, deletes (0.7.0) and key queries. |
 | `q:dispatch` / `q:case` | `bpmn:process` | Content-based dispatch to called elements. |
 | `q:variables` / `q:variable` | `bpmn:process` | Declared process variables — type or schema, `transient` / `sensitive` / `source`. |
 | `q:onValidation` | `bpmn:process` | The structural-failure policy (`route` / `reject` / `error`). |
@@ -495,6 +495,10 @@ field of a stored map value; `expect="unchanged"` is an optimistic compare-and-s
 lock; `expect="absent"` (0.6.10) writes only when the key does not exist yet — a claim exactly one
 replica wins. A lost compare-and-set raises `SUTRA.RUNTIME.DATASTORE.CONFLICT`, which an error
 boundary on the data task can catch.
+
+On a write, `delete="true"` (0.7.0) removes the key's row instead of writing a value. A missing
+key is a no-op, and `expect="unchanged"` makes the delete conditional on the revision the instance
+read. See [Deleting a row](data-stores.md#deleting-a-row).
 
 On a read, `query` (0.6.10) turns the binding into a key query: every row whose key starts with
 `key` (`query="prefix"`) or lies in `[key, to)` (`query="range"`), keys compared bytewise, in key

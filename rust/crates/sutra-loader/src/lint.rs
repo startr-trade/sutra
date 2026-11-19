@@ -525,6 +525,7 @@ pub fn validate_deployment_with_manifests(
     check_templates_compile(deployment, &dep_label, out);
     check_channel_declarations(deployment, &definitions, &dep_label, out);
     check_channel_uniqueness(deployment, &definitions, &dep_label, out);
+    check_uncorrelated_routes(deployment, &definitions, &dep_label, out);
     check_coverage_store(deployment, &stores, &dep_label, out);
     check_coverage_correlations(deployment, &definitions, &dep_label, out);
     check_requirements_map(deployment, &dep_label, out);
@@ -535,7 +536,7 @@ pub fn validate_deployment_with_manifests(
     check_node_references(deployment, &definitions, &dep_label, out);
     check_local_send_destinations(deployment, &dep_label, out);
     check_called_elements(deployment, &dep_label, out);
-    check_start_and_wait(deployment, &dep_label, out);
+    check_start_and_wait(deployment, &definitions, &dep_label, out);
     check_feel_sites(deployment, &dep_label, out);
     check_receipt_attributes(deployment, &dep_label, out);
     check_timer_config_keys(deployment, &dep_label, out);
@@ -1368,6 +1369,52 @@ fn analyse_predicate(source_text: &str, vocabulary: &DeclaredAttributes) -> Sele
     }
 }
 
+/// `uncorrelated: start: <processId>` names a process of this deployment that has a start event
+/// on the channel — otherwise an uncorrelated message would have nowhere to go.
+fn check_uncorrelated_routes(
+    deployment: &LoadedDeployment,
+    definitions: &[ChannelDefinition],
+    dep_label: &str,
+    out: &mut Vec<LintDiagnostic>,
+) {
+    for def in definitions {
+        let Some(process_id) = def.binding.uncorrelated_start() else {
+            continue;
+        };
+        let channel = &def.binding.channel_name;
+        let exists = deployment
+            .processes
+            .values()
+            .any(|module| module.processes().iter().any(|p| p.id == process_id));
+        let problem = if !exists {
+            Some(format!(
+                "deployment {dep_label}: channel '{channel}' uncorrelated start names process \
+                 '{process_id}', which is not a process of this deployment"
+            ))
+        } else if !subscribers_of(deployment, channel)
+            .iter()
+            .any(|sub| sub.process_id == process_id)
+        {
+            Some(format!(
+                "deployment {dep_label}: channel '{channel}' uncorrelated start names process \
+                 '{process_id}', which has no start event on channel '{channel}' (add a start \
+                 event with <q:source channel=\"{channel}\"/>)"
+            ))
+        } else {
+            None
+        };
+        if let Some(message) = problem {
+            out.push(
+                LintDiagnostic::error(
+                    sutra_channels::codes::CONFIG_CHANNEL_UNCORRELATED_INVALID,
+                    message,
+                )
+                .at_named("channels.yaml", channel),
+            );
+        }
+    }
+}
+
 fn check_channel_uniqueness(
     deployment: &LoadedDeployment,
     definitions: &[ChannelDefinition],
@@ -1380,6 +1427,11 @@ fn check_channel_uniqueness(
         }
         let channel = &def.binding.channel_name;
         let mut subscribers = subscribers_of(deployment, channel);
+        // The start events an `uncorrelated: start` reserves take only messages no wait
+        // correlates, so they never compete with the channel's ordinary starts.
+        if let Some(reserved) = def.binding.uncorrelated_start() {
+            subscribers.retain(|sub| sub.process_id != reserved);
+        }
         if subscribers.is_empty() {
             // A relay-only channel (its messages resume a waiting instance) has no start
             // subscriber, and is not inert. Neither is a channel another channel names as its
@@ -4621,9 +4673,11 @@ fn check_called_elements(
 
 /// A start event and a wait on one channel, with message types that can overlap: a message that
 /// correlates to a parked instance answers its wait and starts nothing, so a flow that meant to
-/// start a second instance with a repeated key does not. A warning, at the start.
+/// start a second instance with a repeated key does not. A warning, at the start. Not for a start
+/// the channel's `uncorrelated: start` reserves: taking only what no wait correlates is its point.
 fn check_start_and_wait(
     deployment: &LoadedDeployment,
+    definitions: &[ChannelDefinition],
     dep_label: &str,
     out: &mut Vec<LintDiagnostic>,
 ) {
@@ -4651,6 +4705,14 @@ fn check_start_and_wait(
                 source.and_then(|s| s.message_type_pattern.as_deref()),
             );
             for channel in channels {
+                let reserved = definitions.iter().any(|d| {
+                    !d.is_outbound()
+                        && d.binding.channel_name == *channel
+                        && d.binding.uncorrelated_start() == Some(process.id.as_str())
+                });
+                if reserved {
+                    continue;
+                }
                 let overlapping: Vec<String> = waits
                     .iter()
                     .filter(|w| {
@@ -4791,7 +4853,7 @@ fn check_raw_body_masking(
         for flow in &mut flows {
             flow.spread(&tainted_stores);
             for (_, write) in &flow.writes {
-                if flow.tainted.contains(&write.value_var) {
+                if !write.delete && flow.tainted.contains(&write.value_var) {
                     tainted_stores.insert(write.store.clone());
                 }
             }
@@ -4935,7 +4997,7 @@ impl<'p> RawBodyFlow<'p> {
             }
         }
         for (node, write) in &self.writes {
-            if self.tainted.contains(&write.value_var) {
+            if !write.delete && self.tainted.contains(&write.value_var) {
                 out.push(
                     LintDiagnostic::warning(
                         codes::CONFIG_BPMN_RAW_BODY_STORED,
@@ -5554,7 +5616,9 @@ fn variable_readers(
             }
             for write in &mapping.store_writes {
                 add_feel_roots(&write.key_expression, &mut readers);
-                readers.insert(write.value_var.clone()); // a bare variable read
+                if !write.delete {
+                    readers.insert(write.value_var.clone()); // a bare variable read
+                }
             }
         }
         // Template `{{root}}` reads — only the Handlebars analyzer exists Rust-side.

@@ -26,3 +26,4 @@ tokio-rustls = { workspace = true }
 [dev-dependencies]
 sutra-testkit = { path = "../sutra-testkit", features = ["broker-tls"] }
 testcontainers = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["fmt"] }

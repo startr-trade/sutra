@@ -108,6 +108,32 @@ impl SqlDialect {
         }
     }
 
+    /// The revision a newly inserted row starts at: the database's own clock in microseconds
+    /// since the Unix epoch (UTC), read in the INSERT statement itself so every replica uses one
+    /// clock, and never below 1 (a clock set before 1970 cannot seed a zero or negative revision,
+    /// which mean "absent"). Writes then add 1, so a row's revisions are strictly increasing but
+    /// not dense. Seeding from the clock rather than at 1 is what keeps a key that is deleted and
+    /// created again from reusing a revision an earlier version of the row had — the read cache
+    /// and `expect="unchanged"` both compare revisions and would otherwise take the re-created
+    /// row for the old one. That holds while the database clock moves forward between the row's
+    /// last write and its re-creation by more than the number of writes it took; a clock stepped
+    /// backwards can break it, and the floor of 1 does not prevent that.
+    pub fn revision_seed(self) -> &'static str {
+        match self {
+            SqlDialect::Postgres => {
+                "GREATEST(1, CAST(EXTRACT(EPOCH FROM clock_timestamp()) * 1000000 AS BIGINT))"
+            }
+            SqlDialect::Mysql => {
+                "GREATEST(1, TIMESTAMPDIFF(MICROSECOND, '1970-01-01 00:00:00', UTC_TIMESTAMP(6)))"
+            }
+            // SYSUTCDATETIME() is evaluated once per statement, so both reads agree.
+            SqlDialect::Mssql => {
+                "CASE WHEN DATEDIFF_BIG(MICROSECOND, '19700101', SYSUTCDATETIME()) < 1 THEN 1 \
+                 ELSE DATEDIFF_BIG(MICROSECOND, '19700101', SYSUTCDATETIME()) END"
+            }
+        }
+    }
+
     /// This dialect's current-timestamp function, as the KV path already writes it.
     pub fn now(self) -> &'static str {
         match self {
@@ -422,6 +448,17 @@ impl ProjectedStore {
         )
     }
 
+    /// The conditional delete — binds `[key, expected_rev]`. Zero rows affected is the detected
+    /// conflict (a concurrent commit bumped `rev`, or the row is already gone).
+    pub fn delete_if_revision_sql(&self, dialect: SqlDialect) -> String {
+        format!(
+            "DELETE FROM {} WHERE {KEY_COLUMN} = {} AND {REV_COLUMN} = {}",
+            self.table,
+            dialect.placeholder(1),
+            dialect.placeholder(2)
+        )
+    }
+
     /// The upsert's `UPDATE` half — binds `[fields…, key]`. `rev`/`updated_at` move exactly as on
     /// the KV path.
     pub fn update_sql(&self, dialect: SqlDialect) -> String {
@@ -457,7 +494,8 @@ impl ProjectedStore {
         sets.join(", ")
     }
 
-    /// The upsert's `INSERT` half — binds `[key, fields…]`, seeding `rev` at 1.
+    /// The upsert's `INSERT` half — binds `[key, fields…]`, seeding `rev` from the database clock
+    /// ([`SqlDialect::revision_seed`]).
     pub fn insert_sql(&self, dialect: SqlDialect) -> String {
         let columns: Vec<&str> = std::iter::once(KEY_COLUMN)
             .chain(self.projection.columns())
@@ -469,7 +507,7 @@ impl ProjectedStore {
                 .enumerate()
                 .map(|(i, (_, class))| dialect.write_expr(class, i + 2)),
         );
-        values.push("1".to_string());
+        values.push(dialect.revision_seed().to_string());
         values.push(dialect.now().to_string());
         format!(
             "INSERT INTO {} ({}) VALUES ({})",
@@ -855,9 +893,12 @@ mod tests {
         );
         assert_eq!(
             store.insert_sql(SqlDialect::Postgres),
-            "INSERT INTO accounts (store_key, account_id, balance, version, frozen, opened_at, \
+            format!(
+                "INSERT INTO accounts (store_key, account_id, balance, version, frozen, opened_at, \
              rev, updated_at) VALUES ($1, $2, CAST($3 AS NUMERIC), CAST($4 AS NUMERIC), \
-             CAST($5 AS BOOLEAN), CAST($6 AS DATE), 1, CURRENT_TIMESTAMP)"
+             CAST($5 AS BOOLEAN), CAST($6 AS DATE), {}, CURRENT_TIMESTAMP)",
+                SqlDialect::Postgres.revision_seed()
+            )
         );
         assert_eq!(
             store.update_if_revision_sql(SqlDialect::Postgres),
@@ -895,8 +936,11 @@ mod tests {
         );
         assert_eq!(
             store.insert_sql(SqlDialect::Mysql),
-            "INSERT INTO accounts (store_key, account_id, balance, version, frozen, opened_at, \
-             rev, updated_at) VALUES (?, ?, ?, ?, ?, ?, 1, CURRENT_TIMESTAMP)"
+            format!(
+                "INSERT INTO accounts (store_key, account_id, balance, version, frozen, opened_at, \
+             rev, updated_at) VALUES (?, ?, ?, ?, ?, ?, {}, CURRENT_TIMESTAMP)",
+                SqlDialect::Mysql.revision_seed()
+            )
         );
         assert_eq!(
             store.update_if_revision_sql(SqlDialect::Mysql),
@@ -922,8 +966,11 @@ mod tests {
         );
         assert_eq!(
             store.insert_sql(SqlDialect::Mssql),
-            "INSERT INTO accounts (store_key, account_id, balance, version, frozen, opened_at, \
-             rev, updated_at) VALUES (@P1, @P2, @P3, @P4, @P5, @P6, 1, SYSUTCDATETIME())"
+            format!(
+                "INSERT INTO accounts (store_key, account_id, balance, version, frozen, opened_at, \
+             rev, updated_at) VALUES (@P1, @P2, @P3, @P4, @P5, @P6, {}, SYSUTCDATETIME())",
+                SqlDialect::Mssql.revision_seed()
+            )
         );
     }
 

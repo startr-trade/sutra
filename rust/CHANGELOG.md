@@ -11,7 +11,134 @@ This is the changelog for the **Rust-native** engine (`rust/` workspace). It beg
 
 ## [Unreleased]
 
-Nothing yet.
+## [0.7.0] — 2026-11-19
+
+**2026-11-19.** **A data task can delete a store row** with `<q:store key="…" delete="true"/>`. It
+adds an attribute to the frozen `q:` namespace (`xsd/q.xsd`, `urn:sutra:q:1.0`), which is why this
+is 0.7.0; the addition is backward compatible and existing packages load and run unchanged. **A
+data-store row's revision now starts from the database clock,** so a row deleted and created again
+never reuses a revision: rows created after the upgrade start from a large revision, not 1. **A
+message that correlates to no live instance is recorded,** and a channel can route it to a process
+(`uncorrelated: { start: … }`). **The AMQP transport works with IBM MQ.** Codecs can seal what they
+send and resolve references of their own. One PostgreSQL migration, V103, builds an index
+concurrently. There is no archive or snapshot format change.
+
+### Added
+
+- **q-namespace addition — row delete from a data task.** `<q:store key="…" delete="true"/>` on a
+  write removes the key's row; the data output association needs no `<sourceRef>`. Deleting a
+  missing key is a no-op. With `expect="unchanged"` the delete applies only while the row's revision
+  is the one the instance read (never read: only while the key is still absent), else
+  `SUTRA.RUNTIME.DATASTORE.CONFLICT`, catchable by an error boundary. A delete runs where a write
+  runs (on the `<bpmn:transaction>` scope's store transaction, else autocommit), waits behind a
+  `forUpdate` row lock, and invalidates the read cache like a write. It works on key/value and typed
+  stores on PostgreSQL, MySQL, MariaDB and SQL Server. `@delete` with `@field`, `@forUpdate`,
+  `expect="absent"` or any key-query attribute, or a delete reference used as a read, is refused with
+  the new `SUTRA.PARSE.STORE.DELETE_INVALID`.
+- Data-store SPI: `DataStore::delete_if_revision` / `DataStoreTx::delete_if_revision` (default: an
+  unconditional delete that reports applied), implemented by the in-memory store, the read cache and
+  the three SQL dialects.
+- **A message that correlates to no live instance is recorded.** When a message on a channel a
+  wait subscribes to finds no instance carrying its correlation key
+  (`SUTRA.RUNTIME.RELAY.CORRELATION_NOT_FOUND`, for example a reply after its instance ended), the
+  engine logs a WARN with `SUTRA.INBOUND.RELAY_UNCORRELATED` and appends an
+  `inbound.RELAY_UNCORRELATED` record to the deployment's audit journal, on every transport. Both
+  carry the channel, message type, dedup key and the correlation keys tried (masked when sensitive
+  or redacted), never the body or headers. Before, an HTTP sender got a 500 and nothing else
+  recorded it.
+- **`uncorrelated: { start: <processId> }` on an inbound channel** (`channels.yaml`; no `q:`
+  change) sends such a message to a process of the package instead of refusing it. That process's
+  start events on the channel are reserved for uncorrelated messages, and the instance reads
+  `event.uncorrelated` (`code`, `keys`, `ended`). A message that correlates still resumes its
+  instance. A malformed block fails to load, and `sutra lint` reports a `start` naming no process
+  or one with no start event on the channel, both as `SUTRA.CONFIG.CHANNEL.UNCORRELATED_INVALID`.
+- **The `amqp` (AMQP 1.0) transport works with IBM MQ's AMQP channel**, proven at tier 2 against two
+  IBM MQ 10.0.1 queue managers (local queues, a remote queue definition over a mutual-TLS channel pair,
+  a topic with administrative subscriptions, TLS, SASL PLAIN, concurrent sends, a queue-manager
+  restart). New, all off by default:
+  - inbound channel property `address-type: queue | topic`, and destination query `type=queue|topic`:
+    sent as the link's terminus capability. IBM MQ reads an address without one as a topic string.
+  - destination query `durable=true|false`, `ttl-ms=<n>` (the message header), `body=text|binary` (the
+    payload as one AMQP string or binary value instead of a `data` section: IBM MQ stores them as `MQSTR`
+    and `MQFMT_NONE`, CCSID 1208, and a `data` section as an embedded AMQP message, `MQAMQP`), and
+    `property-names=identifier` (application-property names rewritten to identifiers, for receivers that
+    accept no other: `sutra-outbox-key` is sent as `sutra_outbox_key`; the source reads both), and
+    `application-properties=none` (no application properties at all, so an IBM MQ application reading a
+    default queue gets a plain message, not one behind an MQRFH2 header).
+  - the `x-amqp-message-id`, `x-amqp-correlation-id`, `x-amqp-reply-to` and `x-amqp-subject` headers:
+    the source writes the AMQP message properties into them, and the sink sends them back as those
+    properties.
+  - outage windows: `SUTRA.{INBOUND,OUTBOUND}.AMQP.OUTAGE_STARTED` when the broker is lost and
+    `..._ENDED` when it is back, with `outage_started`, `outage_ended` and `outage_ms`.
+- **Codecs can seal what they send and resolve references of their own.** Two default methods
+  on `PayloadCodec` (`sutra-codec-spi`), both inert unless a codec overrides them:
+  - `seal(body, content_type)`: the governing codec's last transform of an outbound message,
+    called after its read-back passed and before the outbox commit, for `<q:send>` emissions
+    and for both forms of reply (a render and an encoded object). `Ok(Some(bytes))` replaces the
+    body; an error refuses the message with the new `SUTRA.OUTBOUND.SEAL_FAILED`. This is what
+    lets an extension codec sign template-rendered messages, which never pass through `encode`.
+  - `bind_refs(resolver)`: called once when a deployment's bundle codec is minted at plan time
+    on the runtime host, with the engine's envref resolver (`env:`, `secret:`, `vault:`, `${…}`),
+    so a codec's bundle files can name secrets as references. An error refuses the deployment
+    with the new `SUTRA.CODEC.BIND_REFS_FAILED`. The bound instance is shared by every
+    activation of that plan.
+  - `InboundChain::seal_outbound` beside `validate_outbound`; `CodecRefResolver` in
+    `sutra-codec-spi`.
+
+  Existing codecs are unchanged.
+
+### Fixed
+
+- **A deployment flip could serve an older set of versions, or route a channel to a version whose
+  lanes were not yet built.** With the database deployment source, the deploy API, the
+  `LISTEN sutra_deployments` convergence loop (which also hears the replica's own deploys) and the
+  quiescence sweep each re-activated the served set with no mutual exclusion, so one flip's lane
+  rebuild could land between another's lane rebuild and transport rewire: a request for a channel
+  of the new version answered 404 (`RESOLVE.CHANNEL.UNKNOWN`), or a broadcast briefly had one
+  subscriber, until the next notification. Re-activations are now serialized, each reading the
+  store afresh, so the last one serves the latest committed set.
+- **`make image` could ship another tree's engine code.** The engine Dockerfile's shared cargo
+  target cache and the file times of a reused `COPY` layer let cargo take changed workspace crates
+  as fresh. The build now decides freshness by content (a sha256 manifest of the last good build's
+  sources in the cache), so an image always carries the tree it was built from. Published images
+  were built from a cold cache and are not affected.
+- The `CORRELATION_NOT_FOUND` refusal for a key whose instances have all ended no longer carries
+  `sutra.waitPending=true`; the mark stays only while an instance may still reach the wait. A
+  `local://` delivery for an ended instance therefore takes the poison posture at once instead of
+  being retried for about four minutes.
+- **The AMQP transport opened every connection under one container id** (`sutra-amqp-sink` for every
+  send, `sutra-amqp-source-<channel>` for every replica). A broker that takes the container id as the
+  client's identity closes the open connection when another opens with the same id: IBM MQ does
+  (`amqp:link:stolen`), so concurrent sends, and replicas of one channel, cut each other off. Each
+  connection now has its own id.
+- **The AMQP sink did not set the message's `to` property.** IBM MQ refuses such a message
+  (`AMQXR0032E`), so no send reached it; `to` now repeats the target address.
+
+### Changed
+
+- **A data-store row's first revision is the database clock, not 1.** An insert now seeds `rev`
+  with the database's own clock in microseconds since the epoch (never below 1, read in the insert
+  statement so every replica shares one clock); each write still adds 1. Revisions are strictly
+  increasing per row but not dense, and a key deleted and created again never reuses a revision.
+  That keeps another replica's read cache from serving the old row and keeps an
+  `expect="unchanged"` write or delete that read the old row from applying. Rows written before
+  this release keep their revisions and are unaffected; the `rev` column must be a 64-bit integer
+  (`BIGINT`), as every shipped migration declares it. It holds while the database clock moves
+  forward: a clock stepped backwards between a delete and the re-create can break it.
+- The AMQP sink sets the `message-id` property to the outbox key (it sent none before).
+- The AMQP source renders a binary message id that is not printable text as lower-case hex. It decoded
+  it as UTF-8 before, which maps different ids onto the same replacement characters, so two messages
+  from a broker with binary ids (IBM MQ's 24-byte `MsgId`) could share an idempotency key.
+- The AMQP source drops trailing blanks from `reply-to` and `subject` (IBM MQ pads `ReplyToQ` to 48
+  characters) and treats an all-zero binary correlation or message id as none (MQ's `MQCI_NONE`).
+- A destination query value the AMQP sink cannot take (`type=exchange`, `durable=yes`, …) is a permanent
+  `SUTRA.OUTBOUND.AMQP.CONFIG_INVALID`; `type=topic` was read but had no effect before.
+
+### Migration
+
+- PostgreSQL: V103 builds the partial index `alias_index_retired_lookup` concurrently (blocks no
+  writes), which the ended-key check reads. A completing instance writes one more index entry per
+  correlation key it retires.
 
 ## [0.6.25] — 2026-11-19
 

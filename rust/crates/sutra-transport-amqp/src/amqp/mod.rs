@@ -33,6 +33,10 @@ pub use sink::AmqpMessageSink;
 pub use source::{AmqpSourceConfig, AmqpTriggerSource};
 pub use tls::AmqpTlsProperties;
 
+mod options;
+mod outage;
+pub use options::{identifier_name, AddressType, AmqpSendOptions, BodySection, PropertyNames};
+
 use sutra_channels::config::ChannelDefinition;
 use sutra_channels::diag::Diagnostic;
 
@@ -52,6 +56,12 @@ pub mod codes {
     pub const INBOUND_BROKER_TLS_FAILED: &str = "SUTRA.INBOUND.AMQP.BROKER_TLS_FAILED";
     /// The broker refused the consumer's SASL credentials.
     pub const INBOUND_BROKER_AUTH_FAILED: &str = "SUTRA.INBOUND.AMQP.BROKER_AUTH_FAILED";
+    /// The consumer lost its broker connection (or could not open one) and the outage began.
+    /// Logged once per outage with its start time.
+    pub const INBOUND_BROKER_OUTAGE_STARTED: &str = "SUTRA.INBOUND.AMQP.OUTAGE_STARTED";
+    /// The consumer is attached again after an outage. Logged with the outage's start, end and
+    /// length.
+    pub const INBOUND_BROKER_OUTAGE_ENDED: &str = "SUTRA.INBOUND.AMQP.OUTAGE_ENDED";
 
     pub const OUTBOUND_SEND_FAILED: &str = "SUTRA.OUTBOUND.AMQP.SEND_FAILED";
     /// A step of an outbound send (open, session, attach, send, settle) got no answer from the
@@ -63,6 +73,12 @@ pub mod codes {
     pub const OUTBOUND_BROKER_TLS_FAILED: &str = "SUTRA.OUTBOUND.AMQP.BROKER_TLS_FAILED";
     /// The broker refused the sink's SASL credentials.
     pub const OUTBOUND_BROKER_AUTH_FAILED: &str = "SUTRA.OUTBOUND.AMQP.BROKER_AUTH_FAILED";
+    /// Sends to a broker started failing to reach it (connect, session, attach or a timeout).
+    /// Logged once per broker per outage with its start time.
+    pub const OUTBOUND_BROKER_OUTAGE_STARTED: &str = "SUTRA.OUTBOUND.AMQP.OUTAGE_STARTED";
+    /// A send reached the broker again after an outage. Logged with the outage's start, end and
+    /// length.
+    pub const OUTBOUND_BROKER_OUTAGE_ENDED: &str = "SUTRA.OUTBOUND.AMQP.OUTAGE_ENDED";
 
     /// `SUTRA.STARTUP.REFUSED.HARDCODED_SECRET` — literal broker credentials in channel
     /// YAML are refused (15-factor Factor 3; the shared engine-wide code).
@@ -84,6 +100,58 @@ pub const PROPERTY_OUTBOX_KEY: &str = "sutra-outbox-key";
 pub const PROPERTY_CONTENT_TYPE: &str = "content-type";
 /// The application-property naming a reply destination (a frozen wire name).
 pub const PROPERTY_REPLY_TO: &str = "sutra-reply-to";
+
+/// The header a received message's AMQP `message-id` is written to (rendered as text: a binary id
+/// that is not printable text is lower-case hex), and that an outbound message may set to name its
+/// own `message-id` (the outbox key otherwise).
+pub const HEADER_MESSAGE_ID: &str = "x-amqp-message-id";
+/// The header carrying the AMQP `correlation-id`, both ways (rendered like the message id).
+pub const HEADER_CORRELATION_ID: &str = "x-amqp-correlation-id";
+/// The header carrying the AMQP `reply-to` address, both ways.
+pub const HEADER_REPLY_TO: &str = "x-amqp-reply-to";
+/// The header carrying the AMQP `subject`, both ways.
+pub const HEADER_SUBJECT: &str = "x-amqp-subject";
+/// The outbound headers that fill AMQP message properties instead of riding as application
+/// properties.
+pub const PROPERTY_FIELD_HEADERS: [&str; 4] = [
+    HEADER_MESSAGE_ID,
+    HEADER_CORRELATION_ID,
+    HEADER_REPLY_TO,
+    HEADER_SUBJECT,
+];
+
+/// A container id for one connection: `prefix` (letters, digits, `-`, `_` and `.` kept, others
+/// `_`, at most 64 characters), then the process id, the time and a counter.
+///
+/// Some brokers take the container id as the client's identity and close an open connection when
+/// another opens with the same id: IBM MQ's AMQP channel answers it with `amqp:link:stolen`
+/// ("ServerContext_Takeover"). The sink opens a connection per send and a channel can run on
+/// several replicas, so no two connections may share an id. IBM MQ refuses an id much longer
+/// than 100 characters, which the 64-character prefix keeps well clear of.
+pub(crate) fn unique_container_id(prefix: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let clean: String = prefix
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(64)
+        .collect();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    format!(
+        "{clean}-{}-{nanos:x}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    )
+}
 
 /// Default broker port (plaintext).
 pub const DEFAULT_PORT: u16 = 5672;
@@ -144,6 +212,10 @@ pub struct AmqpChannelProperties {
     pub ack_mode: AckMode,
     /// Per-channel singleton declaration (`singleton: true` / `consumer: exclusive`).
     pub singleton: bool,
+    /// What the source address names (`address-type: queue | topic`), sent to the broker as the
+    /// receiver link's source capability. Unset (the default) sends no capability and leaves the
+    /// broker to decide, which is how the transport behaved before the key existed.
+    pub address_type: Option<AddressType>,
 }
 
 /// The connection properties that may be an environment or secret reference, including the TLS
@@ -164,6 +236,7 @@ impl std::fmt::Debug for AmqpChannelProperties {
             .field("queue", &self.queue)
             .field("topic", &self.topic)
             .field("singleton", &self.singleton)
+            .field("address_type", &self.address_type)
             .finish_non_exhaustive()
     }
 }
@@ -231,6 +304,18 @@ impl AmqpChannelProperties {
             channel,
         )?;
         let ack_mode = AckMode::parse(props.get("ack-mode").map(String::as_str));
+        let address_type = match non_blank(props.get("address-type")) {
+            None => None,
+            Some(raw) => Some(AddressType::parse(&raw).ok_or_else(|| {
+                Diagnostic::error(
+                    codes::INBOUND_CONFIG_INVALID,
+                    format!(
+                        "amqp channel '{channel}' property 'address-type' must be 'queue' or \
+                         'topic', got '{raw}'"
+                    ),
+                )
+            })?),
+        };
         Ok(AmqpChannelProperties {
             host,
             port,
@@ -244,6 +329,7 @@ impl AmqpChannelProperties {
             receive_timeout_ms,
             ack_mode,
             singleton: def.singleton(),
+            address_type,
         })
     }
 
@@ -459,10 +545,10 @@ fn pct_encode_userinfo(raw: &str) -> String {
 
 // ---- destination URIs (sink side) ---------------------------------------------------------
 
-/// A parsed `amqp10://[user:pass@]host[:port]/<destination>[?type=topic]` destination — the
-/// URI AUTHORITY names the broker, the PATH names the queue/topic, `?type=topic` forces a
-/// topic. Unlike Kafka the broker rides the URI (per-authority connection cache);
-/// credentials in the userinfo negotiate SASL PLAIN.
+/// A parsed `amqp10://[user:pass@]host[:port]/<destination>[?<options>]` destination — the
+/// URI AUTHORITY names the broker, the PATH names the queue/topic, and the query carries the
+/// per-destination send options ([`AmqpSendOptions`]: `type`, `durable`, `ttl-ms`, `body`,
+/// `property-names`). Credentials in the userinfo negotiate SASL PLAIN.
 #[derive(Clone, PartialEq, Eq)]
 pub struct AmqpDestination {
     pub host: String,
@@ -474,6 +560,8 @@ pub struct AmqpDestination {
     pub address: String,
     /// True when `?type=topic` was supplied.
     pub is_topic: bool,
+    /// The send options read from the query.
+    pub options: AmqpSendOptions,
 }
 
 /// A destination's userinfo may hold a resolved password, so it stays out of debug output.
@@ -485,6 +573,7 @@ impl std::fmt::Debug for AmqpDestination {
             .field("tls", &self.tls)
             .field("address", &self.address)
             .field("is_topic", &self.is_topic)
+            .field("options", &self.options)
             .finish_non_exhaustive()
     }
 }
@@ -606,7 +695,9 @@ pub fn parse_destination(destination: &str) -> Result<AmqpDestination, Diagnosti
             format!("has no queue/topic name — expected {SCHEME}://<host>:<port>/<destination>"),
         ));
     }
-    let is_topic = query_is_topic(query);
+    let options = AmqpSendOptions::from_query(query)
+        .map_err(|detail| malformed(codes::OUTBOUND_CONFIG_INVALID, detail))?;
+    let is_topic = options.address_type == Some(AddressType::Topic);
     Ok(AmqpDestination {
         host,
         port,
@@ -615,20 +706,8 @@ pub fn parse_destination(destination: &str) -> Result<AmqpDestination, Diagnosti
         password,
         address,
         is_topic,
+        options,
     })
-}
-
-/// True when the query string carries `type=topic` (ASCII case-insensitive).
-fn query_is_topic(query: Option<&str>) -> bool {
-    let Some(query) = query else { return false };
-    for part in query.split('&') {
-        if let Some((k, v)) = part.split_once('=') {
-            if k.trim().eq_ignore_ascii_case("type") && v.trim().eq_ignore_ascii_case("topic") {
-                return true;
-            }
-        }
-    }
-    false
 }
 
 /// Minimal percent-decoding for userinfo segments (`%XX` → byte, others verbatim).
@@ -843,6 +922,16 @@ mod tests {
             "amqp10s://broker:5671/q?type=topic"
         );
         assert_eq!(redact_destination("no-scheme"), "no-scheme");
+    }
+
+    #[test]
+    fn container_ids_are_unique_bounded_and_keep_their_prefix() {
+        let a = unique_container_id("sutra-amqp-source-orders in");
+        let b = unique_container_id("sutra-amqp-source-orders in");
+        assert_ne!(a, b);
+        assert!(a.starts_with("sutra-amqp-source-orders_in-"), "{a}");
+        let long = unique_container_id(&"x".repeat(500));
+        assert!(long.len() <= 100, "{} chars", long.len());
     }
 
     #[test]

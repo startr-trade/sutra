@@ -53,6 +53,10 @@ pub const PARSE_STORE_KEY_REQUIRED: &str = "SUTRA.PARSE.STORE.KEY_REQUIRED";
 /// without `@to`, a limit outside 1..=10000, an aggregate without the field it needs, a query on
 /// a write association, or a query combined with `@forUpdate`.
 pub const PARSE_STORE_QUERY_INVALID: &str = "SUTRA.PARSE.STORE.QUERY_INVALID";
+/// A `<q:store delete="true">` that cannot run as declared: combined with `@field`,
+/// `@forUpdate`, `@expect="absent"` or any key-query attribute, used as a read, or a `@delete`
+/// value that is not a boolean.
+pub const PARSE_STORE_DELETE_INVALID: &str = "SUTRA.PARSE.STORE.DELETE_INVALID";
 pub const PARSE_Q_ON_VALIDATION_INVALID_MODE: &str = "SUTRA.PARSE.Q_ON_VALIDATION_INVALID_MODE";
 pub const PARSE_BOUNDARY_EVENT_INVALID_REF: &str = "SUTRA.PARSE.BOUNDARY_EVENT.INVALID_REF";
 

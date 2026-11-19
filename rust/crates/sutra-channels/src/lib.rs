@@ -78,6 +78,8 @@ pub mod inline_chain;
 pub mod outbox_dispatch;
 #[cfg(feature = "transport")]
 pub mod source;
+#[cfg(feature = "transport")]
+pub mod uncorrelated;
 
 /// Contract-frozen telemetry names (spans / metrics / attribute keys) — defined once in
 /// `sutra_executor::telemetry`, re-exported here so channel-side call sites and the OTLP
@@ -107,7 +109,7 @@ pub use capacity::{
 };
 pub use config::{
     load_channel_definitions, ChannelBinding, ChannelDefinition, Namespace, SessionEnd,
-    UNLABELED_LABEL,
+    UncorrelatedRoute, UNLABELED_LABEL,
 };
 pub use diag::Diagnostic;
 #[cfg(feature = "transport")]

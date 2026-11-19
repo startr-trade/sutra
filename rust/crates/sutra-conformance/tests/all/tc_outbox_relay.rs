@@ -10,7 +10,7 @@
 
 use std::collections::BTreeSet;
 use std::process::Command;
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::support::callback::{start_recorder, HostRecorder};
@@ -108,41 +108,56 @@ fn count(slot: &'static OnceLock<Fixture>, query: &str) -> i64 {
     sql(slot, query).parse().unwrap_or(-1)
 }
 
-/// POST `n` orders with refs `<prefix>-<i>`, 16 at a time, spread round-robin over `ports` (one
-/// per engine); returns the refs the intake ACCEPTED (answered 2xx — sent only after the order's
-/// step committed synchronously).
+/// POST `n` orders with refs `<prefix>-<i>`, 16 in flight at a time, spread round-robin over
+/// `ports` (one per engine); returns the refs the intake ACCEPTED (answered 2xx — sent only after
+/// the order's step committed synchronously).
 async fn post_orders(ports: Vec<u16>, prefix: String, n: usize) -> BTreeSet<String> {
-    let client = reqwest::Client::new();
-    let mut accepted = BTreeSet::new();
-    let refs: Vec<String> = (0..n).map(|i| format!("{prefix}-{i:04}")).collect();
-    for (c, chunk) in refs.chunks(16).enumerate() {
-        let mut posts = Vec::new();
-        for (i, r) in chunk.iter().enumerate() {
-            let port = ports[(c * 16 + i) % ports.len()];
-            let client = client.clone();
-            let r = r.clone();
-            let body = format!(r#"{{"ref":"{r}","amount":10,"party":"party-a","sentAt":0}}"#);
-            posts.push(tokio::spawn(async move {
-                let ok = client
-                    .post(format!("http://127.0.0.1:{port}/channels/order-in"))
-                    .header("Content-Type", "application/json")
-                    .header("X-Api-Key", API_KEY)
-                    .body(body)
-                    .timeout(Duration::from_secs(30))
-                    .send()
-                    .await
-                    .map(|r| r.status().is_success())
-                    .unwrap_or(false);
-                (r, ok)
-            }));
-        }
-        for post in posts {
-            if let Ok((r, true)) = post.await {
-                accepted.insert(r);
-            }
-        }
-    }
+    let accepted = Arc::new(Mutex::new(BTreeSet::new()));
+    post_orders_into(ports, prefix, n, Arc::clone(&accepted)).await;
+    let accepted = accepted.lock().expect("accepted refs").clone();
     accepted
+}
+
+/// [`post_orders`], adding each accepted ref to `accepted` as its answer arrives, so a caller can
+/// watch the load while it runs. The window slides: a new order is posted as soon as any of the 16
+/// in flight is answered, never after a whole batch, so the load is continuous and there is always
+/// accepted work that has not called back yet (a batch barrier lets the callbacks catch up with
+/// every accepted order between batches).
+async fn post_orders_into(
+    ports: Vec<u16>,
+    prefix: String,
+    n: usize,
+    accepted: Arc<Mutex<BTreeSet<String>>>,
+) {
+    const IN_FLIGHT: usize = 16;
+    let client = reqwest::Client::new();
+    let mut posts = tokio::task::JoinSet::new();
+    for i in 0..n {
+        if posts.len() >= IN_FLIGHT {
+            let _ = posts.join_next().await;
+        }
+        let port = ports[i % ports.len()];
+        let client = client.clone();
+        let accepted = Arc::clone(&accepted);
+        let r = format!("{prefix}-{i:04}");
+        posts.spawn(async move {
+            let body = format!(r#"{{"ref":"{r}","amount":10,"party":"party-a","sentAt":0}}"#);
+            let ok = client
+                .post(format!("http://127.0.0.1:{port}/channels/order-in"))
+                .header("Content-Type", "application/json")
+                .header("X-Api-Key", API_KEY)
+                .body(body)
+                .timeout(Duration::from_secs(30))
+                .send()
+                .await
+                .map(|r| r.status().is_success())
+                .unwrap_or(false);
+            if ok {
+                accepted.lock().expect("accepted refs").insert(r);
+            }
+        });
+    }
+    while posts.join_next().await.is_some() {}
 }
 
 /// The distinct refs with `prefix` the recorder has seen, and how many callbacks in total.
@@ -234,8 +249,9 @@ fn assert_exactly_once(slot: &'static OnceLock<Fixture>, prefix: &str, settled: 
     }
 }
 
-/// Load `n` orders (spread over `ports`) while `kill` runs once 30 orders have called back;
-/// returns the accepted refs.
+/// Load `n` orders (spread over `ports`) and run `kill` once 30 orders have called back AND at
+/// least 8 accepted orders have not: the kill must land with accepted work in flight, or recovery
+/// would have nothing to recover. Returns the accepted refs.
 async fn load_and_kill(
     slot: &'static OnceLock<Fixture>,
     ports: Vec<u16>,
@@ -243,11 +259,34 @@ async fn load_and_kill(
     n: usize,
     kill: impl FnOnce(),
 ) -> BTreeSet<String> {
-    let posting = tokio::spawn(post_orders(ports, prefix.to_string(), n));
-    let _ = await_callbacks(slot, prefix, 30, Duration::from_secs(60)).await;
+    const SETTLED_FIRST: usize = 30;
+    const IN_FLIGHT_AT_KILL: usize = 8;
+    let live = Arc::new(Mutex::new(BTreeSet::new()));
+    let posting = tokio::spawn(post_orders_into(
+        ports,
+        prefix.to_string(),
+        n,
+        Arc::clone(&live),
+    ));
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let (done, _) = called_back(slot, prefix);
+        let pending = live
+            .lock()
+            .expect("accepted refs")
+            .difference(&done)
+            .count();
+        if (done.len() >= SETTLED_FIRST && pending >= IN_FLIGHT_AT_KILL)
+            || Instant::now() > deadline
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     kill();
     let done = called_back(slot, prefix).0.len();
-    let accepted = posting.await.expect("posting task");
+    posting.await.expect("posting task");
+    let accepted = live.lock().expect("accepted refs").clone();
     assert!(
         done < accepted.len(),
         "the kill landed mid-flight ({done} called back of {} accepted)",

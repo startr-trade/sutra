@@ -27,7 +27,18 @@
 //!   The engine per-channel lease — not the broker — makes a `singleton: true` channel
 //!   consume on exactly one replica.
 //!
-//! Idempotency key: the `sutra-outbox-key` application property when set
+//! - **Outage window**: the first failed connect, or a lost connection, logs
+//!   `SUTRA.INBOUND.AMQP.OUTAGE_STARTED` with its time; the next attach logs
+//!   `SUTRA.INBOUND.AMQP.OUTAGE_ENDED` with the start, the end and the length in milliseconds.
+//! - **Address type**: `address-type: queue | topic` sends the matching source capability, which
+//!   brokers that read an address without one as a topic need for a queue.
+//!
+//! Message properties ride as headers: `message-id`, `correlation-id`, `reply-to` and `subject`
+//! as `x-amqp-message-id`, `x-amqp-correlation-id`, `x-amqp-reply-to`, `x-amqp-subject` (a binary
+//! id that is not printable text as lower-case hex).
+//!
+//! Idempotency key: the `sutra-outbox-key` application property when set (or its identifier
+//! spelling `sutra_outbox_key`)
 //! (`explicit_event_id = true`); otherwise the AMQP `message-id` (NON-explicit) and, absent
 //! that, the synthetic `address-<delivery-id>` coordinate — so a fallback key never
 //! suppresses a re-post through inbox dedup (the Kafka `topic-partition-offset` posture).
@@ -38,8 +49,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use fe2o3_amqp::link::delivery::DeliveryInfo;
-use fe2o3_amqp::types::messaging::Body;
-use fe2o3_amqp::types::primitives::{SimpleValue, Value};
+use fe2o3_amqp::types::messaging::{Body, Source};
+use fe2o3_amqp::types::primitives::{SimpleValue, Symbol, Value};
 use fe2o3_amqp::{Connection, Delivery, Receiver, Session};
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, info, warn};
@@ -53,9 +64,12 @@ use sutra_channels::source::{
     LeaderGate, TriggerSource,
 };
 
+use super::outage::OutageWindow;
 use super::tls::{classify_open_error, open_tls_connection, AmqpBrokerTarget, AmqpConnectFailure};
 use super::{
-    codes, AckMode, AmqpChannelProperties, PROPERTY_CONTENT_TYPE, PROPERTY_OUTBOX_KEY, TRANSPORT,
+    codes, identifier_name, unique_container_id, AckMode, AmqpChannelProperties,
+    HEADER_CORRELATION_ID, HEADER_MESSAGE_ID, HEADER_REPLY_TO, HEADER_SUBJECT,
+    PROPERTY_CONTENT_TYPE, PROPERTY_OUTBOX_KEY, TRANSPORT,
 };
 
 /// The body type the receiver decodes into — `Body<Value>` accepts any body section (a
@@ -333,6 +347,9 @@ async fn supervise(
     attached: Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
 ) {
     let mut backoff = config.reconnect_min;
+    // The outage in progress, from the first failed connect or the lost connection until the
+    // next attach. Both ends are logged, so the window can be read from the log.
+    let mut outage: Option<OutageWindow> = None;
     loop {
         if stop.is_requested() {
             return;
@@ -346,6 +363,16 @@ async fn supervise(
         }
         match open_session(&config).await {
             Err(diagnostic) => {
+                if outage.is_none() {
+                    let window = OutageWindow::begin();
+                    warn!(
+                        channel = %config.channel,
+                        code = codes::INBOUND_BROKER_OUTAGE_STARTED,
+                        outage_started = %window.started(),
+                        "amqp consumer has no broker connection; retrying"
+                    );
+                    outage = Some(window);
+                }
                 // NON-FATAL: WARN + retry in the background; readiness unaffected.
                 warn!(
                     channel = %config.channel,
@@ -366,6 +393,17 @@ async fn supervise(
                     address = config.properties.source_address().unwrap_or_default(),
                     "amqp consumer up"
                 );
+                if let Some(window) = outage.take() {
+                    let ended = window.end();
+                    info!(
+                        channel = %config.channel,
+                        code = codes::INBOUND_BROKER_OUTAGE_ENDED,
+                        outage_started = %ended.started,
+                        outage_ended = %ended.ended,
+                        outage_ms = ended.millis as u64,
+                        "amqp consumer reconnected after an outage"
+                    );
+                }
                 // First successful attach: release anyone blocked in `start()`. Fired once; later
                 // reconnects find the receiver already taken and simply skip it.
                 if let Some(tx) = attached.lock().await.take() {
@@ -379,10 +417,16 @@ async fn supervise(
                         channel = %config.channel,
                         "amqp consumer detached — leadership lost"
                     ),
-                    SessionEnd::ConnectionLost => warn!(
-                        channel = %config.channel,
-                        "amqp consumer stream failed — reconnecting"
-                    ),
+                    SessionEnd::ConnectionLost => {
+                        let window = OutageWindow::begin();
+                        warn!(
+                            channel = %config.channel,
+                            code = codes::INBOUND_BROKER_OUTAGE_STARTED,
+                            outage_started = %window.started(),
+                            "amqp consumer stream failed — reconnecting"
+                        );
+                        outage = Some(window);
+                    }
                 }
             }
         }
@@ -402,7 +446,7 @@ async fn open_session(config: &AmqpSourceConfig) -> Result<BrokerSession, Diagno
             ),
         )
     })?;
-    let container = format!("sutra-amqp-source-{}", config.channel);
+    let container = unique_container_id(&format!("sutra-amqp-source-{}", config.channel));
     let opened = if props.tls {
         match props.tls_settings.client_config() {
             Ok(tls_config) => {
@@ -448,7 +492,19 @@ async fn open_session(config: &AmqpSourceConfig) -> Result<BrokerSession, Diagno
             ),
         )
     })?;
-    let receiver = Receiver::attach(&mut session, format!("{container}-recv"), address)
+    let source = {
+        let builder = Source::builder().address(address.to_string());
+        match props.address_type {
+            Some(kind) => builder
+                .capabilities(vec![Symbol::from(kind.capability())])
+                .build(),
+            None => builder.build(),
+        }
+    };
+    let receiver = Receiver::builder()
+        .name(format!("{container}-recv"))
+        .source(source)
+        .attach(&mut session)
         .await
         .map_err(|e| {
             Diagnostic::error(
@@ -699,6 +755,30 @@ fn to_inbound_message(config: &AmqpSourceConfig, delivery: &Delivery<WireBody>) 
         .as_ref()
         .and_then(|p| p.message_id.as_ref())
         .and_then(message_id_to_string);
+    if let Some(properties) = &message.properties {
+        // The message properties a reply or a correlating flow reads, under the names the sink
+        // takes them back from. Written after the application properties, so they win a clash.
+        // Trailing blanks are dropped: brokers with fixed-width names (IBM MQ's 48-character
+        // ReplyToQ) pad them.
+        let mut put = |name: &str, value: Option<String>| {
+            if let Some(value) = value
+                .map(|v| v.trim_end().to_string())
+                .filter(|v| !v.is_empty())
+            {
+                headers.insert(name.to_string(), value);
+            }
+        };
+        put(
+            HEADER_MESSAGE_ID,
+            properties.message_id.as_ref().and_then(present_id),
+        );
+        put(
+            HEADER_CORRELATION_ID,
+            properties.correlation_id.as_ref().and_then(present_id),
+        );
+        put(HEADER_REPLY_TO, properties.reply_to.clone());
+        put(HEADER_SUBJECT, properties.subject.clone());
+    }
     let body = body_bytes(&message.body);
     let coordinate = format!(
         "{}-{}",
@@ -729,9 +809,12 @@ fn project_inbound(
     if let Some(id) = native_id {
         headers.insert(sutra_channels::NATIVE_MESSAGE_ID_HEADER.to_string(), id);
     }
+    // A sender that writes identifier property names (`property-names=identifier`) sends
+    // `sutra_outbox_key` and `content_type`; both spellings are read.
+    let named = |k: &str, name: &str| k.eq_ignore_ascii_case(name) || k == identifier_name(name);
     let outbox_key = headers
         .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case(PROPERTY_OUTBOX_KEY))
+        .find(|(k, _)| named(k, PROPERTY_OUTBOX_KEY))
         .map(|(_, v)| v.trim().to_string())
         .filter(|v| !v.is_empty());
     let explicit_event_id = outbox_key.is_some();
@@ -747,7 +830,7 @@ fn project_inbound(
         .unwrap_or(coordinate);
     let content_type = headers
         .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case(PROPERTY_CONTENT_TYPE))
+        .find(|(k, _)| named(k, PROPERTY_CONTENT_TYPE))
         .map(|(_, v)| v.clone())
         .filter(|v| !v.is_empty());
     InboundMessage {
@@ -789,15 +872,40 @@ fn value_to_bytes(value: &Value) -> Vec<u8> {
 
 /// Render a message-id (`ID:`-prefix stripped, matching the Qpid provider form) as a string.
 fn message_id_to_string(id: &fe2o3_amqp::types::messaging::MessageId) -> Option<String> {
+    let raw = render_message_id(id);
+    let stripped = raw.strip_prefix("ID:").unwrap_or(&raw).to_string();
+    Some(stripped).filter(|s| !s.is_empty())
+}
+
+/// An id worth passing on: rendered, unless it is a binary id of zero bytes only, which brokers
+/// with fixed-width binary ids send for "none" (IBM MQ's `MQCI_NONE`).
+fn present_id(id: &fe2o3_amqp::types::messaging::MessageId) -> Option<String> {
     use fe2o3_amqp::types::messaging::MessageId;
-    let raw = match id {
+    match id {
+        MessageId::Binary(b) if b.iter().all(|c| *c == 0) => None,
+        other => Some(render_message_id(other)),
+    }
+}
+
+/// Render a message-id or correlation-id as text. A binary id that is printable ASCII is read as
+/// that text, as before; any other binary id is written as lower-case hex. Brokers that keep
+/// their own 24-byte binary ids (and hand them to AMQP clients as binary) put arbitrary bytes
+/// there, and decoding those as UTF-8 would map different ids onto the same replacement
+/// characters, so two messages could share an idempotency key.
+fn render_message_id(id: &fe2o3_amqp::types::messaging::MessageId) -> String {
+    use fe2o3_amqp::types::messaging::MessageId;
+    match id {
         MessageId::String(s) => s.clone(),
         MessageId::Ulong(u) => u.to_string(),
         MessageId::Uuid(u) => format!("{u:?}"),
-        MessageId::Binary(b) => String::from_utf8_lossy(b).into_owned(),
-    };
-    let stripped = raw.strip_prefix("ID:").unwrap_or(&raw).to_string();
-    Some(stripped).filter(|s| !s.is_empty())
+        MessageId::Binary(b) => {
+            if !b.is_empty() && b.iter().all(|c| (0x20..0x7f).contains(c)) {
+                String::from_utf8_lossy(b).into_owned()
+            } else {
+                b.iter().map(|c| format!("{c:02x}")).collect()
+            }
+        }
+    }
 }
 
 /// Render an application-property value as a string (strings verbatim; other scalars debug).
@@ -838,6 +946,7 @@ mod tests {
             receive_timeout_ms: 1000,
             ack_mode: super::super::AckMode::OnPersist,
             singleton: false,
+            address_type: None,
         }
     }
 
@@ -907,6 +1016,48 @@ mod tests {
         assert_eq!(m.tenant, "acme");
         assert_eq!(m.channel, "payments-in");
         assert!(!m.received_at.is_empty());
+    }
+
+    #[test]
+    fn identifier_spellings_of_the_outbox_key_and_content_type_are_read() {
+        let m = project_inbound(
+            &config(),
+            headers(&[
+                ("sutra_outbox_key", "ob-in-2"),
+                ("content_type", "application/xml"),
+            ]),
+            None,
+            "in-q-4".to_string(),
+            b"<a/>".to_vec(),
+        );
+        assert_eq!(m.idempotency_key, "ob-in-2");
+        assert!(m.explicit_event_id);
+        assert_eq!(m.content_type.as_deref(), Some("application/xml"));
+    }
+
+    #[test]
+    fn binary_ids_render_as_text_when_printable_and_as_hex_otherwise() {
+        use fe2o3_amqp::types::messaging::MessageId;
+        use fe2o3_amqp::types::primitives::Binary;
+        let printable = MessageId::Binary(Binary::from(b"ID:abc-1".to_vec()));
+        assert_eq!(message_id_to_string(&printable).as_deref(), Some("abc-1"));
+        // A 24-byte id of the kind brokers stamp themselves: text, then counter bytes.
+        let mut raw = b"AMQ QM1     ".to_vec();
+        raw.extend_from_slice(&[0x00, 0xff, 0x10, 0x80, 1, 2, 3, 4, 5, 6, 7, 8]);
+        let opaque = MessageId::Binary(Binary::from(raw.clone()));
+        let rendered = render_message_id(&opaque);
+        assert_eq!(rendered.len(), 48);
+        assert!(rendered.starts_with("414d5120514d3120"), "{rendered}");
+        // Two ids differing only in non-text bytes stay distinct.
+        raw[13] = 0xfe;
+        let other = MessageId::Binary(Binary::from(raw));
+        assert_ne!(render_message_id(&other), rendered);
+        assert_eq!(render_message_id(&MessageId::String("s-1".into())), "s-1");
+        assert_eq!(
+            present_id(&MessageId::Binary(Binary::from(vec![0u8; 24]))),
+            None
+        );
+        assert_eq!(present_id(&opaque), Some(rendered));
     }
 
     #[test]

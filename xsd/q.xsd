@@ -457,6 +457,20 @@
         refuses any other type). A NULL column (an absent optional field) is skipped by a sum and groups under
         "null". The table's store_key column must sort bytewise and lead an index (its primary key), else the
         query is refused with SUTRA.RUNTIME.DATASTORE.QUERY_KEY_ORDER / QUERY_KEY_INDEX.
+
+        Row delete (0.7.0, additive): @delete="true" on a WRITE (the reference is the targetRef of a data
+        output association; its sourceRef is optional and ignored) removes the @key row instead of writing
+        a value. A delete of a missing key is a no-op. With @expect="unchanged" it applies only while the
+        row's revision is the one this instance read (never read, or read missing: only while the key is
+        still absent), else SUTRA.RUNTIME.DATASTORE.CONFLICT, catchable like a compare-and-set conflict.
+        It runs where a write runs: on the enclosing bpmn:transaction scope's store transaction (committed
+        or rolled back with it), else autocommit; the DELETE waits behind a @forUpdate row lock; it
+        invalidates the read cache like a write. A row's revision starts at the database clock (microseconds
+        since the epoch) and rises by one per write, so a key deleted and created again never reuses a
+        revision: a cached or expect="unchanged" view of the old row is never taken for the new one.
+        @delete cannot be combined with @field, @forUpdate,
+        @expect="absent", @query, @to, @rows, @limit, @after or q:aggregate, nor used on a READ
+        (SUTRA.PARSE.STORE.DELETE_INVALID).
         See the book's "Data stores" chapter.
       </xsd:documentation>
     </xsd:annotation>
@@ -475,6 +489,7 @@
     <xsd:attribute name="rows" type="xsd:boolean" default="true"/>
     <xsd:attribute name="limit" type="q:StoreQueryLimit"/>
     <xsd:attribute name="after" type="xsd:string"/>
+    <xsd:attribute name="delete" type="xsd:boolean" default="false"/>
   </xsd:complexType>
 
   <xsd:simpleType name="StoreExpect">

@@ -96,6 +96,7 @@ fn source(tls: bool, port: u16, tls_settings: AmqpTlsProperties, queue: &str) ->
         receive_timeout_ms: 250,
         ack_mode: AckMode::OnPersist,
         singleton: false,
+        address_type: None,
     };
     let mut config = AmqpSourceConfig::new("acme", "acme/orders/1.0.0", "orders-in", properties);
     config.gate_poll = Duration::from_millis(150);

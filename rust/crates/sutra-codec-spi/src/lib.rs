@@ -28,7 +28,7 @@ pub mod result;
 pub mod schema;
 pub mod shape;
 
-pub use codec::PayloadCodec;
+pub use codec::{CodecRefResolver, PayloadCodec};
 pub use issue::{IssueSeverity, ValidationIssue};
 pub use mapped::{MappedDecodeResult, MappedMap, MappedValue};
 pub use result::{

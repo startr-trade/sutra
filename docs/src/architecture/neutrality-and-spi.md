@@ -144,9 +144,21 @@ pub trait PayloadCodec {
     fn decode(&self, body: &[u8], content_type: Option<&str>) -> DecodeResult;   // never panics
     fn declared_message_types(&self) -> Vec<String> { Vec::new() }
     fn shape_of(&self, message_type: Option<&str>) -> Option<SchemaShape> { None }
+    fn bind_refs(&self, resolve: CodecRefResolver) -> Result<(), String> { Ok(()) }
+    fn seal(&self, body: &[u8], content_type: Option<&str>) -> Result<Option<Vec<u8>>, String> { Ok(None) }
     // + encode (the reply direction)
 }
 ```
+
+**Sealing and references.** A codec that must change the bytes it sends, for example to add a
+digital signature, implements `seal`. The engine calls it after the codec's own read-back of an
+outbound message passed and before the message is committed to the outbox, for sends and replies
+alike, template renders included. A seal error refuses the message (`SUTRA.OUTBOUND.SEAL_FAILED`).
+A codec whose bundle files name references (`secret:NAME`, `env:NAME`) resolves them in
+`bind_refs`. The engine calls it once, when the deployment is planned on the runtime host, through
+the same resolver channel credentials use. An unresolvable reference refuses the deployment
+(`SUTRA.CODEC.BIND_REFS_FAILED`). The engine still names no format and no algorithm: what sealing
+means is the codec's business.
 
 A zero-config, globally-named codec — each built-in format (`json`, `xml`, `yaml`, `csv`,
 `raw-text`, `raw-bytes`), and any extension crate that wants a global name — submits a

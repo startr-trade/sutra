@@ -180,6 +180,7 @@ fn source_with_mode(port: u16, queue: &str, channel: &str, ack_mode: AckMode) ->
         receive_timeout_ms: 250,
         ack_mode,
         singleton: false,
+        address_type: None,
     };
     let mut config = AmqpSourceConfig::new("acme", "acme/payments/1.0.0", channel, properties);
     config.gate_poll = Duration::from_millis(150);

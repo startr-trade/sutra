@@ -64,6 +64,44 @@ pub fn correlation_snapshot(
     out
 }
 
+/// How one correlation key already computed from `variables` is shown on an observability
+/// surface (a log line, an audit record): `value` itself, or masked by the same rules
+/// [`correlation_snapshot`] applies — the alias name or a variable its `expression` reads is
+/// declared `sensitive`, or a redactor produced a masked projection of its input (the projected
+/// value is shown for a plain path, the placeholder otherwise).
+pub fn shown_alias_value(
+    process: &ProcessDefinition,
+    alias_name: &str,
+    expression: &str,
+    value: &str,
+    variables: &Variables,
+) -> String {
+    let sensitive: HashSet<&str> = process
+        .declared_variables
+        .iter()
+        .filter(|d| d.sensitive)
+        .map(|d| d.name.as_str())
+        .collect();
+    if sensitive.contains(alias_name) {
+        return sutra_bpmn::REDACTED_PLACEHOLDER.to_string();
+    }
+    let roots = expression_roots(expression);
+    let path = plain_path(expression);
+    if let Some(masked) = masked_by_input(&roots, path.as_deref(), variables, &sensitive) {
+        return masked;
+    }
+    if variables
+        .get(&format!(
+            "{alias_name}{}",
+            sutra_bpmn::REDACTION_COMPANION_SUFFIX
+        ))
+        .is_some()
+    {
+        return sutra_bpmn::REDACTED_PLACEHOLDER.to_string();
+    }
+    value.to_string()
+}
+
 /// One alias's rendered value, or `None` when it has none yet.
 fn alias_value(
     alias: &AliasBinding,
@@ -541,6 +579,53 @@ mod tests {
         assert_eq!(
             expression_roots(r#"a.b + c["x"] and "lit.d" = e . f"#),
             vec!["a", "c", "and", "e"]
+        );
+    }
+
+    #[test]
+    fn a_tried_key_is_shown_as_is_unless_its_input_is_protected() {
+        let p = receipt_process(&["secret"], &[]);
+        let vars: Variables = [
+            ("reply".to_string(), map(&[("ref", s("R-1"))])),
+            ("secret".to_string(), map(&[("ref", s("S-1"))])),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            shown_alias_value(&p, "key", "reply.ref", "R-1", &vars),
+            "R-1"
+        );
+        assert_eq!(
+            shown_alias_value(&p, "key", "secret.ref", "S-1", &vars),
+            sutra_bpmn::REDACTED_PLACEHOLDER
+        );
+        assert_eq!(
+            shown_alias_value(&p, "secret", "reply.ref", "R-1", &vars),
+            sutra_bpmn::REDACTED_PLACEHOLDER,
+            "a sensitive alias name masks its value"
+        );
+    }
+
+    #[test]
+    fn a_tried_key_over_a_redacted_input_shows_the_projection() {
+        let p = receipt_process(&[], &[]);
+        let vars: Variables = [
+            ("reply".to_string(), map(&[("ref", s("R-1"))])),
+            (
+                format!("reply{}", sutra_bpmn::REDACTION_COMPANION_SUFFIX),
+                map(&[("ref", s("R-*"))]),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            shown_alias_value(&p, "key", "reply.ref", "R-1", &vars),
+            "R-*"
+        );
+        assert_eq!(
+            shown_alias_value(&p, "key", "string(reply.ref)", "R-1", &vars),
+            sutra_bpmn::REDACTED_PLACEHOLDER,
+            "a non-path expression over a redacted input is masked whole"
         );
     }
 }
