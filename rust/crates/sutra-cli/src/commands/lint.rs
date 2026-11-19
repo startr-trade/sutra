@@ -453,6 +453,18 @@ pub(crate) mod tests {
         (code, out)
     }
 
+    fn lint_against_full(
+        package: std::path::PathBuf,
+        active: std::path::PathBuf,
+    ) -> (i32, String, String) {
+        let args = LintArgs {
+            package_dir: package,
+            active_set: vec![active],
+            ..Default::default()
+        };
+        run_captured("", |io| execute(args, &GlobalArgs::default(), io))
+    }
+
     const STORE_ON_SHARED_REF: &str =
         "datastores:\n  - name: accounts\n    type: sql\n    sql:\n      url-ref: env:SHARED_DB_URL\n";
 
@@ -489,11 +501,17 @@ pub(crate) mod tests {
             "{}.sutra",
             package.file_stem().unwrap().to_string_lossy()
         ));
-        for entry in std::fs::read_dir(&active).unwrap() {
-            std::fs::rename(entry.unwrap().path(), &same_name).unwrap();
+        // Collect first, then rename: on Windows a rename while the directory handle is still
+        // being iterated can leave the entry unreadable for the lint that follows.
+        let entries: Vec<_> = std::fs::read_dir(&active)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        for path in entries {
+            std::fs::rename(path, &same_name).unwrap();
         }
-        let (code, out) = lint_against(package, active);
-        assert_eq!(code, exit::OK, "{out}");
+        let (code, out, err) = lint_against_full(package, active);
+        assert_eq!(code, exit::OK, "stdout: {out}\nstderr: {err}");
         assert!(!out.contains("SUTRA.DEPLOY.ENDPOINT"), "{out}");
     }
 
