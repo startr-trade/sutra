@@ -6298,7 +6298,17 @@ async fn commit_store_tx(state: &mut ExecutionState<'_>) -> Option<String> {
 /// a dead-lettered message's log line carries only the code.
 fn store_op_failed(store: &str, key: &str, node_id: &str, op: &str, err: &StoreError) -> Signal {
     let code = err.code().unwrap_or(codes::RUNTIME_UNEXPECTED);
-    if err.code().is_some() {
+    if code == codes::RUNTIME_DATASTORE_UNAVAILABLE {
+        tracing::warn!(
+            code = %code,
+            store = %store,
+            node = %node_id,
+            op = %op,
+            "data store unreachable; the step is not committed and the delivery is refused for a \
+             retry: {}",
+            err.message()
+        );
+    } else if err.code().is_some() {
         tracing::error!(
             code = %code,
             store = %store,

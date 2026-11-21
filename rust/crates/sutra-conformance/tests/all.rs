@@ -34,6 +34,8 @@ mod tc_audit_sinks;
 mod tc_broker_tls;
 #[path = "all/tc_coverage_cycles.rs"]
 mod tc_coverage_cycles;
+#[path = "all/tc_db_restart.rs"]
+mod tc_db_restart;
 #[path = "all/tc_dedup_refusal.rs"]
 mod tc_dedup_refusal;
 #[path = "all/tc_early_reply_refused.rs"]

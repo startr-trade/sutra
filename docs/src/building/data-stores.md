@@ -982,7 +982,7 @@ for r in a b; do
     -e SUTRA_ADMIN_OIDC_DEV_DISABLED=true \
     -e ITEMS_DB_URL=postgres://items-db:5432/postgres \
     -e ITEMS_DB_USER=sutra_engine -e ITEMS_DB_PASSWORD=dev-only \
-    -e ITEMS_API_KEY=dev-only-items-key ghcr.io/startr-trade/sutra:0.8.1
+    -e ITEMS_API_KEY=dev-only-items-key ghcr.io/startr-trade/sutra:0.8.2
   until curl -sf -o /dev/null "http://127.0.0.1:$(docker port items-$r 8080 | head -1 | cut -d: -f2)/sutra/health/ready"; do
     sleep 1
   done
@@ -1112,6 +1112,14 @@ after an operator's edit is acceptable. When you change rows by hand, bump `rev`
 UPDATE data_store SET store_value = '{"maxAmount": 500}', rev = rev + 1
  WHERE store_name = 'refdata' AND store_key = 'default';
 ```
+
+## When the database cannot be reached
+
+A data task whose database cannot be reached (a dropped connection, a pool timeout, a server
+restarting) fails with `SUTRA.RUNTIME.DATASTORE.UNAVAILABLE`. That is not a failed instance: the
+step is not committed and the delivery is refused for a retry (HTTP 503, a broker redelivery, the
+outbox's backoff for a hop between processes, the timer poller's backoff), whatever the process
+declares about idempotency. It is never dead-lettered. (Since 0.8.2.)
 
 ## Isolation and atomicity
 

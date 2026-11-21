@@ -1340,6 +1340,12 @@ impl ChannelEngine {
         message: &InboundMessage,
         cause: Diagnostic,
     ) -> Result<DispatchOutcome, Diagnostic> {
+        // A data task whose database was unreachable: nothing was committed and nothing about
+        // the delivery is wrong, so it is refused retryably whatever the process asserts — never
+        // consumed and dead-lettered, which would lose a message the sender was told is taken.
+        if let Some(refusal) = transient_execution_refusal(&cause) {
+            return Err(refusal);
+        }
         if process.idempotent {
             return Err(cause.with_attribute(ACK_DISPOSITION_ATTR, ACK_DISPOSITION_REQUEUE));
         }
@@ -3456,6 +3462,11 @@ impl ChannelEngine {
                     // used to be left silently sitting at its old frontier), then surface the cause.
                     let d = e.to_diagnostic();
                     let cause = Diagnostic::error(&d.code, d.message.clone());
+                    if let Some(refusal) = transient_execution_refusal(&cause) {
+                        // The instance stays at its frontier; the delivery comes again.
+                        let _ = self.emissions.drain();
+                        return Err(refusal);
+                    }
                     self.mark_instance_failed(bridge, &pinned, instance_id, &snapshot, &cause)
                         .await;
                     return Err(cause);
@@ -4223,6 +4234,11 @@ impl ChannelEngine {
                     // diagnostic then surfaces to the poller as before.
                     let d = e.to_diagnostic();
                     let cause = Diagnostic::error(&d.code, d.message.clone());
+                    if let Some(refusal) = transient_execution_refusal(&cause) {
+                        // The timer stays due; the poller fires it again after its backoff.
+                        let _ = self.emissions.drain();
+                        return Err(refusal);
+                    }
                     self.mark_instance_failed(
                         &bridge,
                         &pinned,
@@ -4455,6 +4471,10 @@ impl ChannelEngine {
                     // snapshot, exactly as an exhausted registered-task retry.
                     let d = e.to_diagnostic();
                     let cause = Diagnostic::error(&d.code, d.message.clone());
+                    if let Some(refusal) = transient_execution_refusal(&cause) {
+                        let _ = self.emissions.drain();
+                        return Err(refusal);
+                    }
                     self.mark_instance_failed(
                         &bridge,
                         &pinned,
@@ -5710,6 +5730,16 @@ impl ChannelEngine {
     /// instance is persisted FAILED, exactly as a failed resume.
     async fn fail_chain(&self, chain: Box<InlineChain>, cause: Diagnostic) -> InlineStep {
         let _ = self.emissions.drain();
+        if let Some(refusal) = transient_execution_refusal(&cause) {
+            // Nothing reached a quiescent commit: a stored instance stays at its frontier, a
+            // start leaves nothing behind, and the delivery comes again.
+            self.release_chain(&chain, ChainEnd::Aborted).await;
+            return InlineStep::Done {
+                outcome: Err(refusal),
+                settle_consumed: false,
+                completed: false,
+            };
+        }
         if let (Some(stored), Some(bridge)) = (&chain.stored, self.bridge.clone()) {
             self.mark_instance_failed(
                 &bridge,
@@ -7556,6 +7586,20 @@ fn cloud_event_to_feel(ce: &crate::cloudevents::CloudEvent) -> FeelValue {
         );
     }
     FeelValue::Map(map)
+}
+
+/// The refusal for an execution failure that was a data task's database being unreachable
+/// (`SUTRA.RUNTIME.DATASTORE.UNAVAILABLE`), or `None` for any other failure. The step did not
+/// commit — the engine's own records of the delivery (instance, inbox dedup, outbox rows) are as
+/// they were before it — so the delivery is offered again: HTTP answers 503, a broker delivery goes
+/// back for redelivery, the in-process sink and the timer poller retry with their backoff.
+fn transient_execution_refusal(cause: &Diagnostic) -> Option<Diagnostic> {
+    (cause.code == sutra_executor::codes::RUNTIME_DATASTORE_UNAVAILABLE).then(|| {
+        cause
+            .clone()
+            .with_attribute(TRANSIENT_ATTR, "true")
+            .with_attribute(ACK_DISPOSITION_ATTR, ACK_DISPOSITION_REQUEUE)
+    })
 }
 
 /// A refusal the sender should repeat: HTTP answers 503, a broker delivery goes back for

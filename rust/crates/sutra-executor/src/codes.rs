@@ -9,6 +9,12 @@ pub const RUNTIME_MULTI_INSTANCE_COMPLETION_FAILED: &str =
     "SUTRA.RUNTIME.MULTI_INSTANCE.COMPLETION_FAILED";
 pub const RUNTIME_ADHOC_COMPLETION_FAILED: &str = "SUTRA.RUNTIME.ADHOC.COMPLETION_FAILED";
 pub const RUNTIME_DATASTORE_CONFLICT: &str = "SUTRA.RUNTIME.DATASTORE.CONFLICT";
+/// A data task could not reach its store's database (a dropped or reset connection, a pool
+/// timeout, a server shutting down or restarting). Nothing about the delivery is wrong: the step
+/// is not committed, the instance stays where it was, and the delivery is refused retryably (HTTP
+/// 503, a broker redelivery, the outbox's backoff for an in-process hop, the timer poller's
+/// backoff for a timer), never dead-lettered and never recorded as a failed instance.
+pub const RUNTIME_DATASTORE_UNAVAILABLE: &str = "SUTRA.RUNTIME.DATASTORE.UNAVAILABLE";
 /// A `<q:decode>` expression gave null or a non-string. Catchable.
 pub const RUNTIME_DECODE_NOT_TEXT: &str = "SUTRA.RUNTIME.DECODE.NOT_TEXT";
 /// A `<q:decode>` codec reported a fatal parse, or cannot be used at run time. Catchable.

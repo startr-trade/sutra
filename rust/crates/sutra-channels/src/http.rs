@@ -1763,6 +1763,9 @@ fn status_for_code(code: &str) -> u16 {
         // Nothing ran: the delivery could not be checked for a duplicate, so it is refused until
         // it can be. The sender retries with the same id.
         codes::INBOUND_DEDUP_CHECK_UNAVAILABLE | codes::INBOUND_DEDUP_IN_DOUBT => return 503,
+        // A data task's database was unreachable: nothing was committed, and the same request
+        // succeeds once it is back.
+        sutra_executor::codes::RUNTIME_DATASTORE_UNAVAILABLE => return 503,
         _ => {}
     }
     if code.starts_with("SUTRA.INBOUND.REJECTED.") {
@@ -1955,6 +1958,10 @@ mod local_channel_tests {
     fn a_delivery_refused_by_the_dedup_check_answers_a_retryable_status() {
         assert_eq!(status_for_code(codes::INBOUND_DEDUP_CHECK_UNAVAILABLE), 503);
         assert_eq!(status_for_code(codes::INBOUND_DEDUP_IN_DOUBT), 503);
+        assert_eq!(
+            status_for_code(sutra_executor::codes::RUNTIME_DATASTORE_UNAVAILABLE),
+            503
+        );
     }
 
     /// A failure the caller caused answers 422 with that cause's code; the at-most-once incident

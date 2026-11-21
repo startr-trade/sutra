@@ -256,6 +256,9 @@ vulnerabilities:
   # It stopped the 0.7.0 release run at the image scan, so 0.7.0 published no image. Checked on the
   # 0.8.0 binary: `readelf -d` lists libgcc_s, libm, libc and the loader only, and the binary holds
   # no libssl or libcrypto name to load at run time. Expires with the 0.6.25 batch.
+  - id: CVE-2026-126765
+    statement: "libc6 (glibc) glob functions, in the distroless base. The engine does not import glob, glob64, globfree or fnmatch: readelf --dyn-syms on the 0.8.2 binary lists none of them (it links libgcc_s, libm, libc and the loader only), and the image has no shell or other program that would call them. Debian ships no fixed package (status: affected)."
+    expired_at: 2026-12-16
   - id: CVE-2026-84786
     statement: "libssl3 (a DANE-enabled TLS client may dereference a NULL pointer) in the distroless base. The engine never loads libssl3: readelf -d on the 0.8.1 binary names libgcc_s, libm, libc and the loader only, and the binary contains no libssl or libcrypto name for dlopen. Nothing in it enables DANE: rustls has no DANE, and the Kafka client's compiled-in OpenSSL 3.6.3 is used only by librdkafka 2.12.1, which never calls SSL_dane_enable or SSL_CTX_dane_enable (no DANE reference in its source), and no workspace crate uses the openssl bindings. Debian ships no fixed package (status: affected)."
     expired_at: 2026-12-16

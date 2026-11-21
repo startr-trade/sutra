@@ -2153,3 +2153,129 @@ fn no_codec_and_no_content_type_stays_raw_bytes() {
         Some(sutra_codec_spi::CodecValue::Bytes(_))
     ));
 }
+
+// ---- a data task whose database is unreachable ------------------------------------------------
+
+/// A store whose database cannot be reached: every operation fails the way the engine's SQL
+/// stores report a dropped connection or a pool timeout.
+struct UnreachableStore;
+
+#[async_trait::async_trait(?Send)]
+impl sutra_executor::DataStore for UnreachableStore {
+    fn name(&self) -> &str {
+        "log"
+    }
+    async fn get(&self, _key: &str) -> Result<Option<FeelValue>, sutra_executor::StoreError> {
+        Err(unreachable_error())
+    }
+    async fn put(&self, _key: &str, _value: FeelValue) -> Result<(), sutra_executor::StoreError> {
+        Err(unreachable_error())
+    }
+    async fn delete(&self, _key: &str) -> Result<(), sutra_executor::StoreError> {
+        Err(unreachable_error())
+    }
+    async fn begin(
+        &self,
+    ) -> Result<Option<Rc<dyn sutra_executor::DataStoreTx>>, sutra_executor::StoreError> {
+        Err(unreachable_error())
+    }
+}
+
+fn unreachable_error() -> sutra_executor::StoreError {
+    sutra_executor::StoreError::with_code(
+        sutra_executor::codes::RUNTIME_DATASTORE_UNAVAILABLE,
+        "put failed for 'log'[k]: error communicating with database: Broken pipe",
+    )
+}
+
+fn bpmn_store_write() -> String {
+    r#"<?xml version="1.0"?>
+    <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                      xmlns:q="urn:sutra:q:1.0">
+      <bpmn:dataStore id="logStore" name="log"/>
+      <bpmn:process id="echo">
+        <bpmn:extensionElements>
+          <q:variables><q:variable name="logged" type="string"/></q:variables>
+        </bpmn:extensionElements>
+        <bpmn:dataStoreReference id="refLog" dataStoreRef="logStore">
+          <bpmn:extensionElements><q:store key="&quot;k&quot;"/></bpmn:extensionElements>
+        </bpmn:dataStoreReference>
+        <bpmn:startEvent id="S">
+          <bpmn:extensionElements>
+            <q:source channel="orders-in" name="payload"/>
+          </bpmn:extensionElements>
+        </bpmn:startEvent>
+        <bpmn:serviceTask id="T">
+          <bpmn:dataInputAssociation>
+            <bpmn:assignment><bpmn:from>"x"</bpmn:from><bpmn:to>logged</bpmn:to></bpmn:assignment>
+          </bpmn:dataInputAssociation>
+          <bpmn:dataOutputAssociation>
+            <bpmn:sourceRef>logged</bpmn:sourceRef><bpmn:targetRef>refLog</bpmn:targetRef>
+          </bpmn:dataOutputAssociation>
+        </bpmn:serviceTask>
+        <bpmn:endEvent id="E"/>
+        <bpmn:sequenceFlow id="f1" sourceRef="S" targetRef="T"/>
+        <bpmn:sequenceFlow id="f2" sourceRef="T" targetRef="E"/>
+      </bpmn:process>
+    </bpmn:definitions>"#
+        .to_string()
+}
+
+#[test]
+fn a_data_task_whose_database_is_unreachable_is_refused_for_a_retry_not_dead_lettered() {
+    // The process is non-idempotent (the default), which would dead-letter and CONSUME an
+    // ordinary failure. A store that could not be reached changed nothing, so the delivery must
+    // come again: an in-process hop that was consumed here would be lost for good.
+    let module = BpmnModelLoader::new()
+        .load(bpmn_store_write().as_bytes())
+        .expect("BPMN loads");
+    let sink = Rc::new(DrainingSink::new());
+    let executor = TokenExecutor::builder(TaskRegistry::new())
+        .with_feel()
+        .with_data_stores(|_, _| {
+            Some(Rc::new(UnreachableStore) as Rc<dyn sutra_executor::DataStore>)
+        })
+        .with_emission_sink(Rc::clone(&sink) as Rc<dyn sutra_executor::EmissionSink>)
+        .build();
+    let incidents = Rc::new(InMemoryIncidentSink::new());
+    let engine = ChannelEngine::builder(
+        executor,
+        sink,
+        InboundChain::new(
+            CodecRegistry::with_builtins(),
+            sutra_channels::FormatRegistry::with_builtins(),
+            ValidatorRegistry::new(),
+        ),
+    )
+    .with_binding(ChannelBinding::new(
+        "orders-in",
+        namespace(),
+        deployment(),
+        "raw-text",
+    ))
+    .with_module(&deployment(), &module)
+    .with_inbox(Rc::new(InMemoryInboxStore::new()) as Rc<dyn InboxStore>)
+    .with_incident_sink(Rc::clone(&incidents) as Rc<dyn IncidentSink>)
+    .build();
+    let refused = drive(engine.dispatch(&inbound("orders-in", b"x", "text/plain")))
+        .expect_err("refused, not consumed");
+    assert_eq!(
+        refused.code,
+        sutra_executor::codes::RUNTIME_DATASTORE_UNAVAILABLE
+    );
+    assert_eq!(
+        refused
+            .attributes
+            .get(sutra_channels::TRANSIENT_ATTR)
+            .map(String::as_str),
+        Some("true")
+    );
+    assert_eq!(
+        refused
+            .attributes
+            .get(ACK_DISPOSITION_ATTR)
+            .map(String::as_str),
+        Some(sutra_channels::ACK_DISPOSITION_REQUEUE)
+    );
+    assert!(incidents.incidents().is_empty(), "nothing dead-lettered");
+}

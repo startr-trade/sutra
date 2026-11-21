@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  intake: an order arrives over HTTP, is logged as "in|<ref>" and forwarded to the worker over a
+  local channel. The HTTP answer is sent only after the step that enqueues the forward committed.
+-->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0"
+                  id="Definitions_dbrestart_intake"
+                  targetNamespace="urn:sutra:module:dbrestart:1.0.0">
+  <bpmn:dataStore id="logStore" name="log"/>
+
+  <bpmn:process id="intake" isExecutable="true">
+    <bpmn:extensionElements>
+      <q:variables>
+        <q:variable name="logged" type="string"/>
+        <q:variable name="responseBody" type="object"/>
+      </q:variables>
+    </bpmn:extensionElements>
+    <bpmn:dataStoreReference id="refIn" dataStoreRef="logStore">
+      <bpmn:extensionElements><q:store key="'in|' + payload.ref"/></bpmn:extensionElements>
+    </bpmn:dataStoreReference>
+
+    <bpmn:startEvent id="Start"><bpmn:extensionElements><q:source channel="order-in"/></bpmn:extensionElements></bpmn:startEvent>
+    <bpmn:serviceTask id="LogIn" name="Log the order">
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>payload.ref</bpmn:from><bpmn:to>logged</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>{ref: payload.ref}</bpmn:from><bpmn:to>responseBody</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+      <bpmn:dataOutputAssociation>
+        <bpmn:sourceRef>logged</bpmn:sourceRef><bpmn:targetRef>refIn</bpmn:targetRef>
+      </bpmn:dataOutputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sendTask id="Forward" name="Forward to the worker">
+      <bpmn:extensionElements><q:send channel="to-worker"/></bpmn:extensionElements>
+    </bpmn:sendTask>
+    <bpmn:endEvent id="End"/>
+    <bpmn:sequenceFlow id="F1" sourceRef="Start" targetRef="LogIn"/>
+    <bpmn:sequenceFlow id="F2" sourceRef="LogIn" targetRef="Forward"/>
+    <bpmn:sequenceFlow id="F3" sourceRef="Forward" targetRef="End"/>
+  </bpmn:process>
+</bpmn:definitions>

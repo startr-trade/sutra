@@ -11,6 +11,66 @@ This is the changelog for the **Rust-native** engine (`rust/` workspace). It beg
 
 ## [Unreleased]
 
+## [0.8.2] — 2026-11-21
+
+**2026-11-21.** A patch release with two fixes. **A message the engine had accepted is no longer
+lost when its database restarts:** a data task that cannot reach its store's database now refuses
+the delivery for a retry instead of dead-lettering it. **The AMQP 1.0 sink keeps its connections**
+instead of opening one per message. One configuration key (`SUTRA_SINK_AMQP_MAX_CONNECTIONS`) and
+one diagnostic code (`SUTRA.RUNTIME.DATASTORE.UNAVAILABLE`) are added; no `q:`, migration, archive
+or snapshot change.
+
+### Fixed
+
+- **An accepted message is no longer lost across a database restart.** When a data task's store
+  could not reach its database (a pooled connection the restart had broken, a pool timeout, a
+  server shutting down or not yet accepting connections), the step failed like any execution
+  error. A process that does not declare itself idempotent (the default) then dead-lettered the
+  delivery and consumed it. For an in-process hop that meant the outbox row was deleted as
+  delivered although its target never ran, after the sender had already been answered: the
+  message was gone. Such a failure is now coded `SUTRA.RUNTIME.DATASTORE.UNAVAILABLE` and refused
+  for a retry whatever the process declares: nothing is committed, the instance stays where it
+  was, and the delivery comes again (HTTP answers 503, a broker delivery is released for
+  redelivery, an in-process hop is retried with the outbox's backoff, a timer fires again after
+  the poller's backoff). It is never dead-lettered, and a resumed instance is never recorded as
+  FAILED for it. The engine's own tables already behaved this way; the flush-deferred bookkeeping
+  writes (the instance claim, the outbox claim and its lease, the delete of delivered rows) are
+  unchanged and were not the cause: losing one only redelivers. A new tier-2 suite
+  (`tc_db_restart`) restarts, and separately kills, PostgreSQL under load and checks that every
+  accepted order reaches its second process exactly once. `DataStoreError::is_transient` is the
+  new seam.
+- **A delivery that ran during a database outage is no longer run twice.** A dispatch that
+  completed without a step to carry its inbox dedup record wrote it afterwards and only logged a
+  failure, so the delivery was acknowledged with no record; when the outbox's delete of the row
+  was lost too, the redelivery ran the process again. The step commits (park, re-park, terminal,
+  sync emissions) and that write now ride out an unreachable database for up to 30 s before
+  giving up, so a step that has run is recorded rather than run again.
+
+### Changed
+
+- **The AMQP 1.0 sink keeps its connections.** It used to open a connection, a session and a
+  sender link for every message and close them after the broker settled it. It now keeps, per
+  broker (scheme, host, port and credentials), a pool of at most 8 connections
+  (`SUTRA_SINK_AMQP_MAX_CONNECTIONS`), each with its one session (IBM MQ's AMQP channel allows one
+  per connection) and a sender link per target address. A send takes an idle connection, reuses
+  its link or attaches one, and returns the connection once the broker has settled the message;
+  with every connection busy it waits for one, for at most the operation timeout. A connection
+  that fails a send is dropped; a send that failed on a reused connection is tried once more on a
+  fresh one at once, so a broker restart is ridden out without an outage. A connection idle for
+  two minutes is closed, and the transport's drain closes them all at shutdown. The delivery
+  guarantee is unchanged: delivered only on the broker's `accepted`, every other outcome retried
+  by the outbox, receivers dedupe on `sutra-outbox-key`. Measured with the tier-2
+  benchmark (Apache ActiveMQ Artemis on loopback, a durable queue, 400 messages): one at a time
+  22.3 → 227 messages/s (p50 44.8 → 4.2 ms), eight at a time 177 → 1,209 messages/s.
+  `AmqpMessageSink::with_max_connections`, `connections_opened`, `idle_connections` and
+  `drain_all_sinks` are new.
+
+### Security
+
+- **CVE-2026-126765 (libc6 glob functions) is triaged in `.trivyignore.yaml`** until 2026-12-16:
+  no fixed Debian package; the engine does not import `glob`, `globfree` or `fnmatch`
+  (`readelf --dyn-syms` on the 0.8.2 binary), and the image has no shell.
+
 ## [0.8.1] — 2026-11-19
 
 **2026-11-19.** A patch release. **The SQL audit sink writes in batches**, so on a durable

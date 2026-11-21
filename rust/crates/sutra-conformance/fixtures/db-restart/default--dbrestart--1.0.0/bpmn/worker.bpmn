@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  worker: started by the intake's local forward. It counts how often it ran for the order in
+  "out|<ref>" (read, add one, write), so a lost forward leaves no row and a forward processed twice
+  leaves a count of 2.
+-->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0"
+                  id="Definitions_dbrestart_worker"
+                  targetNamespace="urn:sutra:module:dbrestart:1.0.0">
+  <bpmn:dataStore id="logStore" name="log"/>
+
+  <bpmn:process id="worker" isExecutable="true">
+    <bpmn:extensionElements>
+      <q:variables>
+        <q:variable name="runs" type="number"/>
+      </q:variables>
+    </bpmn:extensionElements>
+    <bpmn:dataObject id="doSeen" name="seen"/>
+    <bpmn:dataStoreReference id="refOutRead" dataStoreRef="logStore">
+      <bpmn:extensionElements><q:store key="'out|' + payload.ref"/></bpmn:extensionElements>
+    </bpmn:dataStoreReference>
+    <bpmn:dataStoreReference id="refOutWrite" dataStoreRef="logStore">
+      <bpmn:extensionElements><q:store key="'out|' + payload.ref"/></bpmn:extensionElements>
+    </bpmn:dataStoreReference>
+
+    <bpmn:startEvent id="Start"><bpmn:extensionElements><q:source channel="worker-in"/></bpmn:extensionElements></bpmn:startEvent>
+    <bpmn:serviceTask id="Count" name="Count the run">
+      <bpmn:dataInputAssociation>
+        <bpmn:sourceRef>refOutRead</bpmn:sourceRef><bpmn:targetRef>doSeen</bpmn:targetRef>
+      </bpmn:dataInputAssociation>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>if seen = null then 1 else seen + 1</bpmn:from><bpmn:to>runs</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+      <bpmn:dataOutputAssociation>
+        <bpmn:sourceRef>runs</bpmn:sourceRef><bpmn:targetRef>refOutWrite</bpmn:targetRef>
+      </bpmn:dataOutputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="End"/>
+    <bpmn:sequenceFlow id="F1" sourceRef="Start" targetRef="Count"/>
+    <bpmn:sequenceFlow id="F2" sourceRef="Count" targetRef="End"/>
+  </bpmn:process>
+</bpmn:definitions>

@@ -1,0 +1,10 @@
+# Deployment package for the database-restart conformance suite: an HTTP intake that logs the order
+# and forwards it over a local channel to a worker that logs it again. Every hop touches a data
+# store on the suite's PostgreSQL, so a database restart under load reaches both the engine's own
+# records (instances, inbox dedup, outbox) and the data tasks. Labels are opaque selectors.
+labels:
+  "tenant": "default"
+  "module": "dbrestart"
+  "version": "1.0.0"
+engine:
+  minContract: 1

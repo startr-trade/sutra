@@ -912,11 +912,12 @@ async fn tls_and_sasl_plain_on_the_amqp_channel() {
 
 // ---- concurrency ---------------------------------------------------------------------------
 
-/// The AMQP channel allows one session per connection; the sink opens a connection per send, so
-/// concurrent sends are concurrent connections, each with its one session.
+/// The AMQP channel allows one session per connection; the sink pools its connections, each with
+/// its one session and a sender link per queue, so 40 concurrent sends share at most the pool's
+/// bound of connections, and every message arrives.
 #[ignore = "docker"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn concurrent_sends_each_use_their_own_connection_and_session() {
+async fn concurrent_sends_share_the_pooled_connections_each_with_one_session() {
     let p = pair();
     let (source, intake) = start_source(
         "concurrent-in",
@@ -943,6 +944,11 @@ async fn concurrent_sends_each_use_their_own_connection_and_session() {
     for send in sends {
         expect_delivered(send.await.unwrap());
     }
+    assert!(
+        sink.connections_opened() <= sutra_transport_amqp::sink::DEFAULT_MAX_CONNECTIONS as u64,
+        "{} connections for 40 sends",
+        sink.connections_opened()
+    );
     wait_for("all concurrent deliveries", Duration::from_secs(60), || {
         keys.iter().all(|k| intake.keys().contains(k))
     })

@@ -47,6 +47,34 @@ pub const SINK_TLS_INSECURE_SKIP_VERIFY_ENV: &str = "SUTRA_SINK_AMQP_TLS_INSECUR
 /// 30000). Unset, blank or not a positive integer: the default, with a warning for a bad value.
 pub const SINK_OPERATION_TIMEOUT_ENV: &str = "SUTRA_SINK_AMQP_OPERATION_TIMEOUT_MS";
 
+/// The env var bounding how many connections the outbound sink keeps to one broker (default
+/// [`crate::amqp::sink::DEFAULT_MAX_CONNECTIONS`]). Unset, blank or not a positive integer: the
+/// default, with a warning for a bad value.
+pub const SINK_MAX_CONNECTIONS_ENV: &str = "SUTRA_SINK_AMQP_MAX_CONNECTIONS";
+
+/// The sink's per-broker connection bound from the environment (see [`SINK_MAX_CONNECTIONS_ENV`]).
+pub fn sink_max_connections_from_env() -> usize {
+    sink_max_connections_from(std::env::var(SINK_MAX_CONNECTIONS_ENV).ok().as_deref())
+}
+
+fn sink_max_connections_from(value: Option<&str>) -> usize {
+    let default = crate::amqp::sink::DEFAULT_MAX_CONNECTIONS;
+    match value.map(str::trim).filter(|v| !v.is_empty()) {
+        None => default,
+        Some(v) => match v.parse::<usize>() {
+            Ok(n) if n > 0 => n,
+            _ => {
+                tracing::warn!(
+                    code = crate::amqp::codes::OUTBOUND_CONFIG_INVALID,
+                    "{SINK_MAX_CONNECTIONS_ENV} must be a positive integer, got '{v}'; using \
+                     {default}"
+                );
+                default
+            }
+        },
+    }
+}
+
 /// The sink's operation timeout from the environment (see [`SINK_OPERATION_TIMEOUT_ENV`]).
 pub fn sink_operation_timeout_from_env() -> std::time::Duration {
     sink_operation_timeout_from(std::env::var(SINK_OPERATION_TIMEOUT_ENV).ok().as_deref())
@@ -92,7 +120,8 @@ pub fn register_amqp_sink_with_tls(
     registry.register(Arc::new(
         AmqpMessageSink::new(username, password)
             .with_tls_settings(tls_settings)
-            .with_operation_timeout(sink_operation_timeout_from_env()),
+            .with_operation_timeout(sink_operation_timeout_from_env())
+            .with_max_connections(sink_max_connections_from_env()),
     ));
 }
 
@@ -190,9 +219,11 @@ impl AmqpChannels {
             .unwrap_or(0)
     }
 
-    /// Await-drain every consumer + release the channel-lease election (async shutdown).
+    /// Await-drain every consumer + release the channel-lease election, then close the outbound
+    /// sinks' pooled connections (async shutdown).
     pub async fn drain(&self) {
         let Some(state) = &self.inner else {
+            crate::amqp::drain_all_sinks(sink_operation_timeout_from_env()).await;
             return;
         };
         for source in state.snapshot_sources() {
@@ -201,6 +232,7 @@ impl AmqpChannels {
         if let Some(election) = &state.election {
             election.release_all().await;
         }
+        crate::amqp::drain_all_sinks(sink_operation_timeout_from_env()).await;
     }
 
     /// Detached stop of every consumer + lease release (the sync `shutdown` path).
@@ -693,6 +725,16 @@ mod tests {
         );
         assert_eq!(sink_operation_timeout_from(Some("0")), default);
         assert_eq!(sink_operation_timeout_from(Some("soon")), default);
+    }
+
+    #[test]
+    fn the_connection_bound_reads_a_positive_integer_and_falls_back_on_a_bad_value() {
+        let default = crate::amqp::sink::DEFAULT_MAX_CONNECTIONS;
+        assert_eq!(sink_max_connections_from(None), default);
+        assert_eq!(sink_max_connections_from(Some("")), default);
+        assert_eq!(sink_max_connections_from(Some("3")), 3);
+        assert_eq!(sink_max_connections_from(Some("0")), default);
+        assert_eq!(sink_max_connections_from(Some("many")), default);
     }
 
     #[test]

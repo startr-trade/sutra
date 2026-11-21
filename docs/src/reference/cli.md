@@ -362,7 +362,7 @@ instance did, offline. See [Logging and audit](../operating/logging.md).
 ### `sutra version`
 
 ```
-sutra version            # sutra 0.8.1 (1a2b3c4, built 2026-11-15)
+sutra version            # sutra 0.8.2 (1a2b3c4, built 2026-11-15)
 sutra --version          # identical text
 sutra version --format json
 ```
@@ -370,8 +370,8 @@ sutra version --format json
 Prints the tool version and the build it came from. The parenthesis names the commit the binary
 was built from (`-dirty` appended when tracked files had uncommitted changes) and that commit's
 date in UTC. It is never the wall clock, so two builds of one commit print the same line. An
-unknown part is left out rather than guessed: `sutra 0.8.1 (1a2b3c4)` without a date, plain
-`sutra 0.8.1` when git is unavailable and no build variable was set. A release build takes both
+unknown part is left out rather than guessed: `sutra 0.8.2 (1a2b3c4)` without a date, plain
+`sutra 0.8.2` when git is unavailable and no build variable was set. A release build takes both
 from `SUTRA_BUILD_COMMIT` and `SOURCE_DATE_EPOCH`; a local build reads them from git. The engine
 image's `sutra-engine --version` prints the same, and its `sutra-engine starting` log line carries
 `version`, `commit` and `built` fields.
@@ -383,7 +383,7 @@ binary name prints that name, and one that versions itself independently of the 
 
 ```
 <tool> 2.0.0
-sutra  0.8.1 (engine)
+sutra  0.8.2 (engine)
 ```
 
 The tool's own version is its first line read up to the first ` (`, so a distribution may print
@@ -396,7 +396,7 @@ reporting tool's own, `engine` the embedded engine's (equal for this binary). `c
 `built` are present when known:
 
 ```json
-{"name":"sutra","version":"0.8.1","engine":"0.8.1","commit":"1a2b3c4","built":"2026-11-15"}
+{"name":"sutra","version":"0.8.2","engine":"0.8.2","commit":"1a2b3c4","built":"2026-11-15"}
 ```
 
 ---

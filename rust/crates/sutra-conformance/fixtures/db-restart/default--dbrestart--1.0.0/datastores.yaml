@@ -1,0 +1,10 @@
+# One key/value store on the suite's own PostgreSQL: the database the test restarts.
+datastores:
+  - name: log
+    type: sql
+    sql:
+      url-ref: env:LOG_DB_URL
+      username-ref: env:LOG_DB_USER
+      password-ref: env:LOG_DB_PASSWORD
+      migrations: migrations/log
+    dataClass: operational

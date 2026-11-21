@@ -27,10 +27,19 @@
 //! `SUTRA.OUTBOUND.AMQP.OUTAGE_STARTED`; the next send that reaches it logs
 //! `SUTRA.OUTBOUND.AMQP.OUTAGE_ENDED` with the start, the end and the length.
 //!
-//! Unlike Kafka the broker host rides the URI (per-authority); the
-//! sink opens a fresh connection per send (the outbox delivery loop is a background spine,
-//! not a hot path) and closes it after the disposition settles — no shared mutable state,
-//! trivially `Send`. Engine-wide default credentials (from `SUTRA_SINK_AMQP_{USERNAME,
+//! Unlike Kafka the broker host rides the URI (per-authority). **The sink keeps its connections.**
+//! Per broker (scheme, host, port and credentials) it holds a pool of at most
+//! [`DEFAULT_MAX_CONNECTIONS`] connections (`SUTRA_SINK_AMQP_MAX_CONNECTIONS`), each with one
+//! session (IBM MQ's AMQP channel allows one per connection) and a sender link per target address
+//! (at most 32; the least recently used is detached past that). A send takes an idle connection,
+//! reuses its link to the target or attaches one, and puts the connection back once the broker has
+//! settled the message; past the bound it waits for one, for at most the operation timeout. A
+//! connection that fails a send is dropped, and a send that failed on a reused connection is tried
+//! once more on a fresh one at once (a broker restart leaves every pooled connection dead, which
+//! is not an outage of the broker). One left idle for [`IDLE_CLOSE`] is closed. The transport's
+//! drain closes them all ([`drain_all_sinks`]). Opening a connection, a session and a link per
+//! message cost several broker round trips and, on IBM MQ, a channel instance per send.
+//! Engine-wide default credentials (from `SUTRA_SINK_AMQP_{USERNAME,
 //! PASSWORD}`) apply when the URI carries no userinfo (anonymous when both are empty).
 //!
 //! An `amqp10s://` destination is secured natively (see [`super::tls`]) under the engine-wide
@@ -48,13 +57,17 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::time::{Duration, Instant};
 use sutra_channels::connectivity::{ConnectivityDirection, ConnectivityEvent, SendContext};
 
+use fe2o3_amqp::connection::ConnectionHandle;
+use fe2o3_amqp::session::SessionHandle;
 use fe2o3_amqp::types::messaging::{ApplicationProperties, Header, Message, Properties, Target};
 use fe2o3_amqp::types::primitives::{Binary, Symbol};
 use fe2o3_amqp::{Connection, Sender, Session};
+use tokio::sync::Semaphore;
 
 use sutra_channels::diag::Diagnostic;
 use sutra_channels::sink::{BoxFuture, MessageSink, OutboundMessage, SendOutcome};
@@ -101,6 +114,8 @@ pub struct AmqpMessageSink {
     /// the engine collects connectivity events: each channel that sends during an outage
     /// reports its own down, and its own up on its first send that reaches the broker again.
     channel_outages: Mutex<HashMap<(String, String, String), OutageWindow>>,
+    /// The pooled connections, per broker.
+    pools: Arc<LanePools>,
 }
 
 impl AmqpMessageSink {
@@ -119,7 +134,34 @@ impl AmqpMessageSink {
             operation_timeout: DEFAULT_OPERATION_TIMEOUT,
             outages: Mutex::new(HashMap::new()),
             channel_outages: Mutex::new(HashMap::new()),
+            pools: Self::new_pools(DEFAULT_MAX_CONNECTIONS),
         }
+    }
+
+    fn new_pools(max_connections: usize) -> Arc<LanePools> {
+        let pools = Arc::new(LanePools::new(max_connections));
+        let mut live = lock(live_pools());
+        live.retain(|weak| weak.strong_count() > 0);
+        live.push(Arc::downgrade(&pools));
+        pools
+    }
+
+    /// Keep at most `max` connections to each broker instead of [`DEFAULT_MAX_CONNECTIONS`]
+    /// (at least one).
+    pub fn with_max_connections(mut self, max: usize) -> AmqpMessageSink {
+        self.pools = Self::new_pools(max);
+        self
+    }
+
+    /// How many broker connections this sink has opened so far, pooled or not. A send on a pooled
+    /// connection opens none.
+    pub fn connections_opened(&self) -> u64 {
+        self.pools.opened.load(Ordering::Relaxed)
+    }
+
+    /// How many connections sit idle in the pool, over every broker.
+    pub fn idle_connections(&self) -> usize {
+        self.pools.idle_count()
     }
 
     /// Bound each broker round trip of a send by `timeout` instead of the default 30 s.
@@ -163,9 +205,12 @@ impl AmqpMessageSink {
         Ok(config)
     }
 
-    /// Drain posture: connection-per-send holds no long-lived resources, so drain is a no-op
-    /// (present for API symmetry with the other broker sinks).
-    pub async fn drain(&self) {}
+    /// Close every pooled connection (each step bounded by the operation timeout). A send still
+    /// running finishes and then closes its connection, and any later send uses a connection of
+    /// its own, closed after the send: the drain never fails a send.
+    pub async fn drain(&self) {
+        close_pool(&self.pools, self.operation_timeout).await;
+    }
 
     /// Fold the engine-wide default credentials into a destination that carries none.
     fn apply_default_credentials(&self, mut dest: AmqpDestination) -> AmqpDestination {
@@ -203,8 +248,14 @@ impl MessageSink for AmqpMessageSink {
             } else {
                 None
             };
-            let (outcome, reach) =
-                deliver(&destination, message, tls_config, self.operation_timeout).await;
+            let (outcome, reach) = deliver(
+                &self.pools,
+                &destination,
+                message,
+                tls_config,
+                self.operation_timeout,
+            )
+            .await;
             self.record_outage(&destination, &message.destination, reach);
             outcome
         })
@@ -326,17 +377,280 @@ async fn bounded<T>(
     })
 }
 
-/// Open a connection → session → sender, send the projected message, settle the outcome,
-/// then close. Connection/session/send failures are RETRYABLE (the outbox loop re-attempts);
-/// a broker that rejects the disposition is likewise retryable, and so is a broker that does not
-/// answer a step within `timeout`.
+/// How many connections the sink keeps to one broker by default: the engine's default number of
+/// outbox delivery workers, so a send never waits for a connection in normal operation.
+pub const DEFAULT_MAX_CONNECTIONS: usize = 8;
+
+/// A pooled connection left unused this long is closed instead of reused.
+pub const IDLE_CLOSE: Duration = Duration::from_secs(120);
+
+/// The most sender links one pooled connection keeps attached. Past it, the link used least
+/// recently is detached.
+const MAX_LINKS_PER_CONNECTION: usize = 32;
+
+/// How often a send also closes the pooled connections that went idle on every broker.
+const SWEEP_INTERVAL: Duration = Duration::from_secs(30);
+
+/// One broker as the pool tells them apart: the connection's scheme, authority and SASL
+/// credentials. It holds a resolved password, so it has no `Debug`.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct BrokerKey {
+    tls: bool,
+    host: String,
+    port: u16,
+    username: Option<String>,
+    password: Option<String>,
+}
+
+impl BrokerKey {
+    fn of(destination: &AmqpDestination) -> BrokerKey {
+        BrokerKey {
+            tls: destination.tls,
+            host: destination.host.clone(),
+            port: destination.port,
+            username: destination.username.clone(),
+            password: destination.password.clone(),
+        }
+    }
+}
+
+/// One pooled connection with its one session (IBM MQ's AMQP channel allows one session per
+/// connection) and the sender links attached on it, one per target. A lane is used by one send at
+/// a time: a send takes it out of the pool and puts it back when it is done with it.
+struct Lane {
+    connection: ConnectionHandle<()>,
+    session: SessionHandle<()>,
+    senders: HashMap<String, (Sender, Instant)>,
+    last_used: Instant,
+}
+
+impl Lane {
+    /// Whether the lane can carry another send: its connection and session are still running and
+    /// it has not sat idle past [`IDLE_CLOSE`].
+    fn usable(&self, now: Instant) -> bool {
+        !self.connection.is_closed()
+            && !self.session.is_ended()
+            && now.duration_since(self.last_used) < IDLE_CLOSE
+    }
+
+    /// Detach every link, end the session and close the connection, each step bounded.
+    async fn close(mut self, timeout: Duration) {
+        for (_, (sender, _)) in self.senders.drain() {
+            let _ = tokio::time::timeout(timeout, sender.close()).await;
+        }
+        let _ = tokio::time::timeout(timeout, self.session.end()).await;
+        let _ = tokio::time::timeout(timeout, self.connection.close()).await;
+    }
+}
+
+/// The idle lanes to one broker, and the permits that bound how many lanes exist at once.
+struct BrokerLanes {
+    idle: Mutex<Vec<Lane>>,
+    permits: Arc<Semaphore>,
+}
+
+/// Every broker's pooled connections for one sink.
+struct LanePools {
+    brokers: Mutex<HashMap<BrokerKey, Arc<BrokerLanes>>>,
+    max_connections: usize,
+    /// Set by [`AmqpMessageSink::drain`]: from then on a send closes its connection when it is
+    /// done, as before pooling, instead of returning it to the pool.
+    closed: AtomicBool,
+    /// Connections opened so far (pooled or not).
+    opened: AtomicU64,
+    last_sweep: Mutex<Instant>,
+}
+
+impl LanePools {
+    fn new(max_connections: usize) -> LanePools {
+        LanePools {
+            brokers: Mutex::new(HashMap::new()),
+            max_connections: max_connections.max(1),
+            closed: AtomicBool::new(false),
+            opened: AtomicU64::new(0),
+            last_sweep: Mutex::new(Instant::now()),
+        }
+    }
+
+    fn broker(&self, key: &BrokerKey) -> Arc<BrokerLanes> {
+        let mut brokers = lock(&self.brokers);
+        Arc::clone(brokers.entry(key.clone()).or_insert_with(|| {
+            Arc::new(BrokerLanes {
+                idle: Mutex::new(Vec::new()),
+                permits: Arc::new(Semaphore::new(self.max_connections)),
+            })
+        }))
+    }
+
+    /// The most recently used idle lane that can still carry a send; dead or expired ones met on
+    /// the way are dropped (which closes them).
+    fn take_idle(&self, broker: &BrokerLanes) -> Option<Lane> {
+        let now = Instant::now();
+        let mut idle = lock(&broker.idle);
+        while let Some(lane) = idle.pop() {
+            if lane.usable(now) {
+                return Some(lane);
+            }
+        }
+        None
+    }
+
+    /// Put a lane back for the next send, unless the sink is draining.
+    fn give_back(&self, broker: &BrokerLanes, mut lane: Lane) {
+        if self.closed.load(Ordering::Acquire) {
+            return;
+        }
+        lane.last_used = Instant::now();
+        lock(&broker.idle).push(lane);
+    }
+
+    /// At most every [`SWEEP_INTERVAL`], drop the idle lanes on every broker that are dead or
+    /// expired, so a broker nobody sends to any more does not keep its connections open.
+    fn sweep(&self) {
+        let now = Instant::now();
+        {
+            let mut last = lock(&self.last_sweep);
+            if now.duration_since(*last) < SWEEP_INTERVAL {
+                return;
+            }
+            *last = now;
+        }
+        let brokers: Vec<Arc<BrokerLanes>> = lock(&self.brokers).values().cloned().collect();
+        for broker in brokers {
+            lock(&broker.idle).retain(|lane| lane.usable(now));
+        }
+    }
+
+    /// Every idle lane on every broker, taken out of the pool.
+    fn take_all_idle(&self) -> Vec<Lane> {
+        let brokers: Vec<Arc<BrokerLanes>> = lock(&self.brokers).values().cloned().collect();
+        brokers
+            .iter()
+            .flat_map(|broker| std::mem::take(&mut *lock(&broker.idle)))
+            .collect()
+    }
+
+    fn idle_count(&self) -> usize {
+        let brokers: Vec<Arc<BrokerLanes>> = lock(&self.brokers).values().cloned().collect();
+        brokers.iter().map(|b| lock(&b.idle).len()).sum()
+    }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Every live sink's pools, so the transport's drain can close their connections without the
+/// sink registry handing the sinks back.
+fn live_pools() -> &'static Mutex<Vec<Weak<LanePools>>> {
+    static LIVE: OnceLock<Mutex<Vec<Weak<LanePools>>>> = OnceLock::new();
+    LIVE.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Close the pooled connections of every AMQP 1.0 sink in the process (the transport's drain at
+/// shutdown). A send still running finishes on its own connection and then closes it.
+pub async fn drain_all_sinks(timeout: Duration) {
+    let pools: Vec<Arc<LanePools>> = {
+        let mut live = lock(live_pools());
+        live.retain(|weak| weak.strong_count() > 0);
+        live.iter().filter_map(Weak::upgrade).collect()
+    };
+    for pool in pools {
+        close_pool(&pool, timeout).await;
+    }
+}
+
+async fn close_pool(pool: &LanePools, timeout: Duration) {
+    pool.closed.store(true, Ordering::Release);
+    for lane in pool.take_all_idle() {
+        lane.close(timeout).await;
+    }
+}
+
+/// Deliver one message on a pooled connection to its broker.
+///
+/// - A send takes an idle connection to the broker, or opens one when none is idle and fewer than
+///   the pool's bound exist; past the bound it waits, at most the operation timeout, for one to
+///   come back.
+/// - The sender link to the message's target is reused when the connection has one, attached
+///   otherwise.
+/// - A connection that fails a send is dropped. When it had been reused, the send is tried once
+///   more on a fresh connection at once: a broker restart or an idle close leaves pooled
+///   connections dead, and that is not an outage. A timeout is not retried at once (a fresh
+///   connection would most likely wait as long); the outbox sends again later.
+///
+/// The delivery guarantee is the one the sink always had: [`SendOutcome::Delivered`] only on the
+/// broker's `accepted`, everything else retryable or permanent. A send retried after a lost
+/// connection may already have been accepted, and the `sutra-outbox-key` property is what a
+/// receiver dedupes that on, as for any outbox retry.
 async fn deliver(
+    pools: &LanePools,
     destination: &AmqpDestination,
     message: &OutboundMessage,
     tls_config: Option<Arc<rustls::ClientConfig>>,
     timeout: Duration,
 ) -> (SendOutcome, Reach) {
     let redacted = redact_destination(&message.destination);
+    pools.sweep();
+    let broker = pools.broker(&BrokerKey::of(destination));
+    let waited = bounded(
+        timeout,
+        "waited for a free connection to the broker",
+        &redacted,
+        Arc::clone(&broker.permits).acquire_owned(),
+    )
+    .await;
+    let _permit = match waited {
+        Ok(Ok(permit)) => permit,
+        // Every connection was busy: that says nothing about whether the broker is there.
+        Err(timed_out) => return (timed_out, Reach::Unknown),
+        Ok(Err(_)) => unreachable!("the pool never closes its semaphore"),
+    };
+
+    if let Some(mut lane) = pools.take_idle(&broker) {
+        let (outcome, healthy) =
+            send_on_lane(&mut lane, destination, message, &redacted, timeout).await;
+        if healthy {
+            pools.give_back(&broker, lane);
+            return (outcome, Reach::Reached);
+        }
+        drop(lane);
+        let retry_at_once = matches!(
+            &outcome,
+            SendOutcome::RetryableFailure(d) if d.code != codes::OUTBOUND_SEND_TIMEOUT
+        );
+        if !retry_at_once {
+            return (outcome, Reach::Unknown);
+        }
+        tracing::debug!(
+            destination = %redacted,
+            "amqp sink: a pooled connection failed a send; sending once more on a fresh one"
+        );
+    }
+
+    let mut lane = match open_lane(pools, destination, tls_config, &redacted, timeout).await {
+        Ok(lane) => lane,
+        Err(failed) => return failed,
+    };
+    let (outcome, healthy) =
+        send_on_lane(&mut lane, destination, message, &redacted, timeout).await;
+    if healthy {
+        pools.give_back(&broker, lane);
+    }
+    (outcome, Reach::Reached)
+}
+
+/// Open a connection and begin its session. `Err` carries the send's outcome and what it says
+/// about the broker's reachability.
+async fn open_lane(
+    pools: &LanePools,
+    destination: &AmqpDestination,
+    tls_config: Option<Arc<rustls::ClientConfig>>,
+    redacted: &str,
+    timeout: Duration,
+) -> Result<Lane, (SendOutcome, Reach)> {
     let container_id = unique_container_id(CONTAINER_ID);
     let open = async {
         match tls_config {
@@ -354,9 +668,9 @@ async fn deliver(
                 .map_err(classify_open_error),
         }
     };
-    let opened = match bounded(timeout, "opened the connection", &redacted, open).await {
+    let opened = match bounded(timeout, "opened the connection", redacted, open).await {
         Ok(opened) => opened,
-        Err(timed_out) => return (timed_out, Reach::Unreachable),
+        Err(timed_out) => return Err((timed_out, Reach::Unreachable)),
     };
     let mut connection = match opened {
         Ok(c) => c,
@@ -376,79 +690,111 @@ async fn deliver(
                 code,
                 format!("amqp sink could not connect to {redacted}: {detail}"),
             ));
-            return (outcome, reach);
+            return Err((outcome, reach));
         }
     };
-    let outcome =
-        deliver_on_connection(&mut connection, destination, message, &redacted, timeout).await;
-    // Best-effort close (the outcome is already decided), bounded like every other step.
-    let _ = bounded(
-        timeout,
-        "closed the connection",
-        &redacted,
-        connection.close(),
-    )
-    .await;
-    (outcome, Reach::Reached)
-}
-
-/// Whether a send reached its broker, for the outage window.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Reach {
-    /// The connection opened: the broker is there, whatever it then did with the message.
-    Reached,
-    /// The connection could not be opened, or opening it timed out.
-    Unreachable,
-    /// The broker answered but refused the TLS handshake or the login: says nothing either way.
-    Unknown,
-}
-
-async fn deliver_on_connection(
-    connection: &mut fe2o3_amqp::connection::ConnectionHandle<()>,
-    destination: &AmqpDestination,
-    message: &OutboundMessage,
-    redacted: &str,
-    timeout: Duration,
-) -> SendOutcome {
+    pools.opened.fetch_add(1, Ordering::Relaxed);
     let begun = bounded(
         timeout,
         "began a session",
         redacted,
-        Session::begin(connection),
+        Session::begin(&mut connection),
     )
     .await;
-    let mut session = match begun {
-        Err(timed_out) => return timed_out,
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => {
-            return SendOutcome::RetryableFailure(Diagnostic::error(
-                codes::OUTBOUND_SEND_FAILED,
-                format!("amqp sink could not begin a session to {redacted}: {e}"),
-            ));
+    let failed = match begun {
+        Ok(Ok(session)) => {
+            return Ok(Lane {
+                connection,
+                session,
+                senders: HashMap::new(),
+                last_used: Instant::now(),
+            })
         }
+        Err(timed_out) => timed_out,
+        Ok(Err(e)) => SendOutcome::RetryableFailure(Diagnostic::error(
+            codes::OUTBOUND_SEND_FAILED,
+            format!("amqp sink could not begin a session to {redacted}: {e}"),
+        )),
     };
-    let attached = bounded(
+    let _ = bounded(
         timeout,
-        "attached a sender",
+        "closed the connection",
         redacted,
-        Sender::builder()
-            .name(format!("{CONTAINER_ID}-{}", destination.address))
-            .target(target_for(destination))
-            .attach(&mut session),
+        connection.close(),
     )
     .await;
-    let mut sender = match attached {
-        Ok(Ok(s)) => s,
-        failed => {
-            let _ = bounded(timeout, "ended the session", redacted, session.end()).await;
-            return match failed {
-                Err(timed_out) => timed_out,
-                Ok(Err(e)) => SendOutcome::RetryableFailure(Diagnostic::error(
-                    codes::OUTBOUND_SEND_FAILED,
-                    format!("amqp sink could not attach a sender to {redacted}: {e}"),
-                )),
-                Ok(Ok(_)) => unreachable!("matched above"),
-            };
+    Err((failed, Reach::Reached))
+}
+
+/// The key a lane keeps a sender link under: the target address and its capability.
+fn link_key(destination: &AmqpDestination) -> String {
+    match destination.options.address_type {
+        Some(kind) => format!("{}?type={}", destination.address, kind.capability()),
+        None => destination.address.clone(),
+    }
+}
+
+/// The link name: unique on its connection, which holds at most one link per [`link_key`].
+fn link_name(destination: &AmqpDestination) -> String {
+    match destination.options.address_type {
+        Some(kind) => format!(
+            "{CONTAINER_ID}-{}-{}",
+            destination.address,
+            kind.capability()
+        ),
+        None => format!("{CONTAINER_ID}-{}", destination.address),
+    }
+}
+
+/// Send the projected message on `lane`, attaching a sender for its target when the lane has
+/// none. Returns the outcome and whether the lane is fit to carry the next send: it is after a
+/// settled send (accepted or not) and after a refusal before anything went on the wire; it is not
+/// after a link, session, connection or timeout failure.
+async fn send_on_lane(
+    lane: &mut Lane,
+    destination: &AmqpDestination,
+    message: &OutboundMessage,
+    redacted: &str,
+    timeout: Duration,
+) -> (SendOutcome, bool) {
+    let key = link_key(destination);
+    let mut sender = match lane.senders.remove(&key) {
+        Some((sender, _)) => sender,
+        None => {
+            if lane.senders.len() >= MAX_LINKS_PER_CONNECTION {
+                let oldest = lane
+                    .senders
+                    .iter()
+                    .min_by_key(|(_, (_, used))| *used)
+                    .map(|(k, _)| k.clone());
+                if let Some(oldest) = oldest {
+                    // Dropping a sender detaches its link.
+                    lane.senders.remove(&oldest);
+                }
+            }
+            let attached = bounded(
+                timeout,
+                "attached a sender",
+                redacted,
+                Sender::builder()
+                    .name(link_name(destination))
+                    .target(target_for(destination))
+                    .attach(&mut lane.session),
+            )
+            .await;
+            match attached {
+                Ok(Ok(sender)) => sender,
+                Err(timed_out) => return (timed_out, false),
+                Ok(Err(e)) => {
+                    return (
+                        SendOutcome::RetryableFailure(Diagnostic::error(
+                            codes::OUTBOUND_SEND_FAILED,
+                            format!("amqp sink could not attach a sender to {redacted}: {e}"),
+                        )),
+                        false,
+                    )
+                }
+            }
         }
     };
 
@@ -459,30 +805,51 @@ async fn deliver_on_connection(
         send_projected(&mut sender, destination, message),
     )
     .await;
-    let outcome = match sent {
-        Err(timed_out) => timed_out,
-        Ok(Err(SendError::Permanent(diagnostic))) => SendOutcome::PermanentFailure(diagnostic),
-        Ok(Err(SendError::Broker(e))) => SendOutcome::RetryableFailure(Diagnostic::error(
-            codes::OUTBOUND_SEND_FAILED,
-            format!("amqp publish to {redacted} failed: {e}"),
-        )),
+    let (outcome, healthy) = match sent {
+        Err(timed_out) => (timed_out, false),
+        Ok(Err(SendError::Permanent(diagnostic))) => {
+            (SendOutcome::PermanentFailure(diagnostic), true)
+        }
+        Ok(Err(SendError::Broker(e))) => (
+            SendOutcome::RetryableFailure(Diagnostic::error(
+                codes::OUTBOUND_SEND_FAILED,
+                format!("amqp publish to {redacted} failed: {e}"),
+            )),
+            false,
+        ),
         Ok(Ok(outcome)) => {
             if outcome.is_accepted() {
-                SendOutcome::Delivered
+                (SendOutcome::Delivered, true)
             } else {
-                SendOutcome::RetryableFailure(Diagnostic::error(
-                    codes::OUTBOUND_SEND_FAILED,
-                    format!(
-                        "amqp publish to {redacted} was not accepted (disposition: {outcome:?})"
-                    ),
-                ))
+                (
+                    SendOutcome::RetryableFailure(Diagnostic::error(
+                        codes::OUTBOUND_SEND_FAILED,
+                        format!(
+                            "amqp publish to {redacted} was not accepted (disposition: \
+                             {outcome:?})"
+                        ),
+                    )),
+                    true,
+                )
             }
         }
     };
+    if healthy {
+        lane.senders.insert(key, (sender, Instant::now()));
+    }
+    (outcome, healthy)
+}
 
-    let _ = bounded(timeout, "closed the sender", redacted, sender.close()).await;
-    let _ = bounded(timeout, "ended the session", redacted, session.end()).await;
-    outcome
+/// Whether a send reached its broker, for the outage window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reach {
+    /// A connection was open: the broker is there, whatever it then did with the message.
+    Reached,
+    /// The connection could not be opened, or opening it timed out.
+    Unreachable,
+    /// The broker answered but refused the TLS handshake or the login, every pooled connection
+    /// was busy, or a pooled connection timed out: says nothing either way.
+    Unknown,
 }
 
 /// The target terminus for a destination: its address, plus the `queue` / `topic` capability

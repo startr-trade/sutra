@@ -30,7 +30,16 @@ use sutra_feel::FeelValue;
 /// Map a durable-store backend failure to the executor SPI's typed error (fail-closed).
 /// A coded backend failure keeps its code, so the instance (or the dead letter) is attributed to
 /// it rather than to an unexpected error.
+/// A failure that is the store's database being unreachable is coded
+/// `SUTRA.RUNTIME.DATASTORE.UNAVAILABLE`, which the dispatcher refuses retryably instead of
+/// failing the instance.
 fn to_store_err(e: DataStoreError) -> StoreError {
+    if e.is_transient() {
+        return StoreError::with_code(
+            sutra_executor::codes::RUNTIME_DATASTORE_UNAVAILABLE,
+            e.to_string(),
+        );
+    }
     match e.code() {
         Some(code) => StoreError::with_code(code, e.to_string()),
         None => StoreError::new(e.to_string()),

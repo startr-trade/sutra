@@ -137,7 +137,10 @@ These are limits of MQ's AMQP support, not settings:
 - **Other descriptor fields.** `Report`, `Feedback`, `GroupId`, `MsgSeqNumber`, `Offset` and `MsgFlags`
   keep their defaults, and segmentation and message groups are not available.
 - **One AMQP session per connection.** The engine opens one connection, with one session, per inbound
-  channel and per outbound send, which fits.
+  channel. Outbound it keeps a pool of up to 8 connections per queue manager
+  (`SUTRA_SINK_AMQP_MAX_CONNECTIONS`), each with one session and a sender link per queue, which fits.
+  Those connections stay open (closed after two minutes idle), so each is a running instance of the
+  AMQP channel: allow for the engine's replicas times the bound in the channel's instance limits.
 - **Message size.** An AMQP channel accepts messages up to its `MAXMSGL` (4 MB unless set); raise it,
   and the queues', for larger messages.
 
@@ -346,7 +349,7 @@ docker run -d --name mqdemo-engine --network mqdemo-net -p 127.0.0.1::8080 \
   -e SUTRA_SINK_AMQP_USERNAME=app \
   -e SUTRA_SINK_AMQP_PASSWORD="$MQ_PASSWORD" \
   -e SUTRA_SINK_AMQP_TLS_CA_FILE=/etc/sutra/mq-ca.pem \
-  ghcr.io/startr-trade/sutra:0.8.1
+  ghcr.io/startr-trade/sutra:0.8.2
 PORT=$(docker port mqdemo-engine 8080 | head -1 | cut -d: -f2)
 until curl -sf "http://127.0.0.1:$PORT/sutra/health/ready"; do sleep 1; done
 ```

@@ -29,7 +29,7 @@ pub mod sink;
 pub mod source;
 pub mod tls;
 
-pub use sink::AmqpMessageSink;
+pub use sink::{drain_all_sinks, AmqpMessageSink};
 pub use source::{AmqpSourceConfig, AmqpTriggerSource};
 pub use tls::AmqpTlsProperties;
 

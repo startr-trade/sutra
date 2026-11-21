@@ -79,6 +79,38 @@ use sutra_persistence::{DeploymentId as PersistDeploymentId, PersistenceError};
 pub const DEFAULT_INSTANCE_RETENTION: std::time::Duration =
     std::time::Duration::from_secs(7 * 24 * 60 * 60);
 
+/// How long the inbox dedup record of a delivery that has already run is retried while the
+/// database is unreachable, before the failure is logged and the delivery acknowledged without it.
+/// A restart breaks every pooled connection at once, and a server coming back takes seconds.
+const SETTLE_RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Run a step's commit, and run it again while it fails only because the database is unreachable,
+/// for at most [`SETTLE_RETRY_BUDGET`]. Every caller's attempt is one transaction built from the
+/// same inputs, so a retry writes exactly what the failed attempt would have.
+///
+/// The step has already run, and a data task's autocommitted writes cannot be undone, so giving up
+/// at once would make the delivery come again and run those writes twice. A retry after a commit
+/// whose answer was lost finds the step's inbox dedup record already there
+/// (`SUTRA.INBOUND.DUPLICATE_CONCURRENT`), which a redelivering sender treats as done.
+async fn commit_riding_out_outage<T, F, Fut>(what: &str, attempt: F) -> Result<T, PersistenceError>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<T, PersistenceError>>,
+{
+    let deadline = std::time::Instant::now() + SETTLE_RETRY_BUDGET;
+    let mut pause = std::time::Duration::from_millis(50);
+    loop {
+        match attempt().await {
+            Err(e) if e.is_transient() && std::time::Instant::now() + pause < deadline => {
+                warn!(error = %e, "{what} could not reach the database; retrying");
+                tokio::time::sleep(pause).await;
+                pause = (pause * 2).min(std::time::Duration::from_secs(2));
+            }
+            other => return other,
+        }
+    }
+}
+
 /// Persistence-backed [`InstanceBridge`] + channel [`InboxStore`].
 ///
 /// `Sync` deliberately (no interior single-thread state): the [`IncidentSink`] seam's
@@ -575,7 +607,10 @@ impl InstanceBridge for PersistenceBridge {
         // instance is unreachable, which is a stronger guarantee than a claim. Ownership
         // only becomes meaningful from the first RESUME onwards, which is where the claim
         // is taken and `commit_repark` hands it back.
-        let committed = commit_step_with_timers(&self.pool, &step, &timers).await;
+        let committed = commit_riding_out_outage("park step commit", || {
+            commit_step_with_timers(&self.pool, &step, &timers)
+        })
+        .await;
         self.after_enqueue(deployment, &step.outbox, reserved, committed.is_ok())
             .await;
         committed.map_err(|e| persistence_diag("park step commit failed", &e))?;
@@ -681,15 +716,12 @@ impl InstanceBridge for PersistenceBridge {
         // instance row; the wait resolution, the alias retirement and the outbox enqueues stay
         // in the same commit-or-nothing envelope, so a completed instance still never leaves a
         // live wait behind and still never loses a send.
-        let retained = async {
+        // Taken once: every attempt below writes the same dedup keys.
+        let pending = self.pending_for(&dep);
+        let attempt = || async {
             let mut tx = begin_deployment_tx(&self.pool, &dep).await?;
-            sutra_persistence::step::record_inbox_seen_in(
-                &mut tx,
-                &dep,
-                &self.pending_for(&dep),
-                Some(instance),
-            )
-            .await?;
+            sutra_persistence::step::record_inbox_seen_in(&mut tx, &dep, &pending, Some(instance))
+                .await?;
             let retained = if retain {
                 // Row-locking read, then the SAME key-patch shape `commit_failed` uses: the
                 // stored bytes are re-stamped COMPLETED and written straight back. No decode,
@@ -762,8 +794,8 @@ impl InstanceBridge for PersistenceBridge {
                 .await
                 .map_err(PersistenceError::db("terminal step commit"))?;
             Ok::<bool, PersistenceError>(retained)
-        }
-        .await;
+        };
+        let retained = commit_riding_out_outage("terminal step commit", attempt).await;
         self.after_enqueue(deployment, &entries, reserved, retained.is_ok())
             .await;
         let retained = retained.map_err(|e| persistence_diag("terminal step failed", &e))?;
@@ -858,13 +890,15 @@ impl InstanceBridge for PersistenceBridge {
             .map(|a| (a.name.clone(), a.value.clone()))
             .collect();
         let reserved = self.reserve_local(&mut step.outbox);
-        let committed = commit_step_with_timers_releasing_retiring(
-            &self.pool,
-            &step,
-            &timers,
-            Some(&self.claim_owner),
-            &retired,
-        )
+        let committed = commit_riding_out_outage("re-park step commit", || {
+            commit_step_with_timers_releasing_retiring(
+                &self.pool,
+                &step,
+                &timers,
+                Some(&self.claim_owner),
+                &retired,
+            )
+        })
         .await;
         self.after_enqueue(deployment, &step.outbox, reserved, committed.is_ok())
             .await;
@@ -1054,12 +1088,14 @@ impl InstanceBridge for PersistenceBridge {
         let reserved = self.reserve_local(&mut entries);
         // Sync-path terminal step: the completed activation's emissions land in
         // ONE deployment-scoped transaction — all rows, or none.
-        let committed = async {
+        // Taken once: every attempt below writes the same dedup keys.
+        let pending = self.pending_for(&dep);
+        let attempt = || async {
             let mut tx = begin_deployment_tx(&self.pool, &dep).await?;
             sutra_persistence::step::record_inbox_seen_in(
                 &mut tx,
                 &dep,
-                &self.pending_for(&dep),
+                &pending,
                 entries.first().map(|entry| entry.instance_id),
             )
             .await?;
@@ -1077,8 +1113,8 @@ impl InstanceBridge for PersistenceBridge {
             tx.commit()
                 .await
                 .map_err(PersistenceError::db("sync-path outbox commit"))
-        }
-        .await;
+        };
+        let committed = commit_riding_out_outage("sync-path outbox commit", attempt).await;
         self.after_enqueue(deployment, &entries, reserved, committed.is_ok())
             .await;
         committed.map_err(|e| persistence_diag("sync-path outbox commit failed", &e))?;
@@ -1155,11 +1191,17 @@ impl ChannelInboxStore for PersistenceBridge {
             let Ok(dep) = PersistDeploymentId::new(p.deployment.value()) else {
                 continue;
             };
-            match self
-                .inbox
-                .record_seen_for(&dep, &p.channel, &p.event_id, instance)
-                .await
-            {
+            // The delivery has already run, and its effects outside the engine's own tables (a
+            // data task's autocommitted write) cannot be undone: the record is what keeps a
+            // redelivery of the same event from running it again. A database that is briefly
+            // unreachable (a restart breaks every pooled connection) is waited out, bounded,
+            // instead of acknowledging the delivery with no record behind it.
+            let recorded = commit_riding_out_outage("inbox dedup write", || {
+                self.inbox
+                    .record_seen_for(&dep, &p.channel, &p.event_id, instance)
+            })
+            .await;
+            match recorded {
                 Ok(true) => {}
                 // Only a delivery that raced another gets here: no step wrote its key, so what it
                 // did was not durable, and it has already run.
