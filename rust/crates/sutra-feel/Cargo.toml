@@ -31,3 +31,7 @@ criterion = { version = "0.5", default-features = false, features = ["cargo_benc
 [[bench]]
 name = "feel_benches"
 harness = false
+
+[[bench]]
+name = "feel_scope_benches"
+harness = false

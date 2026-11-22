@@ -377,9 +377,10 @@ async fn bounded<T>(
     })
 }
 
-/// How many connections the sink keeps to one broker by default: the engine's default number of
-/// outbox delivery workers, so a send never waits for a connection in normal operation.
-pub const DEFAULT_MAX_CONNECTIONS: usize = 8;
+/// How many connections the sink keeps to one broker by default: the engine's default bound on
+/// the sends in flight to one destination (`sutra.outbox.destination-concurrency`), so a broker
+/// destination's sends do not queue for a connection in normal operation.
+pub const DEFAULT_MAX_CONNECTIONS: usize = 32;
 
 /// A pooled connection left unused this long is closed instead of reused.
 pub const IDLE_CLOSE: Duration = Duration::from_secs(120);

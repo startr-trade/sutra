@@ -112,6 +112,8 @@ pub(crate) fn to_claimed(entry: OutboxEntry) -> ClaimedOutboxRow {
         // once-only marker that keeps it to ONE incident per entry.
         required: entry.required,
         last_diagnostic_json: entry.last_diagnostic_json,
+        // The enqueue instant: the delivery-lag histogram measures from it.
+        created_at: entry.created_at,
     }
 }
 

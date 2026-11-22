@@ -258,6 +258,33 @@ The full per-transport wiring matrix, the bounded-registry knobs, and when to pi
 in [Acknowledgement modes](../operating/ack-modes.md) — that's the operating-chapter deep dive this
 summary points at.
 
+### AMQP 1.0: deliveries in flight and link credit {#amqp-1-0-deliveries-in-flight}
+
+An AMQP 1.0 inbound channel processes several deliveries of one binding at once (*since 0.8.3*):
+
+```yaml
+channels:
+  - name: orders-in
+    transport: amqp
+    host: broker.example
+    queue: orders
+    address-type: queue
+    codec: json
+    ack-mode: on-persist
+    max-in-flight: 16     # deliveries processed at once (1..1024); 1 = one at a time
+    prefetch-count: 10    # link credit floor
+```
+
+- `max-in-flight` (default `16`) is how many intake calls run at once. Each delivery is still
+  accepted only after its own message is persisted (or, with `on-complete`, its instance ends),
+  and a duplicate is still absorbed by the inbox. On stop the engine waits for the calls in
+  flight and settles each; on a lost connection the broker redelivers what was not settled.
+- `prefetch-count` sets the link credit: the receiver grants `max(prefetch-count, 2 ×
+  max-in-flight)` credits, 32 by default. Before 0.8.3 the property was read but not applied.
+- **Order.** The engine never promised inbound order for a broker source. With `max-in-flight`
+  above 1, two messages for the same instance can reach it in either order. `max-in-flight: 1`
+  processes deliveries one at a time, in arrival order, as before 0.8.3.
+
 ## Secrets on a channel
 
 A channel's credentials (broker username/password, an API key) are never literal values in

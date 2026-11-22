@@ -5149,6 +5149,7 @@ impl ChannelEngine {
             node_id: Some(row.node_id),
             required: row.required,
             last_diagnostic_json: None,
+            created_at: time::OffsetDateTime::UNIX_EPOCH,
         };
         crate::outbox_dispatch::encode_wire_message(
             &claimed,

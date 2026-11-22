@@ -177,6 +177,8 @@ fn source_with_mode(port: u16, queue: &str, channel: &str, ack_mode: AckMode) ->
         queue: Some(queue.to_string()),
         topic: None,
         prefetch_count: 10,
+        // Serial: these tests script decisions in arrival order.
+        max_in_flight: 1,
         receive_timeout_ms: 250,
         ack_mode,
         singleton: false,

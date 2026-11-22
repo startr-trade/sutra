@@ -80,6 +80,8 @@ pub mod inline_chain;
 #[cfg(feature = "transport")]
 pub mod outbox_dispatch;
 #[cfg(feature = "transport")]
+mod outbox_scheduler;
+#[cfg(feature = "transport")]
 pub mod source;
 #[cfg(feature = "transport")]
 pub mod uncorrelated;
@@ -149,8 +151,9 @@ pub use intake::{InboundChain, IntakeOutcome};
 #[cfg(feature = "transport")]
 pub use outbox_dispatch::{
     encode_wire_message, spawn_concurrent_dispatch_loop, spawn_dispatch_loop, ClaimedOutboxRow,
-    DispatchStats, LiveDeploymentSet, OutboxConcurrency, OutboxDispatcher, OutboxDispatcherHandle,
-    OutboxRowStore, OutboxSignal, PoisonedDelivery, RetryPolicy, BOUNDED_RETRY_ATTR,
+    DeliveryObservation, DispatchStats, LiveDeploymentSet, OutboxConcurrency, OutboxDispatcher,
+    OutboxDispatcherHandle, OutboxRowStore, OutboxSignal, PoisonedDelivery, RetryPolicy,
+    BOUNDED_RETRY_ATTR,
 };
 pub use owner_scopes::{OwnerScope, OwnerScopes};
 pub use policy::{
@@ -167,12 +170,13 @@ pub use registry::{
 };
 pub use shard_metrics::{ShardLaneMetrics, ShardRouterMetrics};
 pub use sink::{
-    scheme_of, BoxFuture, MessageSink, OutboundMessage, SendOutcome, SinkRegistry, PULL_SCHEME,
+    destination_authority, scheme_of, BoxFuture, MessageSink, OutboundMessage, SendOutcome,
+    SinkRegistry, PULL_SCHEME,
 };
 #[cfg(feature = "transport")]
 pub use source::{
     AckDecision, AlwaysLeading, DeferredSettle, DeliveryDisposition, DeliveryDropRecord,
-    InboundIntake, LeaderGate, TriggerSource,
+    InboundIntake, IntakeWindow, LeaderGate, TriggerSource,
 };
 pub use stores::{
     AliasStore, CollectingOutbox, DedupCheckOutcome, InMemoryAliasStore, InMemoryInboxStore,

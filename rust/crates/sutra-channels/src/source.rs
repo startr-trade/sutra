@@ -217,6 +217,75 @@ pub trait InboundIntake: Send + Sync {
     }
 }
 
+/// A bounded set of intake calls in flight, each tagged with the transport's settle token —
+/// how a broker source processes several deliveries of one binding at once without giving up
+/// ack-after-persist.
+///
+/// The source keeps ownership of its receiver: it pushes one call per delivery while
+/// [`Self::has_room`], and settles each delivery when [`Self::next`] hands back its token with
+/// the call's [`DeliveryDisposition`], in completion order (not arrival order). The window is
+/// transport-neutral, so every broker source can share it. A window of 1 is the serial
+/// one-delivery-at-a-time consumer.
+pub struct IntakeWindow<'a, T> {
+    calls: futures_util::stream::FuturesUnordered<BoxFuture<'a, (T, DeliveryDisposition)>>,
+    cap: usize,
+}
+
+impl<'a, T: Send + 'a> IntakeWindow<'a, T> {
+    /// A window holding at most `max_in_flight` calls; `0` is treated as `1`.
+    pub fn new(max_in_flight: usize) -> Self {
+        IntakeWindow {
+            calls: futures_util::stream::FuturesUnordered::new(),
+            cap: max_in_flight.max(1),
+        }
+    }
+
+    /// True while another call may start.
+    pub fn has_room(&self) -> bool {
+        self.calls.len() < self.cap
+    }
+
+    /// The calls in flight.
+    pub fn len(&self) -> usize {
+        self.calls.len()
+    }
+
+    /// True when no call is in flight.
+    pub fn is_empty(&self) -> bool {
+        self.calls.is_empty()
+    }
+
+    /// Start one intake call, tagged with `token`. The caller checks [`Self::has_room`] first:
+    /// pushing into a full window is a bug (a debug-build panic).
+    pub fn push(&mut self, token: T, call: BoxFuture<'a, DeliveryDisposition>) {
+        debug_assert!(self.has_room(), "IntakeWindow::push without room");
+        self.calls
+            .push(Box::pin(async move { (token, call.await) }));
+    }
+
+    /// The next finished call with its token, in completion order; `None` when the window is
+    /// empty. Cancel-safe: a call that has not finished stays in the window.
+    pub async fn next(&mut self) -> Option<(T, DeliveryDisposition)> {
+        use futures_util::StreamExt as _;
+        self.calls.next().await
+    }
+
+    /// Wait for every call in flight, for at most `bound`, and return the finished ones. A call
+    /// still running at the bound stays in the window: dropping the window then drops it, and
+    /// its delivery is never settled, so the broker redelivers it.
+    pub async fn drain(&mut self, bound: std::time::Duration) -> Vec<(T, DeliveryDisposition)> {
+        let mut finished = Vec::with_capacity(self.calls.len());
+        let deadline = tokio::time::Instant::now() + bound;
+        while !self.calls.is_empty() {
+            match tokio::time::timeout_at(deadline, self.next()).await {
+                Ok(Some(done)) => finished.push(done),
+                Ok(None) | Err(_) => break,
+            }
+        }
+        finished
+    }
+}
+
 /// One inbound transport consumer serving ONE channel binding — the singleton unit the
 /// per-channel lease role gates. Constructed from the channel's [`crate::config::ChannelDefinition`]
 /// (connection URL, queue, credentials via `${ENV}` refs); this trait is only the

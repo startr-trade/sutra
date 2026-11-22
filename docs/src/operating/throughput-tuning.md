@@ -169,11 +169,123 @@ SUTRA_OUTBOX_TICK_INTERVAL=PT0.01S` added to the last run, 8.05 ms on 0.6.5 and 
 |---|---|---|
 | `sutra.engine.shards` | `1` | the disk is busy less than the time it takes to flush, and orders queue at intake. Read [Execution lanes](../architecture/execution-lanes.md) first: lanes run different instances in parallel. |
 | `sutra.datasource.max-connections` | `8` | you raise the lanes: keep it at least the lane count, plus a few |
-| `sutra.datasource.dispatch-max-connections` | `2` | rarely; the dispatcher's claim and its batched delete each hold one connection |
-| `sutra.outbox.workers` | the lane count, at least 8 | outbound deliveries are slow (a remote HTTP endpoint); each worker waits on one delivery at a time |
+| `sutra.datasource.dispatch-max-connections` | `4` | rarely; the dispatcher's claim and its batched delete each hold one connection, the rest serve the defers of failed sends |
+| `sutra.outbox.workers` | `32` | many destinations are slow at once: it bounds the sends in flight across all of them |
+| `sutra.outbox.destination-concurrency` | `32` | one destination is slow and can take more parallel requests; see [Outbound bursts](#outbound-bursts) |
+| `sutra.outbox.max-buffered` | `4096` | `sutra.outbox.buffered` sits at the bound during a burst and memory allows |
 | `sutra.outbox.batch-size` | `50` | a deployment enqueues far more than 50 rows between claims |
 | `sutra.outbox.tick-interval` | `PT5S` | you want retries and rows from other replicas picked up sooner; local deliveries do not wait for it |
 | `cache:` on a data store | off | a store is read on every request and changed rarely — see [Caching reads](../building/data-stores.md#caching-reads) |
+
+## Outbound bursts {#outbound-bursts}
+
+Each process instance's outbound rows form one ordered chain: they leave one after another, in
+the order they were enqueued, while different instances' chains send in parallel. Two bounds
+apply to a send, taken in this order: one per **destination authority** (scheme, host and port;
+`sutra.outbox.destination-concurrency`) and one across **every destination**
+(`sutra.outbox.workers`). A row waiting for a busy destination holds no global slot, so a slow
+counterparty delays only its own rows. The claimer stops claiming only when
+`sutra.outbox.max-buffered` rows are held in memory.
+
+Three instruments show whether outbound delivery keeps up:
+
+- `sutra.outbox.delivery.lag` (histogram, milliseconds, by `scheme`): enqueue to delivery, once
+  per delivered row. Its p99 is the number to watch.
+- `sutra.outbox.in-flight` (gauge): at `sutra.outbox.workers` for long, the global bound is the
+  limit.
+- `sutra.outbox.buffered` (gauge): at `sutra.outbox.max-buffered`, the claimer is waiting.
+
+The defaults come from a burst bench: `tools/sutra-load-test/relay-bench.sh BURST=3500` enqueues
+3,500 rows in about 6 s across two HTTP destinations, one answering at once and one after
+500 ms (30% of instances), on durable PostgreSQL. Lag is measured by the receiving end, against
+the instant the engine built each request.
+
+| Engine | `workers` / `destination-concurrency` | Drain | Fast lag p50 / p99 / max | Slow lag p99 | Slow rows/s |
+|---|---|---|---|---|---|
+| 0.8.2 | 8 workers by instance | 84.5 s | 35.9 s / 73.9 s / 78.9 s | 73.6 s | 12.5 |
+| 0.8.3 | 8 / 8 | 65.5 s | 6.3 s / 18.8 s / 19.1 s | 59.1 s | 16.1 |
+| 0.8.3 | 16 / 8 | 65.5 s | 5 ms / 7 ms / 10 ms | 59.8 s | 16.0 |
+| 0.8.3 | 16 / 16 | 32.8 s | 172 ms / 666 ms / 864 ms | 27.6 s | 32.1 |
+| 0.8.3 | 32 / 16 | 32.9 s | 5 ms / 11 ms / 17 ms | 27.5 s | 32.1 |
+| 0.8.3 | **32 / 32 (default)** | **16.5 s** | **25 ms / 166 ms / 187 ms** | **12.3 s** | **64.2** |
+| 0.8.3 | 64 / 16 | 32.9 s | 4 ms / 7 ms / 9 ms | 27.8 s | 32.0 |
+| 0.8.3 | 64 / 32 | 16.5 s | 4 ms / 7 ms / 15 ms | 12.3 s | 64.2 |
+| 0.8.3 | 128 / 32 | 16.5 s | 5 ms / 8 ms / 11 ms | 12.2 s | 64.2 |
+
+Peak PostgreSQL connections stayed at 8–9 in every run.
+
+The defaults are the smallest pair whose fast-destination p99 stays under 2 s and whose drain
+time is within 10% of the best. The slow destination drains at about
+`destination-concurrency / its latency`; the fast one is only held back once the slow one can take
+every global slot (8 / 8 above).
+
+### Watch outbound lag under a burst
+
+This walkthrough runs the burst bench twice against a local OpenTelemetry Collector, first with a
+global bound so small that the slow destination takes all of it, then with the defaults, and
+reads `sutra.outbox.delivery.lag` from the collector each time. It needs Docker, k6, PostgreSQL
+18's server binaries and a release build of the engine and CLI (`cargo build --profile release-it
+-p sutra-dist -p sutra-cli`).
+
+**Step 1: start a collector** that receives OTLP and exposes the metrics for Prometheus:
+
+```bash
+cat > /tmp/otelcol.yaml <<'YAML'
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  prometheus:
+    endpoint: 0.0.0.0:8889
+service:
+  pipelines:
+    metrics:
+      receivers: [otlp]
+      exporters: [prometheus]
+YAML
+docker run -d --name walk-otelcol -p 127.0.0.1::4317 -p 127.0.0.1::8889 \
+  -v /tmp/otelcol.yaml:/etc/otelcol-contrib/config.yaml:ro otel/opentelemetry-collector-contrib
+OTLP=$(docker port walk-otelcol 4317/tcp | head -1)
+PROM=$(docker port walk-otelcol 8889/tcp | head -1)
+```
+
+**Step 2: a burst with the slow destination holding the fast one.** Eight sends in flight in
+total and eight per destination: the slow destination can take every slot.
+
+```bash
+export SUTRA_ENGINE_BIN=rust/target/release-it/sutra-engine SUTRA_CLI=rust/target/release-it/sutra
+BURST=3500 ENGINE_ENV="SUTRA_TELEMETRY_OTLP_ENDPOINT=http://$OTLP \
+  SUTRA_TELEMETRY_METRICS_EXPORT_INTERVAL=1000 SUTRA_TELEMETRY_SERVICE_NAME=walk-8 \
+  SUTRA_OUTBOX_WORKERS=8 SUTRA_OUTBOX_DESTINATION_CONCURRENCY=8" \
+  tools/sutra-load-test/relay-bench.sh
+curl -s "http://$PROM/metrics" | grep 'sutra_outbox_delivery_lag_milliseconds_bucket{job="walk-8"' \
+  | grep -E 'le="(100|1000|10000|\+Inf)"'
+```
+
+The bench's block shows the fast destination waiting: on our run its lag was 6.5 s / 17.5 s /
+17.7 s (p50 / p99 / max), and the histogram has 41 of the 3,500 rows within 100 ms, 231 within a
+second and 1,746 within ten.
+
+**Step 3: the same burst with the defaults** (32 / 32):
+
+```bash
+BURST=3500 ENGINE_ENV="SUTRA_TELEMETRY_OTLP_ENDPOINT=http://$OTLP \
+  SUTRA_TELEMETRY_METRICS_EXPORT_INTERVAL=1000 SUTRA_TELEMETRY_SERVICE_NAME=walk-default" \
+  tools/sutra-load-test/relay-bench.sh
+curl -s "http://$PROM/metrics" | grep 'sutra_outbox_delivery_lag_milliseconds_bucket{job="walk-default"' \
+  | grep -E 'le="(100|1000|10000|\+Inf)"'
+```
+
+The fast destination no longer waits: 26 ms / 165 ms / 184 ms, and 2,139 rows land within
+100 ms. The rows still over a second are the slow destination's own (1,048 of them, drained at
+64 rows/s), and the whole burst drains in 16.5 s instead of 66.7 s. The histogram carries only
+the `scheme` attribute, so both HTTP destinations share one series; the per-destination split
+comes from the bench's sink.
+
+**Step 4: clean up.** `docker rm -f walk-otelcol`. The bench stops its own engine, sinks and
+database.
 
 ## PostgreSQL autovacuum {#postgresql-autovacuum}
 

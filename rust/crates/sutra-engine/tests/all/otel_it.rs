@@ -451,3 +451,77 @@ async fn one_sync_post_exports_traces_metrics_and_logs_over_otlp() {
 
     telemetry.shutdown();
 }
+
+/// Tier 2: a real delivery through the PostgreSQL outbox lands one `sutra.outbox.delivery.lag`
+/// histogram point, in milliseconds, by destination scheme — and the destination itself is not
+/// an attribute.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "docker"]
+async fn outbox_lag_histogram_is_exported() {
+    use opentelemetry::metrics::MeterProvider as _;
+    use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
+    use opentelemetry_sdk::metrics::{InMemoryMetricExporter, PeriodicReader, SdkMeterProvider};
+    use sutra_persistence::stores::{OutboxStore, PgOutboxStore};
+
+    let exporter = InMemoryMetricExporter::default();
+    let reader = PeriodicReader::builder(exporter.clone()).build();
+    let provider = SdkMeterProvider::builder().with_reader(reader).build();
+    let meter = provider.meter("sutra-engine");
+
+    let app = axum::Router::new().route("/cb", axum::routing::post(|| async { "ok" }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let sink_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let pool = crate::outbox_it::fresh_pool().await;
+    let mut e = crate::outbox_it::entry(&format!("http://{sink_addr}/cb"));
+    e.created_at -= time::Duration::seconds(2);
+    PgOutboxStore::new(pool.clone())
+        .enqueue(&e)
+        .await
+        .expect("enqueue");
+    let mut sinks = sutra_channels::SinkRegistry::new();
+    sinks.register(Arc::new(sutra_channels::HttpSink::new()));
+    let dispatcher = sutra_channels::OutboxDispatcher::new(
+        Arc::new(sutra_engine::outbox::PgOutboxRows::new(pool)),
+        sinks,
+        sutra_channels::RetryPolicy::new(
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(300),
+            false,
+        ),
+        50,
+    )
+    .with_delivery_observer(sutra_engine::otel::outbox_delivery_lag_observer_on(&meter));
+    let stats = dispatcher
+        .dispatch_deployment(&crate::outbox_it::channel_dep())
+        .await;
+    assert_eq!(stats.succeeded, 1, "{stats:?}");
+
+    provider.force_flush().expect("flush");
+    let mut points = Vec::new();
+    for rm in exporter.get_finished_metrics().expect("finished metrics") {
+        for scope in rm.scope_metrics() {
+            for metric in scope.metrics() {
+                if metric.name() != "sutra.outbox.delivery.lag" {
+                    continue;
+                }
+                assert_eq!(metric.unit(), "ms");
+                if let AggregatedMetrics::U64(MetricData::Histogram(h)) = metric.data() {
+                    for dp in h.data_points() {
+                        let attrs: Vec<(String, String)> = dp
+                            .attributes()
+                            .map(|kv| (kv.key.to_string(), kv.value.to_string()))
+                            .collect();
+                        points.push((dp.count(), dp.sum(), attrs));
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(points.len(), 1, "one series: {points:?}");
+    let (count, sum, attrs) = &points[0];
+    assert_eq!(*count, 1, "one delivered row");
+    assert!(*sum >= 2000, "lag measured from created_at, in ms: {sum}");
+    assert_eq!(attrs, &[("scheme".to_string(), "http".to_string())]);
+}

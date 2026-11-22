@@ -476,6 +476,7 @@ pub(crate) fn build_engine_runtime(
     let actor_handle = handle.clone();
     let actor_pool = pool.clone();
     let actor_labels = metrics_labels.clone();
+    let outbox_lag_metrics = metrics_labels.is_some();
     let actor_audit = audit.clone();
     let actor_key_provider = key_provider;
     let actor_deferred_acks = Arc::clone(&deferred_acks);
@@ -745,6 +746,13 @@ pub(crate) fn build_engine_runtime(
                 }
             });
         });
+        // `sutra.outbox.lag-warn`, and the `sutra.outbox.delivery.lag` histogram when metrics are
+        // wired.
+        dispatcher_build = dispatcher_build.with_lag_warn(outbox_tuning.lag_warn);
+        if outbox_lag_metrics {
+            dispatcher_build = dispatcher_build
+                .with_delivery_observer(crate::otel::outbox_delivery_lag_observer());
+        }
         let dispatcher = Arc::new(
             dispatcher_build
                 // Outbound HTTP auth-header material resolves through the engine's shared envref
@@ -757,6 +765,8 @@ pub(crate) fn build_engine_runtime(
             deployments = deployment_ids.len(),
             tick = ?outbox_tick_interval,
             workers = outbox_tuning.workers,
+            destination_concurrency = outbox_tuning.destination_concurrency,
+            max_buffered = outbox_tuning.max_buffered,
             batch_size = outbox_tuning.batch_size,
             transports = transport_factories().len(),
             "outbox dispatcher spawned (http/https + one broker sink per registered transport)"
@@ -771,6 +781,8 @@ pub(crate) fn build_engine_runtime(
             outbox_tick_interval,
             sutra_channels::OutboxConcurrency {
                 workers: outbox_tuning.workers,
+                per_destination: outbox_tuning.destination_concurrency,
+                max_buffered: outbox_tuning.max_buffered,
             },
             outbox_signal.clone(),
         )

@@ -27,6 +27,7 @@ mod password;
 pub mod paths;
 pub mod positions;
 mod random;
+mod scope;
 pub mod temporal;
 pub mod value;
 

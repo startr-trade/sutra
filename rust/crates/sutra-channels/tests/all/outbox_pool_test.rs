@@ -54,6 +54,7 @@ fn row(entry: &str, instance: &str, pooled: bool) -> ClaimedOutboxRow {
         node_id: None,
         required: false,
         last_diagnostic_json: None,
+        created_at: time::OffsetDateTime::UNIX_EPOCH,
     }
 }
 

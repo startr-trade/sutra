@@ -137,7 +137,7 @@ These are limits of MQ's AMQP support, not settings:
 - **Other descriptor fields.** `Report`, `Feedback`, `GroupId`, `MsgSeqNumber`, `Offset` and `MsgFlags`
   keep their defaults, and segmentation and message groups are not available.
 - **One AMQP session per connection.** The engine opens one connection, with one session, per inbound
-  channel. Outbound it keeps a pool of up to 8 connections per queue manager
+  channel. Outbound it keeps a pool of up to 32 connections per queue manager (8 before 0.8.3)
   (`SUTRA_SINK_AMQP_MAX_CONNECTIONS`), each with one session and a sender link per queue, which fits.
   Those connections stay open (closed after two minutes idle), so each is a running instance of the
   AMQP channel: allow for the engine's replicas times the bound in the channel's instance limits.

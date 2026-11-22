@@ -33,6 +33,7 @@ use crate::error::FeelError;
 use crate::password;
 use crate::positions::FeelSourcePositions;
 use crate::random;
+use crate::scope::FeelScope;
 use crate::value::{canonical_string_of, FeelContext, FeelDuration, FeelValue, TimeQualifier};
 
 /// FEEL builtins whose canonical spelling contains spaces (DMN uses these; this engine's arms
@@ -195,7 +196,7 @@ pub fn eval(expr: &FeelExpr, context: &FeelContext) -> Result<FeelValue, FeelErr
         positions: None,
         type_resolver: None,
     }
-    .eval_internal(expr, context)
+    .eval_internal(expr, &FeelScope::Root(context))
 }
 
 /// Same as [`eval`] but with source positions in scope for the duration of the evaluation:
@@ -209,7 +210,7 @@ pub fn eval_with_positions(
         positions: Some(positions),
         type_resolver: None,
     }
-    .eval_internal(expr, context)
+    .eval_internal(expr, &FeelScope::Root(context))
 }
 
 /// Same as [`eval_with_positions`] but with a custom-type resolver in scope — consulted by
@@ -228,7 +229,7 @@ pub fn eval_with_positions_and_types(
         positions: Some(positions),
         type_resolver,
     }
-    .eval_internal(expr, context)
+    .eval_internal(expr, &FeelScope::Root(context))
 }
 
 /// Evaluate as boolean (FEEL truthiness for the result: `Boolean` passes through, `null` is
@@ -276,7 +277,7 @@ impl Evaluator<'_> {
         }
     }
 
-    fn eval_internal(&self, expr: &FeelExpr, ctx: &FeelContext) -> Result<FeelValue, FeelError> {
+    fn eval_internal(&self, expr: &FeelExpr, ctx: &FeelScope<'_>) -> Result<FeelValue, FeelError> {
         match expr {
             FeelExpr::Literal { value, .. } => Ok(value.clone()),
             FeelExpr::Path { segments, .. } => Ok({
@@ -376,7 +377,8 @@ impl Evaluator<'_> {
                     // Snapshot the definition-site scope so the body can reference an outer
                     // (non-parameter) variable at call time (DMN-TCK 0092-feel-lambda
                     // decision_007_1/007_2 — a lambda closing over a DMN input-data variable).
-                    captured: ctx.clone(),
+                    // The one place a scope is copied: the function value outlives this frame.
+                    captured: ctx.flatten(),
                     external: external_binding,
                 }))
             }
@@ -410,17 +412,21 @@ impl Evaluator<'_> {
             }
             FeelExpr::ContextLit { entries, .. } => {
                 // Entries evaluate in order; each may reference earlier keys (FEEL context
-                // semantics), so accumulate into a local scope layered over `ctx`. A repeated
-                // key is an invalid context literal (DMN-TCK 0057-feel-context#decision008) ⇒
-                // `null`, not "last value wins".
-                let mut local = ctx.clone();
-                let mut map = std::collections::BTreeMap::new();
+                // semantics). The entries built so far are the frame each next entry evaluates
+                // under, layered over `ctx`. A repeated key is an invalid context literal
+                // (DMN-TCK 0057-feel-context#decision008) ⇒ `null`, not "last value wins".
+                let mut map = FeelContext::new();
                 for (key, value_expr) in entries {
                     if map.contains_key(key) {
                         return Ok(FeelValue::Null);
                     }
-                    let v = self.eval_internal(value_expr, &local)?;
-                    local.insert(key.clone(), v.clone());
+                    let v = self.eval_internal(
+                        value_expr,
+                        &FeelScope::Frame {
+                            parent: ctx,
+                            bindings: &map,
+                        },
+                    )?;
                     map.insert(key.clone(), v);
                 }
                 Ok(FeelValue::Map(map))
@@ -457,8 +463,11 @@ impl Evaluator<'_> {
                 // which stay on `bool_agg`'s original, order-independent 3-valued reduction —
                 // this is a quantified-EXPRESSION-specific reading, not a `bool_agg` change).
                 for item in items {
-                    let mut local = ctx.clone();
-                    local.insert(var.clone(), item);
+                    let frame = FeelContext::from([(var.clone(), item)]);
+                    let local = FeelScope::Frame {
+                        parent: ctx,
+                        bindings: &frame,
+                    };
                     match self.eval_internal(condition, &local)? {
                         FeelValue::Boolean(b) if b != *every => return Ok(FeelValue::Boolean(b)),
                         // Not yet definitive — keep scanning. A `null` result is treated the same
@@ -473,7 +482,15 @@ impl Evaluator<'_> {
             }
             FeelExpr::For { bindings, body, .. } => {
                 let mut out = Vec::new();
-                self.eval_for(bindings, 0, ctx, body, &mut out)?;
+                // `partial` is a copy of the results so far, made per iteration: only worth
+                // making when the body reads it. Otherwise the body still sees `partial` bound,
+                // to an empty list, so a name lookup resolves exactly as before.
+                let reads_partial = crate::paths::extract(body)
+                    .iter()
+                    .any(|p| p.root() == "partial");
+                let unread_partial = (!reads_partial)
+                    .then(|| FeelContext::from([("partial".to_string(), FeelValue::List(vec![]))]));
+                self.eval_for(bindings, 0, ctx, body, unread_partial.as_ref(), &mut out)?;
                 Ok(FeelValue::List(out))
             }
             FeelExpr::Filter {
@@ -555,7 +572,7 @@ impl Evaluator<'_> {
         &self,
         src: FeelValue,
         predicate: &FeelExpr,
-        ctx: &FeelContext,
+        ctx: &FeelScope<'_>,
     ) -> Result<FeelValue, FeelError> {
         if src.is_null() {
             return Ok(FeelValue::Null);
@@ -579,18 +596,22 @@ impl Evaluator<'_> {
         // result, not just that one element.
         let mut out = Vec::new();
         for item in as_list(&src) {
-            let mut local = ctx.clone();
+            let mut frame = FeelContext::new();
             // The synthetic `item` convenience binding (the whole current element) is set
             // FIRST, so a context element's OWN field also named `item` — DMN-TCK
             // 0069-feel-list#decision026: `[{item: 1}, ...][item >= 2]` — SHADOWS it, not the
             // other way around (the predicate means "this row's `item` field", never "compare
             // the whole row to a number").
-            local.insert("item".to_string(), item.clone());
+            frame.insert("item".to_string(), item.clone());
             if let FeelValue::Map(m) = &item {
                 for (k, v) in m {
-                    local.insert(k.clone(), v.clone());
+                    frame.insert(k.clone(), v.clone());
                 }
             }
+            let local = FeelScope::Frame {
+                parent: ctx,
+                bindings: &frame,
+            };
             match self.eval_internal(predicate, &local)? {
                 FeelValue::Boolean(true) => out.push(item),
                 FeelValue::Boolean(false) | FeelValue::Null => {}
@@ -611,7 +632,7 @@ impl Evaluator<'_> {
     fn iterable_items(
         &self,
         source: &FeelExpr,
-        ctx: &FeelContext,
+        ctx: &FeelScope<'_>,
         _site: usize,
     ) -> Result<Vec<FeelValue>, FeelError> {
         let allow_descending = matches!(
@@ -743,26 +764,50 @@ impl Evaluator<'_> {
     /// sees `partial` bound to the LIST OF RESULTS FROM EVERY PRIOR ITERATION (FEEL's own
     /// implicit for-loop accumulator, §10.3.2.9 — DMN-TCK 0084-feel-for-loops#decision_013's
     /// running-factorial idiom: `for i in 0..4 return if i = 0 then 1 else i * partial[-1]`),
-    /// letting the body reference its own accumulated output so far.
+    /// letting the body reference its own accumulated output so far. `unread_partial` is the
+    /// frame to use when the body never reads `partial` (it binds `partial` to an empty list),
+    /// so the per-iteration copy of the results is made only when it can be observed.
     fn eval_for(
         &self,
         bindings: &[(String, FeelExpr)],
         idx: usize,
-        ctx: &FeelContext,
+        ctx: &FeelScope<'_>,
         body: &FeelExpr,
+        unread_partial: Option<&FeelContext>,
         out: &mut Vec<FeelValue>,
     ) -> Result<(), FeelError> {
         if idx == bindings.len() {
-            let mut local = ctx.clone();
-            local.insert("partial".to_string(), FeelValue::List(out.clone()));
-            out.push(self.eval_internal(body, &local)?);
+            let v = match unread_partial {
+                Some(frame) => self.eval_internal(
+                    body,
+                    &FeelScope::Frame {
+                        parent: ctx,
+                        bindings: frame,
+                    },
+                )?,
+                None => {
+                    let frame =
+                        FeelContext::from([("partial".to_string(), FeelValue::List(out.clone()))]);
+                    self.eval_internal(
+                        body,
+                        &FeelScope::Frame {
+                            parent: ctx,
+                            bindings: &frame,
+                        },
+                    )?
+                }
+            };
+            out.push(v);
             return Ok(());
         }
         let (var, source) = &bindings[idx];
         for item in self.iterable_items(source, ctx, body.start())? {
-            let mut local = ctx.clone();
-            local.insert(var.clone(), item);
-            self.eval_for(bindings, idx + 1, &local, body, out)?;
+            let frame = FeelContext::from([(var.clone(), item)]);
+            let local = FeelScope::Frame {
+                parent: ctx,
+                bindings: &frame,
+            };
+            self.eval_for(bindings, idx + 1, &local, body, unread_partial, out)?;
         }
         Ok(())
     }
@@ -773,7 +818,7 @@ impl Evaluator<'_> {
         left: &FeelExpr,
         op: CompareOp,
         right: &FeelExpr,
-        ctx: &FeelContext,
+        ctx: &FeelScope<'_>,
     ) -> Result<FeelValue, FeelError> {
         let l = self.eval_internal(left, ctx)?;
         let r = self.eval_internal(right, ctx)?;
@@ -850,7 +895,7 @@ impl Evaluator<'_> {
         left: &FeelExpr,
         op: LogicalOp,
         right: &FeelExpr,
-        ctx: &FeelContext,
+        ctx: &FeelScope<'_>,
     ) -> Result<FeelValue, FeelError> {
         // FEEL three-valued logic (§10.3.2.5): operands are {true, false, null}; a non-boolean
         // non-null operand is `null` (unknown). `false` dominates AND, `true` dominates OR,
@@ -889,7 +934,7 @@ impl Evaluator<'_> {
         left: &FeelExpr,
         op: ArithOp,
         right: &FeelExpr,
-        ctx: &FeelContext,
+        ctx: &FeelScope<'_>,
     ) -> Result<FeelValue, FeelError> {
         let l = self.eval_internal(left, ctx)?;
         let r = self.eval_internal(right, ctx)?;
@@ -998,7 +1043,7 @@ impl Evaluator<'_> {
                 .take(f.params.len())
                 .collect()
         };
-        let mut local = f.captured.clone();
+        let mut params = FeelContext::new();
         for (idx, value) in bindings {
             let shape = f
                 .param_shapes
@@ -1006,12 +1051,17 @@ impl Evaluator<'_> {
                 .unwrap_or(&crate::value::FeelTypeShape::Any);
             match crate::value::coerce_to_shape(&value, shape) {
                 Some(coerced) => {
-                    local.insert(f.params[idx].clone(), coerced);
+                    params.insert(f.params[idx].clone(), coerced);
                 }
                 // A declared formal parameter's typeRef isn't satisfied: the call is never made.
                 None => return Ok(FeelValue::Null),
             }
         }
+        let captured = FeelScope::Root(&f.captured);
+        let local = FeelScope::Frame {
+            parent: &captured,
+            bindings: &params,
+        };
         let result = self.eval_internal(&f.body, &local)?;
         Ok(crate::value::coerce_to_shape(&result, &f.return_shape).unwrap_or(FeelValue::Null))
     }
@@ -2337,8 +2387,12 @@ impl Evaluator<'_> {
         if !is_range_literal_endpoint(from) || !is_range_literal_endpoint(to) {
             return None;
         }
-        let start = self.eval_internal(from, &FeelContext::new()).ok()?;
-        let end = self.eval_internal(to, &FeelContext::new()).ok()?;
+        let start = self
+            .eval_internal(from, &FeelScope::Root(&FeelContext::new()))
+            .ok()?;
+        let end = self
+            .eval_internal(to, &FeelScope::Root(&FeelContext::new()))
+            .ok()?;
         if start.is_null() || end.is_null() {
             return None;
         }
@@ -2613,7 +2667,7 @@ fn pow_decimal(base: &BigDecimal, exp: &BigDecimal) -> FeelValue {
 /// segment of `null` stays `null`, so the walk stops there. The first value that is not a `Map`
 /// hands the remaining segments to [`field_access`], which computes owned values (a temporal
 /// component, a `List` projection, a range bound).
-fn resolve_path(segments: &[String], ctx: &FeelContext) -> FeelValue {
+fn resolve_path(segments: &[String], ctx: &FeelScope<'_>) -> FeelValue {
     let Some(mut current) = ctx.get(&segments[0]) else {
         return FeelValue::Null;
     };

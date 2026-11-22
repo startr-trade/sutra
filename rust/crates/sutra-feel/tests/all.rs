@@ -18,5 +18,7 @@ mod feel_password;
 mod feel_path_lookup;
 #[path = "all/feel_paths.rs"]
 mod feel_paths;
+#[path = "all/feel_scope.rs"]
+mod feel_scope;
 #[path = "all/feel_type_conversions.rs"]
 mod feel_type_conversions;

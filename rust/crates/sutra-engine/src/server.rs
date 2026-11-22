@@ -550,6 +550,9 @@ pub async fn serve(config: EngineConfig) -> Result<RunningEngine, Box<dyn std::e
     if metrics_labels.is_some() {
         crate::otel::register_shard_router_meters(engine_handle.shard_metrics());
         crate::otel::register_transport_audit_meters();
+        if let Some(outbox) = &outbox {
+            crate::otel::register_outbox_meters(outbox.gauge_reader());
+        }
     }
 
     // Arm the boot ACTIVE set's timer-start schedules (no-op without persistence, and without
@@ -899,7 +902,7 @@ async fn init_engine_db(
     // (every system store a step touches), DISPATCH for the outbox dispatcher, the timer
     // poller and the sweepers — so neither side can take the other's connections. Sizes are
     // `sutra.datasource.max-connections` (default 8, the pre-0.6.5 size) and
-    // `sutra.datasource.dispatch-max-connections` (default 2).
+    // `sutra.datasource.dispatch-max-connections` (default 4).
     let pool = engine_pool_options(config.datasource_pools.max_connections)
         .connect_lazy_with(options.clone());
     let dispatch = engine_pool_options(config.datasource_pools.dispatch_max_connections)

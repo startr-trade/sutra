@@ -21,10 +21,21 @@
 #   tools/sutra-load-test/relay-bench.sh                      # 20/s for 60 s
 #   RATE=100 DURATION=60s tools/sutra-load-test/relay-bench.sh
 #   ENGINE_ENV="SUTRA_OUTBOX_WORKERS=8" tools/sutra-load-test/relay-bench.sh
+#   BURST=3500 tools/sutra-load-test/relay-bench.sh            # the outbound burst (below)
+#
+# Burst mode (BURST=<rows>): instead of the relay, the burst package (fixtures/burst) is deployed
+# and enough instances are started, as fast as k6 can, to enqueue about BURST outbox rows across
+# two HTTP destinations of the sink: `fast` answers at once, `slow` after SLOW_MS. Each instance
+# emits two requests, plus a repeat for a third of instances; SLOW_SHARE of the instances emit to
+# the slow destination. The block then reports, per destination, the enqueue-to-delivery lag
+# p50/p99/max (sink-measured: receipt minus the `created` stamp the engine put in the request),
+# the drain time, the slow destination's drain rate, engine CPU and the peak number of
+# PostgreSQL connections. No warm-up runs in burst mode.
 #
 # Env:
 #   RATE (20)  DURATION (60s)  WARMUP_RATE (10)  WARMUP_DURATION (10s)
 #   DRAIN_IDLE_S (30)  DRAIN_MAX_S (600)
+#   BURST (unset = relay mode)  SLOW_MS (500)  SLOW_SHARE (0.3)
 #   SUTRA_ENGINE_BIN  (rust/target/release/sutra-engine)   SUTRA_CLI (rust/target/release/sutra)
 #   PG_BIN_DIR (/usr/lib/postgresql/18/bin)   PG_SHARED_BUFFERS (2GB)   PG_COMMIT_DELAY (100)
 #   PG_COMMIT_SIBLINGS (4)   PG_MAX_CONNECTIONS (200)
@@ -67,6 +78,9 @@ PG_COMMIT_DELAY="${PG_COMMIT_DELAY:-100}"
 PG_COMMIT_SIBLINGS="${PG_COMMIT_SIBLINGS:-4}"
 PG_MAX_CONNECTIONS="${PG_MAX_CONNECTIONS:-200}"
 ENGINE_ENV="${ENGINE_ENV:-}"
+BURST="${BURST:-}"
+SLOW_MS="${SLOW_MS:-500}"
+SLOW_SHARE="${SLOW_SHARE:-0.3}"
 API_KEY="relay-bench-key"
 
 log() { printf '[relay-bench] %s\n' "$*" >&2; }
@@ -107,6 +121,7 @@ cleanup() {
     fi
     [ -n "$ENGINE_PID" ] && kill "$ENGINE_PID" 2>/dev/null && wait "$ENGINE_PID" 2>/dev/null
     [ -n "$SINK_PID" ] && kill "$SINK_PID" 2>/dev/null && wait "$SINK_PID" 2>/dev/null
+    [ -n "${SLOW_SINK_PID:-}" ] && kill "$SLOW_SINK_PID" 2>/dev/null && wait "$SLOW_SINK_PID" 2>/dev/null
     [ -f "$PGDATA/postmaster.pid" ] && "$PG_BIN_DIR/pg_ctl" -D "$PGDATA" -m fast stop >/dev/null 2>&1
     [ -n "${PG_LOG_OUT:-}" ] && [ -f "$WORK/pg.log" ] && cp "$WORK/pg.log" "$PG_LOG_OUT"
     rm -rf "$WORK"
@@ -154,16 +169,29 @@ if [ ! -x "$SINK_BIN" ]; then
     log "building the sink"
     (cd "$SCRIPT_DIR/sink" && cargo build --release --quiet) || die "sink build failed"
 fi
-"$SINK_BIN" >"$WORK/sink.log" 2>&1 &
+SLOW_MS="$SLOW_MS" "$SINK_BIN" >"$WORK/sink.log" 2>&1 &
 SINK_PID=$!
 for _ in $(seq 1 50); do grep -q "listening on" "$WORK/sink.log" && break; sleep 0.1; done
 SINK_ADDR="$(sed -n 's/^listening on //p' "$WORK/sink.log")"
 [ -n "$SINK_ADDR" ] || die "sink did not start"
 SINK="http://$SINK_ADDR"
+# Burst mode: the slow destination is a second sink process, so the two destinations are two
+# authorities (scheme + host + port), as two counterparties are; the engine bounds sends per
+# authority, not per path.
+SLOW_SINK="$SINK"
+SLOW_SINK_PID=""
+if [ -n "$BURST" ]; then
+    SLOW_MS="$SLOW_MS" "$SINK_BIN" >"$WORK/sink-slow.log" 2>&1 &
+    SLOW_SINK_PID=$!
+    for _ in $(seq 1 50); do grep -q "listening on" "$WORK/sink-slow.log" && break; sleep 0.1; done
+    SLOW_SINK="http://$(sed -n 's/^listening on //p' "$WORK/sink-slow.log")"
+    [ "$SLOW_SINK" != "http://" ] || die "slow sink did not start"
+fi
 
 # ---- 3. the engine ------------------------------------------------------------------------------
 mkdir -p "$WORK/deployments" "$WORK/secrets"
 PKG_SRC="$SCRIPT_DIR/fixtures/relay"
+[ -n "$BURST" ] && PKG_SRC="$SCRIPT_DIR/fixtures/burst"
 if [ -n "${CACHE_TTL:-}" ]; then
     cp -r "$PKG_SRC" "$WORK/pkg-src"
     printf '    cache:\n      enabled: true\n      maxEntries: 1000\n      ttl: %s\n' "$CACHE_TTL" \
@@ -199,6 +227,7 @@ log "engine on :$ENGINE_PORT ($ENGINE_ENV)"
     export SUTRA_HTTP_PORT="$ENGINE_PORT"
     export SUTRA_DB_MIGRATIONS="$REPO_ROOT/rust/crates/sutra-persistence/migrations"
     export RELAY_BENCH_API_KEY="$API_KEY" RELAY_BENCH_CALLBACK_URL="$SINK/callback"
+    export BURST_FAST_URL="$SINK/fast" BURST_SLOW_URL="$SLOW_SINK/slow"
     export RELAY_DB_URL="postgres://127.0.0.1:$PG_PORT/relaydata" RELAY_DB_USER=sutra RELAY_DB_PASSWORD=sutra
     export RUST_LOG="${RUST_LOG:-warn}"
     for kv in $ENGINE_ENV; do export "${kv?}"; done
@@ -233,6 +262,61 @@ wait_settled() { # expected
         sleep 1; waited=$((waited + 1))
     done
 }
+
+# ---- burst mode: one burst, drained, then the per-destination lag block -----------------------
+if [ -n "$BURST" ]; then
+    # Rows per instance: 2, plus 1 for every third instance.
+    ITEMS="$(python3 -c "import sys; print(max(1, round(int(sys.argv[1]) * 3 / 7)))" "$BURST")"
+    EXPECTED="$(python3 -c "import sys; n = int(sys.argv[1]); print(2 * n + (n + 2) // 3)" "$ITEMS")"
+    HZ="$(getconf CLK_TCK)"
+    T0="$(awk '{print $14 + $15}' "/proc/$ENGINE_PID/stat")"; W0="$(date +%s.%N)"
+    PEAK_CONN=0
+    ( while kill -0 "$ENGINE_PID" 2>/dev/null; do
+        "${PSQL[@]}" -d sutra -c "SELECT count(*) FROM pg_stat_activity WHERE datname = 'sutra'" 2>/dev/null
+        sleep 0.5
+      done ) >"$WORK/conn.log" &
+    CONN_PID=$!
+    log "burst: $ITEMS instances, about $EXPECTED rows, SLOW_SHARE=$SLOW_SHARE SLOW_MS=$SLOW_MS"
+    k6 run --quiet --no-color -e BASE_URL="http://127.0.0.1:$ENGINE_PORT" -e API_KEY="$API_KEY" \
+        -e ITEMS="$ITEMS" -e SLOW_SHARE="$SLOW_SHARE" -e RUN_ID=burst \
+        --summary-export="$K6DIR/burst.json" "$SCRIPT_DIR/profiles/outbox-burst.js" >"$K6DIR/k6-burst.log" 2>&1
+    W_ENQ="$(date +%s.%N)"
+    last=-1; idle=0; waited=0
+    while :; do
+        got="$(( $(curl -s "$SINK/stats" | jq -r '.fast.count // 0' 2>/dev/null || echo 0) + $(curl -s "$SLOW_SINK/stats" | jq -r '.slow.count // 0' 2>/dev/null || echo 0) ))"
+        got="${got:-0}"
+        [ "$got" -ge "$EXPECTED" ] && { drained=yes; break; }
+        if [ "$got" = "$last" ]; then idle=$((idle + 1)); else idle=0; last="$got"; fi
+        { [ "$idle" -ge "$DRAIN_IDLE_S" ] || [ "$waited" -ge "$DRAIN_MAX_S" ]; } && { drained=no; break; }
+        sleep 1; waited=$((waited + 1))
+    done
+    T1="$(awk '{print $14 + $15}' "/proc/$ENGINE_PID/stat")"; W1="$(date +%s.%N)"
+    kill "$CONN_PID" 2>/dev/null; wait "$CONN_PID" 2>/dev/null
+    PEAK_CONN="$(sort -n "$WORK/conn.log" | tail -1)"
+    SINK_STATS="$(jq -c -n --argjson a "$(curl -s "$SINK/stats")" --argjson b "$(curl -s "$SLOW_SINK/stats")" '{fast: $a.fast, slow: $b.slow}')"
+    python3 - "$SINK_STATS" "$K6DIR/burst.json" "$ITEMS" "$EXPECTED" "$W0" "$W_ENQ" "$W1" "$T0" "$T1" "$HZ" \
+        "$drained" "${PEAK_CONN:-0}" "$SLOW_MS" "$SLOW_SHARE" "$ENGINE_ENV" <<'PY' | tee ${OUT:+"$OUT"}
+import json, sys
+(sink, k6, items, expected, w0, wenq, w1, t0, t1, hz, drained, conns, slow_ms, share, env) = sys.argv[1:]
+s = json.loads(sink); w0 = float(w0)
+f, sl = s["fast"], s["slow"]
+last = max(f["lastAtMs"] or 0, sl["lastAtMs"] or 0) / 1000.0
+cpu = (float(t1) - float(t0)) / float(hz) / max(float(w1) - w0, 1e-9)
+slow_span = ((sl["lastAtMs"] or 0) - (sl["firstAtMs"] or 0)) / 1000.0
+slow_rate = sl["count"] / slow_span if slow_span > 0 else 0.0
+print("| rows (expected) | delivered fast / slow | dup | drained | enqueue s | drain s | fast lag p50 / p99 / max | slow lag p50 / p99 / max | slow rows/s | engine CPU (cores) | peak PG conns | engine env |")
+print("|---|---|---|---|---|---|---|---|---|---|---|---|")
+print(f"| {expected} | {f['count']} / {sl['count']} | {f['duplicates'] + sl['duplicates']} | {drained} | "
+      f"{float(wenq) - w0:.1f} | {last - w0:.1f} | "
+      f"{f['lagP50Ms']:.0f} / {f['lagP99Ms']:.0f} / {f['lagMaxMs']:.0f} ms | "
+      f"{sl['lagP50Ms']:.0f} / {sl['lagP99Ms']:.0f} / {sl['lagMaxMs']:.0f} ms | {slow_rate:.1f} | {cpu:.2f} | {conns} | "
+      f"`{env or 'defaults'}` (SLOW_MS={slow_ms}, SLOW_SHARE={share}) |")
+PY
+    DUPS="$(jq -r '.fast.duplicates + .slow.duplicates' <<<"$SINK_STATS")"
+    [ "$drained" = yes ] && [ "$DUPS" = 0 ] && exit 0
+    log "burst: drained=$drained duplicates=$DUPS"
+    exit 1
+fi
 
 # ---- 4. warm-up, measured run, drain -----------------------------------------------------------
 log "warm-up ${WARMUP_RATE}/s x $WARMUP_DURATION"

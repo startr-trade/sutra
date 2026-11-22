@@ -4,5 +4,7 @@
 mod broker_tls;
 #[path = "all/ibm_mq.rs"]
 mod ibm_mq;
+#[path = "all/parallel_intake.rs"]
+mod parallel_intake;
 #[path = "all/sink_pool.rs"]
 mod sink_pool;

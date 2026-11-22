@@ -1,0 +1,142 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  burst-emit: the burst-bench process. Started by one intake, it emits two requests to its
+  destination (to-slow when payload.slow, else to-fast), plus a repeat when payload.repeat. Each
+  request body carries `created`, the instant it was built, which the sink subtracts from the
+  instant it received the request (enqueue-to-delivery lag).
+-->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0"
+                  id="Definitions_burst_emit"
+                  targetNamespace="urn:sutra:module:burst-bench:1.0.0">
+
+  <bpmn:process id="burst-emit" name="Burst emit" isExecutable="true">
+    <bpmn:extensionElements>
+      <q:variables>
+        <q:variable name="responseBody" type="object"/>
+      </q:variables>
+    </bpmn:extensionElements>
+
+    <bpmn:startEvent id="Start" name="Burst item received">
+      <bpmn:extensionElements>
+        <q:source channel="burst-in"/>
+      </bpmn:extensionElements>
+      <bpmn:outgoing>S1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="S1" sourceRef="Start" targetRef="Build1"/>
+
+    <bpmn:serviceTask id="Build1" name="First request (FEEL)">
+      <bpmn:incoming>S1</bpmn:incoming><bpmn:outgoing>S2</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment>
+          <bpmn:from>{ref: payload.ref + "-1", created: string(now())}</bpmn:from>
+          <bpmn:to>responseBody</bpmn:to>
+        </bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="S2" sourceRef="Build1" targetRef="Which"/>
+
+    <bpmn:exclusiveGateway id="Which" name="Slow destination?" default="FastF0">
+      <bpmn:incoming>S2</bpmn:incoming>
+      <bpmn:outgoing>SlowF0</bpmn:outgoing><bpmn:outgoing>FastF0</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:sequenceFlow id="SlowF0" sourceRef="Which" targetRef="SlowSend1">
+      <bpmn:conditionExpression>payload.slow = true</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="FastF0" sourceRef="Which" targetRef="FastSend1"/>
+
+    <bpmn:sendTask id="FastSend1" name="First request">
+      <bpmn:extensionElements><q:send channel="to-fast"/></bpmn:extensionElements>
+      <bpmn:incoming>FastF0</bpmn:incoming><bpmn:outgoing>FastF1</bpmn:outgoing>
+    </bpmn:sendTask>
+    <bpmn:sequenceFlow id="FastF1" sourceRef="FastSend1" targetRef="FastBuild2"/>
+    <bpmn:serviceTask id="FastBuild2" name="Second request (FEEL)">
+      <bpmn:incoming>FastF1</bpmn:incoming><bpmn:outgoing>FastF2</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment>
+          <bpmn:from>{ref: payload.ref + "-2", created: string(now())}</bpmn:from>
+          <bpmn:to>responseBody</bpmn:to>
+        </bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="FastF2" sourceRef="FastBuild2" targetRef="FastSend2"/>
+    <bpmn:sendTask id="FastSend2" name="Second request">
+      <bpmn:extensionElements><q:send channel="to-fast"/></bpmn:extensionElements>
+      <bpmn:incoming>FastF2</bpmn:incoming><bpmn:outgoing>FastF3</bpmn:outgoing>
+    </bpmn:sendTask>
+    <bpmn:sequenceFlow id="FastF3" sourceRef="FastSend2" targetRef="FastRepeat"/>
+    <bpmn:exclusiveGateway id="FastRepeat" name="Repeat?" default="FastFNo">
+      <bpmn:incoming>FastF3</bpmn:incoming>
+      <bpmn:outgoing>FastFYes</bpmn:outgoing><bpmn:outgoing>FastFNo</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:sequenceFlow id="FastFYes" sourceRef="FastRepeat" targetRef="FastBuild3">
+      <bpmn:conditionExpression>payload.repeat = true</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="FastFNo" sourceRef="FastRepeat" targetRef="FastEnd"/>
+    <bpmn:serviceTask id="FastBuild3" name="The repeat (FEEL)">
+      <bpmn:incoming>FastFYes</bpmn:incoming><bpmn:outgoing>FastF4</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment>
+          <bpmn:from>{ref: payload.ref + "-3", created: string(now())}</bpmn:from>
+          <bpmn:to>responseBody</bpmn:to>
+        </bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="FastF4" sourceRef="FastBuild3" targetRef="FastSend3"/>
+    <bpmn:sendTask id="FastSend3" name="The repeat">
+      <bpmn:extensionElements><q:send channel="to-fast"/></bpmn:extensionElements>
+      <bpmn:incoming>FastF4</bpmn:incoming><bpmn:outgoing>FastF5</bpmn:outgoing>
+    </bpmn:sendTask>
+    <bpmn:sequenceFlow id="FastF5" sourceRef="FastSend3" targetRef="FastEnd"/>
+    <bpmn:endEvent id="FastEnd" name="Emitted">
+      <bpmn:incoming>FastFNo</bpmn:incoming><bpmn:incoming>FastF5</bpmn:incoming>
+    </bpmn:endEvent>
+
+    <bpmn:sendTask id="SlowSend1" name="First request">
+      <bpmn:extensionElements><q:send channel="to-slow"/></bpmn:extensionElements>
+      <bpmn:incoming>SlowF0</bpmn:incoming><bpmn:outgoing>SlowF1</bpmn:outgoing>
+    </bpmn:sendTask>
+    <bpmn:sequenceFlow id="SlowF1" sourceRef="SlowSend1" targetRef="SlowBuild2"/>
+    <bpmn:serviceTask id="SlowBuild2" name="Second request (FEEL)">
+      <bpmn:incoming>SlowF1</bpmn:incoming><bpmn:outgoing>SlowF2</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment>
+          <bpmn:from>{ref: payload.ref + "-2", created: string(now())}</bpmn:from>
+          <bpmn:to>responseBody</bpmn:to>
+        </bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="SlowF2" sourceRef="SlowBuild2" targetRef="SlowSend2"/>
+    <bpmn:sendTask id="SlowSend2" name="Second request">
+      <bpmn:extensionElements><q:send channel="to-slow"/></bpmn:extensionElements>
+      <bpmn:incoming>SlowF2</bpmn:incoming><bpmn:outgoing>SlowF3</bpmn:outgoing>
+    </bpmn:sendTask>
+    <bpmn:sequenceFlow id="SlowF3" sourceRef="SlowSend2" targetRef="SlowRepeat"/>
+    <bpmn:exclusiveGateway id="SlowRepeat" name="Repeat?" default="SlowFNo">
+      <bpmn:incoming>SlowF3</bpmn:incoming>
+      <bpmn:outgoing>SlowFYes</bpmn:outgoing><bpmn:outgoing>SlowFNo</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:sequenceFlow id="SlowFYes" sourceRef="SlowRepeat" targetRef="SlowBuild3">
+      <bpmn:conditionExpression>payload.repeat = true</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="SlowFNo" sourceRef="SlowRepeat" targetRef="SlowEnd"/>
+    <bpmn:serviceTask id="SlowBuild3" name="The repeat (FEEL)">
+      <bpmn:incoming>SlowFYes</bpmn:incoming><bpmn:outgoing>SlowF4</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment>
+          <bpmn:from>{ref: payload.ref + "-3", created: string(now())}</bpmn:from>
+          <bpmn:to>responseBody</bpmn:to>
+        </bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="SlowF4" sourceRef="SlowBuild3" targetRef="SlowSend3"/>
+    <bpmn:sendTask id="SlowSend3" name="The repeat">
+      <bpmn:extensionElements><q:send channel="to-slow"/></bpmn:extensionElements>
+      <bpmn:incoming>SlowF4</bpmn:incoming><bpmn:outgoing>SlowF5</bpmn:outgoing>
+    </bpmn:sendTask>
+    <bpmn:sequenceFlow id="SlowF5" sourceRef="SlowSend3" targetRef="SlowEnd"/>
+    <bpmn:endEvent id="SlowEnd" name="Emitted">
+      <bpmn:incoming>SlowFNo</bpmn:incoming><bpmn:incoming>SlowF5</bpmn:incoming>
+    </bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>

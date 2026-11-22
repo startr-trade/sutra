@@ -1,0 +1,12 @@
+# Burst-bench package: the domain-neutral outbound burst behind relay-bench.sh BURST=<rows>.
+# One HTTP intake starts an instance that emits two requests to its destination (a fast one, or
+# for a share of instances a slow one), plus a third (a repeat) for a third of instances. Every
+# request rides the durable outbox, so this package measures enqueue-to-delivery lag when many
+# rows are queued at once against two destinations of different speeds. Labels are opaque
+# selectors.
+labels:
+  "tenant": "default"
+  "module": "burst-bench"
+  "version": "1.0.0"
+engine:
+  minContract: 1

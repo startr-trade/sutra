@@ -81,6 +81,15 @@ pub const METRIC_ENGINE_SHARD_CLAIM_BOUNCES: &str = "sutra.engine.shard.claim-bo
 /// (cumulative since the process started). Non-zero means the audit store is not keeping up.
 pub const METRIC_AUDIT_TRANSPORT_DROPPED: &str = "sutra.audit.transport.dropped";
 
+// ---- outbox delivery meters
+
+/// Enqueue-to-delivery lag of each delivered outbox row, in milliseconds, by [`ATTR_SCHEME`].
+pub const METRIC_OUTBOX_DELIVERY_LAG: &str = "sutra.outbox.delivery.lag";
+/// Outbox sends in progress right now.
+pub const METRIC_OUTBOX_IN_FLIGHT: &str = "sutra.outbox.in-flight";
+/// Outbox rows held in memory right now, in flight or queued for delivery.
+pub const METRIC_OUTBOX_BUFFERED: &str = "sutra.outbox.buffered";
+
 // ---- attribute / dimension keys --------------------------------------------------------
 
 /// THE identity dimension — on every meter and span.
@@ -104,6 +113,8 @@ pub const ATTR_MODULE: &str = "module";
 pub const ATTR_VERSION: &str = "version";
 /// The shard-lane index dimension on every `sutra.engine.shard.*` meter.
 pub const ATTR_SHARD: &str = "shard";
+/// The destination URI scheme of an outbox delivery (`http`, `amqp`, …) — never the destination.
+pub const ATTR_SCHEME: &str = "scheme";
 /// The `sutra.engine.shard.claim-bounces` split dimension: `relay` | `timer`.
 pub const ATTR_CLAIM_BOUNCE_PATH: &str = "path";
 

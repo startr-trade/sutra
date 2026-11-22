@@ -59,6 +59,24 @@ RATE=500 DURATION=60s \
 profile and flamegraphs of the engine and the database (needs `perf` and `inferno`). Read the
 header of `relay-bench.sh` for every knob.
 
+## The outbound burst: delivery lag behind a slow destination
+
+`BURST=<rows>` switches `relay-bench.sh` to the burst package (`fixtures/burst`): it starts enough
+instances, as fast as k6 can, to enqueue about that many outbox rows across two HTTP
+destinations. Each instance emits two requests, plus a repeat for a third of instances;
+`SLOW_SHARE` (default 0.3) of the instances emit to a slow destination. The fast destination is
+the sink's `/fast` endpoint, which answers at once; the slow one is a second sink process's
+`/slow`, which answers after `SLOW_MS` (default 500) milliseconds. They are two processes so they
+are two destination authorities, as two counterparties are. The block reports, per destination,
+the delivery lag p50/p99/max measured by the sink (receipt minus the `created` stamp the engine
+put in the request), the drain time and the slow destination's rows per second.
+
+```bash
+BURST=3500 tools/sutra-load-test/relay-bench.sh
+BURST=3500 ENGINE_ENV="SUTRA_OUTBOX_WORKERS=8 SUTRA_OUTBOX_DESTINATION_CONCURRENCY=8" \
+  tools/sutra-load-test/relay-bench.sh
+```
+
 ## Resource metrics per load step (for a cost model)
 
 Every load step reports the resources it cost, not only its latency: engine CPU and RSS,
@@ -107,12 +125,13 @@ tools/sutra-load-test/
 ├── run.sh             (harness: run k6 against a URL, capture results, exit code)
 ├── step-metrics.sh    (sourced: per-step engine/PostgreSQL CPU, RSS, IOPS, WAL)
 ├── relay-bench.sh     (the relay workload: own PG + sink + engine, per-settle DB cost)
-├── sink/              (the relay workload's callback sink — standalone crate, own Cargo.lock)
+├── sink/              (the relay and burst sink — standalone crate, own Cargo.lock)
 ├── profiles/
 │   ├── smoke.js       (~30 s, 10 RPS, 1 VU — PR feedback)
 │   ├── sustained.js   (~5 min, 100 RPS, 4 VUs — headline number)
 │   ├── burst.js       (~2 min, 0→500 RPS ramp + hold + ramp-down — peak hour)
-│   └── relay.js       (the relay workload's intake, driven by relay-bench.sh)
+│   ├── relay.js       (the relay workload's intake, driven by relay-bench.sh)
+│   └── outbox-burst.js (the outbound burst's intake, relay-bench.sh BURST=<rows>)
 └── results/           (.gitignore'd; CI uploads as artifacts)
 ```
 

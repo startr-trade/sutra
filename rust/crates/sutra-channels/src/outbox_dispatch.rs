@@ -235,6 +235,9 @@ pub struct ClaimedOutboxRow {
     /// The dispatcher reads it for one thing only: the [`INCIDENT_RECORDED_ATTR`] marker that makes
     /// the `required` incident once-only.
     pub last_diagnostic_json: Option<String>,
+    /// When the row was enqueued (`created_at` in the table): what the enqueue-to-delivery lag
+    /// ([`DeliveryObservation::lag`]) is measured from.
+    pub created_at: OffsetDateTime,
 }
 
 /// Row access as the dispatcher needs it — the persistence-free seam (`sutra-engine`
@@ -771,7 +774,7 @@ pub struct DispatchStats {
 
 /// What one claimed entry came to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RowOutcome {
+pub(crate) enum RowOutcome {
     Delivered,
     Failed,
     /// A pooled request had no slot: put back, no attempt counted.
@@ -812,6 +815,37 @@ pub struct OutboxDispatcher {
     /// Where a sink reports the connection changes it sees while sending, with the channel of
     /// the row it is sending ([`crate::connectivity::current_send`]). Empty by default.
     connectivity: crate::connectivity::ConnectivityReporter,
+    /// Called once per row a sink accepted, with its enqueue-to-delivery lag. `None` by default.
+    delivery_observer: Option<Arc<dyn Fn(DeliveryObservation) + Send + Sync>>,
+    /// The lag past which a delivered row logs a (rate-limited) WARN; `None` = off.
+    lag_warn: Option<std::time::Duration>,
+    /// The WARN's rate limit: when it last fired, and how many rows crossed the threshold since.
+    lag_warn_state: std::sync::Mutex<LagWarnState>,
+}
+
+/// One row a sink accepted, as handed to the delivery observer
+/// ([`OutboxDispatcher::with_delivery_observer`]). The destination itself is deliberately absent:
+/// only its scheme is reported, which keeps metric cardinality bounded and destinations off
+/// metrics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeliveryObservation {
+    /// The destination's URI scheme (`http`, `amqp`, …; empty when it carries none).
+    pub scheme: String,
+    /// Enqueue to delivery: the dispatcher's clock at acceptance minus the row's `created_at`,
+    /// saturating at zero.
+    pub lag: std::time::Duration,
+    /// Failed attempts before this one (the row's `attempt_count` as claimed).
+    pub attempt: i32,
+}
+
+/// The lag WARN fires at most once per this interval; the next one carries the count of rows that
+/// crossed the threshold in between.
+const LAG_WARN_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+
+#[derive(Default)]
+struct LagWarnState {
+    last: Option<std::time::Instant>,
+    over_since_last: u64,
 }
 
 /// The call a pooled request's slot is held for: its declared call key, else the entry's id.
@@ -860,7 +894,73 @@ impl OutboxDispatcher {
             poison_notify: None,
             capacity: None,
             connectivity: Default::default(),
+            delivery_observer: None,
+            lag_warn: None,
+            lag_warn_state: std::sync::Mutex::new(LagWarnState::default()),
         }
+    }
+
+    /// Observe every delivered row: `observe` is called once per row a sink accepted, with the
+    /// scheme, the enqueue-to-delivery lag and the attempt count (the engine records it as the
+    /// `sutra.outbox.delivery.lag` histogram). It runs on the delivering task, so it must be cheap.
+    #[must_use]
+    pub fn with_delivery_observer(
+        mut self,
+        observe: Arc<dyn Fn(DeliveryObservation) + Send + Sync>,
+    ) -> OutboxDispatcher {
+        self.delivery_observer = Some(observe);
+        self
+    }
+
+    /// Log a WARN when a delivered row's enqueue-to-delivery lag exceeds `threshold`
+    /// (`sutra.outbox.lag-warn`), at most once a minute, with the count of such rows since the
+    /// last one. A zero threshold turns it off.
+    #[must_use]
+    pub fn with_lag_warn(mut self, threshold: std::time::Duration) -> OutboxDispatcher {
+        self.lag_warn = (!threshold.is_zero()).then_some(threshold);
+        self
+    }
+
+    /// A row was accepted by its sink: report it to the observer, and to the lag WARN.
+    fn observe_delivered(&self, row: &ClaimedOutboxRow) {
+        if self.delivery_observer.is_none() && self.lag_warn.is_none() {
+            return;
+        }
+        let lag = std::time::Duration::try_from((self.now)() - row.created_at).unwrap_or_default();
+        if let Some(observe) = &self.delivery_observer {
+            observe(DeliveryObservation {
+                scheme: crate::sink::scheme_of(&row.destination)
+                    .unwrap_or_default()
+                    .to_ascii_lowercase(),
+                lag,
+                attempt: row.attempt_count,
+            });
+        }
+        let Some(threshold) = self.lag_warn else {
+            return;
+        };
+        if lag <= threshold {
+            return;
+        }
+        let mut state = self.lag_warn_state.lock().expect("lag warn lock");
+        state.over_since_last += 1;
+        let now = std::time::Instant::now();
+        if state
+            .last
+            .is_some_and(|last| now.saturating_duration_since(last) < LAG_WARN_EVERY)
+        {
+            return;
+        }
+        let rows = std::mem::take(&mut state.over_since_last);
+        state.last = Some(now);
+        drop(state);
+        warn!(
+            lag_ms = lag.as_millis() as u64,
+            threshold_ms = threshold.as_millis() as u64,
+            rows_over_threshold = rows,
+            scheme = crate::sink::scheme_of(&row.destination).unwrap_or_default(),
+            "outbox delivery lag over sutra.outbox.lag-warn (rows counted since the last warning)"
+        );
     }
 
     /// Wire the capacity-pool store: an entry marked with a pool waits until its instance
@@ -1000,7 +1100,7 @@ impl OutboxDispatcher {
     }
 
     /// One entry: pool slot → resolve → encode → send → row action.
-    async fn dispatch_one(
+    pub(crate) async fn dispatch_one(
         &self,
         deployment: &DeploymentId,
         row: &ClaimedOutboxRow,
@@ -1174,7 +1274,11 @@ impl OutboxDispatcher {
     /// The delete half of a delivery: the row went out, so it is removed. A failed delete keeps
     /// the row, which redelivers — at-least-once, the consumer's idempotency key (`outbox_key`)
     /// absorbs the duplicate — and is deferred with backoff exactly like the catch-all.
-    async fn finish_delivered(&self, deployment: &DeploymentId, row: &ClaimedOutboxRow) -> bool {
+    pub(crate) async fn finish_delivered(
+        &self,
+        deployment: &DeploymentId,
+        row: &ClaimedOutboxRow,
+    ) -> bool {
         match self.store.delete(deployment, &row.entry_id).await {
             Ok(()) => {
                 self.release_finished_call(deployment, row).await;
@@ -1196,7 +1300,7 @@ impl OutboxDispatcher {
     /// Resolve → encode → send, and on failure the row action (defer or poison). `true` = the
     /// sink took the message; the row is NOT yet deleted — the caller deletes it, now
     /// ([`Self::send_row`]) or in a batch (the concurrent loop).
-    async fn deliver(&self, deployment: &DeploymentId, row: &ClaimedOutboxRow) -> bool {
+    pub(crate) async fn deliver(&self, deployment: &DeploymentId, row: &ClaimedOutboxRow) -> bool {
         let Some(sink) = self.sinks.resolve(&row.destination) else {
             // A retry can never grow a sink — the sink set is fixed at assembly, so an
             // unregistered scheme takes the poison posture (max-delay deferral) under the
@@ -1254,7 +1358,10 @@ impl OutboxDispatcher {
             None => sink.send(&message).await,
         };
         match outcome {
-            SendOutcome::Delivered => true,
+            SendOutcome::Delivered => {
+                self.observe_delivered(row);
+                true
+            }
             // A sink that bounds its own retries: past the bound, the row takes the poison
             // posture instead of growing the backoff further.
             SendOutcome::RetryableFailure(diagnostic)
@@ -1604,9 +1711,25 @@ fn rfc3339(at: OffsetDateTime) -> String {
 pub struct OutboxDispatcherHandle {
     drain: tokio::sync::watch::Sender<bool>,
     task: tokio::task::JoinHandle<()>,
+    /// The concurrent dispatcher's live counts; `None` for the serial tick loop.
+    gauges: Option<Arc<crate::outbox_scheduler::SchedulerGauges>>,
 }
 
 impl OutboxDispatcherHandle {
+    /// `(in flight, buffered)`: the sends in progress, and the rows held in memory (in flight or
+    /// queued) — the `sutra.outbox.in-flight` and `sutra.outbox.buffered` gauges. Always `(0, 0)`
+    /// for the serial tick loop.
+    pub fn gauges(&self) -> (usize, usize) {
+        self.gauges.as_ref().map_or((0, 0), |g| g.read())
+    }
+
+    /// A reader of [`Self::gauges`] that outlives the handle (an observable instrument's
+    /// callback owns one).
+    pub fn gauge_reader(&self) -> impl Fn() -> (usize, usize) + Send + Sync + 'static {
+        let gauges = self.gauges.clone();
+        move || gauges.as_ref().map_or((0, 0), |g| g.read())
+    }
+
     /// Drain-aware hook: refuse every subsequent tick. Idempotent.
     pub fn drain(&self) {
         let _ = self.drain.send(true);
@@ -1692,7 +1815,11 @@ pub fn spawn_dispatch_loop(
         }
         info!("outbox dispatch loop drained — refusing further ticks");
     });
-    OutboxDispatcherHandle { drain, task }
+    OutboxDispatcherHandle {
+        drain,
+        task,
+        gauges: None,
+    }
 }
 
 // ---- the concurrent dispatcher (0.6.5) ---------------------------------------------------------
@@ -1791,7 +1918,7 @@ impl OutboxSignal {
     }
 
     /// The row was delivered and is on its way to the delete batcher: no lease renewal needed.
-    fn mark_delivered(&self, entry_id: &str) {
+    pub(crate) fn mark_delivered(&self, entry_id: &str) {
         self.inner
             .delivered
             .lock()
@@ -1918,11 +2045,19 @@ impl OutboxSignal {
     }
 }
 
-/// Sizing of the concurrent dispatcher (`sutra.outbox.workers`, `sutra.outbox.batch-size`).
+/// Bounds on concurrent outbox delivery (`sutra.outbox.workers`,
+/// `sutra.outbox.destination-concurrency`, `sutra.outbox.max-buffered`). One instance's rows are
+/// always delivered one after another, in claim order, whatever the bounds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OutboxConcurrency {
-    /// Delivery workers. Rows of one instance always go to the same worker, in claim order.
+    /// The most sends in flight at once, across every destination. `1` delivers one row at a
+    /// time.
     pub workers: usize,
+    /// The most sends in flight to one destination authority (scheme + host + port); clamped to
+    /// `1..=workers`.
+    pub per_destination: usize,
+    /// The most rows held in memory, in flight or queued. Past it the claimer waits.
+    pub max_buffered: usize,
 }
 
 /// How far in the future a row handed off in-process is made due in the table. The hand-off
@@ -2053,25 +2188,31 @@ impl OutboxDispatcher {
     }
 }
 
-/// Spawn the CONCURRENT dispatcher (0.6.5): one claimer, `workers` delivery workers and one
-/// delete batcher.
+/// Spawn the CONCURRENT dispatcher: one claimer, a delivery scheduler and one delete batcher.
 ///
 /// * The claimer runs when an enqueue wakes it ([`OutboxSignal::wake`]), on every
 ///   `tick_interval` (the fallback for retries and other replicas' rows), and for every row
-///   handed off by a step commit. It claims due rows past the ones already in flight and routes
-///   each to the worker its instance hashes to, so one instance's rows are delivered one after
-///   another in claim order (`next_attempt_at`, then `created_at`) — the order the serial loop
-///   delivered them in. Rows of different instances are delivered in parallel.
-/// * A row on a pooled outbound channel (capacity pools) is delivered by the claimer itself, in
-///   claim order, exactly as the serial loop does: a free slot must go to the oldest waiter.
-/// * A worker sends; on success the row goes to the delete batcher, which deletes whatever has
-///   accumulated in one transaction. A row stays in flight until its delete commits, so it is
-///   never claimed again in between — not here (the in-flight set), and not on another replica
-///   sharing the database (the claim's lease, [`CLAIM_LEASE`], which a renewer task extends every
-///   [`CLAIM_RENEW_INTERVAL`] for every row still in flight).
+///   handed off by a step commit. It claims due rows past the ones already in flight and submits
+///   each to the scheduler.
+/// * The scheduler keeps one ordered chain per process instance, so one instance's rows are
+///   delivered one after another in claim order (`next_attempt_at`, then `created_at`) — the
+///   order the serial loop delivered them in — while rows of different instances are delivered
+///   in parallel. Sends are bounded per destination authority
+///   ([`OutboxConcurrency::per_destination`]) and overall ([`OutboxConcurrency::workers`]); a row
+///   waiting on a saturated destination holds no global slot, so a slow destination never delays
+///   the others. The only wait the claimer ever has is for buffer room
+///   ([`OutboxConcurrency::max_buffered`]), shared by every instance.
+/// * A row on a pooled outbound channel (capacity pools) goes to a single pooled lane, delivered in
+///   claim order exactly as the serial loop does it, since a free slot must go to the oldest
+///   waiter. The claimer only hands it over and never waits for its send.
+/// * On success a row goes to the delete batcher, which deletes whatever has accumulated in one
+///   transaction. A row stays in flight until its delete commits, so it is never claimed again in
+///   between — not here (the in-flight set), and not on another replica sharing the database (the
+///   claim's lease, [`CLAIM_LEASE`], which a renewer task extends every [`CLAIM_RENEW_INTERVAL`]
+///   for every row still in flight, queued rows included).
 ///
 /// Retry, backoff, poison and incident semantics are the serial loop's, by construction: the
-/// workers call the same per-row code.
+/// scheduler calls the same per-row code.
 pub fn spawn_concurrent_dispatch_loop(
     runtime: &tokio::runtime::Handle,
     dispatcher: Arc<OutboxDispatcher>,
@@ -2082,12 +2223,20 @@ pub fn spawn_concurrent_dispatch_loop(
 ) -> OutboxDispatcherHandle {
     let (drain, mut drained) = tokio::sync::watch::channel(false);
     let interval_duration = tick_interval.max(std::time::Duration::from_millis(1));
-    let workers = concurrency.workers.max(1);
     let batch_size = dispatcher.batch_size();
     let rt = runtime.clone();
+    let (delete_tx, mut delete_rx) =
+        tokio::sync::mpsc::unbounded_channel::<(DeploymentId, ClaimedOutboxRow)>();
+    let scheduler = crate::outbox_scheduler::DeliveryScheduler::new(
+        Arc::clone(&dispatcher),
+        concurrency,
+        signal.clone(),
+        delete_tx,
+        rt.clone(),
+    );
+    let gauges = scheduler.gauges();
     let task = runtime.spawn(async move {
-        let (delete_tx, mut delete_rx) =
-            tokio::sync::mpsc::unbounded_channel::<(DeploymentId, ClaimedOutboxRow)>();
+        let scheduler = Arc::new(scheduler);
         // ---- the delete batcher
         let batcher = {
             let dispatcher = Arc::clone(&dispatcher);
@@ -2111,47 +2260,13 @@ pub fn spawn_concurrent_dispatch_loop(
                 }
             })
         };
-        // ---- the workers
-        let mut worker_tx = Vec::with_capacity(workers);
-        let mut worker_tasks = Vec::with_capacity(workers);
-        for _ in 0..workers {
-            let (tx, mut rx) = tokio::sync::mpsc::channel::<(DeploymentId, ClaimedOutboxRow)>(
-                (batch_size.max(1) as usize).max(16),
-            );
-            worker_tx.push(tx);
-            let dispatcher = Arc::clone(&dispatcher);
-            let signal = signal.clone();
-            let delete_tx = delete_tx.clone();
-            worker_tasks.push(rt.spawn(async move {
-                while let Some((deployment, row)) = rx.recv().await {
-                    if dispatcher.deliver(&deployment, &row).await {
-                        signal.mark_delivered(&row.entry_id);
-                        if let Err(returned) = delete_tx.send((deployment, row)) {
-                            // The batcher is gone (shutdown): delete in place.
-                            let (deployment, row) = returned.0;
-                            dispatcher.finish_delivered(&deployment, &row).await;
-                            signal.release(&[row.entry_id]);
-                        }
-                    } else {
-                        signal.release(&[row.entry_id]);
-                    }
-                }
-            }));
-        }
-        drop(delete_tx);
-        let route = move |row: &ClaimedOutboxRow| -> usize {
-            use std::hash::{Hash, Hasher};
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            row.instance_id.hash(&mut hasher);
-            (hasher.finish() % workers as u64) as usize
-        };
         // ---- the hand-off router: rows straight from step commits. Its own task, so a slow
         // claim never delays a hand-off.
         let mut handoff_rx = signal.open_hand_off();
         let router = {
             let dispatcher = Arc::clone(&dispatcher);
             let signal = signal.clone();
-            let worker_tx = worker_tx.clone();
+            let scheduler = Arc::clone(&scheduler);
             let mut drained = drained.clone();
             rt.spawn(async move {
                 loop {
@@ -2164,18 +2279,9 @@ pub fn spawn_concurrent_dispatch_loop(
                         break;
                     };
                     if row.headers.contains_key(CAPACITY_POOL_HEADER) {
-                        let mut exhausted = std::collections::BTreeSet::new();
-                        let now = (dispatcher.now)();
-                        dispatcher
-                            .dispatch_one(&deployment, &row, now, &mut exhausted)
-                            .await;
-                        signal.release(&[row.entry_id]);
-                    } else if worker_tx[route(&row)]
-                        .send((deployment, row))
-                        .await
-                        .is_err()
-                    {
-                        break;
+                        scheduler.submit_pooled(deployment, row, (dispatcher.now)());
+                    } else {
+                        scheduler.submit(deployment, row).await;
                     }
                 }
                 signal.close_hand_off();
@@ -2187,7 +2293,7 @@ pub fn spawn_concurrent_dispatch_loop(
                 }
             })
         };
-        // ---- the lease renewer: its own task, so a claimer blocked on a full worker queue (a
+        // ---- the lease renewer: its own task, so a claimer waiting for buffer room (a
         // backlog — exactly when rows wait longest) never lets the leases of the rows it already
         // handed out lapse to another replica.
         let renewer = {
@@ -2256,7 +2362,6 @@ pub fn spawn_concurrent_dispatch_loop(
                 break;
             }
             for deployment in deployments.snapshot() {
-                let mut exhausted = std::collections::BTreeSet::new();
                 // Rows a claim returned that a hand-off still owns (it outlived its grace in a
                 // backlog): excluded for the rest of this round, so they cannot fill every batch
                 // and hold the other due rows back.
@@ -2289,12 +2394,9 @@ pub fn spawn_concurrent_dispatch_loop(
                             continue;
                         }
                         if row.headers.contains_key(CAPACITY_POOL_HEADER) {
-                            dispatcher
-                                .dispatch_one(&deployment, &row, now, &mut exhausted)
-                                .await;
-                            signal.release(&[row.entry_id]);
+                            scheduler.submit_pooled(deployment.clone(), row, now);
                         } else {
-                            let _ = worker_tx[route(&row)].send((deployment.clone(), row)).await;
+                            scheduler.submit(deployment.clone(), row).await;
                         }
                     }
                     if !full {
@@ -2303,16 +2405,22 @@ pub fn spawn_concurrent_dispatch_loop(
                 }
             }
         }
-        drop(worker_tx);
+        // Drain order: the router and the claimer stop taking rows, then the scheduler finishes
+        // what it holds, then the batcher deletes the last deliveries.
         let _ = router.await;
         let _ = renewer.await;
-        for task in worker_tasks {
-            let _ = task.await;
+        match Arc::try_unwrap(scheduler) {
+            Ok(scheduler) => scheduler.close().await,
+            Err(_) => warn!("outbox scheduler still shared at drain — not awaiting its chains"),
         }
         let _ = batcher.await;
         info!("concurrent outbox dispatcher drained — refusing further claims");
     });
-    OutboxDispatcherHandle { drain, task }
+    OutboxDispatcherHandle {
+        drain,
+        task,
+        gauges: Some(gauges),
+    }
 }
 
 // ---- tests ----------------------------------------------------------------------------------
@@ -2350,6 +2458,7 @@ mod tests {
             instance_id: "11111111-1111-4111-8111-111111111111".to_string(),
             required: false,
             last_diagnostic_json: None,
+            created_at: OffsetDateTime::UNIX_EPOCH,
         }
     }
 
@@ -3861,6 +3970,7 @@ mod concurrent_tests {
             instance_id: instance.to_string(),
             required: false,
             last_diagnostic_json: None,
+            created_at: OffsetDateTime::UNIX_EPOCH,
         }
     }
 
@@ -4076,7 +4186,11 @@ mod concurrent_tests {
             dispatcher,
             LiveDeploymentSet::new(vec![dep()]),
             std::time::Duration::from_millis(tick_ms),
-            OutboxConcurrency { workers },
+            OutboxConcurrency {
+                workers,
+                per_destination: workers,
+                max_buffered: 4096,
+            },
             signal.clone(),
         )
     }

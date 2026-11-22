@@ -11,6 +11,50 @@ This is the changelog for the **Rust-native** engine (`rust/` workspace). It beg
 
 ## [Unreleased]
 
+## [0.8.3] — 2026-11-22
+
+**2026-11-22.** A patch release for throughput under load. **Outbound delivery no longer queues
+behind a slow destination**, **AMQP 1.0 channels process deliveries concurrently**, and **FEEL**
+no longer copies the whole variable scope per item. Three outbox keys, one AMQP 1.0 channel
+property and three metrics are added; no `q:`, migration, archive or snapshot change.
+
+### Changed
+
+- **Outbound delivery no longer queues behind a slow destination.** Deliveries were spread over a
+  fixed set of workers by instance, so one slow send held up every row behind it, whatever its
+  destination. Each instance now has its own ordered chain, under a global bound
+  (`sutra.outbox.workers`, now the most sends in flight, default 32, was the lane count and at
+  least 8) and a per-destination bound (new `sutra.outbox.destination-concurrency`, default 32;
+  the authority is scheme + host + port). The claimer waits only for buffer room (new
+  `sutra.outbox.max-buffered`, 4096); pooled rows keep their oldest-first lane off the claimer.
+  One instance's messages still go out in order; retry, poison and incident handling are
+  unchanged. On a 3,500-row burst with 30% of instances bound for a 500 ms destination, the fast
+  destination's p99 lag went from 73.9 s to 166 ms and the drain from 84.5 s to 16.5 s.
+- **AMQP 1.0 channels process deliveries concurrently** (new channel property `max-in-flight`,
+  default 16; `1` keeps the one-at-a-time behaviour). A message is still accepted only after it
+  is persisted, and duplicates are still absorbed by the inbox. One binding: 223 → 513 messages/s
+  on the intake bench.
+- **`prefetch-count` now sets the AMQP 1.0 link credit** (`max(prefetch-count, 2 × max-in-flight)`,
+  32 by default); it was parsed but ignored, so the client default of 200 applied.
+- **FEEL** filters, quantifiers, `for` loops, context literals and function calls evaluate against
+  a layered scope instead of a copy of every variable; results are identical (DMN TCK unchanged).
+  At 500 payload items: filter 217×, `some` 354×, `for` 2,311×, `sort` with a lambda 159× faster.
+- Defaults: `sutra.datasource.dispatch-max-connections` 2 → 4; AMQP 1.0 sink connections per
+  broker (`SUTRA_SINK_AMQP_MAX_CONNECTIONS`) 8 → 32.
+
+### Added
+
+- `sutra.outbox.lag-warn` (default `PT10S`, `PT0S` = off): one WARN a minute while delivered rows
+  exceed it.
+- Metrics `sutra.outbox.delivery.lag` (histogram, ms, by scheme), `sutra.outbox.in-flight`,
+  `sutra.outbox.buffered`.
+- `tools/sutra-load-test/relay-bench.sh BURST=<rows>`: the outbound burst bench.
+
+### Security
+
+- The base image's no-fix findings (glibc `iconv`, `glob`; OpenSSL `libssl3`) were re-verified as
+  unreachable on the 0.8.3 binary; their `.trivyignore.yaml` entries cite it.
+
 ## [0.8.2] — 2026-11-21
 
 **2026-11-21.** A patch release with two fixes. **A message the engine had accepted is no longer

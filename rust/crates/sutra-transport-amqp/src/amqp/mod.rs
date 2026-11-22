@@ -159,6 +159,10 @@ pub const DEFAULT_PORT: u16 = 5672;
 pub const DEFAULT_TLS_PORT: u16 = 5671;
 /// Default AMQP prefetch / link credit.
 pub const DEFAULT_PREFETCH: u32 = 10;
+/// Default number of deliveries of one binding processed at once (`max-in-flight`).
+pub const DEFAULT_MAX_IN_FLIGHT: u32 = 16;
+/// The largest `max-in-flight` a channel may declare.
+pub const MAX_IN_FLIGHT_LIMIT: u32 = 1024;
 /// Default per-poll receive timeout (ms).
 pub const DEFAULT_RECEIVE_TIMEOUT_MS: u64 = 1_000;
 
@@ -204,8 +208,12 @@ pub struct AmqpChannelProperties {
     pub queue: Option<String>,
     /// Topic to consume from (`topic`; inbound requires `queue` OR `topic`).
     pub topic: Option<String>,
-    /// AMQP prefetch / receiver link credit (`prefetch-count`, default `10`).
+    /// AMQP prefetch / receiver link credit (`prefetch-count`, default `10`). The link credit is
+    /// `max(prefetch-count, 2 × max-in-flight)`, so the window never waits for credit.
     pub prefetch_count: u32,
+    /// Deliveries of this binding processed at once (`max-in-flight`, 1..=1024, default `16`).
+    /// `1` processes one delivery at a time, in arrival order.
+    pub max_in_flight: u32,
     /// Per-poll receive timeout in ms (`receive-timeout-ms`, default `1000`).
     pub receive_timeout_ms: u64,
     /// Engine-level ack semantics (`ack-mode`, default `on-persist`).
@@ -297,6 +305,21 @@ impl AmqpChannelProperties {
             "prefetch-count",
             channel,
         )?;
+        let max_in_flight = parse_u32(
+            props.get("max-in-flight"),
+            DEFAULT_MAX_IN_FLIGHT,
+            "max-in-flight",
+            channel,
+        )?;
+        if !(1..=MAX_IN_FLIGHT_LIMIT).contains(&max_in_flight) {
+            return Err(Diagnostic::error(
+                codes::INBOUND_CONFIG_INVALID,
+                format!(
+                    "amqp channel '{channel}' property 'max-in-flight' must be between 1 and \
+                     {MAX_IN_FLIGHT_LIMIT}, got {max_in_flight}"
+                ),
+            ));
+        }
         let receive_timeout_ms = parse_u64(
             props.get("receive-timeout-ms"),
             DEFAULT_RECEIVE_TIMEOUT_MS,
@@ -326,6 +349,7 @@ impl AmqpChannelProperties {
             queue,
             topic,
             prefetch_count,
+            max_in_flight,
             receive_timeout_ms,
             ack_mode,
             singleton: def.singleton(),
@@ -771,6 +795,32 @@ mod tests {
         assert!(!props.singleton);
         assert!(props.has_queue());
         assert_eq!(props.source_address(), Some("in-q"));
+    }
+
+    #[test]
+    fn max_in_flight_defaults_and_bounds() {
+        let def = definition(&[("host", "h"), ("queue", "q")]);
+        let props = AmqpChannelProperties::from_definition(&def).expect("props");
+        assert_eq!(props.max_in_flight, DEFAULT_MAX_IN_FLIGHT);
+        for (raw, want) in [("1", 1), (" 64 ", 64), ("1024", MAX_IN_FLIGHT_LIMIT)] {
+            let def = definition(&[("host", "h"), ("queue", "q"), ("max-in-flight", raw)]);
+            let props = AmqpChannelProperties::from_definition(&def).expect("in range");
+            assert_eq!(props.max_in_flight, want, "max-in-flight '{raw}'");
+        }
+    }
+
+    #[test]
+    fn max_in_flight_out_of_range_is_refused() {
+        for raw in ["0", "1025", "-1", "many"] {
+            let def = definition(&[("host", "h"), ("queue", "q"), ("max-in-flight", raw)]);
+            let err = AmqpChannelProperties::from_definition(&def).expect_err(raw);
+            assert_eq!(
+                err.code,
+                codes::INBOUND_CONFIG_INVALID,
+                "max-in-flight '{raw}'"
+            );
+            assert!(err.message.contains("max-in-flight"), "{}", err.message);
+        }
     }
 
     #[test]

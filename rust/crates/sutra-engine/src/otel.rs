@@ -622,6 +622,50 @@ pub use sutra_executor::telemetry::{
     link_span_to_traceparent, parse_traceparent,
 };
 
+/// The delivery observer behind `sutra.outbox.delivery.lag`: one histogram point (milliseconds)
+/// per delivered outbox row, by destination scheme. Fail-open like every meter here: without an
+/// installed provider the histogram is a no-op.
+pub fn outbox_delivery_lag_observer(
+) -> std::sync::Arc<dyn Fn(sutra_channels::DeliveryObservation) + Send + Sync> {
+    outbox_delivery_lag_observer_on(&global::meter("sutra-engine"))
+}
+
+/// [`outbox_delivery_lag_observer`] on a given meter (a test collects through its own provider).
+pub fn outbox_delivery_lag_observer_on(
+    meter: &Meter,
+) -> std::sync::Arc<dyn Fn(sutra_channels::DeliveryObservation) + Send + Sync> {
+    let histogram = meter
+        .u64_histogram(names::METRIC_OUTBOX_DELIVERY_LAG)
+        .with_unit("ms")
+        .with_description("Enqueue-to-delivery lag of each delivered outbox row.")
+        .build();
+    std::sync::Arc::new(move |observed: sutra_channels::DeliveryObservation| {
+        histogram.record(
+            observed.lag.as_millis().min(u128::from(u64::MAX)) as u64,
+            &[KeyValue::new(names::ATTR_SCHEME, observed.scheme)],
+        );
+    })
+}
+
+/// The `sutra.outbox.in-flight` and `sutra.outbox.buffered` gauges over the concurrent
+/// dispatcher's live counts ([`sutra_channels::OutboxDispatcherHandle::gauge_reader`]). Registered
+/// ONCE per boot from `serve`, only when telemetry metrics are wired.
+pub fn register_outbox_meters(read: impl Fn() -> (usize, usize) + Send + Sync + 'static) {
+    let meter: Meter = global::meter("sutra-engine");
+    let read = std::sync::Arc::new(read);
+    let r = std::sync::Arc::clone(&read);
+    let _ = meter
+        .u64_observable_gauge(names::METRIC_OUTBOX_IN_FLIGHT)
+        .with_description("Outbox sends in progress.")
+        .with_callback(move |observer| observer.observe(r().0 as u64, &[]))
+        .build();
+    let _ = meter
+        .u64_observable_gauge(names::METRIC_OUTBOX_BUFFERED)
+        .with_description("Outbox rows held in memory, in flight or queued for delivery.")
+        .with_callback(move |observer| observer.observe(read().1 as u64, &[]))
+        .build();
+}
+
 /// The `sutra.audit.transport.dropped` counter: transport audit events dropped on a full journal
 /// queue, read from the process-wide registry. Registered ONCE per boot from `serve`, only when
 /// telemetry metrics are wired; fail-open like every meter here.

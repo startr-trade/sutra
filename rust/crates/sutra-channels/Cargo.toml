@@ -12,7 +12,7 @@ default = ["transport"]
 # dispatcher / outbox loop / audit dispatcher. OFF (`--no-default-features`) leaves the pure channel
 # MODEL (config/channels.yaml parse, codes, registry, sink::scheme_of) — the only part the
 # deploy-time lint consumes — compiling WITHOUT tokio/axum/hyper, hence to `wasm32-*`.
-transport = ["dep:inventory", "dep:axum", "dep:futures-core", "dep:tokio", "dep:http-body-util", "dep:hyper", "dep:hyper-util", "dep:hyper-rustls", "dep:rustls"]
+transport = ["dep:inventory", "dep:axum", "dep:futures-core", "dep:futures-util", "dep:tokio", "dep:http-body-util", "dep:hyper", "dep:hyper-util", "dep:hyper-rustls", "dep:rustls"]
 
 [dependencies]
 # The dyn-safe async form of the persistence-facing trait seams (InstanceBridge,
@@ -41,6 +41,9 @@ time = { workspace = true }
 axum = { version = "0.8", optional = true }
 # The `Stream` trait an SSE response body is built from (dependency-free polling).
 futures-core = { workspace = true, optional = true }
+# `FuturesUnordered` for the bounded window of intake calls a broker source keeps in flight
+# (`source::IntakeWindow`). Already in the lock through other crates; `std` only.
+futures-util = { version = "0.3", default-features = false, features = ["std"], optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-util"], optional = true }
 tracing = { workspace = true }
 # The outbound HTTP sink — reuses the hyper stack already in the tree (axum's server side);

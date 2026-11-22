@@ -14,6 +14,14 @@
 //!   **accept** (settle Accepted), `NackRequeue` → **release** (settle Released; the broker
 //!   redelivers), `NackDrop` → **reject** (settle Rejected; the broker DLQs/discards the
 //!   poison — advancing IS the drop). The inbox dedup absorbs any release-redelivery.
+//! - **Concurrent intake per binding**: up to `max-in-flight` (default 16) deliveries run
+//!   through the intake at once, in an [`IntakeWindow`]; each is settled when its own call
+//!   returns, in completion order, so two deliveries for one instance may reach the engine in
+//!   either order. `max-in-flight: 1` is the serial, arrival-order consumer. The receiver is
+//!   attached with link credit `max(prefetch-count, 2 × max-in-flight)`, auto-replenished.
+//! - **Session end drains**: a stop, a lost connection or lost leadership first waits (up to
+//!   30 s) for the calls in flight. Only a stop settles them, on the still-open link; otherwise
+//!   the broker redelivers and inbox dedup absorbs the copies.
 //! - **`ack-mode: on-complete` defers the disposition**: the source hands the engine
 //!   per-delivery settle callbacks through [`InboundIntake::deliver_deferred`]; a PARKED
 //!   instance answers `Deferred` and the delivery stays UNSETTLED on the link until the
@@ -49,6 +57,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use fe2o3_amqp::link::delivery::DeliveryInfo;
+use fe2o3_amqp::link::CreditMode;
 use fe2o3_amqp::types::messaging::{Body, Source};
 use fe2o3_amqp::types::primitives::{SimpleValue, Symbol, Value};
 use fe2o3_amqp::{Connection, Delivery, Receiver, Session};
@@ -62,7 +71,7 @@ use sutra_channels::dispatch::InboundMessage;
 use sutra_channels::sink::BoxFuture;
 use sutra_channels::source::{
     AckDecision, DeferredSettle, DeliveryDisposition, DeliveryDropRecord, InboundIntake,
-    LeaderGate, TriggerSource,
+    IntakeWindow, LeaderGate, TriggerSource,
 };
 
 use super::outage::OutageWindow;
@@ -211,6 +220,8 @@ enum Turn {
     Idle,
     /// A deferred settle callback posted a disposition to execute.
     Settle(SettleCommand),
+    /// An intake call in the window returned: the delivery it answers for and its disposition.
+    Finished(DeliveryInfo, DeliveryDisposition),
     /// A delivery arrived (boxed: `Delivery` dwarfs the other variants).
     Delivery(Box<Delivery<WireBody>>),
     /// `recv` failed — the link/connection is unhealthy (message rendered for the WARN).
@@ -548,6 +559,7 @@ async fn open_session(config: &AmqpSourceConfig) -> Result<BrokerSession, Diagno
     let receiver = Receiver::builder()
         .name(format!("{container}-recv"))
         .source(source)
+        .credit_mode(CreditMode::Auto(link_credit(props)))
         .attach(&mut session)
         .await
         .map_err(|e| {
@@ -566,9 +578,28 @@ async fn open_session(config: &AmqpSourceConfig) -> Result<BrokerSession, Diagno
     })
 }
 
+/// How long a session end waits for the intake calls still in flight — the operation timeout
+/// the rest of the transport uses. A call still running at the bound is never settled: the
+/// broker redelivers it and inbox dedup absorbs the copy.
+const DRAIN_BOUND: Duration = Duration::from_secs(30);
+
+/// The receiver link credit: `max(prefetch-count, 2 × max-in-flight)`, so a full window of
+/// intake calls never waits for the broker to grant more credit.
+fn link_credit(props: &AmqpChannelProperties) -> u32 {
+    props
+        .prefetch_count
+        .max(props.max_in_flight.saturating_mul(2))
+}
+
 /// The consume loop: gate re-check per turn (and on an idle receive timeout), delivery →
 /// projection → intake → disposition, interleaved with any DEFERRED dispositions the
 /// `ack-mode: on-complete` settle callbacks posted since the last turn.
+///
+/// Up to `max-in-flight` intake calls run at once in an [`IntakeWindow`]; a delivery is settled
+/// when its own call returns, in completion order. The loop stops receiving while the window is
+/// full. Every session end drains the window first; only a stop settles what the drain
+/// finished, because after a lost connection or lost leadership the link is gone and the broker
+/// redelivers.
 async fn run_session(
     config: &AmqpSourceConfig,
     intake: &Arc<dyn InboundIntake>,
@@ -583,42 +614,59 @@ async fn run_session(
     // which is the correct posture: the broker never saw a disposition, so it redelivers the
     // unsettled delivery and inbox dedup absorbs the duplicate.
     let (settle_tx, mut settle_rx) = tokio::sync::mpsc::unbounded_channel::<SettleCommand>();
-    loop {
+    let mut window: IntakeWindow<'_, DeliveryInfo> =
+        IntakeWindow::new(config.properties.max_in_flight as usize);
+    let end = loop {
         if stop.is_requested() {
-            return SessionEnd::Stopped;
+            break SessionEnd::Stopped;
         }
         if !gate.is_leading() {
-            return SessionEnd::LeadershipLost;
+            break SessionEnd::LeadershipLost;
         }
-        // `Receiver::recv` is documented cancel-safe, so losing the race to a stop signal or a
-        // queued deferred disposition never drops an in-flight transfer.
+        let room = window.has_room();
+        let busy = !window.is_empty();
+        // `Receiver::recv` is documented cancel-safe, so losing the race to a stop signal, a
+        // finished intake call or a queued deferred disposition never drops an in-flight
+        // transfer. `IntakeWindow::next` is cancel-safe too: an unfinished call stays in the
+        // window.
         let turn = tokio::select! {
             _ = stop.notify.notified() => Turn::Stopped,
+            Some((info, disposition)) = window.next(), if busy => Turn::Finished(info, disposition),
             Some(command) = settle_rx.recv() => Turn::Settle(command),
-            r = tokio::time::timeout(recv_timeout, broker.receiver.recv::<WireBody>()) => match r {
+            r = tokio::time::timeout(recv_timeout, broker.receiver.recv::<WireBody>()), if room => match r {
                 Err(_elapsed) => Turn::Idle,
                 Ok(Ok(delivery)) => Turn::Delivery(Box::new(delivery)),
                 Ok(Err(e)) => Turn::RecvFailed(e.to_string()),
             },
+            // A full window still re-checks the gate and stop while its calls run.
+            _ = tokio::time::sleep(recv_timeout), if !room => Turn::Idle,
         };
         let delivery = match turn {
-            Turn::Stopped => return SessionEnd::Stopped,
+            Turn::Stopped => break SessionEnd::Stopped,
             Turn::Idle => continue, // idle gate/stop re-check
+            Turn::Finished(info, disposition) => {
+                if let Err(end) = settle_finished(config, &broker.receiver, info, disposition).await
+                {
+                    break end;
+                }
+                continue;
+            }
             Turn::Settle(command) => {
                 if let Err(end) = settle_deferred(config, &broker.receiver, command).await {
-                    return end;
+                    break end;
                 }
                 continue;
             }
             Turn::RecvFailed(e) => {
                 warn!(channel = %config.channel, error = %e, "amqp recv failed");
-                return SessionEnd::ConnectionLost;
+                break SessionEnd::ConnectionLost;
             }
             Turn::Delivery(delivery) => *delivery,
         };
         let inbound = to_inbound_message(config, &delivery);
         // Per-message inbound auth: a rejected credential drops the delivery natively
         // (AMQP 1.0 settle-accepted — no redelivery, no dead-letter) and NEVER dispatches.
+        // It settles inline and never enters the window.
         if let Some(auth) = &config.inbound_auth {
             if auth.verify(&inbound.headers) == InboundVerdict::Reject {
                 warn!(
@@ -633,35 +681,91 @@ async fn run_session(
                 if let Err(end) =
                     settle(config, &broker.receiver, &delivery, AckDecision::Ack).await
                 {
-                    return end;
+                    break end;
                 }
                 continue;
             }
         }
         // The intake owns ack-mode TIMING; the disposition mirrors the decision.
-        // `on-persist` awaits the decision and disposes at dispatch-return; `on-complete`
-        // hands the engine per-delivery settle callbacks — a PARKED instance defers the
-        // disposition to its terminal event (the deferred-ack registry), a run-to-completion
-        // dispatch disposes now exactly like on-persist.
-        let decision = if config.properties.ack_mode == AckMode::OnComplete {
-            let settle = deferred_settle(&config.channel, &delivery, &settle_tx);
-            match intake.deliver_deferred(inbound, settle).await {
-                DeliveryDisposition::Deferred => {
-                    debug!(
-                        channel = %config.channel,
-                        delivery_id = delivery.delivery_id(),
-                        "delivery deferred — the amqp disposition is held (delivery stays \
-                         UNSETTLED on the link) until the instance's terminal event"
-                    );
-                    continue;
-                }
-                DeliveryDisposition::Settle(decision) => decision,
+        // `on-persist` disposes when the call returns its decision; `on-complete` hands the
+        // engine per-delivery settle callbacks — a PARKED instance defers the disposition to
+        // its terminal event (the deferred-ack registry) and frees its window slot, a
+        // run-to-completion dispatch disposes on return exactly like on-persist.
+        let info = DeliveryInfo::from(&delivery);
+        let call: BoxFuture<'_, DeliveryDisposition> =
+            if config.properties.ack_mode == AckMode::OnComplete {
+                let settle = deferred_settle(&config.channel, &delivery, &settle_tx);
+                intake.deliver_deferred(inbound, settle)
+            } else {
+                let decision = intake.deliver(inbound);
+                Box::pin(async move { DeliveryDisposition::Settle(decision.await) })
+            };
+        window.push(info, call);
+    };
+    drain_window(config, &broker.receiver, &mut window, end).await
+}
+
+/// End a session: wait (up to [`DRAIN_BOUND`]) for the intake calls still in flight, then
+/// settle what finished on the still-open link when the session is stopping. After a lost
+/// connection or lost leadership nothing is settled: the broker redelivers.
+async fn drain_window(
+    config: &AmqpSourceConfig,
+    receiver: &Receiver,
+    window: &mut IntakeWindow<'_, DeliveryInfo>,
+    end: SessionEnd,
+) -> SessionEnd {
+    if window.is_empty() {
+        return end;
+    }
+    let finished = window.drain(DRAIN_BOUND).await;
+    if matches!(end, SessionEnd::Stopped) {
+        for (info, disposition) in finished {
+            if settle_finished(config, receiver, info, disposition)
+                .await
+                .is_err()
+            {
+                break; // the link is gone: the broker redelivers the rest
             }
-        } else {
-            intake.deliver(inbound).await
-        };
-        if let Err(end) = settle(config, &broker.receiver, &delivery, decision).await {
-            return end;
+        }
+    } else if !finished.is_empty() {
+        debug!(
+            channel = %config.channel,
+            finished = finished.len(),
+            "amqp session ended with finished deliveries it can no longer settle; the broker \
+             redelivers them (inbox dedup absorbs the copies)"
+        );
+    }
+    if !window.is_empty() {
+        warn!(
+            channel = %config.channel,
+            code = codes::INBOUND_RECEIVE_FAILED,
+            unfinished = window.len(),
+            "amqp session ended with intake calls still running after {:?}; their deliveries \
+             stay unsettled and the broker redelivers them",
+            DRAIN_BOUND
+        );
+    }
+    end
+}
+
+/// Act on one finished intake call: settle its delivery now, or — when the engine deferred the
+/// disposition to the instance's terminal event — only note it.
+async fn settle_finished(
+    config: &AmqpSourceConfig,
+    receiver: &Receiver,
+    info: DeliveryInfo,
+    disposition: DeliveryDisposition,
+) -> Result<(), SessionEnd> {
+    match disposition {
+        DeliveryDisposition::Settle(decision) => settle(config, receiver, info, decision).await,
+        DeliveryDisposition::Deferred => {
+            debug!(
+                channel = %config.channel,
+                delivery_id = info.delivery_id(),
+                "delivery deferred — the amqp disposition is held (delivery stays \
+                 UNSETTLED on the link) until the instance's terminal event"
+            );
+            Ok(())
         }
     }
 }
@@ -768,6 +872,7 @@ async fn settle(
     // One `DeliveryInfo` up front: the inline path passes `&Delivery`, the deferred path passes
     // the info a settle callback carried across the dispatch.
     let delivery = delivery.into();
+    let delivery_id = delivery.delivery_id();
     let result = match decision {
         AckDecision::Ack => receiver.accept(delivery).await,
         AckDecision::NackRequeue => receiver.release(delivery).await,
@@ -782,6 +887,12 @@ async fn settle(
         );
         return Err(SessionEnd::ConnectionLost);
     }
+    debug!(
+        channel = %config.channel,
+        delivery_id,
+        decision = ?decision,
+        "amqp disposition executed"
+    );
     Ok(())
 }
 
@@ -987,6 +1098,7 @@ mod tests {
             queue: Some("in-q".to_string()),
             topic: None,
             prefetch_count: 10,
+            max_in_flight: crate::amqp::DEFAULT_MAX_IN_FLIGHT,
             receive_timeout_ms: 1000,
             ack_mode: super::super::AckMode::OnPersist,
             singleton: false,
@@ -1008,6 +1120,25 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
+    }
+
+    /// The link credit covers twice the window, and never drops below `prefetch-count`.
+    #[test]
+    fn link_credit_covers_the_window() {
+        let mut props = base_properties();
+        assert_eq!(link_credit(&props), 32, "defaults: max(10, 2 x 16)");
+        props.max_in_flight = 1;
+        assert_eq!(
+            link_credit(&props),
+            10,
+            "prefetch wins over a narrow window"
+        );
+        props.prefetch_count = 500;
+        props.max_in_flight = 64;
+        assert_eq!(link_credit(&props), 500);
+        props.prefetch_count = 0;
+        props.max_in_flight = 1024;
+        assert_eq!(link_credit(&props), 2048);
     }
 
     #[test]

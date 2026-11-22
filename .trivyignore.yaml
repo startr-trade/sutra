@@ -233,6 +233,8 @@ vulnerabilities:
   # libssl); `readelf --dyn-syms` imports no iconv or gconv function. The Kafka client's compiled-in
   # OpenSSL 3.6.3 (openssl-src 300.6.1, librdkafka 2.12.1) is a TLS client over TCP: librdkafka calls
   # neither PEM_X509_INFO_read_bio_ex nor SSL_CTX_set_cert_flags, and runs no QUIC.
+  # Re-checked on the 0.8.3 binary (2026-11-22): the same four libraries, no iconv, gconv, glob,
+  # SSL_ or PEM_ import (only the four weak AWS-LC OPENSSL_memory_* hooks), no libssl name.
   - id: CVE-2026-121757
     statement: "libc6 (glibc) iconv CP949 decoder over-read with //IGNORE. The engine imports no iconv function (readelf --dyn-syms: no iconv, iconv_open or gconv symbol); its text decoding is Rust code compiled into the binary. Debian ships no fixed package."
     expired_at: 2026-12-16
@@ -255,13 +257,28 @@ vulnerabilities:
   # ---- Published 2026-11-19, after the 0.7.0 cut; triaged 2026-11-19 for the 0.8.0 cut ---------
   # It stopped the 0.7.0 release run at the image scan, so 0.7.0 published no image. Checked on the
   # 0.8.0 binary: `readelf -d` lists libgcc_s, libm, libc and the loader only, and the binary holds
-  # no libssl or libcrypto name to load at run time. Expires with the 0.6.25 batch.
+  # no libssl or libcrypto name to load at run time. Expires with the 0.6.25 batch. Re-checked on
+  # the 0.8.3 binary (2026-11-22), with the same result.
   - id: CVE-2026-126765
-    statement: "libc6 (glibc) glob functions, in the distroless base. The engine does not import glob, glob64, globfree or fnmatch: readelf --dyn-syms on the 0.8.2 binary lists none of them (it links libgcc_s, libm, libc and the loader only), and the image has no shell or other program that would call them. Debian ships no fixed package (status: affected)."
+    statement: "libc6 (glibc) glob functions, in the distroless base. The engine does not import glob, glob64, globfree or fnmatch: readelf --dyn-syms on the 0.8.3 binary lists none of them (it links libgcc_s, libm, libc and the loader only), and the image has no shell or other program that would call them. Debian ships no fixed package (status: affected)."
     expired_at: 2026-12-16
   - id: CVE-2026-84786
     statement: "libssl3 (a DANE-enabled TLS client may dereference a NULL pointer) in the distroless base. The engine never loads libssl3: readelf -d on the 0.8.1 binary names libgcc_s, libm, libc and the loader only, and the binary contains no libssl or libcrypto name for dlopen. Nothing in it enables DANE: rustls has no DANE, and the Kafka client's compiled-in OpenSSL 3.6.3 is used only by librdkafka 2.12.1, which never calls SSL_dane_enable or SSL_CTX_dane_enable (no DANE reference in its source), and no workspace crate uses the openssl bindings. Debian ships no fixed package (status: affected)."
     expired_at: 2026-12-16
   - id: CVE-2026-95690
     statement: "libssl3 (crafted out-of-sequence DTLS handshake fragments) in the distroless base. The engine never loads libssl3: readelf -d on the 0.8.0 binary names libgcc_s, libm, libc and the loader only, and the binary contains no libssl or libcrypto name for dlopen. Nothing in it speaks DTLS: rustls has no DTLS, and the Kafka client's compiled-in OpenSSL 3.6.3 runs TLS over TCP as a client only. Debian ships no fixed package (status: affected)."
+    expired_at: 2026-12-16
+
+  # ---- Published by the Trivy DB of 2026-11-22; triaged 2026-11-22 for the 0.8.3 cut -----------
+  # Found by the 0.8.3 release image scan (DB UpdatedAt 2026-11-22T01:10:45Z). Checked on the 0.8.3
+  # binary: `readelf -d` lists libgcc_s, libm, libc and the loader only, and the binary holds no
+  # libssl or libcrypto name to load at run time. The Kafka client's compiled-in OpenSSL
+  # (librdkafka 2.12.1) has no PKCS7_ or CMS_ call, and calls EVP_EncodeBlock only from
+  # rd_base64_encode, which refuses input over INT_MAX, on SASL/SCRAM proofs and OAUTHBEARER token
+  # parts of a few hundred bytes. Expires with the 0.6.25 batch.
+  - id: CVE-2026-121482
+    statement: "libssl3 denial of service on a crafted CMS or PKCS#7 SignedData message, in the distroless base. The engine never loads libssl3: readelf -d on the 0.8.3 binary names libgcc_s, libm, libc and the loader only, and the binary holds no libssl or libcrypto name for dlopen. Nothing in it parses CMS or PKCS#7: rustls does not, and the Kafka client's compiled-in OpenSSL is used by librdkafka, which calls no PKCS7_ or CMS_ function. Debian ships no fixed package (status: affected)."
+    expired_at: 2026-12-16
+  - id: CVE-2026-121481
+    statement: "libssl3 out-of-bounds write through an integer overflow in EVP_EncodeBlock, in the distroless base. The engine never loads libssl3: readelf -d on the 0.8.3 binary names libgcc_s, libm, libc and the loader only, and the binary holds no libssl or libcrypto name for dlopen. The Kafka client's compiled-in OpenSSL is reached only through librdkafka's rd_base64_encode, which refuses input over INT_MAX and encodes SASL/SCRAM proofs and OAUTHBEARER token parts of a few hundred bytes, far below an overflowing length. Debian ships no fixed package (status: affected)."
     expired_at: 2026-12-16

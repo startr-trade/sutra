@@ -63,7 +63,7 @@ fn shipped_migration_roots() -> Vec<PathBuf> {
     vec![repo.join("rust/crates/sutra-persistence/migrations/shipped/core")]
 }
 
-async fn fresh_pool() -> PgPool {
+pub(crate) async fn fresh_pool() -> PgPool {
     let port = container_port();
     let admin = PgPoolOptions::new()
         .max_connections(1)
@@ -153,15 +153,15 @@ async fn capture_server(statuses: Vec<u16>) -> (SocketAddr, Capture) {
 
 // ---- helpers ----------------------------------------------------------------------------------
 
-fn dep() -> PersistDeploymentId {
+pub(crate) fn dep() -> PersistDeploymentId {
     PersistDeploymentId::new("dep-000000000000000000000061").expect("valid deployment id")
 }
 
-fn channel_dep() -> sutra_executor::DeploymentId {
+pub(crate) fn channel_dep() -> sutra_executor::DeploymentId {
     sutra_executor::DeploymentId::of("dep-000000000000000000000061").expect("valid deployment id")
 }
 
-fn entry(destination: &str) -> OutboxEntry {
+pub(crate) fn entry(destination: &str) -> OutboxEntry {
     let now = OffsetDateTime::now_utc();
     let instance = Uuid::new_v4();
     OutboxEntry {

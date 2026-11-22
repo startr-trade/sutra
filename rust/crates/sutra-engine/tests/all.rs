@@ -22,6 +22,10 @@ use sutra_transport_knative as _;
 use sutra_transport_rabbitmq as _;
 use sutra_transport_sqs as _;
 
+#[path = "all/amqp_intake_bench.rs"]
+mod amqp_intake_bench;
+#[path = "all/amqp_parallel_intake_it.rs"]
+mod amqp_parallel_intake_it;
 #[path = "all/archive_activation_conformance.rs"]
 mod archive_activation_conformance;
 #[path = "all/call_log_csv_e2e.rs"]
@@ -50,6 +54,8 @@ mod instance_migration_it;
 mod leadership_it;
 #[path = "all/otel_it.rs"]
 mod otel_it;
+#[path = "all/outbox_burst_it.rs"]
+mod outbox_burst_it;
 #[path = "all/outbox_e2e.rs"]
 mod outbox_e2e;
 #[path = "all/outbox_it.rs"]

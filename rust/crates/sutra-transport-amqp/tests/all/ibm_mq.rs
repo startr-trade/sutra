@@ -394,6 +394,7 @@ fn source_properties(port: u16, password: &str, queue: &str) -> AmqpChannelPrope
         queue: Some(queue.to_string()),
         topic: None,
         prefetch_count: 10,
+        max_in_flight: sutra_transport_amqp::DEFAULT_MAX_IN_FLIGHT,
         receive_timeout_ms: 250,
         ack_mode: AckMode::OnPersist,
         singleton: false,

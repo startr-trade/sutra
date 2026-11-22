@@ -161,6 +161,50 @@ pub fn scheme_of(destination: &str) -> Option<&str> {
     }
 }
 
+/// The authority a destination's sends share a concurrency bound under: lower-case
+/// `scheme://host[:port]`, with the scheme's default port left out and any credentials and path
+/// dropped. A scheme that dials nothing (`local`, `pull`) or carries no authority keys on
+/// `scheme:` alone; an unparseable destination keys on itself up to the first `/` after its
+/// scheme separator. Never used as a metric attribute (cardinality, secrecy).
+pub fn destination_authority(destination: &str) -> String {
+    let Some(scheme) = scheme_of(destination) else {
+        let cut = match destination.find("://") {
+            Some(i) => destination[i + 3..]
+                .find('/')
+                .map_or(destination.len(), |j| i + 3 + j),
+            None => destination.find('/').unwrap_or(destination.len()),
+        };
+        return destination[..cut].to_ascii_lowercase();
+    };
+    let scheme = scheme.to_ascii_lowercase();
+    if scheme == "local" || scheme == PULL_SCHEME {
+        return format!("{scheme}:");
+    }
+    let rest = &destination[scheme.len() + 3..];
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let host_port = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    if host_port.is_empty() {
+        return format!("{scheme}:");
+    }
+    let host_port = host_port.to_ascii_lowercase();
+    // The port follows the last ':' outside an IPv6 literal's brackets.
+    let (host, port) = match host_port.rfind(':') {
+        Some(i) if !host_port[i..].contains(']') => (&host_port[..i], Some(&host_port[i + 1..])),
+        _ => (host_port.as_str(), None),
+    };
+    let default_port = match scheme.as_str() {
+        "http" | "ws" => Some("80"),
+        "https" | "wss" => Some("443"),
+        "amqp" => Some("5672"),
+        "amqps" => Some("5671"),
+        _ => None,
+    };
+    match port {
+        Some(p) if !p.is_empty() && Some(p) != default_port => format!("{scheme}://{host}:{p}"),
+        _ => format!("{scheme}://{host}"),
+    }
+}
+
 // ---- the in-process delivery sink (scheme `local`) -----------------------------------------
 
 /// The in-process delivery sink — the `local` scheme among the transports. Delivers a
@@ -380,6 +424,38 @@ fn now_rfc3339() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn authority_ignores_path_and_credentials() {
+        assert_eq!(
+            destination_authority("HTTPS://user:pw@Api.Example.test:443/a/b?q=1"),
+            "https://api.example.test"
+        );
+        assert_eq!(
+            destination_authority("http://example.test:8081/x"),
+            "http://example.test:8081"
+        );
+        assert_eq!(
+            destination_authority("amqp://broker.test:5672/queue-a"),
+            destination_authority("amqp://broker.test/queue-b")
+        );
+        assert_eq!(
+            destination_authority("http://[::1]:9000/p"),
+            "http://[::1]:9000"
+        );
+    }
+
+    #[test]
+    fn authority_of_a_schemeless_destination() {
+        assert_eq!(
+            destination_authority("local://acme/demoflow/1.0.0/in"),
+            "local:"
+        );
+        assert_eq!(destination_authority("pull://acme/flow/1.0.0/c"), "pull:");
+        assert_eq!(destination_authority("test:///only-path"), "test:");
+        assert_eq!(destination_authority("1bad://host/path"), "1bad://host");
+        assert_eq!(destination_authority("no-scheme/path"), "no-scheme");
+    }
 
     struct FixedSink {
         schemes: Vec<String>,

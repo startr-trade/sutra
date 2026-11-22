@@ -10,8 +10,8 @@ nothing to do with this engine at all.
 
 ```toml
 [dependencies]
-sutra-feel = "0.8.2"
-sutra-dmn  = "0.8.2"   # depends on sutra-feel directly; use it alone if you only need DMN
+sutra-feel = "0.8.3"
+sutra-dmn  = "0.8.3"   # depends on sutra-feel directly; use it alone if you only need DMN
 bpmn-svg   = "0.1"      # versioned on its own; depends on neither
 ```
 

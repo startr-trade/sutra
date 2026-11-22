@@ -14,6 +14,9 @@
 //! | `sutra.datasource.dispatch-max-connections` | `SUTRA_DATASOURCE_DISPATCH_MAX_CONNECTIONS` |
 //! | `sutra.outbox.tick-interval`      | `SUTRA_OUTBOX_TICK_INTERVAL`      |
 //! | `sutra.outbox.workers`            | `SUTRA_OUTBOX_WORKERS`            |
+//! | `sutra.outbox.destination-concurrency` | `SUTRA_OUTBOX_DESTINATION_CONCURRENCY` |
+//! | `sutra.outbox.max-buffered`       | `SUTRA_OUTBOX_MAX_BUFFERED`       |
+//! | `sutra.outbox.lag-warn`           | `SUTRA_OUTBOX_LAG_WARN`           |
 //! | `sutra.outbox.batch-size`         | `SUTRA_OUTBOX_BATCH_SIZE`         |
 //! | `sutra.outbox.retry.base-delay`   | `SUTRA_OUTBOX_RETRY_BASE_DELAY`   |
 //! | `sutra.outbox.retry.max-delay`    | `SUTRA_OUTBOX_RETRY_MAX_DELAY`    |
@@ -479,7 +482,8 @@ pub struct DatasourcePools {
     pub max_connections: u32,
     /// `sutra.datasource.dispatch-max-connections` (env
     /// `SUTRA_DATASOURCE_DISPATCH_MAX_CONNECTIONS`) — the dispatch pool, integer >= 1, default
-    /// `2`: the claimer and the delete batcher each hold at most one connection at a time.
+    /// `4`: the claimer and the delete batcher each hold at most one connection at a time, which
+    /// leaves two for the defers, requeues and poisons of failed sends in a burst.
     pub dispatch_max_connections: u32,
 }
 
@@ -487,7 +491,7 @@ impl Default for DatasourcePools {
     fn default() -> DatasourcePools {
         DatasourcePools {
             max_connections: sutra_datastore::DEFAULT_MAX_CONNECTIONS,
-            dispatch_max_connections: 2,
+            dispatch_max_connections: 4,
         }
     }
 }
@@ -495,23 +499,49 @@ impl Default for DatasourcePools {
 /// The concurrent outbox dispatcher's sizing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OutboxTuning {
-    /// `sutra.outbox.workers` (env `SUTRA_OUTBOX_WORKERS`) — delivery workers, integer >= 1
-    /// (capped at 1024), default `sutra.engine.shards`, at least [`DEFAULT_OUTBOX_WORKERS`]. One instance's rows always go to one
-    /// worker, in order; rows of different instances are delivered in parallel. `1` delivers
-    /// one row at a time, as every release before 0.6.5 did.
+    /// `sutra.outbox.workers` (env `SUTRA_OUTBOX_WORKERS`) — the most sends in flight at once,
+    /// across every destination; integer >= 1 (capped at 1024), default
+    /// [`DEFAULT_OUTBOX_WORKERS`]. One instance's rows are always delivered one after another, in
+    /// order; rows of different instances are delivered in parallel. `1` delivers one row at a
+    /// time, as every release before 0.6.5 did.
     pub workers: usize,
+    /// `sutra.outbox.destination-concurrency` (env `SUTRA_OUTBOX_DESTINATION_CONCURRENCY`) — the
+    /// most sends in flight to one destination authority (scheme + host + port); integer >= 1,
+    /// default [`DEFAULT_OUTBOX_DESTINATION_CONCURRENCY`], clamped to `workers` with a WARN.
+    pub destination_concurrency: usize,
+    /// `sutra.outbox.max-buffered` (env `SUTRA_OUTBOX_MAX_BUFFERED`) — the most rows held in
+    /// memory, in flight or queued; past it the claimer waits. Integer in `workers..=100000`
+    /// (clamped with a WARN), default [`DEFAULT_OUTBOX_MAX_BUFFERED`].
+    pub max_buffered: usize,
+    /// `sutra.outbox.lag-warn` (env `SUTRA_OUTBOX_LAG_WARN`) — a delivered row whose
+    /// enqueue-to-delivery lag exceeds this logs a WARN, at most once a minute. ISO-8601 duration
+    /// or bare seconds, default `PT10S`; `PT0S` turns it off.
+    pub lag_warn: std::time::Duration,
     /// `sutra.outbox.batch-size` (env `SUTRA_OUTBOX_BATCH_SIZE`) — rows claimed per deployment
     /// per claim, integer >= 1 (capped at 10 000), default `50` (the value hardcoded before 0.6.5).
     pub batch_size: i64,
 }
 
 /// The default `sutra.outbox.workers`, chosen by benchmark (see the throughput tuning page).
-pub const DEFAULT_OUTBOX_WORKERS: usize = 8;
+pub const DEFAULT_OUTBOX_WORKERS: usize = 32;
+
+/// The default `sutra.outbox.destination-concurrency`, chosen by benchmark (see the throughput
+/// tuning page).
+pub const DEFAULT_OUTBOX_DESTINATION_CONCURRENCY: usize = 32;
+
+/// The default `sutra.outbox.max-buffered`.
+pub const DEFAULT_OUTBOX_MAX_BUFFERED: usize = 4096;
+
+/// The upper bound of `sutra.outbox.max-buffered`.
+const MAX_OUTBOX_BUFFERED: usize = 100_000;
 
 impl Default for OutboxTuning {
     fn default() -> OutboxTuning {
         OutboxTuning {
             workers: DEFAULT_OUTBOX_WORKERS,
+            destination_concurrency: DEFAULT_OUTBOX_DESTINATION_CONCURRENCY,
+            max_buffered: DEFAULT_OUTBOX_MAX_BUFFERED,
+            lag_warn: std::time::Duration::from_secs(10),
             batch_size: 50,
         }
     }
@@ -660,13 +690,41 @@ impl EngineConfig {
                 }
             },
         };
+        let workers = match value("sutra.outbox.workers", "SUTRA_OUTBOX_WORKERS")? {
+            None => outbox_defaults.workers,
+            Some(raw) => positive("sutra.outbox.workers", &raw)?.min(1024) as usize,
+        };
+        let destination_concurrency = match value(
+            "sutra.outbox.destination-concurrency",
+            "SUTRA_OUTBOX_DESTINATION_CONCURRENCY",
+        )? {
+            None => outbox_defaults.destination_concurrency,
+            Some(raw) => positive("sutra.outbox.destination-concurrency", &raw)?.min(1024) as usize,
+        };
+        let max_buffered = match value("sutra.outbox.max-buffered", "SUTRA_OUTBOX_MAX_BUFFERED")? {
+            None => outbox_defaults.max_buffered,
+            Some(raw) => {
+                positive("sutra.outbox.max-buffered", &raw)?.min(u64::from(u32::MAX)) as usize
+            }
+        };
         let outbox_tuning = OutboxTuning {
-            workers: match value("sutra.outbox.workers", "SUTRA_OUTBOX_WORKERS")? {
-                // Default: one worker per lane, at least DEFAULT_OUTBOX_WORKERS — fewer workers
-                // than lanes leaves lanes idle waiting for their deliveries (benchmark: 32 lanes
-                // with 4 / 8 / 32 workers settled 192 / 406 / 498 of 500 offered per second).
-                None => 0, // resolved below, once the lane count is known
-                Some(raw) => positive("sutra.outbox.workers", &raw)?.min(1024) as usize,
+            workers,
+            destination_concurrency: clamp_outbox_bound(
+                "sutra.outbox.destination-concurrency",
+                destination_concurrency,
+                1,
+                workers,
+            ),
+            max_buffered: clamp_outbox_bound(
+                "sutra.outbox.max-buffered",
+                max_buffered,
+                workers,
+                MAX_OUTBOX_BUFFERED,
+            ),
+            lag_warn: match value("sutra.outbox.lag-warn", "SUTRA_OUTBOX_LAG_WARN")? {
+                None => outbox_defaults.lag_warn,
+                Some(raw) => parse_duration(&raw)
+                    .map_err(|e| ConfigError(format!("sutra.outbox.lag-warn: '{raw}' — {e}")))?,
             },
             batch_size: match value("sutra.outbox.batch-size", "SUTRA_OUTBOX_BATCH_SIZE")? {
                 None => outbox_defaults.batch_size,
@@ -887,14 +945,6 @@ impl EngineConfig {
                         })?,
                 ),
             },
-        };
-        let outbox_tuning = OutboxTuning {
-            workers: if outbox_tuning.workers == 0 {
-                outbox_defaults.workers.max(engine_shards.shards as usize)
-            } else {
-                outbox_tuning.workers
-            },
-            ..outbox_tuning
         };
         // N > 1 is LIVE (execution scale-out Phase 2): the router spawns one actor lane
         // per shard. The 0-refusal above (the `>= 1` filter) is the only validation left.
@@ -1487,6 +1537,20 @@ fn read_properties(path: &PathBuf) -> Result<BTreeMap<String, String>, ConfigErr
     Ok(out)
 }
 
+/// Clamp an outbox bound into `low..=high`, with a WARN naming the key when it had to move.
+fn clamp_outbox_bound(key: &str, value: usize, low: usize, high: usize) -> usize {
+    let clamped = value.clamp(low, high.max(low));
+    if clamped != value {
+        tracing::warn!(
+            key,
+            configured = value,
+            effective = clamped,
+            "outbox bound out of range — clamped (it must lie between {low} and {high})"
+        );
+    }
+    clamped
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1906,6 +1970,70 @@ mod tests {
     }
 
     #[test]
+    fn outbox_concurrency_defaults_and_bounds() {
+        let mut file = BTreeMap::new();
+        file.insert("sutra.deployments.dir".to_string(), "/r".to_string());
+        let c = EngineConfig::from_sources(&file, &|_| None).unwrap();
+        assert_eq!(c.outbox_tuning.workers, 32);
+        assert_eq!(c.outbox_tuning.destination_concurrency, 32);
+        assert_eq!(c.outbox_tuning.max_buffered, 4096);
+        assert_eq!(c.outbox_tuning.lag_warn, std::time::Duration::from_secs(10));
+
+        file.insert("sutra.outbox.workers".to_string(), "5000".to_string());
+        file.insert(
+            "sutra.outbox.max-buffered".to_string(),
+            "1000000".to_string(),
+        );
+        file.insert("sutra.outbox.lag-warn".to_string(), "PT0S".to_string());
+        let c = EngineConfig::from_sources(&file, &|_| None).unwrap();
+        assert_eq!(c.outbox_tuning.workers, 1024, "capped at 1024");
+        assert_eq!(c.outbox_tuning.max_buffered, 100_000, "capped at 100 000");
+        assert!(
+            c.outbox_tuning.lag_warn.is_zero(),
+            "PT0S turns the WARN off"
+        );
+
+        file.insert("sutra.outbox.workers".to_string(), "32".to_string());
+        file.insert("sutra.outbox.max-buffered".to_string(), "8".to_string());
+        let c = EngineConfig::from_sources(&file, &|_| None).unwrap();
+        assert_eq!(
+            c.outbox_tuning.max_buffered, 32,
+            "the buffer holds at least one row per send in flight"
+        );
+
+        for (key, bad) in [
+            ("sutra.outbox.destination-concurrency", "0"),
+            ("sutra.outbox.max-buffered", "none"),
+            ("sutra.outbox.lag-warn", "soon"),
+        ] {
+            let mut f = file.clone();
+            f.insert(key.to_string(), bad.to_string());
+            assert!(
+                EngineConfig::from_sources(&f, &|_| None).is_err(),
+                "{key}={bad} is refused"
+            );
+        }
+    }
+
+    #[test]
+    fn destination_concurrency_is_clamped_to_workers() {
+        let mut file = BTreeMap::new();
+        file.insert("sutra.deployments.dir".to_string(), "/r".to_string());
+        file.insert("sutra.outbox.workers".to_string(), "4".to_string());
+        file.insert(
+            "sutra.outbox.destination-concurrency".to_string(),
+            "16".to_string(),
+        );
+        let c = EngineConfig::from_sources(&file, &|_| None).unwrap();
+        assert_eq!(c.outbox_tuning.destination_concurrency, 4);
+        let c = EngineConfig::from_sources(&file, &|name| {
+            (name == "SUTRA_OUTBOX_DESTINATION_CONCURRENCY").then(|| "2".to_string())
+        })
+        .unwrap();
+        assert_eq!(c.outbox_tuning.destination_concurrency, 2);
+    }
+
+    #[test]
     fn outbox_workers_batch_size_and_pools_default_and_parse() {
         let mut file = BTreeMap::new();
         file.insert("sutra.deployments.dir".to_string(), "/r".to_string());
@@ -1920,14 +2048,14 @@ mod tests {
         })
         .unwrap();
         assert_eq!(
-            c.outbox_tuning.workers, 32,
-            "one worker per lane by default"
+            c.outbox_tuning.workers, DEFAULT_OUTBOX_WORKERS,
+            "the send bound no longer follows the lane count"
         );
         assert_eq!(
             c.datasource_pools.max_connections, 8,
             "the pre-0.6.5 pool size"
         );
-        assert_eq!(c.datasource_pools.dispatch_max_connections, 2);
+        assert_eq!(c.datasource_pools.dispatch_max_connections, 4);
 
         file.insert("sutra.outbox.workers".to_string(), "16".to_string());
         file.insert("sutra.outbox.batch-size".to_string(), "200".to_string());

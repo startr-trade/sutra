@@ -29,12 +29,16 @@ mod http_it_test;
 mod inline_call_test;
 #[path = "all/intake_test.rs"]
 mod intake_test;
+#[path = "all/intake_window_test.rs"]
+mod intake_window_test;
 #[path = "all/message_decode_test.rs"]
 mod message_decode_test;
 #[path = "all/outbound_validation_test.rs"]
 mod outbound_validation_test;
 #[path = "all/outbox_pool_test.rs"]
 mod outbox_pool_test;
+#[path = "all/outbox_scheduler_test.rs"]
+mod outbox_scheduler_test;
 #[path = "all/relay_resume_test.rs"]
 mod relay_resume_test;
 #[path = "all/reply_encode_test.rs"]

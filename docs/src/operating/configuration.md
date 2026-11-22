@@ -43,8 +43,9 @@ engine ever disagree.
 (`max-connections`, default `8`, the size it always had) serves the execution lanes: intake,
 steps and resumes. Size it at least to `sutra.engine.shards`, because each lane holds a
 connection while it commits a step. The **dispatch** pool (`dispatch-max-connections`, default
-`2`) serves the outbox dispatcher and the timer poller, so a burst of intake can never leave
-delivery waiting for a connection.
+`4` since 0.8.3, `2` before) serves the outbox dispatcher and the timer poller, so a burst of
+intake can never leave delivery waiting for a connection. The claimer and the delete batcher hold
+one connection each; the others serve the defers and requeues of failed sends in a burst.
 
 This is the engine-internal database (instances, outbox, lease, audit, inbox) — never a
 package's own business data store, which owns its connection independently in `datastores.yaml`
@@ -59,6 +60,9 @@ package's own business data store, which owns its connection independently in `d
 |---|---|
 | `sutra.outbox.tick-interval` | `SUTRA_OUTBOX_TICK_INTERVAL` |
 | `sutra.outbox.workers` | `SUTRA_OUTBOX_WORKERS` |
+| `sutra.outbox.destination-concurrency` | `SUTRA_OUTBOX_DESTINATION_CONCURRENCY` |
+| `sutra.outbox.max-buffered` | `SUTRA_OUTBOX_MAX_BUFFERED` |
+| `sutra.outbox.lag-warn` | `SUTRA_OUTBOX_LAG_WARN` |
 | `sutra.outbox.batch-size` | `SUTRA_OUTBOX_BATCH_SIZE` |
 | `sutra.outbox.retry.base-delay` / `.max-delay` / `.jitter` | `SUTRA_OUTBOX_RETRY_BASE_DELAY` / `_MAX_DELAY` / `_JITTER` |
 | `sutra.outbox.retry.max-attempts` | `SUTRA_OUTBOX_RETRY_MAX_ATTEMPTS` |
@@ -66,10 +70,21 @@ package's own business data store, which owns its connection independently in `d
 | `sutra.ack.deferred.timeout` | `SUTRA_ACK_DEFERRED_TIMEOUT` |
 | `sutra.ack.deferred.sweep-interval` | `SUTRA_ACK_DEFERRED_SWEEP_INTERVAL` |
 
-*Since 0.6.5* the outbox delivers on several workers: `sutra.outbox.workers` (default: the lane
-count, at least 8). One instance's deliveries always go to the same worker, in the order they
-were enqueued; the deliveries of different instances run in parallel (`1` restores one delivery
-at a time). A step that enqueues wakes the dispatcher at once, and a `local://` delivery is handed
+The outbox delivers many rows at once, under three bounds (*since 0.8.3*):
+
+- `sutra.outbox.workers` (default `32`, 1..1024) is the most sends in flight at once, across
+  every destination. `1` restores one delivery at a time. Before 0.8.3 it was a count of workers
+  rows were spread over by instance, defaulting to the lane count and at least 8.
+- `sutra.outbox.destination-concurrency` (default `32`) is the most sends in flight to one
+  destination authority: scheme, host and port, the path ignored. It is clamped to `workers` with
+  a WARN. A row waiting on a busy destination holds no global slot, so a slow destination does
+  not delay the others.
+- `sutra.outbox.max-buffered` (default `4096`, from `workers` to 100 000) is the most rows held in
+  memory, in flight or queued. Past it the claimer waits.
+
+One instance's deliveries still go out one after another, in the order they were enqueued;
+different instances never share a queue. `sutra.outbox.lag-warn` (default `PT10S`, `PT0S` = off)
+logs one WARN a minute while delivered rows exceed it, enqueue to delivery. A step that enqueues wakes the dispatcher at once, and a `local://` delivery is handed
 to it in-process as soon as the step's commit is durable, so the tick (`tick-interval`, default
 `PT5S`) only paces retries that fall due and rows another replica enqueued.
 `sutra.outbox.batch-size` (default `50`) is how many due rows one claim takes per deployment.

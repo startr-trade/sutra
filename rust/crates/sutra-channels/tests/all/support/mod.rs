@@ -242,3 +242,6 @@ impl PayloadCodec for StructuralStandInCodec {
         Err("the structural stand-in is decode-only (replies are template renders)".to_string())
     }
 }
+
+/// The outbox row-store and sink doubles the concurrent-dispatcher tests share.
+pub mod outbox_doubles;
