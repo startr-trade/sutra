@@ -28,6 +28,7 @@ engine ever disagree.
 | `sutra.deployments.dir` | `SUTRA_DEPLOYMENTS_DIR` | Required for the `dir` source: the directory of `.sutra` archives the engine watches. |
 | `sutra.deployments.poll-interval` | `SUTRA_DEPLOYMENTS_POLL_INTERVAL` | How often the `dir` source rescans (default a few seconds). |
 | `sutra.http.port` | `SUTRA_HTTP_PORT` | Listen port; `0` binds an OS-assigned port (always use `0` locally — see [Quickstart](../getting-started/quickstart.md)). |
+| `sutra.http.max-body-bytes` | `SUTRA_HTTP_MAX_BODY_BYTES` | *(0.8.4)* Inbound HTTP request-body limit, default `2097152` (2 MiB), clamped to 1 KiB..1 GiB with a WARN. An HTTP channel's `max-body-bytes` overrides it; a larger body answers 413 `SUTRA.INBOUND.BODY_TOO_LARGE`. See [Limits and quotas](limits.md#inbound-http-request-body). |
 
 ## The engine's own datasource
 
@@ -266,6 +267,7 @@ started.
 | `sutra.*` key | env |
 |---|---|
 | `sutra.codec.max-payload-bytes` | `SUTRA_CODEC_MAX_PAYLOAD_BYTES` |
+| `sutra.http.max-body-bytes` | `SUTRA_HTTP_MAX_BODY_BYTES` |
 
 Full explanation: [Limits and quotas](limits.md).
 

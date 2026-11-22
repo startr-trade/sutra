@@ -1031,7 +1031,73 @@ struct HttpChannel {
     /// The serving deployment, as a receipt names it.
     deployment_id: String,
     labels: std::collections::BTreeMap<String, String>,
+    /// The channel's own request-body ceiling (`max-body-bytes`), already clamped; `None`
+    /// takes the engine-wide [`http_max_body_bytes`].
+    max_body_bytes: Option<usize>,
 }
+
+/// The default inbound HTTP request-body ceiling: 2 MiB, the size axum applies by default.
+pub const DEFAULT_HTTP_MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
+/// The smallest body ceiling the engine accepts (1 KiB); a smaller value is raised to it.
+pub const MIN_HTTP_MAX_BODY_BYTES: usize = 1024;
+/// The largest body ceiling the engine accepts (1 GiB); a larger value is lowered to it.
+pub const MAX_HTTP_MAX_BODY_BYTES: usize = 1024 * 1024 * 1024;
+
+/// The engine-wide body ceiling every HTTP channel without its own override serves with.
+/// Process-wide like the other boot-time installs: the engine sets it once from
+/// `sutra.http.max-body-bytes` before it serves, and each request reads it.
+static ENGINE_HTTP_MAX_BODY_BYTES: AtomicUsize = AtomicUsize::new(DEFAULT_HTTP_MAX_BODY_BYTES);
+
+/// Clamp a requested body ceiling into `MIN_HTTP_MAX_BODY_BYTES..=MAX_HTTP_MAX_BODY_BYTES`.
+/// Returns the value to use and whether it had to change, so the caller can warn.
+pub fn clamp_http_max_body_bytes(requested: u64) -> (usize, bool) {
+    let clamped = requested.clamp(
+        MIN_HTTP_MAX_BODY_BYTES as u64,
+        MAX_HTTP_MAX_BODY_BYTES as u64,
+    );
+    (clamped as usize, clamped != requested)
+}
+
+/// Install the engine-wide HTTP request-body ceiling (clamped into the accepted range).
+pub fn install_http_max_body_bytes(bytes: usize) {
+    let (bytes, _) = clamp_http_max_body_bytes(bytes as u64);
+    ENGINE_HTTP_MAX_BODY_BYTES.store(bytes, Ordering::Relaxed);
+}
+
+/// The engine-wide HTTP request-body ceiling currently installed.
+pub fn http_max_body_bytes() -> usize {
+    ENGINE_HTTP_MAX_BODY_BYTES.load(Ordering::Relaxed)
+}
+
+/// The channel's `max-body-bytes` override, clamped (with a WARN when it had to be). A value
+/// that is not a byte count refuses the channel, like any other malformed binding option.
+fn channel_max_body_bytes(def: &ChannelDefinition) -> Result<Option<usize>, Diagnostic> {
+    let Some(raw) = def.properties.get(CHANNEL_MAX_BODY_BYTES_KEY) else {
+        return Ok(None);
+    };
+    let requested = raw.trim().parse::<u64>().map_err(|_| {
+        Diagnostic::error(
+            codes::CONFIG_PROPERTY_INVALID,
+            format!(
+                "Channel '{}': {CHANNEL_MAX_BODY_BYTES_KEY} '{raw}' is not a byte count",
+                def.binding.channel_name
+            ),
+        )
+    })?;
+    let (bytes, clamped) = clamp_http_max_body_bytes(requested);
+    if clamped {
+        tracing::warn!(
+            channel = %def.binding.channel_name,
+            requested,
+            used = bytes,
+            "{CHANNEL_MAX_BODY_BYTES_KEY} is outside {MIN_HTTP_MAX_BODY_BYTES}..={MAX_HTTP_MAX_BODY_BYTES} bytes; clamped"
+        );
+    }
+    Ok(Some(bytes))
+}
+
+/// The inbound HTTP channel binding option that overrides the engine-wide body ceiling.
+pub const CHANNEL_MAX_BODY_BYTES_KEY: &str = "max-body-bytes";
 
 /// The swappable `(METHOD, path)` → channel table the HTTP transport serves from — the
 /// route side of the binding pointer flip. Handlers read the CURRENT snapshot per
@@ -1149,6 +1215,7 @@ pub fn http_routes_of_resolved(
             reply_stream_sse: def.wants_reply_stream_sse(),
             deployment_id: def.binding.deployment_id().value().to_string(),
             labels: def.binding.labels(),
+            max_body_bytes: channel_max_body_bytes(def)?,
         };
         if by_route
             .insert((method.clone(), path.clone()), channel)
@@ -1199,7 +1266,7 @@ pub fn channel_router_dynamic(table: &ChannelRouteTable, handle: EngineHandle) -
              method: axum::http::Method,
              uri: axum::http::Uri,
              headers: HeaderMap,
-             body: Bytes| async move {
+             body: axum::body::Body| async move {
                 let route_key = (method.as_str().to_uppercase(), uri.path().to_string());
                 serve_route(state, route_key, headers, body).await
             },
@@ -1211,7 +1278,7 @@ async fn serve_route(
     State(state): State<Arc<AppState>>,
     route_key: (String, String),
     headers: HeaderMap,
-    body: Bytes,
+    body: axum::body::Body,
 ) -> Response {
     let routes = state.routes.current();
     // Read once, up front: every failure below renders its RFC 7807 problem document in the
@@ -1237,6 +1304,14 @@ async fn serve_route(
     if let Err(diagnostic) = authenticate(channel, &headers) {
         return problem_response(401, &diagnostic, problem_ct);
     }
+
+    // 1b. Read the body under the channel's ceiling (its own `max-body-bytes`, else the
+    //     engine-wide `sutra.http.max-body-bytes`). The body is read here, after the route
+    //     and the caller are known, so an override can raise the ceiling for one channel.
+    let body = match read_body(channel, &headers, body).await {
+        Ok(bytes) => bytes,
+        Err((status, diagnostic)) => return problem_response(status, &diagnostic, problem_ct),
+    };
 
     // 2. Extract the inbound CloudEvent per `cloudevents.mode`. A failed extraction
     //    (missing required attribute, malformed envelope) is a 400 reject.
@@ -1746,13 +1821,64 @@ fn dead_letter_problem(incident: &str, cause_code: &str, detail: String) -> (u16
     (status_for_code(code), diagnostic)
 }
 
+/// Read a request body, refusing it with 413 (`SUTRA.INBOUND.BODY_TOO_LARGE`) once it passes
+/// the channel's ceiling: at once when `Content-Length` already says so, otherwise as soon as
+/// the streamed bytes cross it. A body that breaks off mid-read is a 400.
+async fn read_body(
+    channel: &HttpChannel,
+    headers: &HeaderMap,
+    body: axum::body::Body,
+) -> Result<Bytes, (u16, Diagnostic)> {
+    let limit = channel.max_body_bytes.unwrap_or_else(http_max_body_bytes);
+    let too_large = || {
+        (
+            413,
+            Diagnostic::error(
+                codes::INBOUND_BODY_TOO_LARGE,
+                format!(
+                    "Request body exceeds the {limit}-byte limit of channel '{}' \
+                     (sutra.http.max-body-bytes, or the channel's {CHANNEL_MAX_BODY_BYTES_KEY})",
+                    channel.channel_name
+                ),
+            )
+            .with_attribute("limitBytes", limit.to_string()),
+        )
+    };
+    let declared = headers
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok());
+    if declared.is_some_and(|len| len > limit as u64) {
+        return Err(too_large());
+    }
+    match axum::body::to_bytes(body, limit).await {
+        Ok(bytes) => Ok(bytes),
+        Err(e) => {
+            let mut source: Option<&(dyn std::error::Error + 'static)> = Some(&e);
+            while let Some(err) = source {
+                if err.is::<http_body_util::LengthLimitError>() {
+                    return Err(too_large());
+                }
+                source = err.source();
+            }
+            Err((
+                400,
+                Diagnostic::error(
+                    codes::INBOUND_BODY_UNREADABLE,
+                    format!("Request body could not be read: {e}"),
+                ),
+            ))
+        }
+    }
+}
+
 fn status_for_code(code: &str) -> u16 {
     match code {
         codes::INBOUND_REJECTED_AUTH => return 401,
         // The caller's document failed its contract — `reject` at intake, or an unhandled
         // `error` posture. Their file, their fix; a retry of the same bytes cannot succeed.
         codes::INBOUND_VALIDATION_REJECT | codes::INBOUND_VALIDATION_ERROR => return 400,
-        codes::INBOUND_PAYLOAD_TOO_LARGE => return 413,
+        codes::INBOUND_PAYLOAD_TOO_LARGE | codes::INBOUND_BODY_TOO_LARGE => return 413,
         // A correlation alias this message would bind is already held by another instance.
         codes::INBOUND_ALIAS_CONFLICT_REJECT => return 409,
         // Load shedding, not failure: the request was well formed and may succeed later.

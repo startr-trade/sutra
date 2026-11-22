@@ -323,3 +323,73 @@ async fn nothing_is_written_when_audit_is_off() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(rows(&pool).await.is_empty());
 }
+
+/// Records the sink each instance and node event of a pass is routed to.
+#[derive(Default)]
+struct RoutedSinks(std::cell::RefCell<Vec<(String, Option<String>)>>);
+
+impl sutra_executor::listener::ExecutionListener for RoutedSinks {
+    fn on_instance_started(&self, e: &sutra_executor::listener::InstanceEvent) {
+        self.0
+            .borrow_mut()
+            .push(("INSTANCE_STARTED".into(), e.audit_sink.clone()));
+    }
+    fn on_token_entered(&self, e: &sutra_executor::listener::TokenEvent) {
+        self.0
+            .borrow_mut()
+            .push((format!("NODE_ENTERED {}", e.node_id), e.audit_sink.clone()));
+    }
+}
+
+/// `<q:audit capture="none"/>` means the same to both audit paths: the executor routes none of
+/// the process's `INSTANCE_*`/`NODE_*` events (even with an engine default sink), and the
+/// transport journal suppresses the instance's transport events; nothing lands in the table.
+#[ignore = "docker"]
+#[tokio::test]
+async fn capture_none_consistent_with_execution_audit() {
+    use std::rc::Rc;
+    let pool = fresh_pool().await;
+    let instance = Uuid::new_v4();
+
+    let bpmn = r#"<?xml version="1.0"?>
+        <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                          xmlns:q="urn:sutra:q:1.0">
+          <bpmn:process id="quiet">
+            <bpmn:extensionElements><q:audit sink="sql" capture="none"/></bpmn:extensionElements>
+            <bpmn:startEvent id="S"/>
+            <bpmn:endEvent id="E"/>
+            <bpmn:sequenceFlow id="f1" sourceRef="S" targetRef="E"/>
+          </bpmn:process>
+        </bpmn:definitions>"#;
+    let module = sutra_bpmn::BpmnModelLoader::new()
+        .load(bpmn.as_bytes())
+        .expect("BPMN loads");
+    let process = module.process("quiet").expect("present").clone();
+    let capture = process.audit.as_ref().expect("declares <q:audit>").capture;
+    assert_eq!(capture, AuditCapture::None);
+
+    let routed = Rc::new(RoutedSinks::default());
+    let executor = sutra_executor::TokenExecutor::builder(sutra_executor::TaskRegistry::new())
+        .with_listener(Rc::clone(&routed) as Rc<dyn sutra_executor::listener::ExecutionListener>)
+        .with_default_audit_sink(Some("sql".to_string()))
+        .build();
+    executor
+        .execute_sync(&process, sutra_executor::Variables::default())
+        .await
+        .expect("runs");
+    let routed = routed.0.borrow().clone();
+    assert!(!routed.is_empty(), "the pass still reports");
+    assert!(
+        routed.iter().all(|(_, sink)| sink.is_none()),
+        "execution audit routes nothing: {routed:?}"
+    );
+
+    let registry = journal(&pool, Some("sql"), Some("sql"), AuditCapture::Metadata);
+    assert_eq!(
+        registry.append(instance_scope(instance, capture, Some("sql")), refused()),
+        TransportAuditOutcome::Suppressed,
+        "the transport journal agrees"
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(rows(&pool).await.is_empty());
+}

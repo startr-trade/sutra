@@ -347,6 +347,7 @@ async fn run_inner(
         deployment_source: DeploymentSourceKind::Dir,
         deployments_dir: Some(args.deployments.clone()),
         http_port: 0,
+        http_max_body_bytes: 2 * 1024 * 1024,
         datasource_url: Some(url.to_owned()),
         datasource_username: args.datasource.username.clone(),
         datasource_password: args.datasource.password.clone(),

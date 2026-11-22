@@ -184,7 +184,7 @@ docker run -d --name outages-engine --network outages-net -p 127.0.0.1::8080 \
   -e BROKER_USER=demo -e BROKER_PASSWORD=demo-only \
   -e SUTRA_SINK_AMQP_USERNAME=demo -e SUTRA_SINK_AMQP_PASSWORD=demo-only \
   -e OUTAGES_API_KEY=demo-key \
-  ghcr.io/startr-trade/sutra:0.8.3
+  ghcr.io/startr-trade/sutra:0.8.4
 PORT=$(docker port outages-engine 8080 | head -1 | cut -d: -f2)
 until curl -sf "http://127.0.0.1:$PORT/sutra/health/ready"; do sleep 1; done
 ```

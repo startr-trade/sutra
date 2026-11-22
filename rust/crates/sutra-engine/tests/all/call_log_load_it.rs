@@ -145,6 +145,7 @@ fn config_for(deployments_dir: PathBuf, url: &str) -> EngineConfig {
         deployments_dir: Some(deployments_dir),
         deployments_poll_interval: std::time::Duration::from_secs(1),
         http_port: 0,
+        http_max_body_bytes: 2 * 1024 * 1024,
         datasource_url: Some(url.to_string()),
         datasource_username: Some("postgres".into()),
         datasource_password: Some("postgres".into()),

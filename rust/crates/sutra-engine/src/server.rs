@@ -257,6 +257,9 @@ pub async fn serve(config: EngineConfig) -> Result<RunningEngine, Box<dyn std::e
     // ---- capacity pools: engine configuration every deployment's `pool:` is checked against
     // (installed before the first archive is planned) ------------------------------------------
     crate::capacity::install_configured_pools(&config.capacity_pools);
+    // ---- the inbound HTTP request-body ceiling every HTTP channel without its own
+    // `max-body-bytes` serves with (`sutra.http.max-body-bytes`) --------------------------------
+    sutra_channels::install_http_max_body_bytes(config.http_max_body_bytes);
     if !config.capacity_pools.is_empty() {
         info!(
             pools = ?config

@@ -4986,13 +4986,15 @@ impl TokenExecutor {
 
     /// B1 — the single audit sink a process's events route to: its process-level `<q:audit sink>`
     /// (author control) → the engine default (`with_default_audit_sink`, which the manifest default
-    /// feeds). `None` = the process is not audited.
+    /// feeds). `None` = the process is not audited — including a process whose own `<q:audit>`
+    /// (or the manifest default it inherited) says `capture="none"`: that switches off every
+    /// `INSTANCE_*` and `NODE_*` event of the process, as the transport journal already does.
     fn effective_audit_sink(&self, process: &ProcessDefinition) -> Option<String> {
-        process
-            .audit
-            .as_ref()
-            .map(|a| a.sink.clone())
-            .or_else(|| self.default_audit_sink.clone())
+        match process.audit.as_ref() {
+            Some(audit) if audit.capture == sutra_bpmn::qbindings::AuditCapture::None => None,
+            Some(audit) => Some(audit.sink.clone()),
+            None => self.default_audit_sink.clone(),
+        }
     }
 
     /// The correlation keys an audit event carries (see [`crate::audit_correlation`]). Empty

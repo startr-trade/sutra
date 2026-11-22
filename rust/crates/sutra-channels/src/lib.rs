@@ -136,9 +136,11 @@ pub use external_task::{
 };
 #[cfg(feature = "transport")]
 pub use http::{
-    channel_router, channel_router_dynamic, http_routes_of, http_routes_of_resolved,
-    shard_index_of, spawn_engine, spawn_engine_sharded, ChannelRouteTable, EngineHandle,
-    EngineShard, HttpRouteSet,
+    channel_router, channel_router_dynamic, clamp_http_max_body_bytes, http_max_body_bytes,
+    http_routes_of, http_routes_of_resolved, install_http_max_body_bytes, shard_index_of,
+    spawn_engine, spawn_engine_sharded, ChannelRouteTable, EngineHandle, EngineShard, HttpRouteSet,
+    CHANNEL_MAX_BODY_BYTES_KEY, DEFAULT_HTTP_MAX_BODY_BYTES, MAX_HTTP_MAX_BODY_BYTES,
+    MIN_HTTP_MAX_BODY_BYTES,
 };
 #[cfg(feature = "transport")]
 pub use http_sink::{shared_client_tls_config, HttpSink};

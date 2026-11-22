@@ -39,4 +39,5 @@ zip = { workspace = true }
 # binaries force-link the same way; a test binary links only the lib, so it must do so itself).
 sutra-formats = { path = "../sutra-formats" }
 tempfile = "3"
+tokio = { version = "1", features = ["rt", "macros"] }
 

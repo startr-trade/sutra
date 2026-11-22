@@ -93,7 +93,7 @@ A process chooses how much each of its audit events carries, with `<q:audit capt
 
 | `capture` | Each event carries |
 |---|---|
-| `none` | no audit event at all |
+| `none` | no audit event at all: on the process (or as the manifest's `audit.capture`), none of its `INSTANCE_*`, `NODE_*` or transport events; on a node, none of that node's (*before 0.8.4 a process-level `none` still wrote the instance and node events at metadata level*) |
 | `metadata` | the event, node and diagnostic, with no variable content |
 | `payload` (the default) | the redacted variable snapshot |
 | `media` (0.6) | metadata, plus the media references found among the variables (`{kind: "media", uri, sha256, …}`), never the media itself |

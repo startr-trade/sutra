@@ -247,6 +247,7 @@ async fn three_emissions_from_one_instance_all_deliver() {
         deployments_dir: Some(synthesize_deployments_dir()),
         deployments_poll_interval: std::time::Duration::from_secs(2),
         http_port: 0,
+        http_max_body_bytes: 2 * 1024 * 1024,
         datasource_url: Some(datasource_url.clone()),
         datasource_username: None,
         datasource_password: None,

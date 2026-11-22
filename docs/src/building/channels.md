@@ -153,6 +153,11 @@ The channel never names a process; the process names the channel. That is what l
 by three transports at once, and why a second subscriber to the same `(channel, messageType)` is a
 deploy-time error unless the channel opts into broadcast.
 
+**Request-body limit (HTTP).** An inbound HTTP channel accepts request bodies up to
+`sutra.http.max-body-bytes` (2 MiB by default); `max-body-bytes: <bytes>` on the channel raises or
+lowers that for this channel alone (*since 0.8.4*). A larger body answers 413
+`SUTRA.INBOUND.BODY_TOO_LARGE`. See [Limits and quotas](../operating/limits.md#inbound-http-request-body).
+
 **Concurrency admission.** A channel may optionally declare `maxConcurrentInstances` — an
 admission cap on simultaneously active instances from that channel (a suspended instance still
 holds its slot). Absent, the channel is unbounded.

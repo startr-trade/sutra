@@ -17,7 +17,8 @@ pub struct ProcessAudit {
     /// The single sink name events route to (`"sql"` | `"jsonl"` | `"otel"`) — one source of truth.
     pub sink: String,
     /// Capture level for the whole process: `Metadata` (default) or `Payload` (redacted variable
-    /// snapshot on `NODE_ENTERED`). `None` is not a process-level value — it only suppresses per node.
+    /// snapshot on `NODE_ENTERED`). `None` switches the whole process's execution audit off (every
+    /// `INSTANCE_*` and `NODE_*` event); on a node it suppresses that node's events only.
     pub capture: AuditCapture,
 }
 

@@ -13,7 +13,7 @@
 //! properties), so the assertions are about what the far side sees, not about what the transport
 //! believes it sent.
 //!
-//! The restart test stops and starts its own queue manager, so it has a container of its own.
+//! The restart tests stop and start their own queue manager, so each has a container of its own.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -410,6 +410,7 @@ async fn start_source(
     config.gate_poll = Duration::from_millis(150);
     config.reconnect_min = Duration::from_millis(250);
     config.reconnect_max = Duration::from_secs(2);
+    config.operation_timeout = Duration::from_secs(10);
     let source = AmqpTriggerSource::new(config).expect("source");
     let intake = Arc::new(CollectingIntake::default());
     source
@@ -1182,6 +1183,216 @@ async fn the_source_and_sink_ride_out_a_queue_manager_restart_and_log_the_outage
             .any(|l| l.contains(codes::OUTBOUND_BROKER_OUTAGE_ENDED)),
         "the sink logged its window"
     );
+
+    source.stop().await.unwrap();
+    docker(&["rm", "-f", &name]);
+}
+
+/// A TCP relay in front of the queue manager's AMQP port that can cut the connections it carries
+/// and, while holding, accept new ones without ever answering them. That is how a restarting
+/// queue manager can look from the client side: the address takes the connection, then nothing
+/// comes back.
+struct HoldingRelay {
+    port: u16,
+    holding: Arc<std::sync::atomic::AtomicBool>,
+    cut: tokio::sync::watch::Sender<u64>,
+    accepted: Arc<std::sync::atomic::AtomicUsize>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl HoldingRelay {
+    async fn start(target: u16) -> HoldingRelay {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let holding = Arc::new(AtomicBool::new(false));
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let (cut, _) = tokio::sync::watch::channel(0u64);
+        let task = {
+            let holding = holding.clone();
+            let accepted = accepted.clone();
+            let cut = cut.clone();
+            tokio::spawn(async move {
+                let mut held = Vec::new();
+                while let Ok((mut client, _)) = listener.accept().await {
+                    accepted.fetch_add(1, Ordering::SeqCst);
+                    if holding.load(Ordering::SeqCst) {
+                        held.push(client); // accepted, never answered, never closed
+                        continue;
+                    }
+                    let mut cut_rx = cut.subscribe();
+                    tokio::spawn(async move {
+                        let Ok(mut upstream) =
+                            tokio::net::TcpStream::connect(("127.0.0.1", target)).await
+                        else {
+                            return; // the queue manager is down: the client sees the close
+                        };
+                        tokio::select! {
+                            _ = tokio::io::copy_bidirectional(&mut client, &mut upstream) => {}
+                            _ = cut_rx.changed() => {}
+                        }
+                    });
+                }
+            })
+        };
+        HoldingRelay {
+            port,
+            holding,
+            cut,
+            accepted,
+            task,
+        }
+    }
+
+    /// Drop every relayed connection and hold every new one.
+    fn cut_and_hold(&self) {
+        self.holding
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.cut.send_modify(|generation| *generation += 1);
+    }
+
+    /// Relay new connections again (the held ones stay held).
+    fn relay(&self) {
+        self.holding
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn accepted(&self) -> usize {
+        self.accepted.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl Drop for HoldingRelay {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// The queue manager restarts, and while it is away the consumer's reconnect lands on an address
+/// that takes the TCP connection and never answers the AMQP open. The consumer gives that attempt
+/// up at its operation timeout, keeps retrying, attaches once the queue manager is back, logs the
+/// outage end with its start, end and length, and receives again.
+#[ignore = "docker"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_source_reconnects_after_a_restart_whose_listener_does_not_answer() {
+    let log = captured_log();
+    ensure_image();
+    let token = unique_token("mqh");
+    let network = format!("sutra-mq-{token}");
+    docker_ok(&["network", "create", &network]);
+    sutra_testkit::reap_network_on_exit(network.clone());
+    let name = format!("sutra-mq-hold-{token}");
+    let pki = TestBrokerPki::generate(&["localhost", "127.0.0.1"]);
+    let keyrpwd = unique_token("kr");
+    let dir = fixture_dir(&pki, &keyrpwd);
+    let password = unique_token("pw");
+    let mqsc = template(&dir, "qm1.mqsc", &[("@KEYRPWD@", &keyrpwd)]);
+    let port = free_port();
+    let qm = QueueManager::start(
+        &name,
+        QM1,
+        &network,
+        &dir,
+        &mqsc,
+        &password,
+        &[(port, 5672)],
+    );
+    qm.start_amqp_channels(&["SUTRA.AMQP"]);
+    let relay = HoldingRelay::start(port).await;
+
+    let channel = format!("hold-in-{token}");
+    let (source, intake) = start_source(
+        &channel,
+        source_properties(relay.port, &password, "APP.P2P"),
+    )
+    .await;
+    let sink = sink(&password);
+    let to = format!("amqp10://127.0.0.1:{port}/APP.P2P?{MQ_QUEUE}&durable=true");
+    let before = unique_token("before-");
+    expect_delivered(sink.send(&message(to.clone(), &before, b"before")).await);
+    wait_for(
+        "the message sent before the outage",
+        Duration::from_secs(30),
+        || intake.keys().contains(&before),
+    )
+    .await;
+
+    // The restart: the consumer's connection drops, its reconnects are taken and never answered.
+    let cut_at = time::OffsetDateTime::now_utc();
+    relay.cut_and_hold();
+    let held_from = relay.accepted();
+    docker_ok(&["stop", "-t", "60", &name]);
+    docker_ok(&["start", &name]);
+    qm.wait_started();
+    assert!(
+        relay.accepted() > held_from,
+        "the consumer reconnected into the held address while the queue manager was away"
+    );
+    // The queue manager is back and reachable again.
+    let back_at = Instant::now();
+    relay.relay();
+    let after = unique_token("after-");
+    let mut attempts = 0u32;
+    loop {
+        attempts += 1;
+        match sink.send(&message(to.clone(), &after, b"after")).await {
+            SendOutcome::Delivered => break,
+            SendOutcome::PermanentFailure(d) => panic!("permanent failure: {d:?}"),
+            SendOutcome::RetryableFailure(_) => {
+                assert!(attempts < 120, "the queue manager accepts sends again");
+                tokio::time::sleep(Duration::from_millis(500)).await
+            }
+        }
+    }
+    let ended_line = || {
+        let text = String::from_utf8_lossy(&log.0.lock().unwrap()).into_owned();
+        text.lines()
+            .filter(|l| l.contains(&channel))
+            .find(|l| l.contains(codes::INBOUND_BROKER_OUTAGE_ENDED))
+            .map(str::to_string)
+    };
+    wait_for(
+        "the outage end, within 60 s of the queue manager being back",
+        Duration::from_secs(60),
+        || ended_line().is_some(),
+    )
+    .await;
+    record(
+        "held-listener restart: seconds from back to OUTAGE_ENDED",
+        &format!("{:?}", back_at.elapsed()),
+    );
+    wait_for(
+        "the message sent after the restart",
+        Duration::from_secs(30),
+        || intake.keys().contains(&after),
+    )
+    .await;
+
+    let text = String::from_utf8_lossy(&log.0.lock().unwrap()).into_owned();
+    let lines: Vec<&str> = text.lines().filter(|l| l.contains(&channel)).collect();
+    record("held-listener restart log lines", &lines.join("\n"));
+    let started = lines
+        .iter()
+        .find(|l| l.contains(codes::INBOUND_BROKER_OUTAGE_STARTED))
+        .expect("the source logged the outage start");
+    assert!(started.contains("outage_started="), "{started}");
+    assert!(
+        lines.iter().any(|l| l.contains("got no answer")),
+        "the held attempt failed at the operation timeout: {lines:#?}"
+    );
+    let ended = ended_line().unwrap();
+    let outage_started = time::OffsetDateTime::parse(
+        &field(&ended, "outage_started"),
+        &time::format_description::well_known::Rfc3339,
+    )
+    .unwrap();
+    assert!(
+        outage_started >= cut_at - time::Duration::seconds(1),
+        "the outage starts at the cut: {outage_started} vs {cut_at}"
+    );
+    assert!(field(&ended, "outage_ended").len() > 10, "{ended}");
+    let ms: u64 = field(&ended, "outage_ms").parse().unwrap();
+    assert!(ms > 0, "{ended}");
 
     source.stop().await.unwrap();
     docker(&["rm", "-f", &name]);

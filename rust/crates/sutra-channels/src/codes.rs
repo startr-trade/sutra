@@ -77,6 +77,14 @@ pub const INBOUND_REJECTED_TENANT_CHANNEL_NOT_ALLOWED: &str =
 /// attribute, malformed envelope, bad `time`, bad `data_base64`) → 400.
 pub const INBOUND_REJECTED_CLOUDEVENT: &str = "SUTRA.INBOUND.REJECTED.CLOUDEVENT";
 pub const INBOUND_PAYLOAD_TOO_LARGE: &str = "SUTRA.INBOUND.PAYLOAD_TOO_LARGE";
+/// An inbound HTTP request body exceeded the transport's body ceiling
+/// (`sutra.http.max-body-bytes`, or the channel's `max-body-bytes` override) → 413. Raised
+/// while the body is read, before any decode; distinct from [`INBOUND_PAYLOAD_TOO_LARGE`],
+/// which is the codec-side payload cap every transport shares.
+pub const INBOUND_BODY_TOO_LARGE: &str = "SUTRA.INBOUND.BODY_TOO_LARGE";
+/// An inbound HTTP request body broke off before it was fully read (the caller went away,
+/// or the stream failed) → 400.
+pub const INBOUND_BODY_UNREADABLE: &str = "SUTRA.INBOUND.BODY_UNREADABLE";
 /// A channel's feature-gate expression resolved to false — the dispatcher rejects the
 /// inbound before any executor work (the `SUTRA.INBOUND.FEATURE_DISABLED` code).
 pub const INBOUND_FEATURE_DISABLED: &str = "SUTRA.INBOUND.FEATURE_DISABLED";

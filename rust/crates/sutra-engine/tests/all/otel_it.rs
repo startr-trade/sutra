@@ -302,6 +302,7 @@ async fn one_sync_post_exports_traces_metrics_and_logs_over_otlp() {
         deployments_dir: Some(synthesize_deployments_dir()),
         deployments_poll_interval: std::time::Duration::from_secs(2),
         http_port: 0,
+        http_max_body_bytes: 2 * 1024 * 1024,
         datasource_url: None,
         datasource_username: None,
         datasource_password: None,

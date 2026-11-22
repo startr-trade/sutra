@@ -38,6 +38,10 @@
 //! - **Outage window**: the first failed connect, or a lost connection, logs
 //!   `SUTRA.INBOUND.AMQP.OUTAGE_STARTED` with its time; the next attach logs
 //!   `SUTRA.INBOUND.AMQP.OUTAGE_ENDED` with the start, the end and the length in milliseconds.
+//!   Every step of an attach (connect and open, session begin, receiver attach) and the
+//!   teardown of a lost session are bounded by the operation timeout (30 s), so a broker that
+//!   takes the connection and never answers — as a restarting queue manager can — costs one
+//!   attempt, not the supervisor.
 //! - **Address type**: `address-type: queue | topic` sends the matching source capability, which
 //!   brokers that read an address without one as a topic need for a queue.
 //!
@@ -103,6 +107,12 @@ pub struct AmqpSourceConfig {
     pub reconnect_min: Duration,
     /// Reconnect backoff ceiling.
     pub reconnect_max: Duration,
+    /// The bound on each broker round trip of an attach (connect with SASL and open, session
+    /// begin, receiver attach) and on the whole teardown. A broker that accepts the TCP
+    /// connection and then never answers — a queue manager going down or coming up, a proxy
+    /// in front of a dead backend — fails the attempt at this bound instead of holding the
+    /// supervisor forever, so the reconnect loop keeps going and the outage end is logged.
+    pub operation_timeout: Duration,
     /// Per-message inbound auth (`inbound-auth.*`), resolved once at wiring. `None` =
     /// no inbound-auth declared. A rejected credential drops the delivery (AMQP 1.0
     /// settle-accepted — no redelivery, no dead-letter).
@@ -110,7 +120,8 @@ pub struct AmqpSourceConfig {
 }
 
 impl AmqpSourceConfig {
-    /// Production defaults: 1s gate poll, 1s→30s reconnect backoff.
+    /// Production defaults: 1s gate poll, 1s→30s reconnect backoff, and the transport's 30 s
+    /// operation bound on every attach and teardown step.
     pub fn new(
         tenant: &str,
         module_key: &str,
@@ -125,6 +136,7 @@ impl AmqpSourceConfig {
             gate_poll: Duration::from_secs(1),
             reconnect_min: Duration::from_secs(1),
             reconnect_max: Duration::from_secs(30),
+            operation_timeout: super::sink::DEFAULT_OPERATION_TIMEOUT,
             inbound_auth: None,
         }
     }
@@ -191,7 +203,9 @@ impl StopToken {
 enum SessionEnd {
     Stopped,
     LeadershipLost,
-    ConnectionLost,
+    /// The link or connection failed; the outage window starts at the failure, not after the
+    /// drain and teardown that follow it.
+    ConnectionLost(OutageWindow),
 }
 
 /// A DEFERRED disposition (`ack-mode: on-complete`) queued by a settle callback for the
@@ -237,11 +251,16 @@ struct BrokerSession {
 
 impl BrokerSession {
     /// Best-effort teardown: detach the receiver (in-flight settle already ran), end the
-    /// session, close the connection.
-    async fn teardown(mut self) {
-        let _ = self.receiver.close().await;
-        let _ = self.session.end().await;
-        let _ = self.connection.close().await;
+    /// session, close the connection — all of it within `bound`. Each step waits for the
+    /// broker's answer, and a peer that is gone without closing the socket never sends one; past
+    /// the bound the handles are dropped, which closes the connection without waiting.
+    async fn teardown(mut self, bound: Duration) -> bool {
+        let steps = async {
+            let _ = self.receiver.close().await;
+            let _ = self.session.end().await;
+            let _ = self.connection.close().await;
+        };
+        tokio::time::timeout(bound, steps).await.is_ok()
     }
 }
 
@@ -381,7 +400,13 @@ async fn supervise(
             }
             continue;
         }
-        match open_session(&config).await {
+        // Every step of the attach is bounded by the operation timeout, and a stop does not
+        // wait for an attempt in progress.
+        let opened = tokio::select! {
+            _ = stop.notify.notified() => return,
+            opened = open_session(&config) => opened,
+        };
+        match opened {
             Err(diagnostic) => {
                 if outage.is_none() {
                     let window = OutageWindow::begin();
@@ -436,15 +461,21 @@ async fn supervise(
                     let _ = tx.send(());
                 }
                 let end = run_session(&config, &intake, &gate, &stop, &mut broker).await;
-                broker.teardown().await;
+                if !broker.teardown(config.operation_timeout).await {
+                    debug!(
+                        channel = %config.channel,
+                        "amqp broker did not answer the detach within {:?}; the connection is \
+                         dropped",
+                        config.operation_timeout
+                    );
+                }
                 match end {
                     SessionEnd::Stopped => return,
                     SessionEnd::LeadershipLost => info!(
                         channel = %config.channel,
                         "amqp consumer detached — leadership lost"
                     ),
-                    SessionEnd::ConnectionLost => {
-                        let window = OutageWindow::begin();
+                    SessionEnd::ConnectionLost(window) => {
                         warn!(
                             channel = %config.channel,
                             code = codes::INBOUND_BROKER_OUTAGE_STARTED,
@@ -489,7 +520,8 @@ fn inbound_connectivity_event(
 }
 
 /// Open the connection, begin a session, attach a receiver on the queue/topic. A broker
-/// that is down fails here (NON-FATAL — the supervisor retries).
+/// that is down, or that does not answer a step within the operation timeout, fails here
+/// (NON-FATAL — the supervisor retries).
 async fn open_session(config: &AmqpSourceConfig) -> Result<BrokerSession, Diagnostic> {
     let props = &config.properties;
     let address = props.source_address().ok_or_else(|| {
@@ -502,28 +534,31 @@ async fn open_session(config: &AmqpSourceConfig) -> Result<BrokerSession, Diagno
         )
     })?;
     let container = unique_container_id(&format!("sutra-amqp-source-{}", config.channel));
-    let opened = if props.tls {
-        match props.tls_settings.client_config() {
-            Ok(tls_config) => {
-                let target = AmqpBrokerTarget {
-                    host: &props.host,
-                    port: props.port,
-                    username: props
-                        .username
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|user| !user.is_empty()),
-                    password: props.password.as_deref().map(str::trim),
-                };
-                open_tls_connection(&container, &target, std::sync::Arc::new(tls_config)).await
+    let connect = async {
+        if props.tls {
+            match props.tls_settings.client_config() {
+                Ok(tls_config) => {
+                    let target = AmqpBrokerTarget {
+                        host: &props.host,
+                        port: props.port,
+                        username: props
+                            .username
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|user| !user.is_empty()),
+                        password: props.password.as_deref().map(str::trim),
+                    };
+                    open_tls_connection(&container, &target, std::sync::Arc::new(tls_config)).await
+                }
+                Err(detail) => Err(AmqpConnectFailure::Tls(detail)),
             }
-            Err(detail) => Err(AmqpConnectFailure::Tls(detail)),
+        } else {
+            Connection::open(container.clone(), props.connection_uri().as_str())
+                .await
+                .map_err(classify_open_error)
         }
-    } else {
-        Connection::open(container.clone(), props.connection_uri().as_str())
-            .await
-            .map_err(classify_open_error)
     };
+    let opened = bounded_step(config, "opened the connection", connect).await?;
     let mut connection = opened.map_err(|failure| {
         let (code, detail) = match failure {
             AmqpConnectFailure::Tls(detail) => (codes::INBOUND_BROKER_TLS_FAILED, detail),
@@ -538,7 +573,8 @@ async fn open_session(config: &AmqpSourceConfig) -> Result<BrokerSession, Diagno
             ),
         )
     })?;
-    let mut session = Session::begin(&mut connection).await.map_err(|e| {
+    let begun = bounded_step(config, "began a session", Session::begin(&mut connection)).await?;
+    let mut session = begun.map_err(|e| {
         Diagnostic::error(
             codes::INBOUND_CONNECTION_FAILED,
             format!(
@@ -556,12 +592,13 @@ async fn open_session(config: &AmqpSourceConfig) -> Result<BrokerSession, Diagno
             None => builder.build(),
         }
     };
-    let receiver = Receiver::builder()
+    let attach = Receiver::builder()
         .name(format!("{container}-recv"))
         .source(source)
         .credit_mode(CreditMode::Auto(link_credit(props)))
-        .attach(&mut session)
-        .await
+        .attach(&mut session);
+    let receiver = bounded_step(config, "attached the receiver", attach)
+        .await?
         .map_err(|e| {
             Diagnostic::error(
                 codes::INBOUND_CONNECTION_FAILED,
@@ -576,6 +613,30 @@ async fn open_session(config: &AmqpSourceConfig) -> Result<BrokerSession, Diagno
         session,
         receiver,
     })
+}
+
+/// Run one broker round trip of an attach under the configured operation timeout. A broker that
+/// accepts the connection and never answers fails the attempt here, so the supervisor retries
+/// instead of waiting forever. `step` names what the broker did not answer, for the WARN.
+async fn bounded_step<T>(
+    config: &AmqpSourceConfig,
+    step: &str,
+    fut: impl std::future::Future<Output = T>,
+) -> Result<T, Diagnostic> {
+    tokio::time::timeout(config.operation_timeout, fut)
+        .await
+        .map_err(|_| {
+            Diagnostic::error(
+                codes::INBOUND_CONNECTION_FAILED,
+                format!(
+                    "amqp channel '{}' got no answer from {}:{} within {} ms while it {step}",
+                    config.channel,
+                    config.properties.host,
+                    config.properties.port,
+                    config.operation_timeout.as_millis()
+                ),
+            )
+        })
 }
 
 /// How long a session end waits for the intake calls still in flight — the operation timeout
@@ -659,7 +720,7 @@ async fn run_session(
             }
             Turn::RecvFailed(e) => {
                 warn!(channel = %config.channel, error = %e, "amqp recv failed");
-                break SessionEnd::ConnectionLost;
+                break SessionEnd::ConnectionLost(OutageWindow::begin());
             }
             Turn::Delivery(delivery) => *delivery,
         };
@@ -885,7 +946,7 @@ async fn settle(
             error = %e,
             "amqp disposition failed — reconnecting (broker will redeliver un-settled work)"
         );
-        return Err(SessionEnd::ConnectionLost);
+        return Err(SessionEnd::ConnectionLost(OutageWindow::begin()));
     }
     debug!(
         channel = %config.channel,
@@ -1317,13 +1378,6 @@ mod tests {
         cfg.gate_poll = Duration::from_millis(20);
         let source = AmqpTriggerSource::new(cfg).expect("source");
 
-        struct NoIntake;
-        impl InboundIntake for NoIntake {
-            fn deliver(&self, _m: InboundMessage) -> BoxFuture<'_, AckDecision> {
-                Box::pin(async { AckDecision::Ack })
-            }
-        }
-
         source.stop().await.expect("stop before start");
         source
             .start(
@@ -1335,5 +1389,138 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(60)).await;
         source.stop().await.expect("stop");
         source.stop().await.expect("second stop is a no-op");
+    }
+
+    /// A listener that takes every TCP connection and never says anything: the AMQP open waits
+    /// for a header that never comes. Counts the connections it took.
+    async fn silent_listener() -> (
+        u16,
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = accepted.clone();
+        let task = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                counter.fetch_add(1, Ordering::SeqCst);
+                held.push(socket);
+            }
+        });
+        (port, accepted, task)
+    }
+
+    fn silent_config(port: u16, operation_timeout: Duration) -> AmqpSourceConfig {
+        let mut props = base_properties();
+        props.host = "127.0.0.1".to_string();
+        props.port = port;
+        props.password = Some("hunter2".to_string());
+        props.username = Some("svc".to_string());
+        let mut cfg = AmqpSourceConfig::new("acme", "acme/m/1.0.0", "silent-in", props);
+        cfg.reconnect_min = Duration::from_millis(10);
+        cfg.reconnect_max = Duration::from_millis(20);
+        cfg.gate_poll = Duration::from_millis(20);
+        cfg.operation_timeout = operation_timeout;
+        cfg
+    }
+
+    struct NoIntake;
+    impl InboundIntake for NoIntake {
+        fn deliver(&self, _m: InboundMessage) -> BoxFuture<'_, AckDecision> {
+            Box::pin(async { AckDecision::Ack })
+        }
+    }
+
+    fn spawn_supervisor(cfg: AmqpSourceConfig) -> (Arc<StopToken>, tokio::task::JoinHandle<()>) {
+        let stop = Arc::new(StopToken::new());
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(supervise(
+            cfg,
+            Arc::new(NoIntake),
+            Arc::new(sutra_channels::source::AlwaysLeading),
+            Arc::clone(&stop),
+            Arc::new(tokio::sync::Mutex::new(Some(tx))),
+        ));
+        (stop, task)
+    }
+
+    async fn wait_until(what: &str, check: impl Fn() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !check() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {what}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// An attach against a broker that takes the connection and never answers fails at the
+    /// operation timeout with a coded, credential-free diagnostic, instead of waiting forever.
+    #[tokio::test]
+    async fn an_attach_to_a_broker_that_never_answers_fails_at_the_operation_timeout() {
+        let (port, _accepted, listener) = silent_listener().await;
+        let cfg = silent_config(port, Duration::from_millis(300));
+        let outcome = tokio::time::timeout(Duration::from_secs(5), open_session(&cfg)).await;
+        listener.abort();
+        match outcome {
+            Err(_) => panic!("the attach waited on a broker that never answers"),
+            Ok(Ok(_)) => panic!("a silent broker cannot attach"),
+            Ok(Err(d)) => {
+                assert_eq!(d.code, codes::INBOUND_CONNECTION_FAILED, "{}", d.message);
+                assert!(d.message.contains("got no answer"), "{}", d.message);
+                assert!(d.message.contains("opened the connection"), "{}", d.message);
+                assert!(d.message.contains("300 ms"), "{}", d.message);
+                assert!(!d.message.contains("hunter2"), "{}", d.message);
+            }
+        }
+    }
+
+    /// The supervisor gives a silent attempt up and tries again, so a broker that comes back
+    /// after a silent spell is attached to (and the outage end logged).
+    #[tokio::test]
+    async fn the_supervisor_keeps_retrying_a_broker_that_never_answers() {
+        let (port, accepted, listener) = silent_listener().await;
+        let (stop, task) = spawn_supervisor(silent_config(port, Duration::from_millis(100)));
+        wait_until("three attach attempts", || {
+            accepted.load(Ordering::SeqCst) >= 3
+        })
+        .await;
+        stop.request();
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("the supervisor stops")
+            .unwrap();
+        listener.abort();
+    }
+
+    /// A stop does not wait for an attach attempt in progress to reach its bound.
+    #[tokio::test]
+    async fn a_stop_does_not_wait_for_an_attach_in_progress() {
+        let (port, accepted, listener) = silent_listener().await;
+        let (stop, task) = spawn_supervisor(silent_config(port, Duration::from_secs(60)));
+        wait_until("the attach attempt", || {
+            accepted.load(Ordering::SeqCst) >= 1
+        })
+        .await;
+        // The attempt is waiting on the silent broker now.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        stop.request();
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("the stop ends the supervisor without waiting out the attach bound")
+            .unwrap();
+        listener.abort();
+    }
+
+    /// The production default bounds an attach step by the transport's operation timeout.
+    #[test]
+    fn the_attach_bound_defaults_to_the_operation_timeout() {
+        assert_eq!(
+            config().operation_timeout,
+            crate::amqp::sink::DEFAULT_OPERATION_TIMEOUT
+        );
     }
 }

@@ -294,6 +294,7 @@ async fn boot(deployments_dir: PathBuf, datasource_url: String, clock: TestClock
         deployments_dir: Some(deployments_dir),
         deployments_poll_interval: std::time::Duration::from_millis(200),
         http_port: 0,
+        http_max_body_bytes: 2 * 1024 * 1024,
         datasource_url: Some(datasource_url),
         datasource_username: None,
         datasource_password: None,

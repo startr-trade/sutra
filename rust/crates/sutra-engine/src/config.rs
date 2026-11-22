@@ -38,6 +38,7 @@
 //! | `sutra.external-task.retries`     | `SUTRA_EXTERNAL_TASK_RETRIES`     |
 //! | `sutra.external-task.retry-timeout` | `SUTRA_EXTERNAL_TASK_RETRY_TIMEOUT` |
 //! | `sutra.codec.max-payload-bytes`   | `SUTRA_CODEC_MAX_PAYLOAD_BYTES`   |
+//! | `sutra.http.max-body-bytes`       | `SUTRA_HTTP_MAX_BODY_BYTES`       |
 //! | `sutra.audit.jsonl.path`          | `SUTRA_AUDIT_JSONL`               |
 //! | `sutra.audit.otel.endpoint`       | `SUTRA_AUDIT_OTEL_ENDPOINT`       |
 //! | `sutra.audit.otel.service-name`   | `SUTRA_AUDIT_OTEL_SERVICE_NAME`   |
@@ -147,6 +148,10 @@ pub struct EngineConfig {
     /// HTTP listen port (`sutra.http.port`); `0` binds a dynamic port. Default `8080`
     /// (container-internal — tests always pass `0`).
     pub http_port: u16,
+    /// The inbound HTTP request-body ceiling every HTTP channel serves with unless it sets its
+    /// own `max-body-bytes` (`sutra.http.max-body-bytes`). Default 2 MiB; clamped to
+    /// 1 KiB..=1 GiB with a WARN. A larger body answers 413 `SUTRA.INBOUND.BODY_TOO_LARGE`.
+    pub http_max_body_bytes: usize,
     /// The ENGINE-INTERNAL datasource (the engine tables: instance/outbox/lease/audit). Never a
     /// module's business store — those own their connections in `datastores.yaml`.
     pub datasource_url: Option<String>,
@@ -267,6 +272,7 @@ impl Default for EngineConfig {
             deployments_dir: None,
             deployments_poll_interval: std::time::Duration::from_secs(2),
             http_port: 8080,
+            http_max_body_bytes: sutra_channels::DEFAULT_HTTP_MAX_BODY_BYTES,
             datasource_url: None,
             crypto_master_key: None,
             crypto_envelope: CryptoEnvelopeConfig::default(),
@@ -651,6 +657,12 @@ impl EngineConfig {
                 .parse::<u16>()
                 .map_err(|_| ConfigError(format!("sutra.http.port: '{p}' is not a valid port")))?,
         };
+
+        let http_max_body_bytes =
+            match value("sutra.http.max-body-bytes", "SUTRA_HTTP_MAX_BODY_BYTES")? {
+                None => sutra_channels::DEFAULT_HTTP_MAX_BODY_BYTES,
+                Some(raw) => parse_http_max_body_bytes(&raw)?,
+            };
 
         let outbox_tick_interval =
             match value("sutra.outbox.tick-interval", "SUTRA_OUTBOX_TICK_INTERVAL")? {
@@ -1063,6 +1075,7 @@ impl EngineConfig {
             deployments_dir: deployments_dir.map(PathBuf::from),
             deployments_poll_interval,
             http_port,
+            http_max_body_bytes,
             datasource_url: value("sutra.datasource.url", "SUTRA_DATASOURCE_URL")?,
             datasource_username: value("sutra.datasource.username", "SUTRA_DATASOURCE_USERNAME")?,
             datasource_password: value("sutra.datasource.password", "SUTRA_DATASOURCE_PASSWORD")?,
@@ -1355,6 +1368,27 @@ fn parse_object_stores(
 /// treated as 24 h — these are engine cadences and retention windows, not calendar arithmetic, so
 /// there is no zone or DST to honour. Weeks/months/years are deliberately NOT accepted: a month is
 /// not a duration.
+/// Parse `sutra.http.max-body-bytes`: a plain byte count, clamped into
+/// `1 KiB..=1 GiB` with a WARN when it falls outside.
+fn parse_http_max_body_bytes(raw: &str) -> Result<usize, ConfigError> {
+    let requested = raw.trim().parse::<u64>().map_err(|_| {
+        ConfigError(format!(
+            "sutra.http.max-body-bytes: '{raw}' is not a byte count"
+        ))
+    })?;
+    let (bytes, clamped) = sutra_channels::clamp_http_max_body_bytes(requested);
+    if clamped {
+        tracing::warn!(
+            requested,
+            used = bytes,
+            "sutra.http.max-body-bytes is outside {}..={} bytes; clamped",
+            sutra_channels::MIN_HTTP_MAX_BODY_BYTES,
+            sutra_channels::MAX_HTTP_MAX_BODY_BYTES
+        );
+    }
+    Ok(bytes)
+}
+
 fn parse_duration(raw: &str) -> Result<std::time::Duration, String> {
     let value = raw.trim();
     if value.is_empty() {
@@ -1554,6 +1588,30 @@ fn clamp_outbox_bound(key: &str, value: usize, low: usize, high: usize) -> usize
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn http_max_body_bytes_defaults_parses_and_clamps() {
+        let mut file = BTreeMap::new();
+        file.insert("sutra.deployments.dir".to_string(), "/d".to_string());
+        let c = EngineConfig::from_sources(&file, &|_| None).unwrap();
+        assert_eq!(c.http_max_body_bytes, 2 * 1024 * 1024, "default is 2 MiB");
+
+        let env = |v: &'static str| {
+            move |name: &str| (name == "SUTRA_HTTP_MAX_BODY_BYTES").then(|| v.to_string())
+        };
+        let c = EngineConfig::from_sources(&file, &env("41943040")).unwrap();
+        assert_eq!(c.http_max_body_bytes, 41_943_040, "env sets 40 MiB");
+
+        file.insert("sutra.http.max-body-bytes".to_string(), "10".to_string());
+        let c = EngineConfig::from_sources(&file, &|_| None).unwrap();
+        assert_eq!(c.http_max_body_bytes, 1024, "below 1 KiB clamps up");
+
+        let c = EngineConfig::from_sources(&file, &env("2147483648")).unwrap();
+        assert_eq!(c.http_max_body_bytes, 1 << 30, "above 1 GiB clamps down");
+
+        let err = EngineConfig::from_sources(&file, &env("40MB")).unwrap_err();
+        assert!(err.0.contains("sutra.http.max-body-bytes"), "{}", err.0);
+    }
 
     #[test]
     fn precedence_canonical_env_over_file() {

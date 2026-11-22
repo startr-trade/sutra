@@ -865,3 +865,95 @@ async fn resume_rejects_a_blank_wait_node() {
         "the blank-node check runs before on_instance_resumed"
     );
 }
+
+/// Every audit-relevant callback of a pass, with the sink it was routed to.
+struct SinkRecorder {
+    events: RefCell<Vec<(String, Option<String>)>>,
+}
+
+impl SinkRecorder {
+    fn push(&self, what: &str, sink: &Option<String>) {
+        self.events
+            .borrow_mut()
+            .push((what.to_string(), sink.clone()));
+    }
+}
+
+impl ExecutionListener for SinkRecorder {
+    fn on_instance_started(&self, e: &InstanceEvent) {
+        self.push("INSTANCE_STARTED", &e.audit_sink);
+    }
+    fn on_instance_completed(&self, e: &InstanceEvent) {
+        self.push("INSTANCE_COMPLETED", &e.audit_sink);
+    }
+    fn on_token_entered(&self, e: &TokenEvent) {
+        self.push(&format!("NODE_ENTERED {}", e.node_id), &e.audit_sink);
+    }
+    fn on_token_left(&self, e: &TokenEvent) {
+        self.push(&format!("NODE_LEFT {}", e.node_id), &e.audit_sink);
+    }
+}
+
+/// `S → T → E` with `audit` in the process's extension elements, run on an executor whose engine
+/// default sink is `sql`; returns every recorded event with its sink.
+async fn run_with_process_audit(audit: &str) -> Vec<(String, Option<String>)> {
+    let bpmn = format!(
+        r#"<?xml version="1.0"?>
+        <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                          xmlns:q="urn:sutra:q:1.0">
+          <bpmn:process id="p1">
+            <bpmn:extensionElements>{audit}</bpmn:extensionElements>
+            <bpmn:startEvent id="S"/>
+            <bpmn:serviceTask id="T" implementation="${{noop}}"/>
+            <bpmn:endEvent id="E"/>
+            <bpmn:sequenceFlow id="f1" sourceRef="S" targetRef="T"/>
+            <bpmn:sequenceFlow id="f2" sourceRef="T" targetRef="E"/>
+          </bpmn:process>
+        </bpmn:definitions>"#
+    );
+    let process = proc(&bpmn, "p1");
+    let registry = TaskRegistry::new().register("noop", |_, _| ok_map(&[]));
+    let recorder = Rc::new(SinkRecorder {
+        events: RefCell::new(Vec::new()),
+    });
+    let executor = TokenExecutor::builder(registry)
+        .with_listener(Rc::clone(&recorder) as Rc<dyn ExecutionListener>)
+        .with_default_audit_sink(Some("sql".to_string()))
+        .build();
+    executor.execute_sync(&process, vars(&[])).await.unwrap();
+    let events = recorder.events.borrow().clone();
+    events
+}
+
+/// A process-level `<q:audit capture="none"/>` switches off every `INSTANCE_*` and `NODE_*`
+/// event of that process, even with an engine default sink configured; any other capture keeps
+/// them routed.
+#[tokio::test]
+async fn process_capture_none_suppresses_every_event() {
+    let silenced = run_with_process_audit(r#"<q:audit sink="sql" capture="none"/>"#).await;
+    assert!(
+        silenced.iter().any(|(e, _)| e == "INSTANCE_STARTED")
+            && silenced.iter().any(|(e, _)| e.starts_with("NODE_ENTERED")),
+        "the pass still runs and reports: {silenced:?}"
+    );
+    assert!(
+        silenced.iter().all(|(_, sink)| sink.is_none()),
+        "capture none routes nothing: {silenced:?}"
+    );
+
+    let audited = run_with_process_audit(r#"<q:audit sink="jsonl" capture="metadata"/>"#).await;
+    assert!(
+        audited
+            .iter()
+            .all(|(_, sink)| sink.as_deref() == Some("jsonl")),
+        "{audited:?}"
+    );
+
+    let defaulted = run_with_process_audit("").await;
+    assert!(
+        defaulted
+            .iter()
+            .all(|(_, sink)| sink.as_deref() == Some("sql")),
+        "no <q:audit> takes the engine default: {defaulted:?}"
+    );
+}

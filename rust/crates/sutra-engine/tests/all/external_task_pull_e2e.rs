@@ -282,6 +282,7 @@ async fn a_parked_task_is_fetched_completed_and_resumes_through_the_inbound_path
         deployments_dir: Some(synthesize_deployments_dir()),
         deployments_poll_interval: std::time::Duration::from_secs(2),
         http_port: 0,
+        http_max_body_bytes: 2 * 1024 * 1024,
         datasource_url: Some(datasource_url.clone()),
         datasource_username: None,
         datasource_password: None,

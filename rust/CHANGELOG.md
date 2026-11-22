@@ -11,6 +11,44 @@ This is the changelog for the **Rust-native** engine (`rust/` workspace). It beg
 
 ## [Unreleased]
 
+## [0.8.4] — 2026-11-22
+
+**2026-11-22.** A patch release. **An AMQP 1.0 channel recovers after a broker restart** even when
+its reconnect lands on an address that never answers, **the inbound HTTP request-body limit is
+configurable**, **process-level audit `capture="none"` is honoured** for node and instance
+events, and **`url` 2.5.9** fixes RUSTSEC-2026-0592. One configuration key, one HTTP
+channel property and two diagnostic codes are added; no `q:`, migration, archive or snapshot
+change.
+
+### Fixed
+
+- **Process-level audit capture none now suppresses node and instance events.** A process's
+  `<q:audit capture="none"/>`, or a manifest-level `audit.capture: none` it inherits, switched off
+  only its transport audit events; its `INSTANCE_*` and `NODE_*` events were still written at
+  metadata level, to the process's sink or the engine default. They are now suppressed too, as
+  `xsd/q.xsd` documents (`none: no audit event`). A process that relied on the old behaviour sets
+  `capture="metadata"`.
+- **AMQP 1.0 inbound attach and teardown are bounded.** The inbound supervisor awaited the
+  connection open, session begin and receiver attach with no timeout, so a reconnect that landed
+  on a listener which never answered held it forever: after a queue-manager restart
+  `OUTAGE_STARTED` was logged and `OUTAGE_ENDED` never came. Each step now runs under the
+  transport's operation timeout (30 s); a timeout is a coded `CONNECTION_FAILED` and the
+  supervisor retries with backoff. Teardown is bounded too, a stop no longer waits for an attach in
+  progress, and an outage window starts at the failure.
+
+### Added
+
+- **`sutra.http.max-body-bytes`** (`SUTRA_HTTP_MAX_BODY_BYTES`, default `2097152`, clamped to
+  1 KiB..1 GiB with a WARN) and the HTTP channel property **`max-body-bytes`** set the inbound
+  request-body limit, which was fixed at axum's 2 MiB. A body over it answers 413
+  `SUTRA.INBOUND.BODY_TOO_LARGE` in the problem shape (it was a plain-text 413); a body that
+  breaks off mid-read answers 400 `SUTRA.INBOUND.BODY_UNREADABLE`. The codec payload cap
+  (`sutra.codec.max-payload-bytes`, 10 MiB) still applies after it.
+
+### Security
+
+- `url` 2.5.8 → 2.5.9 (`form_urlencoded` 1.2.3) for RUSTSEC-2026-0592.
+
 ## [0.8.3] — 2026-11-22
 
 **2026-11-22.** A patch release for throughput under load. **Outbound delivery no longer queues

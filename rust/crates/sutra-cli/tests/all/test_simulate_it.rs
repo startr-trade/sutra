@@ -234,6 +234,7 @@ fn seed_one_parked_instance(deployments_dir: &Path, url: &str, marker: &str) {
             deployments_dir: Some(deployments_dir.to_path_buf()),
             deployments_poll_interval: std::time::Duration::from_millis(200),
             http_port: 0,
+            http_max_body_bytes: 2 * 1024 * 1024,
             datasource_url: Some(url.to_owned()),
             rls_bypass_check_enabled: false,
             ..EngineConfig::default()
@@ -454,6 +455,7 @@ fn seed_day_instances(deployments_dir: &Path, url: &str) {
             deployment_source: DeploymentSourceKind::Dir,
             deployments_dir: Some(deployments_dir.to_path_buf()),
             http_port: 0,
+            http_max_body_bytes: 2 * 1024 * 1024,
             datasource_url: Some(url.to_owned()),
             rls_bypass_check_enabled: false,
             ..EngineConfig::default()

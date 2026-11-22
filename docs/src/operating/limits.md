@@ -53,6 +53,37 @@ redelivers until the Trigger's `delivery` retries are spent. The same oversized 
 arrives again until the pusher gives up. Configure a dead-letter topic on the Dapr subscription, or a
 `deadLetterSink` on the Trigger, so that it ends somewhere visible.
 
+## Inbound HTTP request body
+
+*(0.8.4)* An HTTP channel reads the request body under a limit of its own, before the payload cap
+above applies:
+
+| Config | Default | Range |
+|---|---|---|
+| `sutra.http.max-body-bytes` (`SUTRA_HTTP_MAX_BODY_BYTES`) | 2 MiB (`2097152`) | 1 KiB..1 GiB; a value outside is clamped, with a WARN |
+
+An inbound HTTP channel overrides it with `max-body-bytes`, clamped the same way. A value that is
+not a byte count refuses the channel with `SUTRA.CONFIG.PROPERTY.INVALID`.
+
+```yaml
+channels:
+  - name: bulk-upload
+    transport: http
+    bind: "POST /channels/bulk-upload"
+    max-body-bytes: 41943040     # 40 MiB for this channel
+    payload-cap-bytes: 41943040  # the payload cap (10 MiB by default) applies too
+```
+
+The body is read after the route and the caller's credentials are checked. A body over the limit
+answers **413** with the problem document `SUTRA.INBOUND.BODY_TOO_LARGE` (its `limitBytes`
+attribute names the limit): at once when `Content-Length` declares the size, otherwise as soon as
+the streamed bytes cross it. A body that breaks off mid-read answers 400
+`SUTRA.INBOUND.BODY_UNREADABLE`. Before 0.8.4 the limit was a fixed 2 MiB, answered with a
+plain-text 413.
+
+A body under this limit still meets the payload cap, so a channel raised past 10 MiB needs both
+raised. A proxy or ingress in front of the engine has its own limit; keep it at least as large.
+
 ## Per-tenant quotas
 
 Two more admission checks, enforced before a message reaches the executor — see
@@ -69,7 +100,7 @@ dimensions.
 
 The threat-model backlog names a few more ceilings that aren't wired yet — a FEEL evaluation
 wall-clock/memory budget per expression, and a per-tenant audit-write rate cap. Until they land,
-the payload cap and the two tenant quotas above are the complete set of per-message and
+the HTTP body limit, the payload cap and the two tenant quotas above are the complete set of per-message and
 per-tenant limits. Limits on a shared physical resource (lines, seats, connections) are
 [capacity pools](capacity-pools.md).
 

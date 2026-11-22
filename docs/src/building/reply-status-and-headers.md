@@ -192,7 +192,7 @@ docker run -d --name replies-engine --network replies-net -p 127.0.0.1::8080 \
   -e SUTRA_DATASOURCE_URL=postgres://replies-db:5432/postgres \
   -e SUTRA_DATASOURCE_USERNAME=sutra_engine -e SUTRA_DATASOURCE_PASSWORD=dev-only \
   -e REPLIES_API_KEY=demo-key \
-  ghcr.io/startr-trade/sutra:0.8.3
+  ghcr.io/startr-trade/sutra:0.8.4
 PORT=$(docker port replies-engine 8080 | head -1 | cut -d: -f2)
 until curl -sf "http://127.0.0.1:$PORT/sutra/health/ready"; do sleep 1; done
 ```
