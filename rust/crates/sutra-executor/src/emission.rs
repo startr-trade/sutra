@@ -52,6 +52,12 @@ pub struct Emission {
     /// broker application-properties (the traceparent / `sutra-outbox-key` seam). Empty for
     /// emissions with no `<q:header>` (channel-call requests, header-less sends/replies).
     pub headers: BTreeMap<String, String>,
+    /// The consumer idempotency key, minted when the emission is built so the flow's `sent` view
+    /// can name it. Empty means "mint one at the outbox commit" (an emission built elsewhere).
+    pub outbox_key: String,
+    /// The governing codec already validated and sealed `body` at the emitting node (the
+    /// executor's [`crate::OutboundSealSeam`]), so the commit must not seal it again.
+    pub sealed: bool,
 }
 
 impl Emission {

@@ -44,8 +44,8 @@ pub use emission::{CollectingSink, Emission, EmissionKind, EmissionSink};
 pub use error::ExecError;
 pub use executor::{
     channel_call_failure_is_caught, ExecResult, MessageDecodeFailure, MessageDecodeFailureKind,
-    MessageDecodeOutcome, MessageDecodeSeam, StatefulExecResult, TimerWait, TokenExecutor,
-    CALL_FAILURE_VARIABLE,
+    MessageDecodeOutcome, MessageDecodeSeam, OutboundSealRequest, OutboundSealSeam,
+    StatefulExecResult, TimerWait, TokenExecutor, CALL_FAILURE_VARIABLE,
 };
 pub use listener::{TimerEvent, TimerFire};
 pub use registry::{

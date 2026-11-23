@@ -313,6 +313,60 @@ there. It catches a template that renders the wrong message while declaring the 
 template the codec cannot classify unrendered is reported unverifiable rather than wrong; a
 *stated* codec that does not resolve is an error, because stating it is how you ask for the check.
 
+### `sent` — what the hop put on the wire (0.8.5)
+
+Every outbound emission binds the instance variable `sent`, for the steps after the emitting node:
+a `<q:send>` (send task, message throw event, or a task carrying one), a `<q:reply>` with a
+destination, and a channel-call request. Sealing runs at the emitting node, so `sent` holds the
+exact bytes the outbox row carries — envelope, header and signature included — not the value the
+flow handed over.
+
+| Field | Value |
+|---|---|
+| `body` | the body as text |
+| `bodyBase64` | the same bytes as base64, only when they are not valid UTF-8 |
+| `contentType` | the declared content type, or `null` |
+| `destination` | the resolved destination URI |
+| `outboxKey` | the idempotency key the outbox row and the wire carry |
+| `mode` | `native`, `cloudevent-binary`, `cloudevent-structured` or `match-inbound` |
+| `node`, `kind` | the emitting node, and `send`, `reply` or `call` |
+| `headers` | the `<q:header>` values |
+
+Recording it is an ordinary, visible step. Here a data task right after the send writes the view
+to a data store, keyed by its outbox key:
+
+```xml
+<bpmn:dataObject id="doSent" name="sent"/>
+<bpmn:dataStoreReference id="refHop" dataStoreRef="hops">
+  <bpmn:extensionElements><q:store key="sent.outboxKey"/></bpmn:extensionElements>
+</bpmn:dataStoreReference>
+<bpmn:sendTask id="SendRequest">
+  <bpmn:extensionElements><q:send channel="peer-out"/></bpmn:extensionElements>
+</bpmn:sendTask>
+<bpmn:serviceTask id="RecordSent" name="Record what was sent">
+  <bpmn:dataOutputAssociation>
+    <bpmn:sourceRef>doSent</bpmn:sourceRef>
+    <bpmn:targetRef>refHop</bpmn:targetRef>
+  </bpmn:dataOutputAssociation>
+</bpmn:serviceTask>
+<bpmn:sequenceFlow id="toRecord" sourceRef="SendRequest" targetRef="RecordSent"/>
+```
+
+Each emission overwrites `sent`, so read it in the step directly after the send — on parallel
+branches especially. In the CloudEvent modes `sent.body` is the body before the envelope: `binary`
+adds the attributes as headers at delivery, and `structured` wraps the body in a JSON envelope
+whose `time` is the delivery instant. A synchronous `<q:reply>` (no destination) is rendered after
+the flow has finished, so no step can read it. A send whose contract check or seal fails binds
+nothing; the step then fails with `SUTRA.OUTBOUND.VALIDATION_REJECT` or
+`SUTRA.OUTBOUND.SEAL_FAILED` as described in the section above.
+
+Masking follows the audit capture's rules. If the process declares any `sensitive` variable, or
+the instance holds any redaction companion (`<v>.redacted`), the engine also stores
+`sent.redacted`, with the body and every header value replaced by `[REDACTED]`. Audit snapshots
+and the inspect API show that copy, and `sent` is encrypted at rest like any other
+redaction-controlled variable. The flow itself still reads the real bytes. `sent` is a reserved
+name: a flow variable of that name is overwritten by the next emission.
+
 ## `q:alias` — correlation by your business key
 
 ```xml

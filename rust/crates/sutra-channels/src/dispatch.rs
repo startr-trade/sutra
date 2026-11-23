@@ -1830,6 +1830,11 @@ impl ChannelEngine {
         process: &ProcessDefinition,
         emission: &mut sutra_executor::Emission,
     ) -> Result<(), Diagnostic> {
+        // Already held to its contract and sealed at the emitting node (the executor's
+        // `OutboundSealSeam`): sealing again would transform the bytes twice.
+        if emission.sealed {
+            return Ok(());
+        }
         let bindings = process.bindings_for(&emission.node_id);
         let (declared, channel, fallback) = match emission.kind {
             // A reply names no channel — it answers over the one the request arrived on.
@@ -7323,7 +7328,12 @@ fn to_outbox_emissions(
             content_type: emission.content_type,
             required: emission.required,
             mode: emission.mode,
-            outbox_key: new_uuid(),
+            // Minted at the emitting node, where the flow's `sent` view already names it.
+            outbox_key: if emission.outbox_key.is_empty() {
+                new_uuid()
+            } else {
+                emission.outbox_key
+            },
             cloud_event_json: emission.cloud_event.as_ref().map(cloud_event_to_json),
             auth_ref_json: emission.auth_ref.as_ref().map(auth_ref_to_json),
             labels: labels.clone(),

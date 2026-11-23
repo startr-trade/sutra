@@ -16,6 +16,7 @@ sutra-templates = { path = "../sutra-templates" }
 # channels, and persistence); re-exported here as `sutra_executor::Sensitive` for compatibility.
 sutra-crypto = { path = "../sutra-crypto" }
 serde_json = { workspace = true }
+base64 = { workspace = true }
 bigdecimal = { workspace = true }
 getrandom = { workspace = true }
 sha2 = { workspace = true }

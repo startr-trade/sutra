@@ -204,6 +204,8 @@ pub struct TokenExecutor {
     deployment_config: Option<Box<DeploymentConfigResolver>>,
     /// The codec seam `<q:decode>` runs through. `None` fails a decode step closed.
     message_decode_seam: Option<Rc<dyn MessageDecodeSeam>>,
+    /// The codec seam an outbound emission is sealed through. `None` leaves sealing to the commit.
+    outbound_seal_seam: Option<Rc<dyn OutboundSealSeam>>,
     emissions: Option<Rc<dyn EmissionSink>>,
     auth_resolvers: Option<Box<AuthRefResolverRegistry>>,
     template_engines: TemplateEngineRegistry,
@@ -270,6 +272,45 @@ pub trait MessageDecodeSeam {
     ) -> Result<MessageDecodeOutcome, MessageDecodeFailure>;
 }
 
+/// What [`OutboundSealSeam::seal_outbound`] is asked to hold to its contract and seal: one
+/// outbound body, the codec the author stated on the `<q:send>` / `<q:reply>` (`None` when it
+/// stated none) and the one inferred from the outbound channel it goes out on (empty for a reply
+/// or a bare destination).
+#[derive(Debug, Clone, Copy)]
+pub struct OutboundSealRequest<'a> {
+    /// Names the channel (or, lacking one, the destination) in a diagnostic.
+    pub label: &'a str,
+    pub declared_codec: Option<&'a str>,
+    pub channel_codec: &'a str,
+    pub body: &'a [u8],
+    pub content_type: Option<&'a str>,
+    /// Names the emitting node and process in a diagnostic.
+    pub site: &'a str,
+}
+
+/// The codec side of an outbound emission: validate the body against the governing codec's
+/// contract and let the codec seal it, at the emitting node, so the flow can see the exact bytes
+/// that will go out (`sent`). The executor has no codec dependency, so the channel layer
+/// implements this over its registries.
+///
+/// `Ok(None)` sends the body as it is (no contract, or the codec does not transform it);
+/// `Ok(Some(bytes))` sends `bytes`. An `Err` leaves the emission unsealed: the commit then holds it
+/// to the contract again and fails the step with its usual code, so a refusal behaves exactly as
+/// it did before this seam existed.
+pub trait OutboundSealSeam {
+    fn seal_outbound(
+        &self,
+        deployment: &DeploymentId,
+        request: OutboundSealRequest<'_>,
+    ) -> Result<Option<Vec<u8>>, String>;
+}
+
+/// The variable every outbound emission binds: a read-only view of what was sent.
+pub const SENT_VARIABLE: &str = "sent";
+
+/// The mask `sent.redacted` carries in place of what the message held.
+const SENT_REDACTED_MARKER: &str = "[REDACTED]";
+
 impl TokenExecutor {
     /// The declared outbound channels a channel-call resolves against — read by the dispatcher
     /// to tell a synchronous call ([`crate::ResolvedOutboundChannel::sync`]) from an async one.
@@ -307,6 +348,7 @@ impl TokenExecutor {
                 decisions: Arc::new(DecisionRegistry::new()),
                 outbound_channels: Arc::new(crate::registry::OutboundChannelRegistry::new()),
                 message_decode_seam: None,
+                outbound_seal_seam: None,
                 uuid_supplier: Box::new(new_uuid),
                 now_supplier: Box::new(now_utc),
             },
@@ -2170,7 +2212,10 @@ impl TokenExecutor {
             cloud_event,
             auth_ref: resolved.auth_ref.clone(),
             headers: BTreeMap::new(),
+            outbox_key: new_uuid(),
+            sealed: false,
         };
+        let emission = self.seal_and_record(emission, None, "", id, "call", state);
         if let Some(sink) = self.emissions.as_ref() {
             sink.emit(emission);
         }
@@ -4524,6 +4569,7 @@ impl TokenExecutor {
             &rb,
             &destination,
             auth_ref,
+            "",
             node_id,
             state,
         )?;
@@ -4562,6 +4608,7 @@ impl TokenExecutor {
             &adapter,
             &destination,
             auth_ref,
+            "",
             node_id,
             state,
         )?;
@@ -4604,18 +4651,21 @@ impl TokenExecutor {
             &adapter,
             &resolved.destination,
             resolved.auth_ref.clone(),
+            &resolved.codec,
             node_id,
             state,
         )?;
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn enqueue_outbound(
         &self,
         kind: EmissionKind,
         rb: &ReplyBinding,
         destination: &str,
         auth_ref: Option<AuthRef>,
+        channel_codec: &str,
         node_id: &str,
         state: &mut ExecutionState<'_>,
     ) -> Result<(), Signal> {
@@ -4638,7 +4688,21 @@ impl TokenExecutor {
             cloud_event,
             auth_ref,
             headers,
+            outbox_key: new_uuid(),
+            sealed: false,
         };
+        let kind_label = match kind {
+            EmissionKind::Reply => "reply",
+            EmissionKind::Send => "send",
+        };
+        let emission = self.seal_and_record(
+            emission,
+            rb.codec.as_deref(),
+            channel_codec,
+            node_id,
+            kind_label,
+            state,
+        );
         if let Some(sink) = self.emissions.as_ref() {
             sink.emit(emission);
         }
@@ -4652,6 +4716,71 @@ impl TokenExecutor {
         };
         self.notify(|l| l.on_reply_emitted(&reply_event));
         Ok(())
+    }
+
+    /// Seal `emission` through the [`OutboundSealSeam`] (when one is wired) and bind the `sent`
+    /// view of what it will put on the wire. A seal the seam refuses leaves the emission
+    /// unsealed and binds nothing: the commit re-checks it and fails the step with its usual
+    /// code, exactly as before the seam existed.
+    fn seal_and_record(
+        &self,
+        mut emission: Emission,
+        declared_codec: Option<&str>,
+        channel_codec: &str,
+        node_id: &str,
+        kind_label: &str,
+        state: &mut ExecutionState<'_>,
+    ) -> Emission {
+        if let Some(seam) = &self.outbound_seal_seam {
+            let site = format!("Node '{node_id}' of process '{}'", state.process.id);
+            let request = OutboundSealRequest {
+                // Only a refusal's diagnostic reads it, and a refusal is reported by the commit.
+                label: &emission.destination,
+                declared_codec,
+                channel_codec,
+                body: &emission.body,
+                content_type: emission.content_type.as_deref(),
+                site: &site,
+            };
+            match seam.seal_outbound(&state.deployment, request) {
+                Ok(sealed) => {
+                    if let Some(bytes) = sealed {
+                        emission.body = bytes.into();
+                    }
+                    emission.sealed = true;
+                }
+                Err(detail) => {
+                    tracing::debug!(
+                        node = node_id,
+                        "outbound seal refused at the node; the commit reports it: {detail}"
+                    );
+                    return emission;
+                }
+            }
+        }
+        self.bind_sent_view(&emission, kind_label, state);
+        emission
+    }
+
+    /// Bind [`SENT_VARIABLE`] — and its `.redacted` companion when the instance masks anything —
+    /// for `emission`.
+    fn bind_sent_view(&self, emission: &Emission, kind_label: &str, state: &ExecutionState<'_>) {
+        let view = sent_view(emission, kind_label);
+        let mut ctx = state.ctx.borrow_mut();
+        let companion = format!("{SENT_VARIABLE}{}", sutra_bpmn::REDACTION_COMPANION_SUFFIX);
+        // The audit capture's rule for variables, applied to what was sent: an instance that masks
+        // anything (a redactor-controlled `<v>.redacted`, or any `@sensitive` declaration) masks
+        // the body and headers of what it sent, since they are built from those same values.
+        let masks = state.process.declared_variables.iter().any(|d| d.sensitive)
+            || ctx.variables.iter().any(|(name, _)| {
+                name.ends_with(sutra_bpmn::REDACTION_COMPANION_SUFFIX) && name != companion.as_str()
+            });
+        if masks {
+            ctx.variables.insert(companion, masked_sent_view(&view));
+        } else {
+            ctx.variables.remove(&companion);
+        }
+        ctx.variables.insert(SENT_VARIABLE.to_string(), view);
     }
 
     /// Evaluate each author-declared `<q:header value="<FEEL>">` against the
@@ -5063,6 +5192,13 @@ impl Builder {
     /// `SUTRA.RUNTIME.DECODE.FAILED`.
     pub fn with_message_decode_seam(mut self, seam: Rc<dyn MessageDecodeSeam>) -> Builder {
         self.executor.message_decode_seam = Some(seam);
+        self
+    }
+
+    /// Wire the codec seam outbound emissions are sealed through, at the emitting node. Without
+    /// one the commit seals them, and `sent` shows the body before sealing.
+    pub fn with_outbound_seal_seam(mut self, seam: Rc<dyn OutboundSealSeam>) -> Builder {
+        self.executor.outbound_seal_seam = Some(seam);
         self
     }
 
@@ -5724,6 +5860,83 @@ fn channel_call_body(vars: &Variables) -> Vec<u8> {
 
 /// The reply body: prefer the flow's PRODUCED reply (`responseBody`/`responseObject`) over
 /// the INBOUND `payload.body`. A structured value is sent as JSON, like a channel-call body.
+/// The `sent` view of one emission (see [`SENT_VARIABLE`]).
+fn sent_view(emission: &Emission, kind_label: &str) -> FeelValue {
+    use base64::Engine as _;
+    let mut view = BTreeMap::new();
+    let text = |s: &str| FeelValue::String(s.to_string());
+    match std::str::from_utf8(&emission.body) {
+        Ok(body) => {
+            view.insert("body".to_string(), text(body));
+        }
+        Err(_) => {
+            view.insert(
+                "body".to_string(),
+                FeelValue::String(String::from_utf8_lossy(&emission.body).into_owned()),
+            );
+            view.insert(
+                "bodyBase64".to_string(),
+                FeelValue::String(
+                    base64::engine::general_purpose::STANDARD.encode(&*emission.body),
+                ),
+            );
+        }
+    }
+    view.insert(
+        "contentType".to_string(),
+        emission
+            .content_type
+            .as_deref()
+            .map(text)
+            .unwrap_or(FeelValue::Null),
+    );
+    view.insert("destination".to_string(), text(&emission.destination));
+    view.insert("outboxKey".to_string(), text(&emission.outbox_key));
+    view.insert(
+        "mode".to_string(),
+        text(match emission.mode {
+            ReplyMode::Native => "native",
+            ReplyMode::CloudeventBinary => "cloudevent-binary",
+            ReplyMode::CloudeventStructured => "cloudevent-structured",
+            ReplyMode::MatchInbound => "match-inbound",
+        }),
+    );
+    view.insert("node".to_string(), text(&emission.node_id));
+    view.insert("kind".to_string(), text(kind_label));
+    view.insert(
+        "headers".to_string(),
+        FeelValue::Map(
+            emission
+                .headers
+                .iter()
+                .map(|(name, value)| (name.clone(), text(value)))
+                .collect(),
+        ),
+    );
+    FeelValue::Map(view)
+}
+
+/// `sent.redacted`: the view with the body and every header value masked.
+fn masked_sent_view(view: &FeelValue) -> FeelValue {
+    let FeelValue::Map(fields) = view else {
+        return FeelValue::String(SENT_REDACTED_MARKER.to_string());
+    };
+    let mask = || FeelValue::String(SENT_REDACTED_MARKER.to_string());
+    let mut masked = fields.clone();
+    for field in ["body", "bodyBase64"] {
+        if masked.contains_key(field) {
+            masked.insert(field.to_string(), mask());
+        }
+    }
+    if let Some(FeelValue::Map(headers)) = fields.get("headers") {
+        masked.insert(
+            "headers".to_string(),
+            FeelValue::Map(headers.keys().map(|k| (k.clone(), mask())).collect()),
+        );
+    }
+    FeelValue::Map(masked)
+}
+
 fn extract_reply_body(state: &ExecutionState<'_>) -> Vec<u8> {
     let ctx = state.ctx.borrow();
     let vars = &ctx.variables;

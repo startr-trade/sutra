@@ -403,6 +403,9 @@ pub struct ResolvedOutboundChannel {
     /// through the outbox and a correlated reply. Data only — the executor emits and parks a
     /// sync call exactly like an async one.
     pub sync: bool,
+    /// The channel's codec (empty when it declares none): the contract a `<q:send channel>` that
+    /// states no codec of its own is held to, and sealed by, at the emitting node.
+    pub codec: String,
 }
 
 impl ResolvedOutboundChannel {
@@ -436,7 +439,14 @@ impl ResolvedOutboundChannel {
             mode,
             auth_ref,
             sync: false,
+            codec: String::new(),
         }
+    }
+
+    /// The channel's declared codec (see [`Self::codec`]).
+    pub fn with_codec(mut self, codec: impl Into<String>) -> ResolvedOutboundChannel {
+        self.codec = codec.into();
+        self
     }
 
     /// Mark the channel synchronous (see [`Self::sync`]).

@@ -17,7 +17,7 @@ use sutra_executor::telemetry;
 use sutra_executor::Variables;
 use sutra_executor::{
     DeploymentId, MessageDecodeFailure, MessageDecodeFailureKind, MessageDecodeOutcome,
-    MessageDecodeSeam,
+    MessageDecodeSeam, OutboundSealRequest, OutboundSealSeam,
 };
 use sutra_feel::FeelValue;
 
@@ -798,6 +798,29 @@ impl InboundChain {
                 .with_attribute("nodeId", node_id)
                 .with_attribute("redactor", reference)
             })
+    }
+}
+
+impl OutboundSealSeam for InboundChain {
+    /// Hold an outbound body to its governing codec's contract and seal it at the emitting node —
+    /// the same [`InboundChain::seal_outbound`] the commit runs, so the bytes the flow's `sent`
+    /// view shows are the bytes the outbox row carries.
+    fn seal_outbound(
+        &self,
+        deployment: &DeploymentId,
+        request: OutboundSealRequest<'_>,
+    ) -> Result<Option<Vec<u8>>, String> {
+        InboundChain::seal_outbound(
+            self,
+            deployment,
+            request.label,
+            request.declared_codec,
+            request.channel_codec,
+            request.body,
+            request.content_type,
+            request.site,
+        )
+        .map_err(|d| d.code)
     }
 }
 

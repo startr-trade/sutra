@@ -11,6 +11,48 @@ This is the changelog for the **Rust-native** engine (`rust/` workspace). It beg
 
 ## [Unreleased]
 
+## [0.8.5] — 2026-11-23
+
+**2026-11-23.** A patch release. **A flow can record the exact message each outbound hop sent.**
+No `q:`, migration, archive or snapshot change.
+
+**Before you upgrade:** a `<q:send channel>` with no `codec` of its own, on a step a timer or a
+failed channel call resumed, is now validated and sealed against the channel's codec. 0.8.4 sent
+it unchecked and unsealed. A flow that relied on that gap now fails that step with
+`SUTRA.OUTBOUND.VALIDATION_REJECT`.
+
+### Fixed
+
+- **A `<q:send channel>` on a step resumed by a timer or a failed channel call is now held to the
+  channel's codec.** On a step a timer fire resumed (a timer catch, a timer boundary, a
+  `<q:retry>` re-drive, the tail after `<q:reply continue="true">`) or a channel-call failure
+  resumed (its timeout or a poisoned delivery), the commit looked the channel up under an empty
+  module key. It found nothing, so a send that did not state its own `codec` was neither validated
+  nor sealed, and the message went out unsealed (unsigned, say). A send that stated `codec` was
+  unaffected. Sealing now runs at the emitting node against the channel the executor resolved, so
+  these sends are validated and sealed like every other one.
+
+### Added
+
+- **`sent`, the view of what an outbound hop put on the wire.** After a `<q:send>` (send task,
+  message throw event, or a task carrying one), a `<q:reply>` with a destination, or a
+  channel-call request, the instance variable `sent` holds `body` (the sealed bytes as text; plus
+  `bodyBase64` when they are not UTF-8), `contentType`, `destination`, `outboxKey`, `mode`, `node`,
+  `kind` and the declared `headers`. A later BPMN step records it, for example a data task that
+  writes it to a data store. In the CloudEvent modes it is the pre-envelope body. An instance that
+  masks anything (any `sensitive` declaration or `<v>.redacted` companion) also gets
+  `sent.redacted`, which audit and inspect show instead. `sent` is a reserved name.
+- **`OutboundSealSeam`** (`sutra-executor`), with `TokenExecutor::builder().with_outbound_seal_seam`
+  and `ResolvedOutboundChannel::with_codec`. `Emission` gains `outbox_key` and `sealed`.
+
+### Changed
+
+- **Outbound sealing runs at the emitting node** instead of at the step commit, through the new
+  seam, so `sent` holds the bytes the outbox row carries. A refusal fails the step with
+  `SUTRA.OUTBOUND.VALIDATION_REJECT` / `SUTRA.OUTBOUND.SEAL_FAILED` and nothing is sent, as before.
+  The one difference is the fix above: sends on timer- and channel-call-failure-resumed steps
+  are now checked too. The outbox key is minted when the message is emitted.
+
 ## [0.8.4] — 2026-11-22
 
 **2026-11-22.** A patch release. **An AMQP 1.0 channel recovers after a broker restart** even when

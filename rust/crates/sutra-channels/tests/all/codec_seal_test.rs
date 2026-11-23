@@ -267,3 +267,104 @@ fn a_seal_error_sends_nothing() {
     assert_eq!(code, sutra_channels::codes::OUTBOUND_SEAL_FAILED);
     assert!(outbox.is_empty(), "nothing reached the outbox");
 }
+
+// ---- sealed at the emitting node (the executor's `OutboundSealSeam`) -------------------------
+
+/// S → Render → Send (codec stated) → Record (copies `sent` out) → E.
+const BPMN_RECORDED: &str = r#"<?xml version="1.0"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0">
+  <bpmn:process id="p">
+    <bpmn:startEvent id="S">
+      <bpmn:extensionElements><q:source channel="in" name="req"/></bpmn:extensionElements>
+    </bpmn:startEvent>
+    <bpmn:serviceTask id="Send" implementation="render">
+      <bpmn:extensionElements>
+        <q:send destination="notify://ops/out" codec="seal-codec"/>
+      </bpmn:extensionElements>
+    </bpmn:serviceTask>
+    <bpmn:serviceTask id="Record" implementation="record"/>
+    <bpmn:endEvent id="E"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="S" targetRef="Send"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="Send" targetRef="Record"/>
+    <bpmn:sequenceFlow id="f3" sourceRef="Record" targetRef="E"/>
+  </bpmn:process>
+</bpmn:definitions>"#;
+
+type Recorded = Rc<std::cell::RefCell<Option<FeelValue>>>;
+
+fn engine_sealing_at_the_node(outbox: Rc<CollectingOutbox>, recorded: Recorded) -> ChannelEngine {
+    let module = BpmnModelLoader::new()
+        .load(BPMN_RECORDED.as_bytes())
+        .expect("BPMN");
+    let tasks = TaskRegistry::new()
+        .register("render", |input, _ctx| {
+            let FeelValue::Map(m) = input else {
+                panic!("expected the task input map")
+            };
+            Ok(FeelValue::Map(BTreeMap::from([(
+                "responseBody".to_string(),
+                m.get("req").cloned().expect("the inbound text"),
+            )])))
+        })
+        .register("record", move |_, ctx| {
+            *recorded.borrow_mut() = ctx.variable("sent").cloned();
+            Ok(FeelValue::Map(BTreeMap::new()))
+        });
+    let sink = Rc::new(DrainingSink::new());
+    let executor = TokenExecutor::builder(tasks)
+        .with_feel()
+        .with_emission_sink(Rc::clone(&sink) as Rc<dyn sutra_executor::EmissionSink>)
+        .with_outbound_seal_seam(Rc::new(chain()) as Rc<dyn sutra_executor::OutboundSealSeam>)
+        .build();
+    ChannelEngine::builder(executor, sink, chain())
+        .with_binding(ChannelBinding::new(
+            "in",
+            namespace(),
+            deployment(),
+            "raw-text",
+        ))
+        .with_module(&deployment(), &module)
+        .with_outbox(outbox)
+        .build()
+}
+
+#[test]
+fn sealed_at_the_node_the_flow_sees_the_bytes_the_outbox_holds_sealed_once() {
+    let outbox = Rc::new(CollectingOutbox::new());
+    let recorded: Recorded = Rc::default();
+    let engine = engine_sealing_at_the_node(Rc::clone(&outbox), Rc::clone(&recorded));
+    drive(engine.dispatch(&inbound(GOOD))).expect("dispatch");
+    let sent = outbox.emissions();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(
+        sent[0].body_utf8(),
+        format!("{GOOD}{MARK}"),
+        "sealed once, not again at the commit"
+    );
+    let Some(FeelValue::Map(view)) = recorded.borrow().clone() else {
+        panic!("the step after the send saw no sent view");
+    };
+    assert_eq!(
+        view.get("body"),
+        Some(&FeelValue::String(format!("{GOOD}{MARK}")))
+    );
+    assert_eq!(
+        view.get("outboxKey"),
+        Some(&FeelValue::String(sent[0].outbox_key.clone()))
+    );
+}
+
+#[test]
+fn sealed_at_the_node_a_seal_error_still_sends_nothing() {
+    let outbox = Rc::new(CollectingOutbox::new());
+    let engine = engine_sealing_at_the_node(Rc::clone(&outbox), Rc::default());
+    let result = drive(engine.dispatch(&inbound(UNSEALABLE)));
+    let code = match result {
+        Err(d) => d.code,
+        Ok(DispatchOutcome::DeadLettered { cause_code, .. }) => cause_code,
+        Ok(other) => panic!("expected a refusal, got {other:?}"),
+    };
+    assert_eq!(code, sutra_channels::codes::OUTBOUND_SEAL_FAILED);
+    assert!(outbox.is_empty(), "nothing reached the outbox");
+}

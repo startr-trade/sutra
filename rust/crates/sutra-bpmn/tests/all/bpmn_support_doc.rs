@@ -318,7 +318,8 @@ fn row(kind: NodeKind) -> Row {
             xml: "`<sendTask>`",
             variant: "SendTask",
             wait: Wait::No,
-            notes: "Emit-and-continue; its `<q:send>` is required (enforced at load).",
+            notes: "Emit-and-continue; its `<q:send>` is required (enforced at load). Binds \
+                    `sent`, the view of what it put on the wire, for the steps after it.",
         },
         BusinessRuleTask => Row {
             xml: "`<businessRuleTask>`",
@@ -556,7 +557,14 @@ fn render() -> String {
          redacted variable snapshot) or `media` (metadata-level events, every request the process\n\
          sends is marked `sutra-audit-capture: media` so a media transport records the session it\n\
          opens, and each event carries the media references found among the variables — `kind:\n\
-         \"media\"` with a `uri` and a `sha256` — never the media).\n",
+         \"media\"` with a `uri` and a `sha256` — never the media).\n\n\
+         Every outbound emission — a `<q:send>`, a `<q:reply>` with a destination, a \
+         channel-call request — binds the variable `sent` for the steps after it: the body as the\n\
+         governing codec validated and sealed it (`body`, plus `bodyBase64` when it is not UTF-8),\n\
+         `contentType`, `destination`, `outboxKey`, `mode`, `node`, `kind` and the declared\n\
+         `headers`. It is the pre-envelope body in the CloudEvent modes. An instance that masks\n\
+         anything also gets `sent.redacted`, which audit and inspect show instead. A synchronous\n\
+         `<q:reply>` is rendered after the flow ends and binds nothing.\n",
     );
     s
 }

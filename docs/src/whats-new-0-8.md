@@ -9,6 +9,7 @@ with it.
 
 | Feature | What it gives you | Try it |
 |---|---|---|
+| **A flow can record exactly what it sent** (0.8.5) | Every outbound hop binds `sent`: the body as the codec sealed it, its content type, destination and outbox key, for the next BPMN step to store. | [`sent`](building/q-namespace.md#sent--what-the-hop-put-on-the-wire-085) |
 | **AMQP 1.0 channels recover after a broker restart** (0.8.4) | Every step of the inbound attach and teardown runs under the transport's operation timeout (30 s), so a reconnect that lands on a listener that never answers is retried, and `OUTAGE_ENDED` arrives. | [IBM MQ](operating/ibm-mq.md) |
 | **Process-level audit `capture="none"` is honoured** (0.8.4) | `<q:audit capture="none"/>` on a process, or `audit.capture: none` in the manifest, now suppresses that process's node and instance audit events too, as the transport journal already did. | [Logging and audit](operating/logging.md#what-an-audit-event-captures) |
 | **A configurable inbound HTTP body limit** (0.8.4) | `sutra.http.max-body-bytes` (default 2 MiB) and a channel's `max-body-bytes` set the request-body limit; a larger body answers 413 `SUTRA.INBOUND.BODY_TOO_LARGE`. | [Limits and quotas](operating/limits.md#inbound-http-request-body) |

@@ -35,6 +35,8 @@ mod message_decode_test;
 mod render_model_test;
 #[path = "all/retry_policy_test.rs"]
 mod retry_policy_test;
+#[path = "all/sent_view_test.rs"]
+mod sent_view_test;
 #[path = "all/task_kinds_test.rs"]
 mod task_kinds_test;
 #[path = "all/time_skipping_retry_test.rs"]

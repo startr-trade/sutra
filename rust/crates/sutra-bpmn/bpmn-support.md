@@ -37,7 +37,7 @@ parks iff its inner/wrapped flow does.
 | `<scriptTask>` + `<script>` | `ScriptTask` | no | `<bpmn:script>` names a file in the module's `scripts/` folder (SRL). |
 | `<manualTask>` / `<task>` | `ManualTask` | no | A pure no-op pass-through — a modelling marker, not a wait state. BPMN's UNTYPED `<task>` loads here too: with no type there is no behaviour to run, which is what this already is. `sutra lint` warns on `<task>`, since an author who meant a concrete task type wants telling. |
 | `<receiveTask>` | `ReceiveTask` | **yes** | Parks until a correlated inbound arrives on one of its `<q:source>` channels — the same park as a message catch event, but as an ACTIVITY it can host boundary events. That is how BPMN says "wait for this message, or time out": attach an interrupting timer boundary. `@instantiate="true"` is rejected — an instantiating receive is a start event's job. |
-| `<sendTask>` | `SendTask` | no | Emit-and-continue; its `<q:send>` is required (enforced at load). |
+| `<sendTask>` | `SendTask` | no | Emit-and-continue; its `<q:send>` is required (enforced at load). Binds `sent`, the view of what it put on the wire, for the steps after it. |
 | `<businessRuleTask>` | `BusinessRuleTask` | no | Evaluates a DMN decision file and merges the result into the variables. |
 | `<userTask>` | `UserTask` | **yes** | Parks until an external relay resumes the instance on one of its channels. |
 | `<callActivity>` | `CallActivity` | no | Invokes another process by `@calledElement` (optionally cross-module via a namespace). Data associations on the call itself are rejected — pass data through the called process's declared variables. |
@@ -115,3 +115,10 @@ redacted variable snapshot) or `media` (metadata-level events, every request the
 sends is marked `sutra-audit-capture: media` so a media transport records the session it
 opens, and each event carries the media references found among the variables — `kind:
 "media"` with a `uri` and a `sha256` — never the media).
+
+Every outbound emission — a `<q:send>`, a `<q:reply>` with a destination, a channel-call request — binds the variable `sent` for the steps after it: the body as the
+governing codec validated and sealed it (`body`, plus `bodyBase64` when it is not UTF-8),
+`contentType`, `destination`, `outboxKey`, `mode`, `node`, `kind` and the declared
+`headers`. It is the pre-envelope body in the CloudEvent modes. An instance that masks
+anything also gets `sent.redacted`, which audit and inspect show instead. A synchronous
+`<q:reply>` is rendered after the flow ends and binds nothing.

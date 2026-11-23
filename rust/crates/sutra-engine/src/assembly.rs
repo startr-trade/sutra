@@ -1442,6 +1442,7 @@ pub(crate) fn plan_deployment(
                 def.properties.get("header").map(|s| s.as_str()),
                 def.cloud_events_mode.as_deref().unwrap_or("none"),
             )
+            .with_codec(def.binding.codec.trim())
             .with_sync(sync),
         );
     }
@@ -2305,6 +2306,15 @@ pub(crate) fn build_engine(
         .chain(draining.iter())
         .map(|plan| (plan.dep.value().to_string(), Arc::clone(&plan.config)))
         .collect();
+    let codec_chain = Rc::new(
+        InboundChain::new(
+            Arc::clone(&shared.codecs),
+            Arc::clone(&shared.formats),
+            Arc::clone(&shared.validators),
+        )
+        .with_redactors(decode_redactors)
+        .with_message_decode_cap(payload_cap_bytes),
+    );
     let mut builder = TokenExecutor::builder(TaskRegistry::new())
         .with_feel()
         .with_templates(
@@ -2330,15 +2340,12 @@ pub(crate) fn build_engine(
         })
         .with_deployment_config(move |deployment| config_map.get(deployment.value()).cloned())
         .with_outbound_channels(Arc::clone(&shared.outbound_channels))
-        .with_message_decode_seam(Rc::new(
-            InboundChain::new(
-                Arc::clone(&shared.codecs),
-                Arc::clone(&shared.formats),
-                Arc::clone(&shared.validators),
-            )
-            .with_redactors(decode_redactors)
-            .with_message_decode_cap(payload_cap_bytes),
-        ))
+        .with_message_decode_seam(
+            Rc::clone(&codec_chain) as Rc<dyn sutra_executor::MessageDecodeSeam>
+        )
+        // Outbound bodies are sealed at the emitting node through the same chain, so the flow's
+        // `sent` view holds the exact bytes the outbox row carries.
+        .with_outbound_seal_seam(codec_chain as Rc<dyn sutra_executor::OutboundSealSeam>)
         .with_emission_sink(Rc::clone(&sink) as Rc<dyn sutra_executor::EmissionSink>);
     // TEST-ONLY (P1-7 time-skipping test runtime): `now_override` is `None` on every production
     // boot, in which case the executor keeps its own default (`OffsetDateTime::now_utc`) —
