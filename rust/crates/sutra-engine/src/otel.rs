@@ -666,6 +666,99 @@ pub fn register_outbox_meters(read: impl Fn() -> (usize, usize) + Send + Sync + 
         .build();
 }
 
+/// The work counters of the outbox dispatcher (`sutra.outbox.claim.*`, `.handed-off`, `.sends`,
+/// `.delivered`) and of the timer poller (`sutra.timer.claim.*`, `.fired`) as observable
+/// counters, read from the same atomics [`crate::RunningEngine::work_counters`] reads. Registered
+/// ONCE per boot from `serve`, only when telemetry metrics are wired; a loop the engine did not
+/// start registers nothing.
+pub fn register_work_meters(
+    outbox: Option<std::sync::Arc<sutra_channels::OutboxWorkCounters>>,
+    timer: Option<std::sync::Arc<crate::timer::TimerWorkCounters>>,
+) {
+    let meter: Meter = global::meter("sutra-engine");
+    type Read<T> = fn(&T) -> u64;
+    if let Some(outbox) = outbox {
+        let counters: [(
+            &'static str,
+            &'static str,
+            Read<sutra_channels::OutboxWorkSnapshot>,
+        ); 6] = [
+            (
+                names::METRIC_OUTBOX_CLAIM_QUERIES,
+                "Outbox claim statements issued.",
+                |s| s.claim_queries,
+            ),
+            (
+                names::METRIC_OUTBOX_CLAIM_ROWS,
+                "Rows the outbox claims returned.",
+                |s| s.claim_rows,
+            ),
+            (
+                names::METRIC_OUTBOX_CLAIM_EMPTY,
+                "Outbox claims that returned no row.",
+                |s| s.empty_claims,
+            ),
+            (
+                names::METRIC_OUTBOX_HANDED_OFF,
+                "Outbox rows handed from a step commit to the dispatcher without a claim.",
+                |s| s.handed_off,
+            ),
+            (names::METRIC_OUTBOX_SENDS, "Outbox send attempts.", |s| {
+                s.sends
+            }),
+            (
+                names::METRIC_OUTBOX_DELIVERED,
+                "Outbox rows whose delivery committed.",
+                |s| s.delivered,
+            ),
+        ];
+        for (name, description, read) in counters {
+            let outbox = std::sync::Arc::clone(&outbox);
+            let _ = meter
+                .u64_observable_counter(name)
+                .with_description(description)
+                .with_callback(move |observer| observer.observe(read(&outbox.snapshot()), &[]))
+                .build();
+        }
+    }
+    if let Some(timer) = timer {
+        let counters: [(
+            &'static str,
+            &'static str,
+            Read<crate::timer::TimerWorkSnapshot>,
+        ); 4] = [
+            (
+                names::METRIC_TIMER_CLAIM_QUERIES,
+                "Due-timer claim statements issued.",
+                |s| s.claim_queries,
+            ),
+            (
+                names::METRIC_TIMER_CLAIM_ROWS,
+                "Timer rows the due-timer claims returned.",
+                |s| s.claim_rows,
+            ),
+            (
+                names::METRIC_TIMER_CLAIM_EMPTY,
+                "Due-timer claims that returned no row.",
+                |s| s.empty_claims,
+            ),
+            (
+                names::METRIC_TIMER_FIRED,
+                "Timers whose fire resumed their instance.",
+                |s| s.fired,
+            ),
+        ];
+        for (name, description, read) in counters {
+            let timer = std::sync::Arc::clone(&timer);
+            let _ = meter
+                .u64_observable_counter(name)
+                .with_description(description)
+                .with_callback(move |observer| observer.observe(read(&timer.snapshot()), &[]))
+                .build();
+        }
+    }
+}
+
 /// The `sutra.audit.transport.dropped` counter: transport audit events dropped on a full journal
 /// queue, read from the process-wide registry. Registered ONCE per boot from `serve`, only when
 /// telemetry metrics are wired; fail-open like every meter here.
@@ -681,6 +774,91 @@ pub fn register_transport_audit_meters() {
             observer.observe(sutra_channels::transport_audit().dropped_total(), &[]);
         })
         .build();
+}
+
+/// Register the audit spool's observable instruments: `sutra.audit.spool.healthy`,
+/// `sutra.audit.spool.unshipped_bytes`, `sutra.audit.spool.corrupt`,
+/// `sutra.audit.undeliverable{sink,deployment.id}`, `sutra.audit.ship.failures{sink}`,
+/// `sutra.audit.ship.lag{sink}` and, with a JSONL store, `sutra.audit.replay_duplicates_dropped`.
+/// Called once per boot from `serve`, only when telemetry metrics are wired.
+pub fn register_audit_spool_meters(
+    metrics: std::sync::Arc<sutra_channels::AuditSpoolMetrics>,
+    healthy: sutra_channels::AuditSpoolSender,
+    replay_duplicates: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+) {
+    use std::sync::Arc;
+    use sutra_channels::audit_spool as spool;
+    let meter: Meter = global::meter("sutra-engine");
+    let _ = meter
+        .u64_observable_gauge(spool::METRIC_AUDIT_SPOOL_HEALTHY)
+        .with_description("1 while the audit spool can sync; 0 while step commits fail on it.")
+        .with_callback(move |observer| observer.observe(u64::from(healthy.healthy()), &[]))
+        .build();
+    let m = Arc::clone(&metrics);
+    let _ = meter
+        .u64_observable_gauge(spool::METRIC_AUDIT_SPOOL_UNSHIPPED_BYTES)
+        .with_description("Bytes of audit spool segments not yet shipped by every store.")
+        .with_callback(move |observer| observer.observe(m.unshipped_bytes(), &[]))
+        .build();
+    let m = Arc::clone(&metrics);
+    let _ = meter
+        .u64_observable_counter(spool::METRIC_AUDIT_ATTEMPTS_ABORTED)
+        .with_description(
+            "Audit records of attempts whose step did not commit, dropped by the shippers.",
+        )
+        .with_callback(move |observer| observer.observe(m.attempts_aborted(), &[]))
+        .build();
+    let m = Arc::clone(&metrics);
+    let _ = meter
+        .u64_observable_counter(spool::METRIC_AUDIT_SPOOL_CORRUPT)
+        .with_description("Audit spool records that did not parse (their segment is quarantined).")
+        .with_callback(move |observer| observer.observe(m.corrupt(), &[]))
+        .build();
+    let m = Arc::clone(&metrics);
+    let _ = meter
+        .u64_observable_counter(spool::METRIC_AUDIT_UNDELIVERABLE)
+        .with_description(
+            "Audit events whose store is not configured on this engine (not written).",
+        )
+        .with_callback(move |observer| {
+            for ((sink, deployment), count) in m.undeliverable() {
+                observer.observe(
+                    count,
+                    &[
+                        KeyValue::new("sink", sink),
+                        KeyValue::new("deployment.id", deployment),
+                    ],
+                );
+            }
+        })
+        .build();
+    let m = Arc::clone(&metrics);
+    let _ = meter
+        .u64_observable_counter(spool::METRIC_AUDIT_SHIP_FAILURES)
+        .with_description("Failed attempts to ship a batch of audit records into a store.")
+        .with_callback(move |observer| {
+            for (sink, count) in m.ship_failures() {
+                observer.observe(count, &[KeyValue::new("sink", sink)]);
+            }
+        })
+        .build();
+    let m = Arc::clone(&metrics);
+    let _ = meter
+        .u64_observable_gauge(spool::METRIC_AUDIT_SHIP_LAG)
+        .with_description("Audit records durable in the spool and not yet shipped, per store.")
+        .with_callback(move |observer| {
+            for (sink, lag) in m.ship_lag() {
+                observer.observe(lag, &[KeyValue::new("sink", sink)]);
+            }
+        })
+        .build();
+    if let Some(dropped) = replay_duplicates {
+        let _ = meter
+            .u64_observable_counter(spool::METRIC_AUDIT_REPLAY_DUPLICATES_DROPPED)
+            .with_description("Re-emitted audit events the JSONL file store dropped as duplicates.")
+            .with_callback(move |observer| observer.observe(dropped.load(Ordering::Relaxed), &[]))
+            .build();
+    }
 }
 
 // =====================================================================================

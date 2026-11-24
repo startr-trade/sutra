@@ -122,6 +122,41 @@ pub async fn fresh_pool_named() -> (PgPool, String) {
     (pool, db)
 }
 
+/// Creates a fresh database migrated with the AUDIT family only (V200–V299), as a separate audit
+/// database is, and returns a pool on it.
+pub async fn fresh_audit_pool() -> PgPool {
+    let admin = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&admin_url())
+        .await
+        .expect("admin connect");
+    let db = format!("sutra_test_{}", DB_SEQ.fetch_add(1, Ordering::Relaxed));
+    sqlx::query(&format!("CREATE DATABASE {db}"))
+        .execute(&admin)
+        .await
+        .expect("create test database");
+    admin.close().await;
+
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&db_url(&db))
+        .await
+        .expect("test db connect");
+    let roots = all_migration_roots();
+    let refs: Vec<&std::path::Path> = roots.iter().map(PathBuf::as_path).collect();
+    let scripts = sutra_persistence::migrate::collect_family(
+        &refs,
+        sutra_persistence::migrate::MigrationFamily::Audit,
+    )
+    .expect("collect the audit family");
+    let mut conn = pool.acquire().await.expect("acquire for migration");
+    apply_migrations(&mut conn, &scripts)
+        .await
+        .expect("apply audit migrations");
+    drop(conn);
+    pool
+}
+
 /// Creates a per-test unique `NOBYPASSRLS` application role (roles are cluster-scoped, so
 /// the name must be unique across parallel tests) with CRUD grants on `tables`, plus
 /// membership for the current user so `SET LOCAL ROLE` works. Returns the role name.

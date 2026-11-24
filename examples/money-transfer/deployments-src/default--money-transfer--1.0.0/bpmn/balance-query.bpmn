@@ -22,6 +22,8 @@
     <!-- `account` is set by the Load data task (the store item {balance, frozen}); declared (T4) so the
          balance.hbs template validator knows it (object -> ANY permits account.balance navigation). -->
     <bpmn:extensionElements>
+  <!-- Audit is declared here, in the process: no tag, no audit. A bare tag means events="points" capture="metadata". -->
+  <q:audit/>
       <q:variables>
         <q:variable name="account" type="object"/>
       </q:variables>

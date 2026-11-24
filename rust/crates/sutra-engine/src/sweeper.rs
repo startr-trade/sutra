@@ -326,7 +326,10 @@ impl Default for TerminalRetentionConfig {
 /// as something to REDACT (null the captured payloads, keep the metadata trail) rather than to
 /// delete — so folding it into an instance-state retention clock would quietly destroy evidence an
 /// operator deliberately asked to keep. An audit-journal retention policy is its own feature with
-/// its own key.
+/// its own key ([`AuditRetentionSweeper`], `sutra.audit.retention`).
+///
+/// The media events are in the SQL audit store, a database of its own: with no SQL audit store
+/// there are none to read, the media step is skipped (an INFO line, once), and the purge runs.
 ///
 /// **Singleton by lease, like the stuck-instance scanner.** The DELETE is idempotent, so every
 /// replica could run it safely; running it on one keeps the write amplification at 1×. It shares
@@ -334,22 +337,28 @@ impl Default for TerminalRetentionConfig {
 /// [`RETENTION_SWEEPER_ROLE`].
 pub struct TerminalRetentionSweeper {
     store: PgInstanceStore,
-    audit: sutra_persistence::stores::PgAuditEventStore,
+    /// The SQL audit store, on the audit database; `None` without one.
+    audit: Option<sutra_persistence::stores::PgAuditEventStore>,
+    /// Whether the "no SQL audit store" INFO line was logged.
+    no_audit_logged: std::sync::atomic::AtomicBool,
     deployments: sutra_channels::LiveDeploymentSet,
     gate: Arc<dyn LeaderGate>,
     config: TerminalRetentionConfig,
 }
 
 impl TerminalRetentionSweeper {
-    /// Wire a sweeper. Nothing runs until [`Self::spawn`].
+    /// Wire a sweeper over the engine pool and, when there is one, the SQL audit store's pool.
+    /// Nothing runs until [`Self::spawn`].
     pub fn new(
         pool: PgPool,
+        audit: Option<PgPool>,
         deployments: sutra_channels::LiveDeploymentSet,
         gate: Arc<dyn LeaderGate>,
         config: TerminalRetentionConfig,
     ) -> TerminalRetentionSweeper {
         TerminalRetentionSweeper {
-            audit: sutra_persistence::stores::PgAuditEventStore::new(pool.clone()),
+            audit: audit.map(sutra_persistence::stores::PgAuditEventStore::new),
+            no_audit_logged: std::sync::atomic::AtomicBool::new(false),
             store: PgInstanceStore::new(pool),
             deployments,
             gate,
@@ -408,25 +417,24 @@ impl TerminalRetentionSweeper {
     /// retained and the next sweep retries — a recording is never left behind without a trace.
     /// `None` when the media could not even be listed: the deployment's purge waits a tick.
     async fn erase_expired_media(&self, dep: &PersistDeploymentId) -> Option<Vec<uuid::Uuid>> {
-        /// Media rows handled per deployment per sweep.
-        const MEDIA_BATCH: i64 = 1000;
-        let rows = match self
-            .audit
-            .list_expired_media(dep, self.config.retention, MEDIA_BATCH)
-            .await
-        {
-            Ok(rows) => rows,
-            Err(e) => {
-                warn!(deployment = dep.as_str(), error = %e,
-                      "retention sweeper could not list expired media; the purge waits a tick");
-                return None;
+        let Some(audit) = &self.audit else {
+            if !self
+                .no_audit_logged
+                .swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
+                info!(
+                    "terminal retention: no SQL audit store, so no recorded media events to \
+                     erase — the purge runs without the media step"
+                );
             }
+            return Some(Vec::new());
         };
+        let rows = self.expired_media(audit, dep).await?;
         let mut keep = Vec::new();
         let mut erased = 0usize;
         for (row_id, instance, payload) in rows {
             match crate::media::erase_media(&payload, crate::media::ERASED_FOR_RETENTION).await {
-                Ok(amended) => match self.audit.amend_payload(dep, row_id, &amended).await {
+                Ok(amended) => match audit.amend_payload(dep, row_id, &amended).await {
                     Ok(_) => erased += 1,
                     Err(e) => {
                         warn!(deployment = dep.as_str(), instance = %instance, error = %e,
@@ -456,6 +464,69 @@ impl TerminalRetentionSweeper {
         Some(keep)
     }
 
+    /// Up to [`MEDIA_BATCH`] not-yet-erased media rows, as `(row id, instance, payload)`, of the
+    /// instances retention is done with: a retained terminal row past the window, or no row at
+    /// all (deleted at terminal, purged by an earlier sweep, cancelled) with an
+    /// `INSTANCE_COMPLETED` / `INSTANCE_FAILED` event past the window. An instance still running
+    /// has a row without `terminal_at`, so it is never selected. The media rows come from the
+    /// audit database and the instance rows from the engine database, paged by row id. `None`
+    /// when either could not be read: the deployment's purge waits a tick.
+    async fn expired_media(
+        &self,
+        audit: &sutra_persistence::stores::PgAuditEventStore,
+        dep: &PersistDeploymentId,
+    ) -> Option<Vec<(i64, uuid::Uuid, String)>> {
+        let retention = self.config.retention;
+        let mut due = Vec::new();
+        let mut after = 0i64;
+        while (due.len() as i64) < MEDIA_BATCH {
+            let page = match audit
+                .list_media_page(dep, after, retention, MEDIA_BATCH)
+                .await
+            {
+                Ok(page) => page,
+                Err(e) => {
+                    warn!(deployment = dep.as_str(), error = %e,
+                          "retention sweeper could not list media; the purge waits a tick");
+                    return None;
+                }
+            };
+            let Some(last) = page.last() else {
+                break;
+            };
+            after = last.id;
+            let full = page.len() as i64 == MEDIA_BATCH;
+            let mut instances: Vec<uuid::Uuid> = page.iter().map(|r| r.instance_id).collect();
+            instances.sort();
+            instances.dedup();
+            let states = match self
+                .store
+                .terminal_retention_states(dep, &instances, retention)
+                .await
+            {
+                Ok(states) => states,
+                Err(e) => {
+                    warn!(deployment = dep.as_str(), error = %e,
+                          "retention sweeper could not read instance rows; the purge waits a tick");
+                    return None;
+                }
+            };
+            for row in page {
+                let expired = match states.get(&row.instance_id) {
+                    Some(expired) => *expired,
+                    None => row.terminal_event_expired,
+                };
+                if expired && (due.len() as i64) < MEDIA_BATCH {
+                    due.push((row.id, row.instance_id, row.payload_json));
+                }
+            }
+            if !full {
+                break;
+            }
+        }
+        Some(due)
+    }
+
     /// Spawn the interval loop. Runs until aborted (`RunningEngine::shutdown` / `drain`).
     pub fn spawn(self) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
@@ -477,9 +548,125 @@ impl TerminalRetentionSweeper {
     }
 }
 
+/// Media rows the terminal-retention sweep handles per deployment per tick.
+const MEDIA_BATCH: i64 = 1000;
+
+/// The DB-lease role the audit retention sweeper runs under: its own, like
+/// [`RETENTION_SWEEPER_ROLE`], so a destructive audit delete elects independently.
+pub const AUDIT_RETENTION_ROLE: &str = "audit-retention";
+
+/// The audit retention sweeper (`sutra.audit.retention`): deletes audit rows older than the
+/// retention from the SQL audit store's database, per live deployment, in batches of
+/// `sutra.audit.retention-batch`, looping while a batch comes back full.
+///
+/// A media event whose object is not yet erased is never deleted: it is the only record of an
+/// object still to be deleted (terminal retention or an erasure amends it once the object is
+/// gone, and the next sweep then takes it).
+///
+/// Lease-gated singleton under [`AUDIT_RETENTION_ROLE`], like [`TerminalRetentionSweeper`]: the
+/// lease lives in the engine database, the deletes run on the audit database.
+pub struct AuditRetentionSweeper {
+    audit: sutra_persistence::stores::PgAuditEventStore,
+    deployments: sutra_channels::LiveDeploymentSet,
+    gate: Arc<dyn LeaderGate>,
+    retention: std::time::Duration,
+    config: crate::config::AuditRetentionConfig,
+}
+
+impl AuditRetentionSweeper {
+    /// Wire a sweeper over the audit pool. `None` when `sutra.audit.retention` is unset: audit is
+    /// then kept forever and nothing runs. Nothing runs until [`Self::spawn`].
+    pub fn new(
+        audit: PgPool,
+        deployments: sutra_channels::LiveDeploymentSet,
+        gate: Arc<dyn LeaderGate>,
+        config: crate::config::AuditRetentionConfig,
+    ) -> Option<AuditRetentionSweeper> {
+        let retention = config.retention?;
+        Some(AuditRetentionSweeper {
+            audit: sutra_persistence::stores::PgAuditEventStore::new(audit),
+            deployments,
+            gate,
+            retention,
+            config,
+        })
+    }
+
+    /// One sweep across every live deployment, returning the rows deleted. Ungated (the caller
+    /// decides) and per-deployment isolated: one deployment's failure is logged and the sweep
+    /// goes on.
+    pub async fn sweep_once(&self) -> u64 {
+        let batch = i64::from(self.config.batch);
+        let mut deleted = 0;
+        for deployment in self.deployments.snapshot() {
+            let dep = match PersistDeploymentId::new(deployment.value()) {
+                Ok(dep) => dep,
+                Err(e) => {
+                    warn!(deployment = deployment.value(), error = %e,
+                          "audit retention skips deployment");
+                    continue;
+                }
+            };
+            let mut here = 0;
+            loop {
+                match self
+                    .audit
+                    .delete_expired_batch(&dep, self.retention, batch)
+                    .await
+                {
+                    Ok(rows) => {
+                        here += rows;
+                        if (rows as i64) < batch {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        warn!(deployment = dep.as_str(), error = %e,
+                              "audit retention delete failed for deployment");
+                        break;
+                    }
+                }
+            }
+            if here > 0 {
+                info!(
+                    deployment = dep.as_str(),
+                    deleted = here,
+                    retention_s = self.retention.as_secs(),
+                    "audit retention deleted audit rows past their retention"
+                );
+            }
+            deleted += here;
+        }
+        deleted
+    }
+
+    /// Spawn the interval loop (`sutra.audit.retention-sweep-interval`). Runs until aborted.
+    pub fn spawn(self) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(self.config.sweep_interval);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                if !self.gate.is_leading() {
+                    continue;
+                }
+                let deleted = self.sweep_once().await;
+                debug!(deleted, role = AUDIT_RETENTION_ROLE, "audit retention tick");
+            }
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_audit_retention_role_is_its_own_lease() {
+        assert_eq!(AUDIT_RETENTION_ROLE, "audit-retention");
+        assert_ne!(AUDIT_RETENTION_ROLE, RETENTION_SWEEPER_ROLE);
+        assert_ne!(AUDIT_RETENTION_ROLE, INSTANCE_SWEEPER_ROLE);
+    }
 
     #[test]
     fn retention_defaults_are_a_week_kept_and_an_hourly_purge() {

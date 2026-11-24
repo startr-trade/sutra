@@ -130,6 +130,56 @@ pub fn collect_migrations(roots: &[&Path]) -> Result<Vec<MigrationScript>> {
     order_scripts(scripts)
 }
 
+/// Whether migration version `v` belongs to the audit family (V200–V299, the `audit_event` table).
+///
+/// The audit trail never lives in the engine's operational database: the engine database applies
+/// every family except this one, and a separate audit database applies only this one, keeping its
+/// own `sutra_schema_history`. A range rule rather than a folder rule, because the image bakes all
+/// families into one flattened directory.
+pub fn is_audit_version(v: i64) -> bool {
+    (200..300).contains(&v)
+}
+
+/// Which database a set of migrations is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MigrationFamily {
+    /// The engine's operational database: every script except the audit family.
+    Engine,
+    /// The separate audit database: the audit family (V200–V299) only.
+    Audit,
+}
+
+impl MigrationFamily {
+    /// Whether a script of version `v` belongs to this family.
+    pub fn includes(self, v: i64) -> bool {
+        match self {
+            MigrationFamily::Engine => !is_audit_version(v),
+            MigrationFamily::Audit => is_audit_version(v),
+        }
+    }
+}
+
+/// [`collect_migrations`] filtered to one [`MigrationFamily`], in the same ascending order. An
+/// empty result is an error, as for an unfiltered collection: roots that hold no script of the
+/// family were pointed at the wrong place.
+pub fn collect_family(roots: &[&Path], family: MigrationFamily) -> Result<Vec<MigrationScript>> {
+    let scripts: Vec<MigrationScript> = collect_migrations(roots)?
+        .into_iter()
+        .filter(|s| family.includes(s.version))
+        .collect();
+    if scripts.is_empty() {
+        return Err(PersistenceError::Migration(format!(
+            "no {family:?}-family migration scripts found under {}",
+            roots
+                .iter()
+                .map(|r| r.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
+    Ok(scripts)
+}
+
 /// Applies the runner's ordering invariants to an arbitrarily-sourced script set: ascending
 /// V-number sort, duplicate-version rejection, non-empty. Callers that discover scripts
 /// outside the filesystem walk (e.g. a binary-embedded tree) route through this so the
@@ -441,8 +491,9 @@ mod tests {
         assert_eq!(
             versions,
             vec![
-                101, 201, 202, 203, 301, 304, 305, 306, 401, 402, 403, 404, 501, 601, 602, 603,
-                604, 605, 606, 701, 702, 801, 802, 1001, 1002, 1003, 1101, 1201, 1202, 1301
+                101, 201, 202, 203, 204, 205, 206, 301, 304, 305, 306, 401, 402, 403, 404, 501,
+                601, 602, 603, 604, 605, 606, 701, 702, 801, 802, 1001, 1002, 1003, 1101, 1201,
+                1202, 1301
             ]
         );
         assert_eq!(scripts[0].description, "alias_index");
@@ -544,5 +595,31 @@ mod tests {
         assert_eq!(scripts.len(), 1);
         assert_eq!(scripts[0].version, 2);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn audit_family_is_v2xx_only() {
+        let roots = shipped_migration_roots();
+        let refs: Vec<&Path> = roots.iter().map(PathBuf::as_path).collect();
+        let scripts = collect_family(&refs, MigrationFamily::Audit).unwrap();
+        let versions: Vec<i64> = scripts.iter().map(|s| s.version).collect();
+        assert_eq!(versions, vec![201, 202, 203, 204, 205, 206]);
+        assert!(is_audit_version(200) && is_audit_version(299));
+        assert!(!is_audit_version(199) && !is_audit_version(300) && !is_audit_version(1201));
+    }
+
+    #[test]
+    fn engine_family_excludes_v2xx() {
+        let roots = shipped_migration_roots();
+        let refs: Vec<&Path> = roots.iter().map(PathBuf::as_path).collect();
+        let all = collect_migrations(&refs).unwrap();
+        let engine = collect_family(&refs, MigrationFamily::Engine).unwrap();
+        assert!(engine.iter().all(|s| !is_audit_version(s.version)));
+        assert_eq!(
+            engine.len() + 6,
+            all.len(),
+            "every script but the six audit ones"
+        );
+        assert!(engine.windows(2).all(|w| w[0].version < w[1].version));
     }
 }

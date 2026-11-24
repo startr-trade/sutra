@@ -1,0 +1,23 @@
+-- sutra:no-transaction
+-- The media rows still to be erased: one small partial index over only the `q:audit` media events
+-- whose recordings have not been deleted yet.
+--
+-- The terminal-retention sweeper asks, every tick and per deployment, for the media events of
+-- finished instances (`PgAuditEventStore::list_expired_media`). Its filter is a text test on
+-- `payload_json` (the payload starts with `{"media":` and carries no `"mediaErasure":` marker),
+-- which no other index can answer, so without this one every sweep read the whole journal: on a
+-- journal of tens of millions of rows that is a parallel sequential scan of tens of GB once an
+-- hour, which takes several cores and a burst of disk writes (hint bits) for the best part of a
+-- minute, and the latency of every instance running at the time rises with it. A deployment that
+-- records no media paid for it all the same.
+--
+-- The predicate is the query's own, word for word, so the planner matches it; a deployment that
+-- records no media has no rows in the index and the sweep's lookup is a single index probe.
+-- (deployment_id, id) serves the query's `deployment_id = $1 ... ORDER BY id LIMIT n` directly.
+--
+-- Built concurrently because audit_event is the largest table and a plain build would block its
+-- writes for a full scan. The runner applies this script outside a transaction, under its
+-- migration lock, one statement at a time. The DROP clears an index a crashed concurrent build left
+-- invalid. PostgreSQL only, like V202 and V203.
+DROP INDEX CONCURRENTLY IF EXISTS audit_event_media_pending;
+CREATE INDEX CONCURRENTLY audit_event_media_pending ON audit_event (deployment_id, id) WHERE payload_json LIKE '{"media":%' AND payload_json NOT LIKE '%"mediaErasure":%';

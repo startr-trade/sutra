@@ -588,6 +588,24 @@ mod tests {
         assert_eq!(verify.conn.url.as_deref(), Some("postgres://db/x"));
         assert_eq!(verify.expected_head, Some(803));
     }
+
+    #[test]
+    fn migrate_takes_an_audit_database_url() {
+        let cli = SutraCli::try_parse_from([
+            "sutra",
+            "migrate",
+            "--url",
+            "postgres://db/engine",
+            "--audit-url",
+            "postgres://audit-db/audit",
+        ])
+        .unwrap();
+        let commands::Command::Migrate(args) = cli.command else {
+            panic!("expected migrate");
+        };
+        assert_eq!(args.conn.url.as_deref(), Some("postgres://db/engine"));
+        assert_eq!(args.audit_url.as_deref(), Some("postgres://audit-db/audit"));
+    }
 }
 
 #[cfg(test)]

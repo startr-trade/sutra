@@ -1,5 +1,7 @@
 //! Consolidated integration-test binary for sutra-bpmn (one link unit; modules preserve the original file names as filter paths).
 
+#[path = "all/audit_points_test.rs"]
+mod audit_points_test;
 #[path = "all/bpmn_data_declarations_test.rs"]
 mod bpmn_data_declarations_test;
 #[path = "all/bpmn_support_doc.rs"]

@@ -48,6 +48,75 @@ pub struct TimerPollerConfig {
     /// see `sutra_engine::EngineConfig::now_override`) is byte-identical to before this field
     /// existed.
     pub now_override: Option<sutra_executor::TestClock>,
+    /// Where the poller counts its timer claims and fires. A fresh set by default; the engine
+    /// keeps a clone so [`crate::RunningEngine::work_counters`] can read it.
+    pub work: Arc<TimerWorkCounters>,
+}
+
+/// The timer poller's work counts since it started: the due-timer claims it issued and the
+/// timers it fired. Maintained on every path whether or not anything reads them. Read them with
+/// [`Self::snapshot`].
+#[derive(Debug, Default)]
+pub struct TimerWorkCounters {
+    claim_queries: std::sync::atomic::AtomicU64,
+    claim_rows: std::sync::atomic::AtomicU64,
+    empty_claims: std::sync::atomic::AtomicU64,
+    fired: std::sync::atomic::AtomicU64,
+}
+
+/// A point-in-time copy of [`TimerWorkCounters`]. Subtract two snapshots for the work done in
+/// between.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TimerWorkSnapshot {
+    /// Due-timer claim statements issued.
+    pub claim_queries: u64,
+    /// Timer rows those claims returned.
+    pub claim_rows: u64,
+    /// Claims that returned no row.
+    pub empty_claims: u64,
+    /// Timers whose fire resumed their instance.
+    pub fired: u64,
+}
+
+impl TimerWorkCounters {
+    /// The counts right now.
+    pub fn snapshot(&self) -> TimerWorkSnapshot {
+        use std::sync::atomic::Ordering::Relaxed;
+        TimerWorkSnapshot {
+            claim_queries: self.claim_queries.load(Relaxed),
+            claim_rows: self.claim_rows.load(Relaxed),
+            empty_claims: self.empty_claims.load(Relaxed),
+            fired: self.fired.load(Relaxed),
+        }
+    }
+
+    fn record_claim(&self, rows: usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.claim_queries.fetch_add(1, Relaxed);
+        self.claim_rows.fetch_add(rows as u64, Relaxed);
+        if rows == 0 {
+            self.empty_claims.fetch_add(1, Relaxed);
+        }
+    }
+
+    fn record_fired(&self) {
+        self.fired
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl std::ops::Sub for TimerWorkSnapshot {
+    type Output = TimerWorkSnapshot;
+
+    /// The work done between `rhs` (earlier) and `self` (later); saturating, never negative.
+    fn sub(self, rhs: TimerWorkSnapshot) -> TimerWorkSnapshot {
+        TimerWorkSnapshot {
+            claim_queries: self.claim_queries.saturating_sub(rhs.claim_queries),
+            claim_rows: self.claim_rows.saturating_sub(rhs.claim_rows),
+            empty_claims: self.empty_claims.saturating_sub(rhs.empty_claims),
+            fired: self.fired.saturating_sub(rhs.fired),
+        }
+    }
 }
 
 impl Default for TimerPollerConfig {
@@ -57,6 +126,7 @@ impl Default for TimerPollerConfig {
             batch: 32,
             retry_backoff: std::time::Duration::from_secs(5),
             now_override: None,
+            work: Arc::default(),
         }
     }
 }
@@ -235,7 +305,10 @@ async fn fire_due_timers(
 ) -> usize {
     let now = poll_now(config);
     let due = match store.claim_due_timers(persist_dep, now, config.batch).await {
-        Ok(due) => due,
+        Ok(due) => {
+            config.work.record_claim(due.len());
+            due
+        }
         Err(e) => {
             warn!(deployment = exec_dep.value(), error = %e, "due-timer claim failed");
             return 0;
@@ -458,6 +531,7 @@ async fn fire_one(
                 "timer fired and resumed"
             );
             // The resume step resolved the TIMER row atomically — nothing else to do.
+            config.work.record_fired();
         }
         // Unreachable: `EngineHandle::fire_timer` drives a synchronous chain to its end.
         Ok(TimerFireOutcome::InlineCalls(_)) => {}
@@ -521,5 +595,34 @@ async fn fire_one(
                 warn!(node_id = timer.node_id, error = %e, "timer defer failed");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A drained tick at the default batch: two full claims, one short, one empty. The counts
+    /// add up per claim, and a snapshot difference is the work in between.
+    #[test]
+    fn timer_counters_count_batches() {
+        let counters = TimerWorkCounters::default();
+        let before = counters.snapshot();
+        for rows in [32, 32, 7, 0] {
+            counters.record_claim(rows);
+        }
+        for _ in 0..71 {
+            counters.record_fired();
+        }
+        assert_eq!(
+            counters.snapshot() - before,
+            TimerWorkSnapshot {
+                claim_queries: 4,
+                claim_rows: 71,
+                empty_claims: 1,
+                fired: 71,
+            }
+        );
+        assert_eq!(before - counters.snapshot(), TimerWorkSnapshot::default());
     }
 }

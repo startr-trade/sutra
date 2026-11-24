@@ -8,9 +8,15 @@
 //! relative to the timer's due time (POST + timer duration). New-instance answer latency is
 //! measured alongside, so a run shows whether follow-ups queue behind new work.
 //!
-//! The bar: the p99 follow-up lag stays under a few seconds at a rate the engine's own
-//! new-instance path absorbs easily. A poller that fires only a fixed batch per tick caps fired
-//! timers far below the arrival rate, and the lag then grows for as long as the load lasts.
+//! The bar is relative, so it holds on any machine: the engine KEEPS UP (follow-ups are
+//! delivered at 0.9 x the offered rate or better, and the lag at the end of the run is no worse
+//! than twice the lag at the start, plus 500 ms), and the WORK it did is the work the load needs
+//! (every timer fired once, every follow-up sent once, timers claimed in batches rather than one
+//! by one). A poller that fires only a fixed batch per tick caps fired timers far below the
+//! arrival rate, and the lag then grows for as long as the load lasts.
+//!
+//! `TIMER_LAG_P99_BAR_MS`, when set, is printed against the measured p99 and never asserted: an
+//! absolute latency is a property of the machine, so it is a benchmark figure, not a test.
 //!
 //! ```text
 //! TIMER_LAG_RATE=400 TIMER_LAG_SECS=20 \
@@ -29,6 +35,8 @@ use axum::routing::post;
 use axum::Router;
 
 use sutra_engine::{serve, DeploymentSourceKind, EngineConfig};
+
+use crate::load_support::{keeps_up, perf_line, LoadSample};
 
 static CONTAINER: OnceLock<(
     testcontainers::Container<testcontainers_modules::postgres::Postgres>,
@@ -187,7 +195,15 @@ fn summary(label: &str, mut v: Vec<Duration>) -> Duration {
 async fn timer_fire_lag_stays_bounded_under_a_steady_arrival_rate() {
     let rate = env_or("TIMER_LAG_RATE", 200).max(1);
     let secs = env_or("TIMER_LAG_SECS", 15).max(1);
-    let p99_bar = Duration::from_millis(env_or("TIMER_LAG_P99_BAR_MS", 3000));
+    // Benchmark mode only: printed, never asserted.
+    let p99_bar = std::env::var("TIMER_LAG_P99_BAR_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(Duration::from_millis);
+    // The poller's tick and claim batch (the engine's defaults: 500 ms, 32 rows a claim), which
+    // bound how many timer claims the run may take.
+    let timer_tick = Duration::from_millis(env_or("SUTRA_TIMER_TICK_MS", 500).max(1));
+    const TIMER_CLAIM_BATCH: u64 = 32;
 
     let pg_port = container_port();
     {
@@ -252,6 +268,8 @@ async fn timer_fire_lag_stays_bounded_under_a_steady_arrival_rate() {
     })
     .await
     .expect("engine boots");
+    let work_before = engine.work_counters();
+    let work_started = Instant::now();
     let url = format!("http://{}/channels/work-in", engine.local_addr);
     let client = reqwest::Client::builder()
         .pool_max_idle_per_host(256)
@@ -319,13 +337,25 @@ async fn timer_fire_lag_stays_bounded_under_a_steady_arrival_rate() {
 
     let sent = sent.lock().unwrap().clone();
     let got = arrivals.at.lock().unwrap().clone();
-    let lags: Vec<Duration> = sent
+    let pairs: Vec<(Instant, Duration)> = sent
         .iter()
         .filter_map(|(id, at)| {
             got.get(id)
-                .map(|arrived| arrived.saturating_duration_since(*at + TIMER))
+                .map(|arrived| (*at + TIMER, arrived.saturating_duration_since(*at + TIMER)))
         })
         .collect();
+    let lags: Vec<Duration> = pairs.iter().map(|(_, lag)| *lag).collect();
+    let first_sent = sent.values().min().copied().unwrap_or(start);
+    let last_sent = sent.values().max().copied().unwrap_or(start);
+    let send_span = last_sent
+        .saturating_duration_since(first_sent)
+        .as_secs_f64();
+    let offered_per_s = if send_span > 0.0 {
+        (sent.len().saturating_sub(1)) as f64 / send_span
+    } else {
+        rate as f64
+    };
+    let verdict = keeps_up(&LoadSample::from_pairs(pairs), offered_per_s);
     eprintln!(
         "TIMER-FIRE-LAG run: rate={rate}/s secs={secs} total={total} offered_in={offered:?} \
          follow_ups={} drained_in={drained:?} shards={}",
@@ -334,10 +364,50 @@ async fn timer_fire_lag_stays_bounded_under_a_steady_arrival_rate() {
     );
     summary("answer", answers.lock().unwrap().clone());
     let p99 = summary("follow-up lag past due", lags);
+    eprintln!("TIMER-FIRE-LAG keeps-up: {verdict}");
+    if let Some(bar) = p99_bar {
+        eprintln!(
+            "TIMER-FIRE-LAG benchmark: p99 {p99:?} vs bar {bar:?} ({})",
+            if p99 < bar { "under" } else { "OVER" }
+        );
+    }
+    perf_line("timer_fire_lag", "delivered_per_s", verdict.delivered_per_s);
+
+    // A follow-up arrives before its row's delete commits: give the last deletes a moment so the
+    // counts below cover the whole run.
+    let settle = Instant::now() + Duration::from_secs(10);
+    while (engine.work_counters() - work_before).outbox.delivered < total && Instant::now() < settle
+    {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let work = engine.work_counters() - work_before;
+    let ticks = (work_started.elapsed().as_millis() / timer_tick.as_millis()) as u64 + 2;
+    eprintln!("TIMER-FIRE-LAG work: {work:?} ticks<={ticks}");
     engine.drain_outbox();
+
     assert_eq!(got.len() as u64, total, "every follow-up arrives");
     assert!(
-        p99 < p99_bar,
-        "p99 follow-up lag {p99:?} exceeds {p99_bar:?} at {rate} new instances/s"
+        verdict.passed(),
+        "the engine did not keep up at {rate} new instances/s: {verdict}"
+    );
+    // Work counts: what the load needs, no more.
+    assert_eq!(work.timer.fired, total, "every timer fires exactly once");
+    assert!(
+        work.timer.claim_queries <= total.div_ceil(TIMER_CLAIM_BATCH) + ticks,
+        "timers must be claimed in batches of {TIMER_CLAIM_BATCH}: {} claims for {total} timers \
+         over {ticks} ticks",
+        work.timer.claim_queries
+    );
+    assert_eq!(
+        work.outbox.delivered, total,
+        "every follow-up delivered once"
+    );
+    assert_eq!(
+        work.outbox.sends, work.outbox.delivered,
+        "no retries in this run, so one send per delivery"
+    );
+    assert!(
+        work.outbox.claim_rows + work.outbox.handed_off >= work.outbox.delivered,
+        "every delivered row was claimed or handed off first: {work:?}"
     );
 }

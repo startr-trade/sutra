@@ -5,7 +5,7 @@
                   targetNamespace="urn:sutra:module:sqsintake:1.0.0">
   <bpmn:dataStore id="seenStore" name="seen"/>
   <bpmn:process id="orders" isExecutable="true">
-    <bpmn:extensionElements><q:variables><q:variable name="entry" type="string"/></q:variables></bpmn:extensionElements>
+    <bpmn:extensionElements><q:audit/><q:variables><q:variable name="entry" type="string"/></q:variables></bpmn:extensionElements>
     <bpmn:dataStoreReference id="ref-orders" dataStoreRef="seenStore">
       <bpmn:extensionElements><q:store key="'order|' + payload.Ref"/></bpmn:extensionElements>
     </bpmn:dataStoreReference>

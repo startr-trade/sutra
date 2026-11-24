@@ -12,6 +12,8 @@ mod coverage_golden;
 mod deployment_manifest_test;
 #[path = "all/deployments_list_it.rs"]
 mod deployments_list_it;
+#[path = "all/lint_audit.rs"]
+mod lint_audit;
 #[path = "all/package_overlay_cli_test.rs"]
 mod package_overlay_cli_test;
 #[path = "all/pg_migrate_it.rs"]

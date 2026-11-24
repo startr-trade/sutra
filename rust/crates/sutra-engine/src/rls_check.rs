@@ -283,6 +283,15 @@ pub async fn enforce_rls_bypass_posture(pool: &PgPool, enabled: bool) -> Result<
     Ok(())
 }
 
+/// [`enforce_rls_bypass_posture`] on the SQL audit store's database: the audit database has its
+/// own role and its own `audit_event` table (with its row-level-security policy), so the same
+/// two checks run against it. A bypassing audit role refuses startup like the engine's.
+pub async fn enforce_audit_rls_bypass_posture(audit: &PgPool, enabled: bool) -> Result<(), String> {
+    enforce_rls_bypass_posture(audit, enabled)
+        .await
+        .map_err(|e| format!("audit database (sutra.audit.sql.url): {e}"))
+}
+
 /// Logs each diagnostic at its own severity, carrying the stable code and role as fields.
 fn log_diagnostics(report: &RlsPostureReport) {
     for d in &report.diagnostics {

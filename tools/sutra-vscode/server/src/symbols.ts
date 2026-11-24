@@ -9,7 +9,7 @@
  *     `<q:validators when>` — see qSchema.ts for the canonical list).
  *   - Cross-references on attributes that name an external id —
  *     `<q:source channel>`, `<q:input codec>`, `<q:validators source>`,
- *     `<q:case calledElement>`, `<q:dispatch default>`, `<q:audit sink>`.
+ *     `<q:case calledElement>`, `<q:dispatch default>`.
  *
  * The five "orphan" tags (`q:expression`, `q:condition`, `q:guard`,
  * `q:field`, `q:schema`) that an earlier exploratory pass tracked are
@@ -85,7 +85,6 @@ const REFERENCE_KINDS: ReadonlyArray<{ tag: string; attr: string; kind: string }
   { tag: 'q:validators', attr: 'source', kind: 'validator' },
   { tag: 'q:case', attr: 'calledElement', kind: 'calledElement' },
   { tag: 'q:dispatch', attr: 'default', kind: 'calledElement' },
-  { tag: 'q:audit', attr: 'sink', kind: 'sink' },
   { tag: 'q:reply', attr: 'destination', kind: 'channel' },
 ];
 
@@ -168,7 +167,6 @@ function toSymbol(ev: ElementOpen): QSymbol {
       dispatch: ['default'],
       case: ['calledElement'],
       onValidation: ['mode'],
-      audit: ['sink'],
     };
     for (const attrName of preferred[localName] ?? []) {
       const a = ev.attributes.find((x) => x.name === attrName);

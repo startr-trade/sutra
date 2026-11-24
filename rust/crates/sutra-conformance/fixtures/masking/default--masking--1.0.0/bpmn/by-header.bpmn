@@ -6,7 +6,7 @@
                   targetNamespace="urn:sutra:module:masking:1.0.0">
   <bpmn:process id="by-header" name="Masked, by header" isExecutable="true">
     <bpmn:extensionElements>
-      <q:audit sink="jsonl" capture="payload"/>
+      <q:audit events="all" capture="payload"/>
       <q:variables>
         <q:variable name="payload" type="object" sensitive="true"/>
         <q:variable name="kept" type="string" sensitive="true"/>

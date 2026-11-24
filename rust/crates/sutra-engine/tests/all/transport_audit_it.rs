@@ -14,10 +14,10 @@ use sqlx::PgPool;
 
 use sutra_bpmn::qbindings::AuditCapture;
 use sutra_channels::{
-    AuditSinkRegistry, TransportAuditContext, TransportAuditEvent, TransportAuditOutcome,
-    TransportAuditRegistry, TransportAuditScope,
+    TransportAuditContext, TransportAuditEvent, TransportAuditOutcome, TransportAuditRegistry,
+    TransportAuditScope,
 };
-use sutra_engine::audit_sinks::SqlAuditSink;
+use sutra_engine::audit_sinks::SqlAuditStore;
 use sutra_engine::transport_audit::{DeploymentAuditRoute, EngineTransportAuditJournal};
 use sutra_persistence::migrate::{apply_migrations, collect_migrations};
 use sutra_persistence::stores::{AuditEventRow, PgAuditEventStore};
@@ -100,20 +100,28 @@ async fn fresh_pool() -> PgPool {
         .expect("pool")
 }
 
-/// A registry holding the engine's journal over the SQL sink. `default_sink` is the sink a
-/// process without `<q:audit>` writes to; `route` is the deployment's.
+/// A registry holding the engine's journal, appending to a spool (in a temporary directory) that
+/// a shipper loads into the SQL store. `route` is the deployment's.
 fn journal(
     pool: &PgPool,
-    default_sink: Option<&str>,
     route_sink: Option<&str>,
     route_capture: AuditCapture,
 ) -> TransportAuditRegistry {
-    let mut sinks = AuditSinkRegistry::new();
-    sinks.register(Arc::new(SqlAuditSink::new(pool.clone())));
-    let journal = EngineTransportAuditJournal::spawn(
+    let spool = sutra_channels::AuditSpool::open(sutra_channels::AuditSpoolConfig {
+        dir: std::env::temp_dir().join(format!("sutra-transport-audit-it-{}", Uuid::new_v4())),
+        sync_linger: Duration::ZERO,
+        sinks: ["sql".to_string()].into_iter().collect(),
+        ..Default::default()
+    })
+    .expect("spool");
+    let shipper = sutra_channels::spawn_audit_shipper(
         &tokio::runtime::Handle::current(),
-        sinks,
-        default_sink.map(str::to_string),
+        &spool,
+        Arc::new(SqlAuditStore::new(pool.clone())),
+        sutra_channels::ShipperConfig::default(),
+    );
+    let journal = EngineTransportAuditJournal::new(
+        spool.sender(),
         vec![(
             MODULE.to_string(),
             DeploymentAuditRoute {
@@ -123,8 +131,9 @@ fn journal(
                 capture: route_capture,
             },
         )],
-        64,
     );
+    // The spool and its shipper live for the rest of the test process.
+    Box::leak(Box::new((spool, shipper)));
     let registry = TransportAuditRegistry::new();
     registry.install(journal);
     registry
@@ -187,6 +196,8 @@ fn engine_row(instance: Uuid, seq: i32, event_type: &str) -> AuditEventRow {
         diagnostic_code: None,
         diagnostic_json: None,
         payload_json: "{}".into(),
+        spool_ref: None,
+        attempt: None,
     }
 }
 
@@ -206,7 +217,7 @@ async fn a_transport_event_lands_in_the_instance_and_deployment_journals() {
         .await
         .unwrap();
 
-    let registry = journal(&pool, Some("sql"), Some("sql"), AuditCapture::Metadata);
+    let registry = journal(&pool, Some("sql"), AuditCapture::Metadata);
     // A payload-level process: the fields are kept, the sensitive one redacted.
     assert_eq!(
         registry.append(
@@ -282,12 +293,12 @@ async fn nothing_is_written_when_audit_is_off() {
     let pool = fresh_pool().await;
     let instance = Uuid::new_v4();
 
-    // The engine has no default sink and the process declares no <q:audit>; the deployment has
+    // The process declares no <q:audit> (the engine stamps it capture=none); the deployment has
     // no audited process.
-    let registry = journal(&pool, None, None, AuditCapture::Metadata);
+    let registry = journal(&pool, None, AuditCapture::Metadata);
     assert_eq!(
         registry.append(
-            instance_scope(instance, AuditCapture::Metadata, None),
+            instance_scope(instance, AuditCapture::None, None),
             refused()
         ),
         TransportAuditOutcome::Suppressed
@@ -302,7 +313,7 @@ async fn nothing_is_written_when_audit_is_off() {
         TransportAuditOutcome::Suppressed
     );
     // A process that captures nothing.
-    let audited = journal(&pool, Some("sql"), Some("sql"), AuditCapture::Metadata);
+    let audited = journal(&pool, Some("sql"), AuditCapture::Metadata);
     assert_eq!(
         audited.append(
             instance_scope(instance, AuditCapture::None, Some("sql")),
@@ -342,7 +353,7 @@ impl sutra_executor::listener::ExecutionListener for RoutedSinks {
 }
 
 /// `<q:audit capture="none"/>` means the same to both audit paths: the executor routes none of
-/// the process's `INSTANCE_*`/`NODE_*` events (even with an engine default sink), and the
+/// the process's `INSTANCE_*`/`NODE_*` events, and the
 /// transport journal suppresses the instance's transport events; nothing lands in the table.
 #[ignore = "docker"]
 #[tokio::test]
@@ -355,7 +366,7 @@ async fn capture_none_consistent_with_execution_audit() {
         <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
                           xmlns:q="urn:sutra:q:1.0">
           <bpmn:process id="quiet">
-            <bpmn:extensionElements><q:audit sink="sql" capture="none"/></bpmn:extensionElements>
+            <bpmn:extensionElements><q:audit capture="none"/></bpmn:extensionElements>
             <bpmn:startEvent id="S"/>
             <bpmn:endEvent id="E"/>
             <bpmn:sequenceFlow id="f1" sourceRef="S" targetRef="E"/>
@@ -371,7 +382,6 @@ async fn capture_none_consistent_with_execution_audit() {
     let routed = Rc::new(RoutedSinks::default());
     let executor = sutra_executor::TokenExecutor::builder(sutra_executor::TaskRegistry::new())
         .with_listener(Rc::clone(&routed) as Rc<dyn sutra_executor::listener::ExecutionListener>)
-        .with_default_audit_sink(Some("sql".to_string()))
         .build();
     executor
         .execute_sync(&process, sutra_executor::Variables::default())
@@ -384,7 +394,7 @@ async fn capture_none_consistent_with_execution_audit() {
         "execution audit routes nothing: {routed:?}"
     );
 
-    let registry = journal(&pool, Some("sql"), Some("sql"), AuditCapture::Metadata);
+    let registry = journal(&pool, Some("sql"), AuditCapture::Metadata);
     assert_eq!(
         registry.append(instance_scope(instance, capture, Some("sql")), refused()),
         TransportAuditOutcome::Suppressed,

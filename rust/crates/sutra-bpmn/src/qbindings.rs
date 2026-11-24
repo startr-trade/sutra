@@ -60,6 +60,43 @@ impl AuditCapture {
     }
 }
 
+/// Which execution events an audited process records, per `xsd/q.xsd#AuditEventScope` (the
+/// process-level `<q:audit events>`).
+///
+/// * `All` — the instance lifecycle and every node entered and left.
+/// * `Points` (the default) — the instance lifecycle plus the audit points: the nodes where
+///   something observable happens (events, waits, message exchanges, calls). Gateways, scripts
+///   and plain tasks are not points. See `audit_points`.
+/// * `Instance` — the instance lifecycle only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AuditEventScope {
+    All,
+    #[default]
+    Points,
+    Instance,
+}
+
+impl AuditEventScope {
+    /// The `xsd/q.xsd#AuditEventScope` value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AuditEventScope::All => "all",
+            AuditEventScope::Points => "points",
+            AuditEventScope::Instance => "instance",
+        }
+    }
+
+    /// Parse an `events` attribute value (trimmed). `None` for an empty or unknown value.
+    pub fn parse(s: &str) -> Option<AuditEventScope> {
+        match s.trim() {
+            "all" => Some(AuditEventScope::All),
+            "points" => Some(AuditEventScope::Points),
+            "instance" => Some(AuditEventScope::Instance),
+            _ => None,
+        }
+    }
+}
+
 /// Validation policy on payload structural failure per `xsd/q.xsd#OnValidationMode`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OnValidationMode {
@@ -265,12 +302,11 @@ pub struct SendBinding {
     pub headers: Vec<HeaderAttr>,
 }
 
-/// Parsed per-element `<q:audit>` — audit-sink targeting + capture level for one flow node.
+/// Parsed per-element `<q:audit>` — the capture level of one flow node. A node-level
+/// `<q:audit>` only ever opts its node out (`capture="none"`); where audit is stored is a
+/// deployment setting, never a BPMN one, so the element carries no sink.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuditBinding {
-    /// Defaults to `"sql"` per `xsd/q.xsd#AuditType`.
-    pub sink: String,
-    pub target: Option<String>,
     pub capture: AuditCapture,
 }
 

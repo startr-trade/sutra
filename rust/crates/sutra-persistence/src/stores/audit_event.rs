@@ -6,6 +6,11 @@
 //! already-persisted `(instance, seq)` is a NO-OP rather than a constraint error. Best-effort:
 //! the engine-side sink logs any `Err` and never fails execution.
 //!
+//! A step re-run after a failed or lost commit re-emits the same seqs under a new attempt
+//! (V206): [`PgAuditEventStore::insert_shipped`] keeps, per `(deployment, instance,
+//! attempt_base)`, the rows of the latest attempt and deletes every earlier attempt's rows, so
+//! the journal holds the committed pass, never the one that did not commit.
+//!
 //! pg-only, like the engine's other system stores (instance/inbox/alias) — the runtime
 //! persistence bridge is `PgPool`. The `audit_event` mysql/mssql migrations exist for
 //! dialect-completeness but there is no engine writer for them.
@@ -33,6 +38,25 @@ pub struct AuditEventRow {
     pub diagnostic_code: Option<String>,
     pub diagnostic_json: Option<String>,
     pub payload_json: String,
+    /// The audit spool record this row was shipped from, `<spoolId>:<n>` (V205). The shipper
+    /// can write a record more than once (after a crash between its write and its checkpoint);
+    /// a second row with the same reference is dropped, which the `(deployment, instance, seq)`
+    /// index alone cannot do for a deployment-level or transport row. `None` for a row not
+    /// shipped from a spool (no dedup beyond that index).
+    pub spool_ref: Option<String>,
+    /// The pass that wrote the row (V206); `None` for a row outside a pass (transport,
+    /// deployment-level, engine-written events, rows from before 0.9.0).
+    pub attempt: Option<AuditRowAttempt>,
+}
+
+/// The pass (attempt) an engine audit row came from (V206). For each `(deployment, instance,
+/// base)` the store keeps the rows of the latest `(at, id)` attempt: an earlier attempt from the
+/// same base is one whose step never committed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditRowAttempt {
+    pub id: String,
+    pub base: i32,
+    pub at: OffsetDateTime,
 }
 
 /// Default page size of an instance-history read when the caller supplies no `?limit=`.
@@ -82,49 +106,75 @@ pub struct PgAuditEventStore {
     pool: PgPool,
 }
 
-/// An engine event. The conflict target names the V202 partial unique index (the engine's events
-/// only), so the predicate is repeated for the index to be inferred.
+/// An engine event. `ON CONFLICT DO NOTHING` with no target: any unique violation drops the row,
+/// so both the V202 `(deployment, instance, seq)` index and the V205 `spool_ref` index dedup it
+/// (first writer wins).
 const SQL_INSERT: &str = "INSERT INTO audit_event \
      (deployment_id, instance_id, seq, at, event_type, node_id, diagnostic_code, \
-      diagnostic_json, payload_json) \
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
-     ON CONFLICT (deployment_id, instance_id, seq) WHERE event_type NOT LIKE '%.%' DO NOTHING";
+      diagnostic_json, payload_json, spool_ref, attempt_id, attempt_base, attempt_at) \
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) \
+     ON CONFLICT DO NOTHING";
 
 /// A run of engine events in one statement (the batch form of [`SQL_INSERT`]): `$1` is the
-/// deployment, `$2..$9` are parallel arrays, one element per row. `WITH ORDINALITY` + `ORDER BY`
+/// deployment, `$2..$10` are parallel arrays, one element per row. `WITH ORDINALITY` + `ORDER BY`
 /// insert the rows in array order, and the V203 ordinal trigger (a row-level BEFORE trigger whose
 /// query sees the rows the same statement already inserted) numbers them in that order. A replayed
 /// `(deployment, instance, seq)` is skipped exactly as in the single-row form; `DO NOTHING` also
 /// tolerates two rows with one key in the same statement.
 const SQL_INSERT_BATCH: &str = "INSERT INTO audit_event \
      (deployment_id, instance_id, seq, at, event_type, node_id, diagnostic_code, \
-      diagnostic_json, payload_json) \
+      diagnostic_json, payload_json, spool_ref, attempt_id, attempt_base, attempt_at) \
      SELECT $1, u.instance_id, u.seq, u.at, u.event_type, u.node_id, u.diagnostic_code, \
-            u.diagnostic_json, u.payload_json \
+            u.diagnostic_json, u.payload_json, u.spool_ref, u.attempt_id, u.attempt_base, \
+            u.attempt_at \
      FROM UNNEST($2::uuid[], $3::int4[], $4::timestamptz[], $5::text[], $6::text[], \
-                 $7::text[], $8::text[], $9::text[]) \
+                 $7::text[], $8::text[], $9::text[], $10::text[], $11::text[], $12::int4[], \
+                 $13::timestamptz[]) \
           WITH ORDINALITY AS u(instance_id, seq, at, event_type, node_id, diagnostic_code, \
-                               diagnostic_json, payload_json, ord) \
+                               diagnostic_json, payload_json, spool_ref, attempt_id, \
+                               attempt_base, attempt_at, ord) \
      ORDER BY u.ord \
-     ON CONFLICT (deployment_id, instance_id, seq) WHERE event_type NOT LIKE '%.%' DO NOTHING";
+     ON CONFLICT DO NOTHING";
+
+/// The attempts of a shipped batch (`$2..$5` parallel arrays: instance, base, at, id)
+/// that a LATER attempt from the same base already superseded. `COLLATE "C"` keeps the id
+/// tie-break a byte order.
+const SQL_SUPERSEDED_ATTEMPTS: &str = "SELECT g.id FROM UNNEST($2::uuid[], $3::int4[], \
+     $4::timestamptz[], $5::text[]) AS g(instance_id, base, at, id) \
+     WHERE EXISTS (SELECT 1 FROM audit_event a WHERE a.deployment_id = $1 \
+       AND a.instance_id = g.instance_id AND a.attempt_base = g.base \
+       AND a.attempt_id IS NOT NULL \
+       AND (a.attempt_at, a.attempt_id COLLATE \"C\") > (g.at, g.id COLLATE \"C\"))";
+
+/// Delete the rows of every EARLIER attempt from the same base as one of the batch's
+/// (surviving) attempts: those passes never committed.
+const SQL_DELETE_EARLIER_ATTEMPTS: &str = "DELETE FROM audit_event a USING UNNEST($2::uuid[], \
+     $3::int4[], $4::timestamptz[], $5::text[]) AS g(instance_id, base, at, id) \
+     WHERE a.deployment_id = $1 AND a.instance_id = g.instance_id AND a.attempt_base = g.base \
+       AND a.attempt_id IS NOT NULL \
+       AND (a.attempt_at, a.attempt_id COLLATE \"C\") < (g.at, g.id COLLATE \"C\")";
 
 /// A transport event in an instance's journal: numbered with the instance's current high-water
 /// seq over the ENGINE's events (1 before the first, so a read from the start of the journal —
 /// `seq > 0` — sees it), so it sorts right after the event it followed and never takes a number
-/// the engine will write. Outside the V202 unique index, so it never conflicts.
+/// the engine will write. Outside the V202 unique index; a re-shipped one is dropped by its V205
+/// `spool_ref`.
 const SQL_INSERT_TRANSPORT_INSTANCE: &str = "INSERT INTO audit_event \
      (deployment_id, instance_id, seq, at, event_type, node_id, diagnostic_code, \
-      diagnostic_json, payload_json) \
+      diagnostic_json, payload_json, spool_ref) \
      SELECT $1, $2, COALESCE((SELECT MAX(seq) FROM audit_event \
                               WHERE deployment_id = $1 AND instance_id = $2 \
                                 AND event_type NOT LIKE '%.%'), 1), \
-            $3, $4, $5, $6, $7, $8";
+            $3, $4, $5, $6, $7, $8, $9 \
+     ON CONFLICT DO NOTHING";
 
-/// A transport event in the deployment-level journal (no instance), seq 0.
+/// A transport event in the deployment-level journal (no instance), seq 0. A re-shipped one is
+/// dropped by its V205 `spool_ref`.
 const SQL_INSERT_TRANSPORT_DEPLOYMENT: &str = "INSERT INTO audit_event \
      (deployment_id, instance_id, seq, at, event_type, node_id, diagnostic_code, \
-      diagnostic_json, payload_json) \
-     VALUES ($1, NULL, 0, $2, $3, $4, $5, $6, $7)";
+      diagnostic_json, payload_json, spool_ref) \
+     VALUES ($1, NULL, 0, $2, $3, $4, $5, $6, $7, $8) \
+     ON CONFLICT DO NOTHING";
 
 /// Whether `event_type` is one a transport wrote (`<transport>.<EVENT>`; the engine's own event
 /// types never carry a `.`) — the rule the V202 index predicate encodes.
@@ -138,6 +188,10 @@ const SQL_REDACT_INSTANCE_PAYLOADS: &str = "UPDATE audit_event SET payload_json 
 /// A media-capture payload (`{"media": [...]}`, what `<q:audit capture="media">` writes) whose
 /// media has not been erased yet. The executor serialises the payload with sorted keys and no
 /// whitespace, so the prefix test is exact; the erasure marker is the `mediaErasure` key.
+///
+/// The V204 partial index `audit_event_media_pending` carries this predicate word for word, which
+/// is what lets the planner answer the retention sweep's lookup from it instead of reading the
+/// whole journal every tick. Change one and the other must change with it.
 const MEDIA_PAYLOAD_PREDICATE: &str = "payload_json LIKE '{\"media\":%' \
      AND payload_json NOT LIKE '%\"mediaErasure\":%'";
 
@@ -150,25 +204,49 @@ fn sql_list_media_for_instance() -> String {
     )
 }
 
-/// The media rows, still to be erased, of the instances retention is done with: a retained
-/// terminal row past the window, or no row at all (deleted at terminal, purged by an earlier
-/// sweep, cancelled) with an `INSTANCE_COMPLETED` / `INSTANCE_FAILED` event past the window. An
-/// instance still running has a row without `terminal_at`, so it is never selected.
-fn sql_list_expired_media() -> String {
+/// A page of media rows still to be erased, after the id cursor `$2`, each with whether its
+/// instance has an `INSTANCE_COMPLETED` / `INSTANCE_FAILED` event older than the window `$3`. Only
+/// the audit half of "retention is done with this instance": the instance's own row is in the
+/// engine database ([`crate::stores::PgInstanceStore::terminal_retention_states`]), and the
+/// sweeper combines the two.
+fn sql_list_media_page() -> String {
     format!(
-        "SELECT a.id, a.instance_id, a.payload_json FROM audit_event a \
-         WHERE a.deployment_id = $1 AND a.instance_id IS NOT NULL AND {MEDIA_PAYLOAD_PREDICATE} \
-           AND (EXISTS (SELECT 1 FROM instance_state s \
-                        WHERE s.deployment_id = $1 AND s.instance_id = a.instance_id \
-                          AND s.terminal_at IS NOT NULL \
-                          AND s.terminal_at <= now() - make_interval(secs => $2)) \
-                OR (NOT EXISTS (SELECT 1 FROM instance_state s \
-                                WHERE s.deployment_id = $1 AND s.instance_id = a.instance_id) \
-                    AND EXISTS (SELECT 1 FROM audit_event t \
-                                WHERE t.deployment_id = $1 AND t.instance_id = a.instance_id \
-                                  AND t.event_type IN ('INSTANCE_COMPLETED', 'INSTANCE_FAILED') \
-                                  AND t.at <= now() - make_interval(secs => $2)))) \
-         ORDER BY a.id ASC LIMIT $3"
+        "SELECT a.id, a.instance_id, a.payload_json, \
+                EXISTS (SELECT 1 FROM audit_event t \
+                        WHERE t.deployment_id = $1 AND t.instance_id = a.instance_id \
+                          AND t.event_type IN ('INSTANCE_COMPLETED', 'INSTANCE_FAILED') \
+                          AND t.at <= now() - make_interval(secs => $3)) \
+         FROM audit_event a \
+         WHERE a.deployment_id = $1 AND a.instance_id IS NOT NULL AND a.id > $2 \
+           AND {MEDIA_PAYLOAD_PREDICATE} \
+         ORDER BY a.id ASC LIMIT $4"
+    )
+}
+
+/// One media row still to be erased, as the retention sweeper reads it from the audit database.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingMediaRow {
+    /// The row's id (the next page's cursor, and the row [`PgAuditEventStore::amend_payload`]
+    /// amends).
+    pub id: i64,
+    /// The instance the media belongs to.
+    pub instance_id: Uuid,
+    /// The media payload.
+    pub payload_json: String,
+    /// Whether the instance has a terminal event older than the window asked for.
+    pub terminal_event_expired: bool,
+}
+
+/// One batch of audit retention: up to `$3` rows of deployment `$1` older than `$2` seconds, oldest
+/// id first. A media event whose object is not erased yet is never deleted: it is the only record
+/// of an object still to be deleted.
+fn sql_delete_expired_batch() -> String {
+    format!(
+        "DELETE FROM audit_event WHERE id IN ( \
+           SELECT id FROM audit_event \
+           WHERE deployment_id = $1 AND at < now() - make_interval(secs => $2) \
+             AND NOT ({MEDIA_PAYLOAD_PREDICATE}) \
+           ORDER BY id LIMIT $3)"
     )
 }
 
@@ -208,6 +286,13 @@ type AuditEventColumns = (
     String,
 );
 
+/// The statement [`PgAuditEventStore::list_media_page`] runs (`$1` deployment, `$2` the id
+/// cursor, `$3` retention in seconds, `$4` limit), for tests that check its plan.
+#[doc(hidden)]
+pub fn list_media_page_sql() -> String {
+    sql_list_media_page()
+}
+
 impl PgAuditEventStore {
     /// Wraps a connection pool.
     pub fn new(pool: PgPool) -> Self {
@@ -220,7 +305,7 @@ impl PgAuditEventStore {
     /// A transport event (`<transport>.<EVENT>`) is not numbered by the caller: in an instance's
     /// journal it takes the instance's current high-water seq over the engine's events (its
     /// `row.seq` is ignored), in the deployment-level journal (no instance) seq 0. It is always a
-    /// first write.
+    /// first write, unless its `spool_ref` was written before (then `false`).
     pub async fn insert_in(conn: &mut PgConnection, row: &AuditEventRow) -> Result<bool> {
         if is_transport_audit_event_type(&row.event_type) {
             let query = match row.instance_id {
@@ -236,6 +321,7 @@ impl PgAuditEventStore {
                 .bind(&row.diagnostic_code)
                 .bind(&row.diagnostic_json)
                 .bind(&row.payload_json)
+                .bind(&row.spool_ref)
                 .execute(conn)
                 .await
                 .map_err(PersistenceError::db("audit_event transport insert"))?
@@ -252,6 +338,10 @@ impl PgAuditEventStore {
             .bind(&row.diagnostic_code)
             .bind(&row.diagnostic_json)
             .bind(&row.payload_json)
+            .bind(&row.spool_ref)
+            .bind(row.attempt.as_ref().map(|a| a.id.as_str()))
+            .bind(row.attempt.as_ref().map(|a| a.base))
+            .bind(row.attempt.as_ref().map(|a| a.at))
             .execute(conn)
             .await
             .map_err(PersistenceError::db("audit_event insert"))?
@@ -301,11 +391,134 @@ impl PgAuditEventStore {
         ordered.sort_by_key(|r| r.instance_id);
 
         let mut tx = begin_deployment_tx(&self.pool, deployment).await?;
+        let inserted = Self::insert_ordered_in(&mut tx, deployment, &ordered).await?;
+        tx.commit()
+            .await
+            .map_err(PersistenceError::db("audit_event batch commit"))?;
+        Ok(inserted)
+    }
+
+    /// Persist rows of ANY deployments in ONE transaction — the SQL audit store's shipped batch.
+    /// The transaction re-scopes itself per deployment (`sutra.deployment_id` is transaction-local,
+    /// so each run of one deployment's rows is written under its own scope), and commits once.
+    /// Returns the number of first-writes; a row whose `spool_ref` or `(deployment, instance,
+    /// seq)` was written before is skipped.
+    ///
+    /// Rows are written grouped by `(deployment, instance)` in one global order (a stable sort,
+    /// so each instance's rows keep the order given): the ordinal trigger's per-instance locks are
+    /// then always taken in the same order, and two batches never deadlock. All or nothing: on
+    /// `Err` nothing was committed and the caller ships the same batch again.
+    pub async fn insert_shipped(&self, rows: &[AuditEventRow]) -> Result<u64> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        let mut ordered: Vec<&AuditEventRow> = rows.iter().collect();
+        ordered.sort_by(|a, b| {
+            (a.deployment.as_str(), a.instance_id).cmp(&(b.deployment.as_str(), b.instance_id))
+        });
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(PersistenceError::db("audit_event shipped batch begin"))?;
+        let mut inserted = 0u64;
+        let mut start = 0;
+        while start < ordered.len() {
+            let deployment = &ordered[start].deployment;
+            let mut end = start + 1;
+            while end < ordered.len() && &ordered[end].deployment == deployment {
+                end += 1;
+            }
+            crate::scope::set_deployment_guc(&mut tx, deployment).await?;
+            let rows = Self::supersede_in(&mut tx, deployment, &ordered[start..end]).await?;
+            inserted += Self::insert_ordered_in(&mut tx, deployment, &rows).await?;
+            start = end;
+        }
+        tx.commit()
+            .await
+            .map_err(PersistenceError::db("audit_event shipped batch commit"))?;
+        Ok(inserted)
+    }
+
+    /// For one deployment's rows of a shipped batch: per `(instance, base)` only the latest
+    /// attempt's rows go on (an earlier attempt in the same batch is dropped), an attempt a later
+    /// one already stored supersedes is dropped, and the stored rows of every earlier attempt
+    /// from a surviving attempt's base are deleted. Rows without an attempt pass through.
+    /// Returns the rows to insert, in their order.
+    async fn supersede_in<'a>(
+        conn: &mut PgConnection,
+        deployment: &DeploymentId,
+        rows: &[&'a AuditEventRow],
+    ) -> Result<Vec<&'a AuditEventRow>> {
+        // The latest attempt per (instance, base) within the batch.
+        let mut latest: std::collections::HashMap<(Option<Uuid>, i32), &AuditRowAttempt> =
+            std::collections::HashMap::new();
+        for row in rows {
+            if let Some(a) = &row.attempt {
+                let slot = latest.entry((row.instance_id, a.base)).or_insert(a);
+                if (a.at, a.id.as_bytes()) > (slot.at, slot.id.as_bytes()) {
+                    *slot = a;
+                }
+            }
+        }
+        if latest.is_empty() {
+            return Ok(rows.to_vec());
+        }
+        let groups: Vec<(Uuid, &AuditRowAttempt)> = latest
+            .iter()
+            .filter_map(|((instance, _), a)| instance.map(|i| (i, *a)))
+            .collect();
+        let instances: Vec<Uuid> = groups.iter().map(|(i, _)| *i).collect();
+        let bases: Vec<i32> = groups.iter().map(|(_, a)| a.base).collect();
+        let ats: Vec<OffsetDateTime> = groups.iter().map(|(_, a)| a.at).collect();
+        let ids: Vec<&str> = groups.iter().map(|(_, a)| a.id.as_str()).collect();
+        let superseded: Vec<String> = sqlx::query_scalar(SQL_SUPERSEDED_ATTEMPTS)
+            .bind(deployment.as_str())
+            .bind(&instances)
+            .bind(&bases)
+            .bind(&ats)
+            .bind(&ids)
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(PersistenceError::db("audit_event superseded attempts"))?;
+        sqlx::query(SQL_DELETE_EARLIER_ATTEMPTS)
+            .bind(deployment.as_str())
+            .bind(&instances)
+            .bind(&bases)
+            .bind(&ats)
+            .bind(&ids)
+            .execute(&mut *conn)
+            .await
+            .map_err(PersistenceError::db(
+                "audit_event delete superseded attempts",
+            ))?;
+        Ok(rows
+            .iter()
+            .copied()
+            .filter(|row| match &row.attempt {
+                None => true,
+                Some(a) => {
+                    latest
+                        .get(&(row.instance_id, a.base))
+                        .is_some_and(|l| l.id == a.id)
+                        && !superseded.contains(&a.id)
+                }
+            })
+            .collect())
+    }
+
+    /// Write rows of one deployment, already in write order, on `conn` (in its scope): runs of
+    /// engine events as one multi-row insert each, transport events one by one.
+    async fn insert_ordered_in(
+        conn: &mut PgConnection,
+        deployment: &DeploymentId,
+        ordered: &[&AuditEventRow],
+    ) -> Result<u64> {
         let mut inserted = 0u64;
         let mut start = 0;
         while start < ordered.len() {
             if is_transport_audit_event_type(&ordered[start].event_type) {
-                if Self::insert_in(&mut tx, ordered[start]).await? {
+                if Self::insert_in(conn, ordered[start]).await? {
                     inserted += 1;
                 }
                 start += 1;
@@ -315,13 +528,9 @@ impl PgAuditEventStore {
             while end < ordered.len() && !is_transport_audit_event_type(&ordered[end].event_type) {
                 end += 1;
             }
-            inserted +=
-                Self::insert_engine_run_in(&mut tx, deployment, &ordered[start..end]).await?;
+            inserted += Self::insert_engine_run_in(conn, deployment, &ordered[start..end]).await?;
             start = end;
         }
-        tx.commit()
-            .await
-            .map_err(PersistenceError::db("audit_event batch commit"))?;
         Ok(inserted)
     }
 
@@ -340,6 +549,19 @@ impl PgAuditEventStore {
         let diagnostics: Vec<Option<&str>> =
             rows.iter().map(|r| r.diagnostic_json.as_deref()).collect();
         let payloads: Vec<&str> = rows.iter().map(|r| r.payload_json.as_str()).collect();
+        let spool_refs: Vec<Option<&str>> = rows.iter().map(|r| r.spool_ref.as_deref()).collect();
+        let attempt_ids: Vec<Option<&str>> = rows
+            .iter()
+            .map(|r| r.attempt.as_ref().map(|a| a.id.as_str()))
+            .collect();
+        let attempt_bases: Vec<Option<i32>> = rows
+            .iter()
+            .map(|r| r.attempt.as_ref().map(|a| a.base))
+            .collect();
+        let attempt_ats: Vec<Option<OffsetDateTime>> = rows
+            .iter()
+            .map(|r| r.attempt.as_ref().map(|a| a.at))
+            .collect();
         let done = sqlx::query(SQL_INSERT_BATCH)
             .bind(deployment.as_str())
             .bind(instance_ids)
@@ -350,6 +572,10 @@ impl PgAuditEventStore {
             .bind(codes)
             .bind(diagnostics)
             .bind(payloads)
+            .bind(spool_refs)
+            .bind(attempt_ids)
+            .bind(attempt_bases)
+            .bind(attempt_ats)
             .execute(conn)
             .await
             .map_err(PersistenceError::db("audit_event batch insert"))?;
@@ -367,8 +593,8 @@ impl PgAuditEventStore {
     /// means the end of the journal.
     ///
     /// An empty result is NOT an error and NOT proof the instance never ran: the journal is
-    /// OPT-IN twice over — engine-side (`sutra.audit.sql`) and per-process (`<q:audit>`) — so an
-    /// instance with auditing off has no rows at all. The endpoint says so in its response rather
+    /// written only for a process that declares `<q:audit>` and routes it to the SQL audit store,
+    /// so an instance without that has no rows at all. The endpoint says so in its response rather
     /// than implying the history was lost.
     pub async fn list_for_instance(
         &self,
@@ -478,26 +704,63 @@ impl PgAuditEventStore {
         Ok(rows)
     }
 
-    /// Up to `limit` not-yet-erased media payloads of instances whose retention has run out
-    /// (see the predicate on [`sql_list_expired_media`]), as `(row id, instance, payload)`.
-    pub async fn list_expired_media(
+    /// Delete one batch of `deployment`'s audit rows older than `retention`, at most `batch` rows,
+    /// keeping media events whose object is not erased yet. Returns the rows deleted; the caller
+    /// loops while a batch comes back full.
+    pub async fn delete_expired_batch(
         &self,
         deployment: &DeploymentId,
         retention: std::time::Duration,
-        limit: i64,
-    ) -> Result<Vec<(i64, Uuid, String)>> {
+        batch: i64,
+    ) -> Result<u64> {
         let mut tx = begin_deployment_tx(&self.pool, deployment).await?;
-        let rows: Vec<(i64, Uuid, String)> = sqlx::query_as(&sql_list_expired_media())
+        let deleted = sqlx::query(&sql_delete_expired_batch())
             .bind(deployment.as_str())
+            .bind(retention.as_secs_f64())
+            .bind(batch)
+            .execute(&mut *tx)
+            .await
+            .map_err(PersistenceError::db("audit_event retention delete"))?
+            .rows_affected();
+        tx.commit()
+            .await
+            .map_err(PersistenceError::db("audit_event retention commit"))?;
+        Ok(deleted)
+    }
+
+    /// Up to `limit` not-yet-erased media rows of `deployment` with an id above `after_id`, in id
+    /// order, each saying whether its instance has a terminal event older than `retention` (see
+    /// [`PendingMediaRow`]).
+    pub async fn list_media_page(
+        &self,
+        deployment: &DeploymentId,
+        after_id: i64,
+        retention: std::time::Duration,
+        limit: i64,
+    ) -> Result<Vec<PendingMediaRow>> {
+        let mut tx = begin_deployment_tx(&self.pool, deployment).await?;
+        let rows: Vec<(i64, Uuid, String, bool)> = sqlx::query_as(&sql_list_media_page())
+            .bind(deployment.as_str())
+            .bind(after_id)
             .bind(retention.as_secs_f64())
             .bind(limit)
             .fetch_all(&mut *tx)
             .await
-            .map_err(PersistenceError::db("audit_event list expired media"))?;
-        tx.commit().await.map_err(PersistenceError::db(
-            "audit_event list expired media commit",
-        ))?;
-        Ok(rows)
+            .map_err(PersistenceError::db("audit_event list media page"))?;
+        tx.commit()
+            .await
+            .map_err(PersistenceError::db("audit_event list media page commit"))?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(id, instance_id, payload_json, terminal_event_expired)| PendingMediaRow {
+                    id,
+                    instance_id,
+                    payload_json,
+                    terminal_event_expired,
+                },
+            )
+            .collect())
     }
 
     /// Replace one row's payload — the media-erasure amendment, which says the media the row

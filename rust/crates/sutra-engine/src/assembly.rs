@@ -407,6 +407,170 @@ pub(crate) struct EngineRuntime {
     /// activation flip, `drain`/`stop_all_detached` on shutdown — and names no broker. Order is
     /// the deterministic `transport_factories()` order.
     pub(crate) transports: Vec<Arc<dyn TransportChannels>>,
+    /// The durable audit spool and its shippers; `None` when no audit store is configured.
+    pub(crate) audit: Option<AuditRuntime>,
+}
+
+/// What every lane's audit listener, transport journal and bridge need: the spool to append to,
+/// and the SQL store's shipper progress.
+#[derive(Clone, Debug)]
+pub(crate) struct AuditLink {
+    pub(crate) spool: sutra_channels::AuditSpoolSender,
+    /// The SQL store's shipper progress, when there is a SQL audit store: the features that
+    /// read or amend the audit database (the journal carry on migration) wait on it, so the
+    /// database holds everything spooled before they touch it.
+    pub(crate) sql_shipped: Option<sutra_channels::ShipperProgress>,
+    /// Decides the attempts whose commit outcome is unknown (and, at start, the ones a crash
+    /// left unmarked) from their transaction's status.
+    pub(crate) resolver: Option<crate::audit_recovery::ResolverTx>,
+}
+
+/// The process's audit spool and the shippers that load it into the configured stores. Built
+/// once per process at boot; activation flips reuse it.
+pub(crate) struct AuditRuntime {
+    spool: sutra_channels::AuditSpool,
+    shippers: Vec<sutra_channels::ShipperHandle>,
+    link: AuditLink,
+    replay_duplicates: Option<Arc<std::sync::atomic::AtomicU64>>,
+    shutdown_timeout: std::time::Duration,
+}
+
+impl AuditRuntime {
+    pub(crate) fn link(&self) -> AuditLink {
+        self.link.clone()
+    }
+
+    /// The spool's metrics and, with a JSONL store, its replay-duplicate counter.
+    pub(crate) fn metrics(
+        &self,
+    ) -> (
+        Arc<sutra_channels::AuditSpoolMetrics>,
+        Option<Arc<std::sync::atomic::AtomicU64>>,
+    ) {
+        (self.spool.metrics(), self.replay_duplicates.clone())
+    }
+
+    /// Drain and sync the spool, then give each shipper `sutra.audit.shutdown-timeout` to ship
+    /// what it holds. Whatever is left ships at the next start.
+    pub(crate) async fn shutdown(self) {
+        let spool = self.spool;
+        match tokio::task::spawn_blocking(move || spool.shutdown()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => warn!("audit spool shutdown: {e}"),
+            Err(e) => warn!("audit spool shutdown task failed: {e}"),
+        }
+        for shipper in self.shippers {
+            shipper.shutdown(self.shutdown_timeout).await;
+        }
+    }
+}
+
+/// Open the audit spool when at least one audit store is configured, build every store, and
+/// start one shipper per store. The SQL store is the one place a separate audit database plugs in.
+fn open_audit_runtime(
+    handle: &Handle,
+    audit: &crate::config::AuditConfig,
+    audit_pool: Option<&PgPool>,
+    engine_pool: Option<&PgPool>,
+) -> Result<Option<AuditRuntime>, Box<dyn std::error::Error>> {
+    let mut stores: Vec<Arc<dyn sutra_channels::AuditSink>> = Vec::new();
+    // The OTel-log store exports to a DEDICATED audit OTLP endpoint (`sutra.audit.otel.endpoint`),
+    // its own logs pipeline, independent of the engine telemetry stream.
+    if let Some(endpoint) = audit.otel_endpoint.as_deref() {
+        if crate::audit_sinks::init_audit_otel(handle, audit) {
+            stores.push(Arc::new(crate::audit_sinks::OtelAuditSink));
+        } else {
+            warn!(
+                endpoint,
+                "sutra.audit.otel.endpoint is set but the dedicated audit OTLP exporter could not \
+                 be built — no OTel audit store"
+            );
+        }
+    }
+    // The SQL audit store writes to the AUDIT database (`sutra.audit.sql.url`), never the
+    // engine's own: `serve` opens that pool, and its absence means no SQL store.
+    if let Some(p) = audit_pool {
+        stores.push(Arc::new(crate::audit_sinks::SqlAuditStore::new(p.clone())));
+    }
+    let settings = &audit.spool;
+    let jsonl = settings.files.is_some() || audit.jsonl_path.is_some();
+    let mut names: std::collections::BTreeSet<String> =
+        stores.iter().map(|s| s.name().to_string()).collect();
+    if jsonl {
+        names.insert("jsonl".to_string());
+    }
+    if names.is_empty() {
+        return Ok(None);
+    }
+    let spool = sutra_channels::AuditSpool::open(sutra_channels::AuditSpoolConfig {
+        sinks: names.clone(),
+        ..settings.spool.clone()
+    })
+    .map_err(|e| format!("audit spool {}: {e}", settings.spool.dir.display()))?;
+    let mut replay_duplicates = None;
+    if let Some(files) = &settings.files {
+        let store = sutra_channels::JsonlFileStore::open(files.clone(), spool.spool_id())
+            .map_err(|e| format!("audit file store {}: {e}", files.dir.display()))?;
+        replay_duplicates = Some(store.duplicates_dropped());
+        stores.push(Arc::new(store));
+    } else if let Some(path) = &audit.jsonl_path {
+        warn!(
+            path = %path.display(),
+            "sutra.audit.jsonl.path is deprecated: set sutra.audit.jsonl.dir (rotated files)"
+        );
+        let store =
+            sutra_channels::JsonlFileStore::open_legacy_file(path.clone(), spool.spool_id())
+                .map_err(|e| format!("audit file {}: {e}", path.display()))?;
+        replay_duplicates = Some(store.duplicates_dropped());
+        stores.push(Arc::new(store));
+    }
+    let default_sink = settings.default_sink.clone().or_else(|| {
+        (names.len() == 1)
+            .then(|| names.iter().next().cloned())
+            .flatten()
+    });
+    if let Some(default) = &default_sink {
+        if !names.contains(default) {
+            warn!(
+                default_sink = %default,
+                "sutra.audit.default-sink names a store this engine does not have; events routed \
+                 there are counted as undeliverable, never written"
+            );
+        }
+    }
+    let shippers: Vec<sutra_channels::ShipperHandle> = stores
+        .into_iter()
+        .map(|store| {
+            sutra_channels::spawn_audit_shipper(handle, &spool, store, settings.shipper.clone())
+        })
+        .collect();
+    let sql_shipped = shippers
+        .iter()
+        .find(|shipper| shipper.sink() == "sql")
+        .map(sutra_channels::ShipperHandle::progress);
+    info!(
+        stores = %names.iter().cloned().collect::<Vec<_>>().join(", "),
+        spool = %settings.spool.dir.display(),
+        spool_id = spool.spool_id(),
+        default_sink = %default_sink.as_deref().unwrap_or("-"),
+        "audit spool open; one shipper per audit store"
+    );
+    // Recovery of the attempts a previous run left unmarked, then the resolver of unknown
+    // commit outcomes: one task, deciding from the step transactions' status.
+    let resolver = crate::audit_recovery::spawn(handle, &spool, engine_pool.cloned())
+        .map_err(|e| format!("audit recovery {}: {e}", settings.spool.dir.display()))?;
+    let link = AuditLink {
+        spool: spool.sender(),
+        sql_shipped,
+        resolver: Some(resolver),
+    };
+    Ok(Some(AuditRuntime {
+        spool,
+        shippers,
+        link,
+        replay_duplicates,
+        shutdown_timeout: settings.shutdown_timeout,
+    }))
 }
 
 /// Assemble the engine runtime from the prepared plans: the engine actor (built ON its
@@ -458,6 +622,9 @@ pub(crate) fn build_engine_runtime(
     // `sutra.engine.connectivity-events.channel`: where broker connectivity events go, if
     // anywhere.
     connectivity_events_channel: Option<String>,
+    // The AUDIT database's pool (`sutra.audit.sql.url`), separate from `pool`: the SQL audit
+    // store ships into it. `None` = no SQL audit store.
+    audit_pool: Option<PgPool>,
 ) -> Result<EngineRuntime, Box<dyn std::error::Error>> {
     // Channel topology comes from the ACTIVE plans, plus the channels a superseded DRAINING plan
     // keeps because nothing newer declares them. Any other draining definition claims no route: it
@@ -473,11 +640,12 @@ pub(crate) fn build_engine_runtime(
         .map(|plan| plan.dep.clone())
         .collect();
 
-    let actor_handle = handle.clone();
     let actor_pool = pool.clone();
     let actor_labels = metrics_labels.clone();
     let outbox_lag_metrics = metrics_labels.is_some();
-    let actor_audit = audit.clone();
+    // The durable audit spool and its shippers: one per process, before any lane starts.
+    let audit_runtime = open_audit_runtime(&handle, &audit, audit_pool.as_ref(), pool.as_ref())?;
+    let actor_audit = audit_runtime.as_ref().map(AuditRuntime::link);
     let actor_key_provider = key_provider;
     let actor_deferred_acks = Arc::clone(&deferred_acks);
     let actor_now_override = now_override;
@@ -508,7 +676,6 @@ pub(crate) fn build_engine_runtime(
                 Arc::clone(&boot_draining),
                 Arc::clone(&shared),
                 actor_pool.clone(),
-                actor_handle.clone(),
                 actor_labels.clone(),
                 payload_cap_bytes,
                 actor_audit.clone(),
@@ -794,6 +961,7 @@ pub(crate) fn build_engine_runtime(
         outbox: outbox_handle,
         external_tasks,
         transports,
+        audit: audit_runtime,
     })
 }
 
@@ -2052,13 +2220,11 @@ fn owner_scopes_of(
     )
 }
 
-/// Install the engine's transport audit journal over `sinks`, routing deployment-level events of
+/// Install the engine's transport audit journal over `spool`, routing deployment-level events of
 /// each of `plans` by its module key (an active deployment wins over a draining one of the same
 /// key, which comes after it).
 fn install_transport_audit_journal<'a>(
-    handle: &Handle,
-    sinks: sutra_channels::AuditSinkRegistry,
-    default_sink: Option<String>,
+    spool: sutra_channels::AuditSpoolSender,
     plans: impl Iterator<Item = &'a DeploymentPlan>,
 ) {
     let mut routes: Vec<(String, crate::transport_audit::DeploymentAuditRoute)> = Vec::new();
@@ -2074,17 +2240,10 @@ fn install_transport_audit_journal<'a>(
                 .iter()
                 .flat_map(|m| m.processes())
                 .map(|p| p.audit.as_ref()),
-            default_sink.as_deref(),
         );
         routes.push((module_key, route));
     }
-    let journal = crate::transport_audit::EngineTransportAuditJournal::spawn(
-        handle,
-        sinks,
-        default_sink,
-        routes,
-        crate::transport_audit::TRANSPORT_AUDIT_QUEUE_CAPACITY,
-    );
+    let journal = crate::transport_audit::EngineTransportAuditJournal::new(spool, routes);
     sutra_channels::transport_audit().install(journal);
 }
 
@@ -2107,10 +2266,10 @@ pub(crate) fn build_engine(
     // to every lane (execution scale-out §2 row 10).
     shared: Arc<SharedRegistries>,
     pool: Option<PgPool>,
-    handle: Handle,
     metrics_labels: Option<Vec<String>>,
     payload_cap_bytes: u64,
-    audit: crate::config::AuditConfig,
+    // The process's audit spool and default store; `None` when no audit store is configured.
+    audit: Option<AuditLink>,
     key_provider: Option<Arc<dyn sutra_crypto::KeyProvider + Send + Sync>>,
     incident_sql: bool,
     instance_retention: std::time::Duration,
@@ -2373,103 +2532,50 @@ pub(crate) fn build_engine(
         listener.apply_initial_coverage(&initial_coverage);
         builder = builder.with_listener(listener);
     }
-    // The audit trail. Build ONE registry composing every enabled engine-global sink
-    // (JSONL + OTel-log — the DB sink is the follow-on), then, when it is non-empty, register the
-    // AuditListener on the executor's lifecycle bus (exactly like the OTel metrics listener above),
-    // feeding an async dispatcher spawned on the runtime handle. Recreated per activation — the
-    // executor is rebuilt on a flip and the previous dispatcher drains + exits when its listener
-    // drops. Best-effort: a JSONL open error just drops that sink, it never fails the engine build.
-    // The typed listener handle is hoisted so the ChannelEngine can ALSO reach it (below) — it
-    // seeds/reads the per-instance audit seq across suspend/resume so the seq stays monotonic.
+    // The audit trail: the AuditListener on the executor's lifecycle bus (exactly like the OTel
+    // metrics listener above) appends every event to the process's durable spool; the bridge
+    // below waits for the spool's sync before each step commit, and the shippers load the stores.
+    // Recreated per activation (the executor is rebuilt on a flip); the spool is not. The typed
+    // listener handle is hoisted so the ChannelEngine can ALSO reach it (below): it seeds/reads
+    // the per-instance audit seq across suspend/resume so the seq stays monotonic.
     let mut audit_listener: Option<Rc<sutra_channels::AuditListener>> = None;
-    {
-        let mut registry = sutra_channels::AuditSinkRegistry::new();
-        if let Some(path) = audit.jsonl_path.as_ref() {
-            match sutra_channels::JsonlAuditSink::open(path) {
-                Ok(sink) => registry.register(Arc::new(sink)),
-                Err(e) => warn!(
-                    path = %path.display(),
-                    error = %e,
-                    "audit JSONL sink could not open — JSONL audit disabled for this activation"
-                ),
+    // The lane's audit attempt tracker: its listener registers each pass's attempt, its bridge
+    // settles them at every commit, and the shippers ship only settled-committed attempts.
+    // Only with persistence: without a database nothing commits, so events carry no attempt.
+    let attempt_tracker =
+        (audit.is_some() && pool.is_some()).then(sutra_channels::AuditAttemptTracker::new);
+    match &audit {
+        None => {
+            if shard.index == 0 {
+                // No audit store: transport events have nowhere to go.
+                sutra_channels::transport_audit().clear();
             }
         }
-        // The OTel-log sink exports to a DEDICATED audit OTLP endpoint (`sutra.audit.otel.endpoint`)
-        // — its own logs pipeline, independent of the engine telemetry stream. Register it only when
-        // that pipeline builds. `serve` builds it once from the runtime before any lane starts; this
-        // lane thread has no runtime of its own, so the call passes the engine's handle and, the
-        // provider already existing, only reads it (a per-activation flip reuses it the same way).
-        if let Some(endpoint) = audit.otel_endpoint.as_deref() {
-            if crate::audit_sinks::init_audit_otel(&handle, &audit) {
-                registry.register(Arc::new(crate::audit_sinks::OtelAuditSink));
-            } else {
-                warn!(
-                    endpoint,
-                    "sutra.audit.otel.endpoint is set but the dedicated audit OTLP exporter could \
-                     not be built — OTel audit sink not registered"
-                );
-            }
-        }
-        // The SQL sink (the `<q:audit>` default target) is the durable audit of record — gate it
-        // on both the toggle AND a datasource pool (pg-only). `pool.as_ref()` borrows: the pool is
-        // moved into the PersistenceBridge further below, so the sink takes a cheap Arc clone.
-        if audit.sql {
-            match pool.as_ref() {
-                Some(p) => {
-                    registry.register(Arc::new(crate::audit_sinks::SqlAuditSink::new(p.clone())))
-                }
-                None => warn!(
-                    "sutra.audit.sql is set but no datasource pool is configured — SQL audit sink \
-                     not registered (audit_event needs a database)"
-                ),
-            }
-        }
-        if registry.is_empty() && shard.index == 0 {
-            // No audit sink: transport events have nowhere to go.
-            sutra_channels::transport_audit().clear();
-        }
-        if !registry.is_empty() {
-            let names = registry.names().join(", ");
-            // The engine-default audit sink for a process that declares no `<q:audit sink>` (and
-            // has no manifest default): the highest-priority REGISTERED sink — sql (the
-            // audit-of-record) > jsonl > otel. Audit routes to exactly one sink; this is the
-            // default target. Computed before the registry moves into the dispatcher.
-            let default_audit_sink = ["sql", "jsonl", "otel"]
-                .into_iter()
-                .find(|name| registry.get(name).is_some())
-                .map(str::to_string);
+        Some(link) => {
             // The journal transports append their own events to (`sutra_channels::transport_audit`),
-            // over the same sinks. Installed by lane 0 only — every lane builds the same sinks and
-            // deployment set, and one journal (one writer) serves the process.
+            // into the same spool. Installed by lane 0 only: one journal serves the process.
             if shard.index == 0 {
                 install_transport_audit_journal(
-                    &handle,
-                    registry.clone(),
-                    default_audit_sink.clone(),
+                    link.spool.clone(),
                     active.iter().chain(draining.iter()),
                 );
             }
-            let (tx, rx) = sutra_channels::audit_channel();
-            sutra_channels::spawn_audit_dispatcher(&handle, rx, registry);
-            let listener = Rc::new(sutra_channels::AuditListener::new(tx, || {
+            let listener = sutra_channels::AuditListener::new(link.spool.clone(), || {
                 time::OffsetDateTime::now_utc()
                     .format(&time::format_description::well_known::Rfc3339)
                     .unwrap_or_default()
-            }));
+            });
+            let listener = Rc::new(match &attempt_tracker {
+                Some(tracker) => listener.with_attempt_tracker(tracker.clone()),
+                None => listener,
+            });
             // Register the SAME listener on the executor's lifecycle bus AND retain a typed
             // handle for the ChannelEngine (seq seed/read across suspend/resume). The `let`
             // with an explicit trait-object type coerces the clone (`Rc::clone` would pin the
             // concrete type and fail to unsize).
             let as_listener: Rc<dyn sutra_executor::listener::ExecutionListener> = listener.clone();
-            builder = builder
-                .with_listener(as_listener)
-                .with_default_audit_sink(default_audit_sink.clone());
+            builder = builder.with_listener(as_listener);
             audit_listener = Some(listener);
-            info!(
-                sinks = %names,
-                default_sink = %default_audit_sink.as_deref().unwrap_or("-"),
-                "audit trail active (single-sink routing; default = highest-priority registered)"
-            );
         }
     }
     // The deferred-ack registry observes the SAME lifecycle bus (exactly like
@@ -2600,14 +2706,19 @@ pub(crate) fn build_engine(
             // `instance_retention` decides one thing in the bridge: whether the terminal step
             // RETAINS the instance row (re-stamped COMPLETED, queryable for the window) or deletes
             // it outright the way it always used to (`PT0S`).
-            let bridge = Rc::new(
-                PersistenceBridge::with_key_provider(pool, key_provider)
-                    .with_retention(instance_retention)
-                    // Shard-scoped ownership: same owner ⇒ same lane ⇒ already serialised
-                    // (`-s0` at the single-lane default; the store treats it as opaque).
-                    .with_shard_owner(shard.index)
-                    .with_outbox_signal(outbox_signal),
-            );
+            let bridge = PersistenceBridge::with_key_provider(pool, key_provider)
+                .with_retention(instance_retention)
+                // Shard-scoped ownership: same owner ⇒ same lane ⇒ already serialised
+                // (`-s0` at the single-lane default; the store treats it as opaque).
+                .with_shard_owner(shard.index)
+                .with_outbox_signal(outbox_signal);
+            let bridge = Rc::new(match (&audit, attempt_tracker) {
+                (Some(link), Some(tracker)) => bridge
+                    .with_audit_spool(link.spool.clone())
+                    .with_audit_attempts(tracker, link.resolver.clone()),
+                (Some(link), None) => bridge.with_audit_spool(link.spool.clone()),
+                (None, _) => bridge,
+            });
             // The durable dead-letter sink, opt-in via `sutra.incident.sql`.
             if incident_sql {
                 engine_builder = engine_builder.with_incident_sink(

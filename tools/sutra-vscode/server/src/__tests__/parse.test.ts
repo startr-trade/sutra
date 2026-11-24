@@ -63,7 +63,7 @@ describe('symbol-table extraction', () => {
     expect(dispKinds).toEqual(['case', 'case', 'dispatch']);
     const audit = buildSymbolTable(AUDIT_PROCESS);
     expect(audit.symbols.map((s) => s.kind)).toEqual(['audit']);
-    expect(audit.symbols[0].attributes.sink).toBe('jsonl');
+    expect(audit.symbols[0].attributes.events).toBe('all');
     expect(audit.symbols[0].attributes.capture).toBe('metadata');
   });
 

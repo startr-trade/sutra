@@ -66,6 +66,14 @@ pub mod validators;
 #[cfg(feature = "transport")]
 pub mod audit;
 #[cfg(feature = "transport")]
+pub mod audit_attempts;
+#[cfg(feature = "transport")]
+pub mod audit_files;
+#[cfg(feature = "transport")]
+pub mod audit_shipper;
+#[cfg(feature = "transport")]
+pub mod audit_spool;
+#[cfg(feature = "transport")]
 pub mod connectivity;
 #[cfg(feature = "transport")]
 pub mod dispatch;
@@ -97,9 +105,18 @@ pub use sutra_executor::DeploymentId;
 pub use ack::{DeferredAckListener, DeferredAckRegistry};
 #[cfg(feature = "transport")]
 pub use audit::{
-    audit_channel, deliver_audit_event, deliver_audit_events, spawn_audit_dispatcher, AuditEvent,
-    AuditListener, AuditSink, AuditSinkRegistry, JsonlAuditSink, AUDIT_BATCH_MAX,
+    AuditAttempt, AuditEvent, AuditListener, AuditSink, SpoolRecord, AUDIT_BATCH_MAX,
     AUDIT_CAPTURE_HEADER, AUDIT_CAPTURE_MEDIA, AUDIT_SINK_WRITE_FAILED,
+};
+#[cfg(feature = "transport")]
+pub use audit_attempts::{AuditAttemptTracker, OpenAttempt};
+#[cfg(feature = "transport")]
+pub use audit_files::{AuditFilesConfig, JsonlFileStore};
+#[cfg(feature = "transport")]
+pub use audit_shipper::{spawn_audit_shipper, ShipperConfig, ShipperHandle, ShipperProgress};
+#[cfg(feature = "transport")]
+pub use audit_spool::{
+    AuditSpool, AuditSpoolConfig, AuditSpoolMetrics, AuditSpoolSender, SpoolError, SpoolReader,
 };
 #[cfg(feature = "transport")]
 pub use bridge::replica_id;
@@ -154,8 +171,8 @@ pub use intake::{InboundChain, IntakeOutcome};
 pub use outbox_dispatch::{
     encode_wire_message, spawn_concurrent_dispatch_loop, spawn_dispatch_loop, ClaimedOutboxRow,
     DeliveryObservation, DispatchStats, LiveDeploymentSet, OutboxConcurrency, OutboxDispatcher,
-    OutboxDispatcherHandle, OutboxRowStore, OutboxSignal, PoisonedDelivery, RetryPolicy,
-    BOUNDED_RETRY_ATTR,
+    OutboxDispatcherHandle, OutboxRowStore, OutboxSignal, OutboxWorkCounters, OutboxWorkSnapshot,
+    PoisonedDelivery, RetryPolicy, BOUNDED_RETRY_ATTR,
 };
 pub use owner_scopes::{OwnerScope, OwnerScopes};
 pub use policy::{

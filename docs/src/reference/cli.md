@@ -111,6 +111,8 @@ resolve a different codec registry than the archive it had just sealed.
 
 ```
 sutra lint <PACKAGE_DIR | MANIFEST.yaml> [--overlay <DIR>]... [--active-set <PATH>]... [--engine-url <URL>]
+sutra lint <PACKAGE_DIR> --audit [--format json]
+sutra lint <PACKAGE_DIR> --fix audit [--events all|points] [--dry-run]
 ```
 
 Runs the full package-time validation suite (the same fail-closed checks `sutra package` runs)
@@ -129,6 +131,18 @@ the transports the CLI links (HTTP) and reports a channel on any other as
 `SUTRA.DEPLOY.ENDPOINT.COLLISION`; a data store that would share rows is the warning
 `SUTRA.DEPLOY.DATASTORE.SHARED_CONNECTION`. See [One endpoint, one
 deployment](../building/endpoint-claims.md).
+
+**Audit, `--audit` and `--fix audit` (0.9).** `--audit` prints, per process, whether it declares
+`<q:audit>`, the effective `events` and `capture`, and for every element whether it is audited and
+which rule decided it. A process with no tag is reported `SUTRA.LINT.AUDIT.NOT_DECLARED`: no tag, no
+audit. Plain `sutra lint` also warns of a version-only pin that now audits
+(`SUTRA.LINT.AUDIT.VERSION_PIN_AUDITS`) and of payload capture into a file store
+(`SUTRA.LINT.AUDIT.PAYLOAD_IN_FILE_STORE`). `--fix audit` is a byte-preserving codemod that prints a
+unified diff of what it changed: it gives every process an explicit `<q:audit events=… capture=…>`,
+moves a `sink` / `target` from the BPMN into the manifest's `audit.sink` / `audit.sinks`, and drops
+the manifest's ignored `audit.capture`. `--events` is the scope written where a process has none
+(`all` reproduces 0.8's trail, `points` is the new default). `--dry-run` prints the diff and writes
+nothing. Running it twice changes nothing. See [Upgrading to 0.9](../operating/upgrading-0-9.md).
 
 Given a deployment manifest (a `.yaml` file) instead of a directory, `lint` first prints the
 resolved stack — each layer in order, each overridden file with the layer that won and the one it
@@ -237,11 +251,16 @@ nature, data stores) — the same document the engine serves live per deployment
 ### `sutra migrate`
 
 ```
-sutra migrate [status|verify] [--url <URL>] [--dry-run] [flags]
+sutra migrate [status|verify] [--url <URL>] [--audit-url <URL>] [--dry-run] [flags]
 ```
 
 Applies engine schema migrations to the engine-internal database, or inspects them (`status` —
 applied vs. pending; `verify` — ledger integrity, expected head, checksum drift).
+
+`--audit-url <URL>` (0.9) also applies the audit migrations (the V2xx family) to the **audit
+database**; the engine's own database never gets them. With only `--audit-url`, just the audit
+database is migrated. `status` and `verify` check the engine family and ignore audit rows left in a
+pre-0.9 ledger.
 
 ### `sutra crypto provision-dek`
 
@@ -359,10 +378,16 @@ sutra audit-replay <INSTANCE_ID> --from-jsonl <PATH> [--tenant <TENANT>] [--unti
 Walks a process instance's audit events from a JSONL stream — reconstructing what a specific
 instance did, offline. See [Logging and audit](../operating/logging.md).
 
+`--from-jsonl` takes the file or a directory of files the JSONL store writes
+(`sutra.audit.jsonl.dir`) as they are: a line's extra keys are ignored, and an event that appears
+twice (a step re-run after a crash re-emits its events) is shown once, deduplicated on
+`(deploymentId, instanceId, seq)`. A line without a positive `seq` (a transport event) is never
+deduplicated. See [Recording audit points](../building/recording-audit-points.md).
+
 ### `sutra version`
 
 ```
-sutra version            # sutra 0.8.5 (1a2b3c4, built 2026-11-15)
+sutra version            # sutra 0.9.0 (1a2b3c4, built 2026-11-15)
 sutra --version          # identical text
 sutra version --format json
 ```
@@ -370,8 +395,8 @@ sutra version --format json
 Prints the tool version and the build it came from. The parenthesis names the commit the binary
 was built from (`-dirty` appended when tracked files had uncommitted changes) and that commit's
 date in UTC. It is never the wall clock, so two builds of one commit print the same line. An
-unknown part is left out rather than guessed: `sutra 0.8.5 (1a2b3c4)` without a date, plain
-`sutra 0.8.5` when git is unavailable and no build variable was set. A release build takes both
+unknown part is left out rather than guessed: `sutra 0.9.0 (1a2b3c4)` without a date, plain
+`sutra 0.9.0` when git is unavailable and no build variable was set. A release build takes both
 from `SUTRA_BUILD_COMMIT` and `SOURCE_DATE_EPOCH`; a local build reads them from git. The engine
 image's `sutra-engine --version` prints the same, and its `sutra-engine starting` log line carries
 `version`, `commit` and `built` fields.
@@ -383,7 +408,7 @@ binary name prints that name, and one that versions itself independently of the 
 
 ```
 <tool> 2.0.0
-sutra  0.8.5 (engine)
+sutra  0.9.0 (engine)
 ```
 
 The tool's own version is its first line read up to the first ` (`, so a distribution may print
@@ -396,7 +421,7 @@ reporting tool's own, `engine` the embedded engine's (equal for this binary). `c
 `built` are present when known:
 
 ```json
-{"name":"sutra","version":"0.8.5","engine":"0.8.5","commit":"1a2b3c4","built":"2026-11-15"}
+{"name":"sutra","version":"0.9.0","engine":"0.9.0","commit":"1a2b3c4","built":"2026-11-15"}
 ```
 
 ---

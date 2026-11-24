@@ -1,6 +1,7 @@
 # Summary
 
 [Introduction](introduction.md)
+[What's new in 0.9](whats-new-0-9.md)
 [What's new in 0.8](whats-new-0-8.md)
 [What's new in 0.7](whats-new-0-7.md)
 [What's new in 0.6](whats-new-0-6.md)
@@ -27,6 +28,7 @@
 - [One endpoint, one deployment](building/endpoint-claims.md)
 - [A reply answers the instance waiting for it](building/waits-first.md)
 - [Upgrading a deployment in place](building/upgrading-in-place.md)
+- [Recording audit points](building/recording-audit-points.md)
 - [Acceptance receipts](building/acceptance-receipts.md)
 - [Answering with a status and headers](building/reply-status-and-headers.md)
 - [External tasks: the pull worker surface](building/external-tasks.md)
@@ -72,6 +74,7 @@
 - [Instance migration](operating/instance-migration.md)
 - [Logging and audit](operating/logging.md)
 - [Troubleshooting BPMN solutions](operating/troubleshooting.md)
+- [Upgrading to 0.9](operating/upgrading-0-9.md)
 - [Upgrading to 0.6.18](operating/upgrading-0-6-18.md)
 - [Upgrading to 0.6.19](operating/upgrading-0-6-19.md)
 - [Upgrading to 0.6.20](operating/upgrading-0-6-20.md)

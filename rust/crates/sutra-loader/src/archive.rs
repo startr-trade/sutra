@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
 use sutra_bpmn::loader::BpmnModelLoader;
-use sutra_bpmn::model::{ProcessAudit, ProcessModule};
+use sutra_bpmn::model::{AuditDestinations, ProcessModule};
 use sutra_bpmn::qbindings::AuditCapture;
 use sutra_executor::deployment::DeploymentId;
 
@@ -65,19 +65,160 @@ pub struct ArchiveManifest {
     pub supersedes: Vec<String>,
     /// `entryProcesses` — informational index of externally-reachable processes.
     pub entry_processes: Vec<String>,
-    /// B1 — `audit.{sink,capture}`: the deployment-wide audit default (single sink + capture level)
-    /// for every process that declares no process-level `<q:audit>`. Part of the identity-bearing
-    /// manifest by design: a node/process `<q:audit>` already remints the deploymentId (it lives in
-    /// a `.bpmn` artifact hashed here), so the deployment-level default is identity-bearing too —
-    /// every audit routing change is a new, lineage-tracked deployment version. `None` ⇒ no default
-    /// (absent from the serialization, so existing deploymentIds are unchanged).
-    pub audit: Option<ProcessAudit>,
+    /// `audit` — WHERE the package's audited processes send their events: `audit.sink` (the
+    /// default store) and `audit.sinks` (process id → store). It never turns audit on: only a
+    /// process-level `<q:audit>` does. Identity-bearing, like every routing input. `None` ⇒ the
+    /// block is absent (and absent from the serialization, so such deploymentIds are unchanged).
+    pub audit: Option<ManifestAudit>,
     /// `properties` — the deployment configuration, as UNRESOLVED text (see
     /// [`crate::properties`]). Identity-bearing like `audit`; emitted only when non-empty, so a
     /// manifest without properties keeps its exact bytes and deploymentId.
     pub properties: BTreeMap<String, String>,
     /// `artifacts[]` — EVERY entry in the archive except `manifest.yaml` itself.
     pub artifacts: Vec<ArtifactEntry>,
+}
+
+/// The manifest's `audit` block (`package.yaml` and the sealed `manifest.yaml` share it):
+/// where the package's audited processes send their events. Destination only — whether a process
+/// is audited, and what it captures, is its BPMN's `<q:audit>` alone.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ManifestAudit {
+    /// `audit.sink` — the store every audited process uses unless `sinks` names another.
+    pub sink: Option<String>,
+    /// `audit.sinks` — process id → store, over `sink`.
+    pub sinks: BTreeMap<String, String>,
+    /// `audit.capture` as written. Ignored since 0.9 (a warning says so); kept so the warning can
+    /// name it and `sutra lint --fix audit` can move it into the processes it used to cover.
+    pub capture: Option<AuditCapture>,
+}
+
+impl ManifestAudit {
+    /// The destinations the engine resolves against its configured stores at deploy.
+    pub fn destinations(&self) -> AuditDestinations {
+        AuditDestinations {
+            default: self.sink.clone(),
+            per_process: self.sinks.clone(),
+        }
+    }
+
+    /// The warning an ignored `audit.capture` earns, if one is written.
+    pub fn ignored_capture(&self) -> Option<LintDiagnostic> {
+        self.capture.map(|capture| {
+            LintDiagnostic::warning(
+                codes::MANIFEST_AUDIT_CAPTURE_IGNORED,
+                format!(
+                    "manifest audit.capture '{}' is ignored: a process records what its own \
+                     <q:audit capture> says, and a process without <q:audit> is not audited. \
+                     Run `sutra lint --fix audit` to move it into the processes",
+                    capture.as_str()
+                ),
+            )
+        })
+    }
+
+    /// One error per `audit.sinks` entry that names a process the deployment does not define.
+    pub fn unknown_processes(&self, deployment: &LoadedDeployment) -> Vec<LintDiagnostic> {
+        self.sinks
+            .keys()
+            .filter(|pid| !deployment.processes.contains_key(pid.as_str()))
+            .map(|pid| {
+                LintDiagnostic::error(
+                    codes::MANIFEST_AUDIT_UNKNOWN_PROCESS,
+                    format!(
+                        "manifest audit.sinks names process '{pid}', but no BPMN in the package \
+                         defines it"
+                    ),
+                )
+            })
+            .collect()
+    }
+
+    /// Parse an `audit:` mapping. `sink` and `capture` are strings, `sinks` a string map.
+    pub(crate) fn parse(
+        value: &serde_yaml::Value,
+        invalid: &dyn Fn(String) -> LoaderError,
+    ) -> Result<ManifestAudit, LoaderError> {
+        if value.is_null() {
+            return Ok(ManifestAudit::default());
+        }
+        let map = value
+            .as_mapping()
+            .ok_or_else(|| invalid("audit must be a mapping".to_string()))?;
+        for key in map.keys() {
+            let name = key.as_str().unwrap_or("<non-string>");
+            if !["sink", "sinks", "capture"].contains(&name) {
+                return Err(invalid(format!(
+                    "audit declares unknown key '{name}' (only sink, sinks and capture exist)"
+                )));
+            }
+        }
+        let sink = map
+            .get(serde_yaml::Value::from("sink"))
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let mut sinks = BTreeMap::new();
+        if let Some(value) = map.get(serde_yaml::Value::from("sinks")) {
+            if !value.is_null() {
+                let entries = value
+                    .as_mapping()
+                    .ok_or_else(|| invalid("audit.sinks must be a mapping".to_string()))?;
+                for (k, v) in entries {
+                    let pid = k
+                        .as_str()
+                        .ok_or_else(|| invalid("audit.sinks keys must be strings".to_string()))?;
+                    let store = v
+                        .as_str()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .ok_or_else(|| {
+                            invalid(format!("audit.sinks.{pid} must be a non-empty string"))
+                        })?;
+                    sinks.insert(pid.to_string(), store.to_string());
+                }
+            }
+        }
+        let capture = match map
+            .get(serde_yaml::Value::from("capture"))
+            .and_then(|v| v.as_str())
+        {
+            None | Some("") => None,
+            Some("metadata") => Some(AuditCapture::Metadata),
+            Some("payload") => Some(AuditCapture::Payload),
+            Some("none") => Some(AuditCapture::None),
+            Some("media") => Some(AuditCapture::Media),
+            Some(other) => {
+                return Err(invalid(format!(
+                    "audit.capture '{other}' is not one of metadata|payload|none|media"
+                )))
+            }
+        };
+        Ok(ManifestAudit {
+            sink,
+            sinks,
+            capture,
+        })
+    }
+
+    /// Deterministic serialisation (`sink`, `capture`, then `sinks` sorted) — part of the
+    /// identity-bearing manifest bytes. Each key is written only when set, so a block written
+    /// before `sinks` existed keeps its exact bytes.
+    pub fn push_yaml(&self, out: &mut String) {
+        out.push_str("audit:\n");
+        if let Some(sink) = &self.sink {
+            out.push_str(&format!("  sink: {}\n", quote(sink)));
+        }
+        if let Some(capture) = self.capture {
+            out.push_str(&format!("  capture: {}\n", quote(capture.as_str())));
+        }
+        if !self.sinks.is_empty() {
+            out.push_str("  sinks:\n");
+            for (pid, store) in &self.sinks {
+                out.push_str(&format!("    {}: {}\n", quote(pid), quote(store)));
+            }
+        }
+    }
 }
 
 impl ArchiveManifest {
@@ -88,13 +229,10 @@ impl ArchiveManifest {
         out.push_str(&format!("manifestVersion: {}\n", self.manifest_version));
         out.push_str("engine:\n");
         out.push_str(&format!("  minContract: {}\n", self.engine_min_contract));
-        // B1 — the deployment audit default. Emitted only when present, so a manifest without an
-        // audit default serializes to exactly its pre-B1 bytes (deploymentId unchanged).
+        // The audit destinations. Emitted only when present, so a manifest without an audit
+        // block serializes to exactly the bytes it always had (deploymentId unchanged).
         if let Some(audit) = &self.audit {
-            let capture = audit.capture.as_str();
-            out.push_str("audit:\n");
-            out.push_str(&format!("  sink: {}\n", quote(&audit.sink)));
-            out.push_str(&format!("  capture: {}\n", quote(capture)));
+            audit.push_yaml(&mut out);
         }
         crate::properties::push_properties(&mut out, &self.properties);
         if self.labels.is_empty() {
@@ -188,34 +326,9 @@ impl ArchiveManifest {
         let supersedes = parse_string_list(root, "supersedes", &invalid)?;
         let entry_processes = parse_string_list(root, "entryProcesses", &invalid)?;
 
-        // B1 — the deployment-wide audit default (single sink + capture level). Absent ⇒ None.
-        let audit = if let Some(value) = root.get(serde_yaml::Value::from("audit")) {
-            let map = value
-                .as_mapping()
-                .ok_or_else(|| invalid("audit must be a mapping".to_string()))?;
-            let sink = map
-                .get(serde_yaml::Value::from("sink"))
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-                .unwrap_or("sql")
-                .to_string();
-            let capture = match map
-                .get(serde_yaml::Value::from("capture"))
-                .and_then(|v| v.as_str())
-            {
-                None | Some("") | Some("metadata") => AuditCapture::Metadata,
-                Some("payload") => AuditCapture::Payload,
-                Some("none") => AuditCapture::None,
-                Some("media") => AuditCapture::Media,
-                Some(other) => {
-                    return Err(invalid(format!(
-                        "audit.capture '{other}' is not one of metadata|payload|none|media"
-                    )))
-                }
-            };
-            Some(ProcessAudit { sink, capture })
-        } else {
-            None
+        let audit = match root.get(serde_yaml::Value::from("audit")) {
+            Some(value) => Some(ManifestAudit::parse(value, &invalid)?),
+            None => None,
         };
 
         let properties = match root.get(serde_yaml::Value::from("properties")) {
@@ -707,12 +820,11 @@ fn parse_deployment(
         };
         if let Some(sub) = path.strip_prefix("bpmn/") {
             let content = text(path, bytes)?;
-            // B1 — desugar the manifest-level audit default onto every process that declares no
-            // process-level `<q:audit>`; each process then carries its effective ProcessAudit.
+            // Audit destinations are NOT applied here: the engine resolves them at deploy, with
+            // its own configured stores (see `ManifestAudit::destinations`).
             let module = loader
                 .load(content.as_bytes())
-                .map_err(|e| content_invalid(format!("BPMN entry '{path}' fails to parse: {e}")))?
-                .with_audit_default(&manifest.audit);
+                .map_err(|e| content_invalid(format!("BPMN entry '{path}' fails to parse: {e}")))?;
             match &namespace {
                 None => namespace = Some(module.target_namespace.clone()),
                 Some(ns) if *ns != module.target_namespace => {
@@ -814,6 +926,14 @@ fn parse_deployment(
     // per-process sub-paths onto the referenced `ProcessDefinition`s (so the runtime cursor
     // marks them). Resilient: a referenced-but-absent processId is skipped (lint catches it).
     deployment.resolve_coverage(codes::DEPLOY_ARCHIVE_CONTENT_INVALID)?;
+    if let Some(audit) = &manifest.audit {
+        if let Some(d) = audit.unknown_processes(&deployment).into_iter().next() {
+            return Err(LoaderError::new(
+                codes::MANIFEST_AUDIT_UNKNOWN_PROCESS,
+                d.message,
+            ));
+        }
+    }
     Ok(deployment)
 }
 
@@ -877,9 +997,10 @@ mod tests {
             supersedes: Vec::new(),
             entry_processes: vec!["p".to_string()],
             // Exercise the audit default through the canonical round-trip (deploymentId input).
-            audit: Some(ProcessAudit {
-                sink: "sql".to_string(),
-                capture: AuditCapture::Payload,
+            audit: Some(ManifestAudit {
+                sink: Some("sql".to_string()),
+                sinks: BTreeMap::from([("p".to_string(), "jsonl".to_string())]),
+                capture: Some(AuditCapture::Payload),
             }),
             properties: BTreeMap::from([("retryDelay".to_string(), "${RETRY:PT5S}".to_string())]),
             artifacts: vec![ArtifactEntry {

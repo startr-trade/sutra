@@ -1258,6 +1258,9 @@ struct Subscriber<'a> {
     process_id: &'a str,
     node_id: &'a str,
     source: &'a SourceBinding,
+    /// The process's `<q:process idempotent>` assertion: a flow that says a second run is safe
+    /// needs no dedup key to be told about.
+    idempotent: bool,
     /// Filled in by [`check_channel_uniqueness`], which is the first place that knows the
     /// channel's codec and so the vocabulary to analyse against. `None` = no `filterExpression`.
     predicate: Option<SelectPredicate>,
@@ -1308,6 +1311,7 @@ fn subscribers_of<'a>(deployment: &'a LoadedDeployment, channel: &str) -> Vec<Su
                                 process_id: &process.id,
                                 node_id: id,
                                 source,
+                                idempotent: process.idempotent,
                                 predicate: None,
                             });
                         }
@@ -1585,6 +1589,8 @@ fn check_channel_uniqueness(
         let own_copy = receives_its_own_copy(def);
         if own_copy {
             check_redelivery_dedup(channel, def, &subscribers, dep_label, out);
+        } else if redelivers_point_to_point(def) {
+            check_queue_redelivery_dedup(channel, def, &subscribers, dep_label, out);
         }
 
         // ERROR — non-broadcast uniqueness (broadcast channels are exempt: pub/sub, so any
@@ -1937,6 +1943,55 @@ fn check_redelivery_dedup(
                      id dedupes it where the event has one and the channel reads CloudEvents; to be \
                      sure, declare <q:source dedupKey> (header.<name>, ce.id or body.<path>) or the \
                      channel's idempotency-key-header",
+                    sub.process_id,
+                ),
+            )
+            .at_process(sub.process_id),
+        );
+    }
+}
+
+/// A queue-style broker intake: one copy per message, but delivered at least once. The sender's
+/// outbox sends again when it cannot tell that a send arrived (no settlement in time, or the row's
+/// delete failing after the send), and the broker redelivers what a lost consumer never settled.
+/// Either way the same message arrives twice, and only a key the engine treats as explicit keeps
+/// the second from running again. The transport's fallback key (the broker's message id, an
+/// offset, a delivery coordinate) is deliberately not one, so without a `sutra-outbox-key` property
+/// on the message, a declared `dedupKey` or a key header, the flow runs twice.
+fn redelivers_point_to_point(def: &ChannelDefinition) -> bool {
+    matches!(
+        def.transport.as_deref(),
+        Some("amqp" | "rabbitmq" | "kafka" | "sqs" | "gcp-pubsub")
+    )
+}
+
+/// WARN — a catch-all start on a queue-style broker intake with no dedup key, in a process that
+/// does not assert it is safe to run twice. Typed subscribers are told by
+/// [`check_non_broadcast_uniqueness`]; this covers the catch-all, the common shape of a relay that
+/// takes everything a queue holds.
+fn check_queue_redelivery_dedup(
+    channel: &str,
+    def: &ChannelDefinition,
+    subscribers: &[Subscriber<'_>],
+    dep_label: &str,
+    out: &mut Vec<LintDiagnostic>,
+) {
+    for sub in subscribers {
+        let typed = sub.value().is_some() || sub.pattern().is_some();
+        if typed || sub.idempotent || has_a_dedup_key(sub.source, def) {
+            continue;
+        }
+        out.push(
+            LintDiagnostic::warning(
+                codes::CHANNEL_NO_IDEMPOTENCY_KEY,
+                format!(
+                    "deployment {dep_label}: process '{}' starts on every message of broker \
+                     channel '{channel}' and declares no dedup key. The broker delivers at least \
+                     once: a sender's retry or a redelivery brings the same message again, and \
+                     unless it carries a sutra-outbox-key property the flow runs twice. Declare \
+                     <q:source dedupKey> (amqp.message-id, header.<name>, ce.id or body.<path>), \
+                     the channel's idempotency-key-header, or <q:process idempotent=\"true\"> \
+                     if a second run is safe",
                     sub.process_id,
                 ),
             )

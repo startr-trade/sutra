@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0"
+                  id="Definitions_audit" targetNamespace="urn:sutra:module:audit:1.0.0">
+  <bpmn:process id="flow" isExecutable="true">
+    <bpmn:extensionElements><q:audit/></bpmn:extensionElements>
+    <bpmn:startEvent id="S"/>
+    <bpmn:serviceTask id="T" implementation="${raiser}"/>
+    <bpmn:boundaryEvent id="B" attachedToRef="T">
+      <bpmn:errorEventDefinition/>
+    </bpmn:boundaryEvent>
+    <bpmn:serviceTask id="R" implementation="${noop}"/>
+    <bpmn:endEvent id="EErr"/>
+    <bpmn:endEvent id="ENormal"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="S" targetRef="T"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="T" targetRef="ENormal"/>
+    <bpmn:sequenceFlow id="f3" sourceRef="B" targetRef="R"/>
+    <bpmn:sequenceFlow id="f4" sourceRef="R" targetRef="EErr"/>
+  </bpmn:process>
+</bpmn:definitions>

@@ -4,7 +4,7 @@
                   targetNamespace="urn:sutra:module:timers:1.0.0" id="Definitions_catch_wait">
   <!-- A timer catch whose duration is a flow variable: payload.wait. -->
   <bpmn:process id="te-catch-wait" isExecutable="true">
-    <bpmn:extensionElements><q:audit capture="metadata"/></bpmn:extensionElements>
+    <bpmn:extensionElements><q:audit events="all" capture="metadata"/></bpmn:extensionElements>
     <bpmn:startEvent id="CatchStart">
       <bpmn:extensionElements>
         <q:source channel="te-catch"/>

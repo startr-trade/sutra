@@ -28,7 +28,7 @@ const BPMN = `<?xml version="1.0" encoding="UTF-8"?>
                   targetNamespace="http://example.com/test">
   <bpmn:process id="proc1" isExecutable="true">
     <bpmn:extensionElements>
-      <q:audit sink="sql" target="ROOT_AUDIT" capture="payload"/>
+      <q:audit events="instance" capture="payload"/>
     </bpmn:extensionElements>
     <bpmn:startEvent id="start1">
       <bpmn:extensionElements>
@@ -48,7 +48,7 @@ const BPMN = `<?xml version="1.0" encoding="UTF-8"?>
     </bpmn:startEvent>
     <bpmn:serviceTask id="svc1">
       <bpmn:extensionElements>
-        <q:audit sink="custom-kafka" target="ORDER_ACCEPTED" capture="metadata"/>
+        <q:audit capture="none"/>
       </bpmn:extensionElements>
     </bpmn:serviceTask>
     <bpmn:endEvent id="end1"/>
@@ -215,19 +215,25 @@ describe('QOnValidationGroup', () => {
 // ────────────────────────── QAuditGroup (rewrite) ──────────────────────────
 
 describe('QAuditGroup — xsd/q.xsd AuditType alignment', () => {
-  it('exposes sink + sink-custom + target + capture (no Data class, no Redactors)', () => {
+  it('exposes events + capture (no sink, no target, no Data class, no Redactors)', () => {
     const proc = findById('proc1');
     const group = QAuditGroup({ businessObject: proc }, translate);
     const ids = group.entries.map((e) => e.id);
     expect(ids).toEqual([
-      'q-audit-sink',
-      'q-audit-sink-custom',
-      'q-audit-target',
+      'q-audit-events',
       'q-audit-capture'
     ]);
-    // Confirm the historical "Data class" + "Redactors" entries are gone.
+    expect(ids).not.toContain('q-audit-sink');
+    expect(ids).not.toContain('q-audit-target');
     expect(ids).not.toContain('q-audit-dataClass');
     expect(ids).not.toContain('q-audit-redactors');
+  });
+
+  it('events entry exposes the 3 AuditEventScope values from xsd/q.xsd', () => {
+    const proc = findById('proc1');
+    const group = QAuditGroup({ businessObject: proc }, translate);
+    const events = group.entries.find((e) => e.id === 'q-audit-events');
+    expect(events.options.map((o) => o.value).sort()).toEqual(['all', 'instance', 'points']);
   });
 
   it('capture entry exposes exactly the 3 AuditCapture enum values from xsd/q.xsd', () => {
@@ -238,29 +244,18 @@ describe('QAuditGroup — xsd/q.xsd AuditType alignment', () => {
     expect(values).toEqual(['metadata', 'none', 'payload']);
   });
 
-  it('target entry is labelled as the event-type override', () => {
+  it('reads events + capture from the process-level q:audit', () => {
     const proc = findById('proc1');
     const group = QAuditGroup({ businessObject: proc }, translate);
-    const target = group.entries.find((e) => e.id === 'q-audit-target');
-    expect(target.label).toMatch(/event-type/i);
+    expect(group.entries[0].get().value).toBe('instance');
+    expect(group.entries[1].get().value).toBe('payload');
   });
 
-  it('reads a built-in sink (sql) cleanly - surfaces "sql" with empty custom field', () => {
-    const proc = findById('proc1');
-    const group = QAuditGroup({ businessObject: proc }, translate);
-    expect(group.entries[0].get().value).toBe('sql');
-    expect(group.entries[1].get().value).toBe('');
-    expect(group.entries[2].get().value).toBe('ROOT_AUDIT');
-    expect(group.entries[3].get().value).toBe('payload');
-  });
-
-  it('reads a custom sink — surfaces as "custom" + populates the custom field with the raw id', () => {
+  it('reads a node-level opt-out (capture=none) with events defaulting to points', () => {
     const svc = findById('svc1');
     const group = QAuditGroup({ businessObject: svc }, translate);
-    expect(group.entries[0].get().value).toBe('custom');
-    expect(group.entries[1].get().value).toBe('custom-kafka');
-    expect(group.entries[2].get().value).toBe('ORDER_ACCEPTED');
-    expect(group.entries[3].get().value).toBe('metadata');
+    expect(group.entries[0].get().value).toBe('points');
+    expect(group.entries[1].get().value).toBe('none');
   });
 });
 

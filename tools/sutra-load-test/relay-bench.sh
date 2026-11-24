@@ -41,8 +41,9 @@
 #   PG_COMMIT_SIBLINGS (4)   PG_MAX_CONNECTIONS (200)
 #   ENGINE_ENV   extra "KEY=VALUE ..." for the engine (e.g. pool, outbox and cache knobs)
 #   CACHE_TTL    turn on the `refdata` store's read cache with this ttl (e.g. PT0S, PT5S)
-#   AUDIT        audit both processes at this capture level (metadata, payload) into the SQL sink
-#                (`<q:audit capture="$AUDIT"/>` + SUTRA_AUDIT_SQL=true); the block then also reports
+#   AUDIT        audit both processes at this capture level (metadata, payload) into the SQL audit
+#                store, a database of its own on the same cluster (`<q:audit capture="$AUDIT"/>` +
+#                SUTRA_AUDIT_SQL_URL, spool under the work dir); the block then also reports
 #                the audit rows written and how long the journal took to catch up after the last
 #                settle (the SQL sink writes behind execution, so a slow sink shows up as lag)
 #   KEEP=1       leave the cluster and engine running after the run (prints how to stop them)
@@ -160,7 +161,7 @@ ${PG_EXTRA_CONF:-}
 EOF
 "$PG_BIN_DIR/pg_ctl" -D "$PGDATA" -l "$WORK/pg.log" -w start >/dev/null || die "postgres did not start ($WORK/pg.log)"
 PSQL=(psql -h 127.0.0.1 -p "$PG_PORT" -U sutra -X -q -t -A)
-"${PSQL[@]}" -d postgres -c "CREATE DATABASE sutra" -c "CREATE DATABASE relaydata" || die "createdb failed"
+"${PSQL[@]}" -d postgres -c "CREATE DATABASE sutra" -c "CREATE DATABASE relaydata" -c "CREATE DATABASE sutra_audit" || die "createdb failed"
 "${PSQL[@]}" -d sutra -c "CREATE EXTENSION pg_stat_statements" || die "pg_stat_statements unavailable"
 
 # ---- 2. the sink --------------------------------------------------------------------------------
@@ -214,7 +215,8 @@ if n != 1:
 open(path, "w").write(out)
 PY
     done
-    ENGINE_ENV="SUTRA_AUDIT_SQL=true $ENGINE_ENV"
+    # Audit goes to its own database (never the engine's), through the spool in the work dir.
+    ENGINE_ENV="SUTRA_AUDIT_SQL_URL=postgres://sutra:sutra@127.0.0.1:$PG_PORT/sutra_audit SUTRA_AUDIT_SPOOL_DIR=$WORK/audit-spool $ENGINE_ENV"
 fi
 "$SUTRA_CLI" package "$PKG_SRC" --out "$WORK/deployments" >"$WORK/package.log" 2>&1 \
     || die "packaging failed ($WORK/package.log)"
@@ -357,7 +359,7 @@ if [ -n "${PERF_DIR:-}" ]; then
     perf record -F 499 -g -p "$PG_PIDS" -o "$PERF_DIR/postgres.perf.data" >"$PERF_DIR/postgres.perf.log" 2>&1 &
     PERF_PIDS+=($!)
 fi
-[ -n "${AUDIT:-}" ] && A_BASE="$("${PSQL[@]}" -d sutra -c "SELECT count(*) FROM audit_event")"
+[ -n "${AUDIT:-}" ] && A_BASE="$("${PSQL[@]}" -d sutra_audit -c "SELECT count(*) FROM audit_event")"
 log "measured run ${RATE}/s x $DURATION"
 run_k6 "$RATE" "$DURATION" run "$K6DIR/run.json"
 SENT="$(jq -r '.metrics.iterations.count // 0' "$K6DIR/run.json")"
@@ -366,7 +368,7 @@ AUDIT_LINE=""
 if [ -n "${AUDIT:-}" ]; then
     # The SQL sink writes behind execution: count the journal at the last settle, then wait until
     # it stops growing (3 s without a new row) to see how far behind it ran.
-    audit_rows() { "${PSQL[@]}" -d sutra -c "SELECT count(*) FROM audit_event"; }
+    audit_rows() { "${PSQL[@]}" -d sutra_audit -c "SELECT count(*) FROM audit_event"; }
     A_SETTLED="$(audit_rows)"; A_T0="$(date +%s.%N)"; a_last="$A_SETTLED"; a_idle=0; a_lastgrow="$A_T0"
     while [ "$a_idle" -lt 3 ]; do
         sleep 1

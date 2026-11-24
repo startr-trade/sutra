@@ -25,6 +25,8 @@ use testcontainers_modules::postgres::Postgres;
 const REGION: &str = "us-east-1";
 const API_KEY: &str = "sqs-intake-conformance-key";
 const CONFIG_INVALID: &str = "SUTRA.INBOUND.AWS_SQS.CONFIG_INVALID";
+/// The SQL audit store's database: audit never shares the engine's database.
+const AUDIT_DATABASE: &str = sutra_testkit::conformance::engine::AUDIT_DATABASE;
 
 /// Parked in a `static`: a sync container dropped on a tokio worker panics, so these are never
 /// dropped and the reaper removes them when the process exits.
@@ -54,6 +56,19 @@ fn fixtures() -> &'static Fixtures {
             sutra_testkit::reap_on_exit(postgres.id());
             let localstack_port = localstack.get_host_port_ipv4(4566.tcp()).expect("4566");
             let postgres_port = postgres.get_host_port_ipv4(5432).expect("5432");
+            Command::new("docker")
+                .args([
+                    "exec",
+                    postgres.id(),
+                    "psql",
+                    "-U",
+                    "postgres",
+                    "-d",
+                    "postgres",
+                ])
+                .args(["-tAc", &format!("CREATE DATABASE {AUDIT_DATABASE}")])
+                .output()
+                .expect("create the audit database");
             Fixtures {
                 _localstack: localstack,
                 postgres,
@@ -153,6 +168,9 @@ fn start_engine(fixtures: &Fixtures, database: &str, hint: &str, env: &[(&str, &
     let mut command = Command::new(env!("CARGO_BIN_EXE_sutra-engine"));
     command
         .env("SUTRA_DEPLOYMENTS_DIR", &archives)
+        // The audit spool of this run, in its own work directory (the default is the image's
+        // /var/lib/sutra, which a test process cannot write).
+        .env("SUTRA_AUDIT_SPOOL_DIR", work.join("audit-spool"))
         .env(
             "SUTRA_DATASOURCE_URL",
             format!("postgres://postgres:postgres@127.0.0.1:{pg}/{database}"),
@@ -160,7 +178,10 @@ fn start_engine(fixtures: &Fixtures, database: &str, hint: &str, env: &[(&str, &
         .env("SUTRA_DB_MIGRATIONS", migration_roots())
         .env("SUTRA_HTTP_PORT", port.to_string())
         .env("SUTRA_PERSISTENCE_RLS_BYPASS_CHECK_ENABLED", "false")
-        .env("SUTRA_AUDIT_SQL", "true")
+        .env(
+            "SUTRA_AUDIT_SQL_URL",
+            format!("postgres://postgres:postgres@127.0.0.1:{pg}/{AUDIT_DATABASE}"),
+        )
         .env("SQSI_API_KEY", API_KEY)
         .env(
             "SQSI_STORE_URL",
@@ -284,7 +305,7 @@ async fn await_empty(engine: &Engine, sqs: &Client, queue: &str) {
 fn dropped_audit(fixtures: &Fixtures, cause: &str, channel: &str) -> usize {
     fixtures
         .sql(
-            "postgres",
+            AUDIT_DATABASE,
             &format!(
                 "SELECT COUNT(*) FROM audit_event WHERE event_type = 'inbound.DELIVERY_DROPPED' \
                  AND diagnostic_code = '{cause}' AND diagnostic_json LIKE '%\"{channel}\"%'"

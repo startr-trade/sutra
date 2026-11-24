@@ -1,0 +1,82 @@
+{
+  "processId": "flow",
+  "declared": {
+    "events": "all",
+    "capture": "metadata"
+  },
+  "pool": "all · metadata",
+  "elements": [
+    {
+      "id": "A",
+      "disposition": "desugared",
+      "rule": "events=all",
+      "entered": true
+    },
+    {
+      "id": "E",
+      "disposition": "desugared",
+      "rule": "events=all",
+      "entered": true
+    },
+    {
+      "id": "F",
+      "disposition": "desugared",
+      "rule": "events=all",
+      "entered": true
+    },
+    {
+      "id": "G",
+      "disposition": "desugared",
+      "rule": "events=all",
+      "entered": true
+    },
+    {
+      "id": "J",
+      "disposition": "desugared",
+      "rule": "events=all",
+      "entered": true
+    },
+    {
+      "id": "M",
+      "disposition": "desugared",
+      "rule": "events=all",
+      "entered": true
+    },
+    {
+      "id": "S",
+      "disposition": "desugared",
+      "rule": "events=all",
+      "entered": true
+    },
+    {
+      "id": "SE",
+      "disposition": "desugared",
+      "rule": "events=all",
+      "entered": true
+    },
+    {
+      "id": "SS",
+      "disposition": "desugared",
+      "rule": "events=all",
+      "entered": true
+    },
+    {
+      "id": "Sub",
+      "disposition": "desugared",
+      "rule": "events=all",
+      "entered": true
+    },
+    {
+      "id": "T",
+      "disposition": "desugared",
+      "rule": "events=all",
+      "entered": true
+    },
+    {
+      "id": "X",
+      "disposition": "desugared",
+      "rule": "events=all",
+      "entered": true
+    }
+  ]
+}

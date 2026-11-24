@@ -1015,7 +1015,7 @@ async fn the_source_and_sink_ride_out_a_queue_manager_restart_and_log_the_outage
     let token = unique_token("mqr");
     let network = format!("sutra-mq-{token}");
     docker_ok(&["network", "create", &network]);
-    sutra_testkit::reap_network_on_exit(network.clone());
+    let _network = sutra_testkit::NetworkGuard::new(network.clone());
     let name = format!("sutra-mq-restart-{token}");
     let pki = TestBrokerPki::generate(&["localhost", "127.0.0.1"]);
     let keyrpwd = unique_token("kr");
@@ -1280,7 +1280,7 @@ async fn the_source_reconnects_after_a_restart_whose_listener_does_not_answer() 
     let token = unique_token("mqh");
     let network = format!("sutra-mq-{token}");
     docker_ok(&["network", "create", &network]);
-    sutra_testkit::reap_network_on_exit(network.clone());
+    let _network = sutra_testkit::NetworkGuard::new(network.clone());
     let name = format!("sutra-mq-hold-{token}");
     let pki = TestBrokerPki::generate(&["localhost", "127.0.0.1"]);
     let keyrpwd = unique_token("kr");
@@ -1322,12 +1322,16 @@ async fn the_source_reconnects_after_a_restart_whose_listener_does_not_answer() 
     relay.cut_and_hold();
     let held_from = relay.accepted();
     docker_ok(&["stop", "-t", "60", &name]);
+    // The consumer's backoff can miss a fast restart, so keep the queue manager away until it has
+    // attempted a reconnect into the held address.
+    wait_for(
+        "the consumer to reconnect into the held address while the queue manager was away",
+        Duration::from_secs(60),
+        || relay.accepted() > held_from,
+    )
+    .await;
     docker_ok(&["start", &name]);
     qm.wait_started();
-    assert!(
-        relay.accepted() > held_from,
-        "the consumer reconnected into the held address while the queue manager was away"
-    );
     // The queue manager is back and reachable again.
     let back_at = Instant::now();
     relay.relay();

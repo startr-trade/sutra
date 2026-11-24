@@ -221,10 +221,6 @@ pub struct TokenExecutor {
     outbound_channels: Arc<crate::registry::OutboundChannelRegistry>,
     uuid_supplier: Box<dyn Fn() -> String>,
     now_supplier: Box<dyn Fn() -> String>,
-    /// B1 — the engine-default audit sink applied to a process that declares no `<q:audit sink>`
-    /// (and has no manifest default). `None` = no default; such a process is not audited. Resolves
-    /// the "single source of truth" sink for every lifecycle event the audit listener emits.
-    default_audit_sink: Option<String>,
 }
 
 /// `TokenExecutor` builder — the executor's wiring surface.
@@ -335,7 +331,6 @@ impl TokenExecutor {
                 data_stores: None,
                 coverage_metric_store: None,
                 listeners: Vec::new(),
-                default_audit_sink: None,
                 process_resolver: None,
                 module_resolver: None,
                 deployment_config: None,
@@ -1121,7 +1116,7 @@ impl TokenExecutor {
             ResumeEntry::Leave(node) => {
                 // The satisfied wait is where the token leaves: report it (its park reported
                 // only the entry), so the journal records the wait the resume came through.
-                let (audit_sink, _) = self.resolve_token_audit(&node, &state);
+                let audit_sink = self.resolve_token_audit(&node, &state).left;
                 let left = TokenEvent {
                     deployment: state.deployment.clone(),
                     labels: state.labels.clone(),
@@ -1248,11 +1243,11 @@ impl TokenExecutor {
             return Ok(());
         }
 
-        // B1 — resolve this node's audit routing: the process's single sink (None = node
-        // suppressed via `capture="none"`, or the process is not audited) + the redacted payload
-        // when the process captures at payload level.
-        let (audit_sink, payload_json) = self.resolve_token_audit(node_id, state);
-        let token_event = TokenEvent {
+        // This node's audit routing, from the process's audit plan: the sink of its entry event,
+        // of its leave event (each `None` when the plan records no such event) and the redacted
+        // payload the entry carries when the process captures at payload level.
+        let audit = self.resolve_token_audit(node_id, state);
+        let mut token_event = TokenEvent {
             deployment: state.deployment.clone(),
             labels: state.labels.clone(),
             instance_id: state.instance_id.clone(),
@@ -1260,11 +1255,11 @@ impl TokenExecutor {
             node_type: node_type(node).to_string(),
             correlation: self.audit_correlation_of(
                 state.process,
-                audit_sink.is_some(),
+                audit.left.is_some(),
                 &state.ctx.borrow().variables,
             ),
-            audit_sink,
-            payload_json,
+            audit_sink: audit.entered,
+            payload_json: audit.payload,
         };
         // A reconstruction ghost reaches here only for a gateway, to rebuild its arrival counts.
         // It is not a token passing through, so it is not reported: the audit journal and every
@@ -1273,6 +1268,9 @@ impl TokenExecutor {
         if !quiet {
             self.notify(|l| l.on_token_entered(&token_event));
         }
+        // Every later use of the event is the node being left.
+        token_event.audit_sink = audit.left;
+        token_event.payload_json = None;
 
         let mut left_handled = false;
 
@@ -2375,6 +2373,7 @@ impl TokenExecutor {
         host_id: &str,
         state: &mut ExecutionState<'_>,
     ) -> Result<(), Signal> {
+        self.report_boundary_fired(boundary_id, state);
         let outgoing = state.process.outgoing(boundary_id);
         if outgoing.is_empty() {
             record_call_failure(
@@ -2408,11 +2407,42 @@ impl TokenExecutor {
     /// is still waiting and nothing was cancelled, so turning it into a BPMN error would fail an
     /// instance over a diagram nicety.
     fn route_non_interrupting_boundary(&self, boundary_id: &str, state: &mut ExecutionState<'_>) {
+        self.report_boundary_fired(boundary_id, state);
         for flow in state.process.outgoing(boundary_id) {
             state.fire(flow);
         }
         // NOT marked visited: a recurring boundary is not done, it may fire again.
         // `rearm_fired_boundary` decides whether another occurrence follows.
+    }
+
+    /// Report a boundary event that fired as the token leaving it. A boundary is never run as a
+    /// node (firing routes straight to its outgoing flows), so without this the trail would show
+    /// the host and then the path out, never the event that chose that path. Under every audit
+    /// scope a fired boundary is an audit point.
+    fn report_boundary_fired(&self, boundary_id: &str, state: &ExecutionState<'_>) {
+        if state.ghost {
+            return;
+        }
+        let audit_sink = self.resolve_token_audit(boundary_id, state).left;
+        let event = TokenEvent {
+            deployment: state.deployment.clone(),
+            labels: state.labels.clone(),
+            instance_id: state.instance_id.clone(),
+            node_id: boundary_id.to_string(),
+            node_type: state
+                .process
+                .node(boundary_id)
+                .map(|n| node_type(n).to_string())
+                .unwrap_or_default(),
+            correlation: self.audit_correlation_of(
+                state.process,
+                audit_sink.is_some(),
+                &state.ctx.borrow().variables,
+            ),
+            audit_sink,
+            payload_json: None,
+        };
+        self.notify(|l| l.on_token_left(&event));
     }
 
     /// Re-arm a fired non-interrupting boundary for its next occurrence, when it recurs.
@@ -4311,6 +4341,7 @@ impl TokenExecutor {
     ) -> Result<(), Signal> {
         let process = state.process;
         if let Some(boundary_id) = find_error_boundary(process, source, code) {
+            self.report_boundary_fired(&boundary_id, state);
             for flow in process.outgoing(&boundary_id) {
                 state.fire(flow);
             }
@@ -4366,6 +4397,7 @@ impl TokenExecutor {
             }
         }
         for boundary_id in fired {
+            self.report_boundary_fired(&boundary_id, state);
             for flow in process.outgoing(&boundary_id) {
                 state.fire(flow);
             }
@@ -4420,6 +4452,7 @@ impl TokenExecutor {
             {
                 if attached_to_ref == node_id {
                     let boundary_id = id.clone();
+                    self.report_boundary_fired(&boundary_id, state);
                     for flow in process.outgoing(&boundary_id) {
                         state.fire(flow);
                     }
@@ -5113,17 +5146,16 @@ impl TokenExecutor {
         }
     }
 
-    /// B1 — the single audit sink a process's events route to: its process-level `<q:audit sink>`
-    /// (author control) → the engine default (`with_default_audit_sink`, which the manifest default
-    /// feeds). `None` = the process is not audited — including a process whose own `<q:audit>`
-    /// (or the manifest default it inherited) says `capture="none"`: that switches off every
-    /// `INSTANCE_*` and `NODE_*` event of the process, as the transport journal already does.
+    /// The audit destination of a process's instance events: `Some` when the process declares
+    /// `<q:audit>` with a capture other than `none` — the resolved store name, or `""` when the
+    /// deployment resolved none (the spool writer counts those as undeliverable and never
+    /// re-routes them). `None` = the process is not audited: no `<q:audit>`, no events.
     fn effective_audit_sink(&self, process: &ProcessDefinition) -> Option<String> {
-        match process.audit.as_ref() {
-            Some(audit) if audit.capture == sutra_bpmn::qbindings::AuditCapture::None => None,
-            Some(audit) => Some(audit.sink.clone()),
-            None => self.default_audit_sink.clone(),
-        }
+        process
+            .audit
+            .as_ref()
+            .filter(|a| a.capture != sutra_bpmn::qbindings::AuditCapture::None)
+            .map(|a| a.sink.clone().unwrap_or_default())
     }
 
     /// The correlation keys an audit event carries (see [`crate::audit_correlation`]). Empty
@@ -5158,33 +5190,55 @@ impl TokenExecutor {
         event
     }
 
-    /// B1 — resolve a node's audit routing directive: `(audit_sink, payload_json)`.
-    /// `audit_sink == None` means the node emits NO audit event — either a node-level
-    /// `<q:audit capture="none">` suppression (the only per-node override) or the process is not
-    /// audited. `payload_json` is the redacted variable snapshot when the PROCESS captures at
-    /// payload level (node entry), else `None`.
-    fn resolve_token_audit(
-        &self,
-        node_id: &str,
-        state: &ExecutionState<'_>,
-    ) -> (Option<String>, Option<String>) {
-        use sutra_bpmn::qbindings::AuditCapture;
-        // Node-level override — ONLY `capture="none"` (conscious suppression) is honored.
-        if let Some(node_audit) = state.process.bindings_for(node_id).audit.as_ref() {
-            if node_audit.capture == AuditCapture::None {
-                return (None, None);
-            }
-        }
+    /// A node's audit routing, read from the process's [`sutra_bpmn::AuditPlan`]. `None` sinks
+    /// mean the node emits no audit event at that edge: the process is not audited, the node opts
+    /// out (`<q:audit capture="none">`), or its plan does not record that edge (`events="points"`
+    /// records `NODE_ENTERED` only at a wait node, and nothing at a node that is not a point).
+    /// `payload` is the redacted variable snapshot when the PROCESS captures at payload or media
+    /// level; it rides `NODE_ENTERED`.
+    fn resolve_token_audit(&self, node_id: &str, state: &ExecutionState<'_>) -> TokenAudit {
+        use sutra_bpmn::qbindings::{AuditCapture, AuditEventScope};
+        use sutra_bpmn::ElementAuditDisposition;
         let Some(sink) = self.effective_audit_sink(state.process) else {
-            return (None, None);
+            return TokenAudit::default();
         };
-        let payload = match state.process.audit.as_ref().map(|a| a.capture) {
-            Some(AuditCapture::Payload) => Some(redacted_variable_snapshot(state)),
-            Some(AuditCapture::Media) => media_reference_snapshot(state),
-            _ => None,
+        let entered = match state.process.audit_plan().disposition(node_id) {
+            Some(ElementAuditDisposition::Desugared { entered, .. }) => *entered,
+            // A node the plan does not list (none is expected) follows the scope alone.
+            None if state.process.audit.as_ref().map(|a| a.events)
+                == Some(AuditEventScope::All) =>
+            {
+                true
+            }
+            _ => return TokenAudit::default(),
         };
-        (Some(sink), payload)
+        let entered_sink = entered.then(|| sink.clone());
+        let payload = if entered {
+            match state.process.audit.as_ref().map(|a| a.capture) {
+                Some(AuditCapture::Payload) => Some(redacted_variable_snapshot(state)),
+                Some(AuditCapture::Media) => media_reference_snapshot(state),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        TokenAudit {
+            entered: entered_sink,
+            left: Some(sink),
+            payload,
+        }
     }
+}
+
+/// Where one node's audit events go ([`TokenExecutor::resolve_token_audit`]).
+#[derive(Default)]
+struct TokenAudit {
+    /// The sink of its `NODE_ENTERED`, or `None` when it records none.
+    entered: Option<String>,
+    /// The sink of its `NODE_LEFT`, or `None` when it records none.
+    left: Option<String>,
+    /// The payload snapshot `NODE_ENTERED` carries.
+    payload: Option<String>,
 }
 
 impl Builder {
@@ -5245,14 +5299,6 @@ impl Builder {
 
     pub fn with_listener(mut self, listener: Rc<dyn ExecutionListener>) -> Builder {
         self.executor.listeners.push(listener);
-        self
-    }
-
-    /// B1 — the engine-default audit sink for processes that declare no `<q:audit sink>` (and have
-    /// no deployment-manifest default). The lifecycle events carry the resolved sink so audit
-    /// routes to exactly one sink.
-    pub fn with_default_audit_sink(mut self, sink: Option<String>) -> Builder {
-        self.executor.default_audit_sink = sink;
         self
     }
 

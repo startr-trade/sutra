@@ -1,27 +1,18 @@
-//! Audit-event SPI — the `AuditSink` seam + the built-in JSONL sink.
+//! Audit events and the audit-store SPI.
 //!
-//! # Why this exists
+//! # Shape
 //!
-//! `<q:audit>` ([`sutra_bpmn::qbindings::AuditBinding`]) parses and the per-instance
-//! `audit_seq` persists across park/resume, and `sutra audit-replay` reads a JSONL stream —
-//! but nothing EMITS audit events, so `<q:audit>` is inert in production. This module supplies
-//! the emit side: an [`AuditSink`] trait + a name-keyed [`AuditSinkRegistry`] the engine
-//! fans a per-instance/per-node [`AuditEvent`] out to, plus the built-in [`JsonlAuditSink`]
-//! (the DB + OTel sinks live in `sutra-engine`, which owns the pool + telemetry facade —
-//! exactly like the outbox `MessageSink` trait here vs. its engine-side persistence impl).
-//!
-//! # Shape (mirrors [`crate::sink`])
-//!
-//! Sinks run on the tokio side (a spawned audit-dispatcher task drains a channel the
-//! actor-thread listener feeds), so everything here is `Send + Sync` and the write is async via
-//! the dependency-free boxed-future seam ([`crate::sink::BoxFuture`]). Audit is best-effort: a
-//! sink failure is logged, never propagated into execution.
+//! The [`AuditListener`] turns the executor's lifecycle callbacks into [`AuditEvent`]s on the
+//! actor thread and appends each to the durable audit spool ([`crate::audit_spool`]) without
+//! blocking. Before a step commits, the engine's persistence bridge waits for the spool's group
+//! sync, so every event of a committed step is on disk. One shipper per configured store
+//! ([`crate::audit_shipper`]) then loads the spool into that store through the [`AuditSink`]
+//! seam: the JSONL file store ([`crate::audit_files::JsonlFileStore`]) lives here, the SQL and
+//! OTel stores in the engine, which owns the pool and the telemetry facade.
 
 use std::collections::HashMap;
-use std::io::Write;
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
 
+pub use crate::audit_spool::SpoolRecord;
 use crate::diag::Diagnostic;
 use crate::sink::BoxFuture;
 
@@ -45,7 +36,8 @@ pub const AUDIT_CAPTURE_MEDIA: &str = "media";
 pub struct AuditEvent {
     /// The SINGLE sink this event routes to (`"sql"` | `"jsonl"` | `"otel"`), resolved from the
     /// process's audit policy. The dispatcher delivers the event to exactly this sink (one source of
-    /// truth), never fanned. Falls back to a registered sink only if this one is absent.
+    /// truth), never fanned. Empty when the deploy resolved no destination: the spool counts the
+    /// event as undeliverable and never re-routes it.
     pub sink: String,
     pub deployment_id: String,
     /// The authoring tenant (from the instance labels) — the JSONL `tenant` field.
@@ -70,6 +62,38 @@ pub struct AuditEvent {
     /// transport events. The JSONL line carries it as `correlation`, the OTLP record as one
     /// `correlation.<name>` attribute per key; the SQL row does not store it.
     pub correlation: std::collections::BTreeMap<String, String>,
+    /// The pass that emitted the event (`None` for an event outside a pass: transport events,
+    /// deployment-level and engine-written events). For each `(deployment, instance,
+    /// attempt.base)` the stores keep only the latest attempt's events: an earlier attempt from
+    /// the same base is one that never committed.
+    pub attempt: Option<AuditAttempt>,
+}
+
+/// One pass of an instance on a lane, from its seed (a start, or a resume from a snapshot or
+/// chain) to the hand-off of its seq. At most one pass from a given base commits, and it is the
+/// last one from that base, so a later attempt supersedes an earlier one from the same base.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditAttempt {
+    /// A random id, one per pass.
+    pub id: String,
+    /// The instance's seq when the pass began: its events are `base + 1 …`.
+    pub base: u32,
+    /// When the pass began (RFC 3339): the order between two attempts from one base, with `id`
+    /// breaking a tie.
+    pub at: String,
+}
+
+impl AuditAttempt {
+    /// Whether this attempt is later than `other` (both from the same base).
+    pub fn is_later_than(&self, other: &AuditAttempt) -> bool {
+        let parse = |at: &str| {
+            time::OffsetDateTime::parse(at, &time::format_description::well_known::Rfc3339).ok()
+        };
+        match (parse(&self.at), parse(&other.at)) {
+            (Some(a), Some(b)) if a != b => a > b,
+            _ => (self.at.as_str(), self.id.as_str()) > (other.at.as_str(), other.id.as_str()),
+        }
+    }
 }
 
 impl AuditEvent {
@@ -97,158 +121,36 @@ impl AuditEvent {
         if !self.correlation.is_empty() {
             obj.insert("correlation".into(), serde_json::json!(self.correlation));
         }
+        if let Some(a) = &self.attempt {
+            obj.insert("attemptId".into(), serde_json::json!(a.id));
+            obj.insert("attemptBase".into(), serde_json::json!(a.base));
+            obj.insert("attemptAt".into(), serde_json::json!(a.at));
+        }
         serde_json::Value::Object(obj).to_string()
     }
 }
 
-/// The audit-sink SPI — one configured audit target (`<q:audit sink="…">`; the default is
-/// `"sql"`). Implementations run on the tokio side and answer best-effort: a failure is a
-/// [`Diagnostic`] the dispatcher logs, never an execution error.
+/// The audit-store SPI: one configured audit store (`"sql"`, `"jsonl"`, `"otel"`). A store never
+/// sees an event straight from execution: every event is first made durable in the local audit
+/// spool, and the store's shipper hands it the spool's records in order, in batches.
+/// Implementations run on the tokio side.
 pub trait AuditSink: Send + Sync {
-    /// The sink name matched against `<q:audit sink="…">` — `"jsonl"` / `"sql"` / `"otel"`.
+    /// The store name an audit destination resolves to: `"sql"` | `"jsonl"` | `"otel"`.
     fn name(&self) -> &str;
-    /// Persist one event. Best-effort; a returned `Err` is logged by the dispatcher.
-    fn emit<'a>(&'a self, event: &'a AuditEvent) -> BoxFuture<'a, Result<(), Diagnostic>>;
-
-    /// Persist a run of events, in order. The dispatcher hands a sink everything that queued up
-    /// while its previous write was in flight, so a sink that can write many events for the price
-    /// of one (one database transaction, one commit) overrides this; the default writes them one
-    /// by one through [`AuditSink::emit`]. Returns the failures as `(index into events, why)` —
-    /// each is logged by the dispatcher, exactly as a failed `emit` is, and the events not listed
-    /// were written. An override must keep the per-instance order of `events`.
-    fn emit_batch<'a>(
+    /// Make `records` durable in the store, in order. Must be idempotent per record: the shipper
+    /// hands the same records again after a crash between this call and its checkpoint, and after
+    /// a failed call. `Err` means nothing may be assumed written; the shipper retries the same
+    /// batch.
+    fn ship<'a>(
         &'a self,
-        events: &'a [AuditEvent],
-    ) -> BoxFuture<'a, Vec<(usize, Diagnostic)>> {
-        Box::pin(async move {
-            let mut failed = Vec::new();
-            for (i, event) in events.iter().enumerate() {
-                if let Err(d) = self.emit(event).await {
-                    failed.push((i, d));
-                }
-            }
-            failed
-        })
-    }
-}
-
-/// Name-keyed audit sinks — the `<q:audit sink="…">` selector resolves against this. Empty
-/// when a deployment configures no audit target (then audit emission is a no-op).
-#[derive(Default, Clone)]
-pub struct AuditSinkRegistry {
-    by_name: HashMap<String, Arc<dyn AuditSink>>,
-}
-
-impl AuditSinkRegistry {
-    pub fn new() -> AuditSinkRegistry {
-        AuditSinkRegistry {
-            by_name: HashMap::new(),
-        }
-    }
-
-    /// Register a sink under its [`AuditSink::name`] (last registration wins).
-    pub fn register(&mut self, sink: Arc<dyn AuditSink>) {
-        self.by_name.insert(sink.name().to_string(), sink);
-    }
-
-    /// The sink for a `<q:audit sink="…">` name, if configured.
-    pub fn get(&self, name: &str) -> Option<Arc<dyn AuditSink>> {
-        self.by_name.get(name).cloned()
-    }
-
-    /// Every configured sink (for the "emit to all default sinks" instance-lifecycle path).
-    pub fn all(&self) -> Vec<Arc<dyn AuditSink>> {
-        let mut names: Vec<&String> = self.by_name.keys().collect();
-        names.sort();
-        names.into_iter().map(|n| self.by_name[n].clone()).collect()
-    }
-
-    /// Sorted sink names (deterministic).
-    pub fn names(&self) -> Vec<String> {
-        let mut names: Vec<String> = self.by_name.keys().cloned().collect();
-        names.sort();
-        names
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.by_name.is_empty()
-    }
-}
-
-/// The built-in JSONL audit sink — appends one [`AuditEvent::to_jsonl`] line per event to a
-/// target file, exactly the shape `sutra audit-replay --from-jsonl` reads back.
-///
-/// Every line is ONE `write_all` of the complete line, newline included, made while holding a
-/// lock that is shared by every sink open on the same file in this process. Each executor lane
-/// builds its own sink registry, so several `JsonlAuditSink`s commonly target one path; with a
-/// per-sink lock and a separate newline write, two lanes could interleave and leave two events on
-/// one line. The file is opened in append mode, so a single write also lands whole at the end of
-/// the file.
-pub struct JsonlAuditSink {
-    path: PathBuf,
-    file: Arc<Mutex<std::fs::File>>,
-}
-
-/// The process-wide handle for one JSONL target, keyed by its canonical path. Held weakly: the
-/// file closes once the last sink using it is dropped (an activation flip reopens it).
-fn shared_jsonl_file(path: &std::path::Path) -> std::io::Result<Arc<Mutex<std::fs::File>>> {
-    type OpenFiles = Mutex<HashMap<PathBuf, std::sync::Weak<Mutex<std::fs::File>>>>;
-    static OPEN: std::sync::OnceLock<OpenFiles> = std::sync::OnceLock::new();
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?;
-    let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let mut open = OPEN
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    open.retain(|_, weak| weak.strong_count() > 0);
-    if let Some(shared) = open.get(&key).and_then(std::sync::Weak::upgrade) {
-        return Ok(shared);
-    }
-    let shared = Arc::new(Mutex::new(file));
-    open.insert(key, Arc::downgrade(&shared));
-    Ok(shared)
-}
-
-impl JsonlAuditSink {
-    /// Open (creating + appending to) the JSONL target file. A second sink on the same file
-    /// shares the first one's handle and lock.
-    pub fn open(path: impl Into<PathBuf>) -> std::io::Result<JsonlAuditSink> {
-        let path = path.into();
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)?;
-            }
-        }
-        let file = shared_jsonl_file(&path)?;
-        Ok(JsonlAuditSink { path, file })
-    }
-
-    /// The target file path.
-    pub fn path(&self) -> &std::path::Path {
-        &self.path
-    }
-}
-
-impl AuditSink for JsonlAuditSink {
-    fn name(&self) -> &str {
-        "jsonl"
-    }
-
-    fn emit<'a>(&'a self, event: &'a AuditEvent) -> BoxFuture<'a, Result<(), Diagnostic>> {
-        let mut line = event.to_jsonl();
-        line.push('\n');
-        Box::pin(async move {
-            // A dedicated audit-dispatcher task drives this; the append is small + best-effort.
-            let mut file = self.file.lock().map_err(|_| {
-                Diagnostic::error(AUDIT_SINK_WRITE_FAILED, "audit file lock poisoned")
-            })?;
-            file.write_all(line.as_bytes()).map_err(|e| {
-                Diagnostic::error(AUDIT_SINK_WRITE_FAILED, format!("jsonl append failed: {e}"))
-            })
-        })
+        spool_id: &'a str,
+        records: &'a [SpoolRecord],
+    ) -> BoxFuture<'a, Result<(), Diagnostic>>;
+    /// The highest `n` of `spool_id` already durable in the store, if the store can tell. The
+    /// shipper starts after the larger of this and its own checkpoint.
+    fn recover<'a>(&'a self, spool_id: &'a str) -> BoxFuture<'a, Result<Option<u64>, Diagnostic>> {
+        let _ = spool_id;
+        Box::pin(async { Ok(None) })
     }
 }
 
@@ -261,135 +163,43 @@ use std::cell::RefCell;
 
 use sutra_bpmn::SutraError;
 use sutra_executor::listener::{ExecutionListener, InstanceEvent, TokenEvent};
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
-/// A fresh audit channel: the listener holds the [`UnboundedSender`], the dispatcher drains the
-/// [`UnboundedReceiver`]. Unbounded so a listener callback NEVER blocks the actor thread; audit is
-/// best-effort, and a send only fails once the dispatcher (and thus the whole engine) is gone.
-pub fn audit_channel() -> (UnboundedSender<AuditEvent>, UnboundedReceiver<AuditEvent>) {
-    unbounded_channel()
+use crate::audit_spool::AuditSpoolSender;
+
+/// A random attempt id (UUID v4 text, from the OS random source).
+fn new_attempt_id() -> String {
+    let mut bytes = [0u8; 16];
+    if getrandom::getrandom(&mut bytes).is_err() {
+        // No OS randomness: fall back to the clock and a process counter, still unique here.
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        bytes[..8].copy_from_slice(&(nanos as u64).to_be_bytes());
+        bytes[8..].copy_from_slice(&n.to_be_bytes());
+    }
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
 }
 
-/// The most events the dispatcher hands one sink in one [`AuditSink::emit_batch`]. A batch is
-/// only what queued up while the previous write was in flight — the dispatcher never waits to
-/// fill one — so a lightly loaded engine still writes each event as it comes, and under load the
-/// batch grows towards this cap instead of the queue growing without bound. 256 events is about
-/// 25 process instances' worth of metadata-level audit; past that the commit is no longer the
-/// cost that dominates a write.
+/// The default `sutra.audit.batch-max`: the most spool records a shipper hands its store in one
+/// [`AuditSink::ship`]. 256 events is about 25 process instances' worth of metadata-level audit;
+/// past that the commit is no longer the cost that dominates a write.
 pub const AUDIT_BATCH_MAX: usize = 256;
 
-/// Spawn the audit dispatcher on `handle`: drain the channel and fan each event out to the sink it
-/// names. Whatever has queued while the previous write ran goes out together, up to
-/// [`AUDIT_BATCH_MAX`], so a sink that can group-commit ([`AuditSink::emit_batch`]) pays one
-/// commit per batch rather than one per event. Events are delivered in channel order (one task,
-/// one write at a time), so each instance's events reach the sink in the order the engine emitted
-/// them. A sink failure is logged, never propagated (audit is best-effort). The task ends when
-/// every [`AuditListener`] sender has dropped and the queue is drained (engine shutdown / flip).
-/// Takes a [`tokio::runtime::Handle`] so it can be spawned from the engine's non-async actor
-/// thread.
-pub fn spawn_audit_dispatcher(
-    handle: &tokio::runtime::Handle,
-    mut rx: UnboundedReceiver<AuditEvent>,
-    registry: AuditSinkRegistry,
-) -> tokio::task::JoinHandle<()> {
-    handle.spawn(async move {
-        let mut batch = Vec::with_capacity(AUDIT_BATCH_MAX);
-        while let Some(first) = rx.recv().await {
-            batch.push(first);
-            while batch.len() < AUDIT_BATCH_MAX {
-                match rx.try_recv() {
-                    Ok(event) => batch.push(event),
-                    Err(_) => break,
-                }
-            }
-            deliver_audit_events(&registry, &batch).await;
-            batch.clear();
-        }
-    })
-}
-
-/// The sink an event goes to: the ONE sink it names, or — when that sink is not registered — the
-/// first registered sink (deterministic: sorted names), so the trail is never silently dropped on
-/// a typo. `None` only when no sink is registered at all.
-fn resolve_audit_sink(
-    registry: &AuditSinkRegistry,
-    event: &AuditEvent,
-) -> Option<Arc<dyn AuditSink>> {
-    match registry.get(&event.sink) {
-        Some(s) => Some(s),
-        None => {
-            let fallback = registry.all().into_iter().next();
-            if let Some(fb) = &fallback {
-                tracing::warn!(
-                    requested = %event.sink,
-                    using = %fb.name(),
-                    "audit sink '{}' is not registered — routing to fallback '{}'",
-                    event.sink,
-                    fb.name()
-                );
-            }
-            fallback
-        }
-    }
-}
-
-fn log_audit_failure(sink: &dyn AuditSink, event: &AuditEvent, d: &Diagnostic) {
-    tracing::warn!(
-        code = %d.code,
-        sink = sink.name(),
-        instance = %event.instance_id,
-        event_type = %event.event_type,
-        "audit sink write failed (best-effort): {}",
-        d.message
-    );
-}
-
-/// Deliver one event to the ONE sink it names, logging a failure (audit is best-effort). If that
-/// sink is not registered, the first registered sink (deterministic — sorted names) takes it, so
-/// the trail is never silently dropped on a typo. Shared by the execution-event dispatcher and
-/// the transport-event journal, so both route alike.
-pub async fn deliver_audit_event(registry: &AuditSinkRegistry, event: &AuditEvent) {
-    if let Some(sink) = resolve_audit_sink(registry, event) {
-        if let Err(d) = sink.emit(event).await {
-            log_audit_failure(sink.as_ref(), event, &d);
-        }
-    }
-}
-
-/// Deliver a run of events, routed per event exactly as [`deliver_audit_event`] routes one: each
-/// maximal stretch of consecutive events bound for the same sink goes to that sink as one
-/// [`AuditSink::emit_batch`], so the sink sees them in channel order. Failures are logged per
-/// event (audit is best-effort).
-pub async fn deliver_audit_events(registry: &AuditSinkRegistry, events: &[AuditEvent]) {
-    let sinks: Vec<Option<Arc<dyn AuditSink>>> = events
-        .iter()
-        .map(|e| resolve_audit_sink(registry, e))
-        .collect();
-    let same_sink = |a: &Option<Arc<dyn AuditSink>>, b: &Option<Arc<dyn AuditSink>>| match (a, b) {
-        (Some(a), Some(b)) => Arc::ptr_eq(a, b),
-        (None, None) => true,
-        _ => false,
-    };
-    let mut start = 0;
-    while start < events.len() {
-        let mut end = start + 1;
-        while end < events.len() && same_sink(&sinks[start], &sinks[end]) {
-            end += 1;
-        }
-        if let Some(sink) = &sinks[start] {
-            let run = &events[start..end];
-            for (i, d) in sink.emit_batch(run).await {
-                if let Some(event) = run.get(i) {
-                    log_audit_failure(sink.as_ref(), event, &d);
-                }
-            }
-        }
-        start = end;
-    }
-}
-
 /// The [`ExecutionListener`] that turns per-instance / per-node execution lifecycle callbacks into
-/// [`AuditEvent`]s and enqueues them (non-blocking) for the dispatcher. Registered on the executor
+/// [`AuditEvent`]s and appends them (non-blocking) to the audit spool. Registered on the executor
 /// via `TokenExecutor::builder(...).with_listener(Rc::new(listener))`, exactly like the OTel
 /// metrics listener. Runs on the `Rc`/single-threaded actor thread, so per-instance seq lives in a
 /// `RefCell`.
@@ -398,42 +208,100 @@ pub async fn deliver_audit_events(registry: &AuditSinkRegistry, events: &[AuditE
 /// audit-replay` trail. Per-node `<q:audit capture="payload">` variable capture (with `@sensitive`
 /// redaction) is the follow-on enrichment.
 pub struct AuditListener {
-    tx: UnboundedSender<AuditEvent>,
+    spool: AuditSpoolSender,
     /// RFC 3339 `at` supplier (injected — the engine passes a real clock, tests a fixed one).
     clock: Box<dyn Fn() -> String>,
-    /// Per-instance monotonic seq (the `(deployment_id, instance_id, seq)` dedup key).
-    seqs: RefCell<HashMap<String, u32>>,
+    /// Per-instance monotonic seq (the `(deployment_id, instance_id, seq)` dedup key), for the
+    /// instances RUNNING on this lane only. An entry is dropped when its instance completes and
+    /// when its high-water is handed to a snapshot or a chain ([`Self::take_seq`]): every resume
+    /// re-seeds it from what was persisted ([`Self::seed`]), and resumes land on whichever lane
+    /// the instance id hashes to, so an entry kept past the hand-off would never be read again
+    /// and the map would grow by one entry per instance for the life of the process.
+    seqs: RefCell<HashMap<String, InstanceSeq>>,
+    /// The lane's attempt tracker. With one, every event carries its pass's attempt and the
+    /// shippers hold it until its commit marker; without one (no persistence: nothing commits),
+    /// events carry no attempt and ship at once.
+    tracker: Option<crate::audit_attempts::AuditAttemptTracker>,
+}
+
+/// An instance's seq on this lane, and the pass (attempt) its next events belong to.
+#[derive(Default)]
+struct InstanceSeq {
+    seq: u32,
+    /// Opened by the pass's first event, closed by a seed (a new pass begins).
+    attempt: Option<AuditAttempt>,
 }
 
 impl AuditListener {
-    pub fn new(
-        tx: UnboundedSender<AuditEvent>,
-        clock: impl Fn() -> String + 'static,
-    ) -> AuditListener {
+    pub fn new(spool: AuditSpoolSender, clock: impl Fn() -> String + 'static) -> AuditListener {
         AuditListener {
-            tx,
+            spool,
             clock: Box::new(clock),
             seqs: RefCell::new(HashMap::new()),
+            tracker: None,
         }
     }
 
-    fn next_seq(&self, instance_id: &str) -> u32 {
+    /// Tag events with their pass's attempt, registered in `tracker` (the lane's, shared with
+    /// its persistence bridge, which settles the attempts at each commit).
+    #[must_use]
+    pub fn with_attempt_tracker(
+        mut self,
+        tracker: crate::audit_attempts::AuditAttemptTracker,
+    ) -> AuditListener {
+        self.tracker = Some(tracker);
+        self
+    }
+
+    /// The lane finished a request: an attempt still open reached no commit (the pass wrote
+    /// nothing to the database). It is committed when the request succeeded and aborted when it
+    /// failed.
+    pub fn settle_open_attempts(&self, succeeded: bool) {
+        if let Some(tracker) = &self.tracker {
+            tracker.settle(&self.spool, succeeded);
+        }
+    }
+
+    /// The next seq of `instance_id`, and the attempt it belongs to (with a tracker): the pass's
+    /// open attempt, or a new one when there is none or it was settled (a commit closes it), with
+    /// the seq before this event as its base.
+    fn next_seq(&self, deployment: &str, instance_id: &str) -> (u32, Option<AuditAttempt>) {
         let mut seqs = self.seqs.borrow_mut();
-        let slot = seqs.entry(instance_id.to_string()).or_insert(0);
-        *slot += 1;
-        *slot
+        let slot = seqs.entry(instance_id.to_string()).or_default();
+        let attempt = self.tracker.as_ref().map(|tracker| {
+            let open = slot
+                .attempt
+                .as_ref()
+                .is_some_and(|a| tracker.is_open(&a.id));
+            if !open {
+                let attempt = AuditAttempt {
+                    id: new_attempt_id(),
+                    base: slot.seq,
+                    at: (self.clock)(),
+                };
+                tracker.register(deployment, instance_id, &attempt);
+                slot.attempt = Some(attempt);
+            }
+            slot.attempt.clone().expect("set above")
+        });
+        slot.seq += 1;
+        (slot.seq, attempt)
     }
 
     /// Seed the per-instance seq high-water from a resumed snapshot's persisted `audit_seq`.
     /// The engine calls this on the actor thread right before `resume`, so the first
     /// post-resume event continues at `seq + 1` instead of restarting at 1 and colliding with
     /// the rows a prior pass already persisted (the DB sink's `(deployment_id, instance_id,
-    /// seq)` uniqueness). Never regresses the counter — takes the max of the in-memory and
-    /// persisted values (idempotent if the same instance is seeded twice in one engine life).
+    /// seq)` uniqueness). A seed begins a pass: the counter is SET to the persisted value, even
+    /// below what this lane last emitted. Everything above it belongs to a pass that never
+    /// committed (its high-water would have been persisted), so the re-run numbers its events
+    /// from there again under a new attempt, which supersedes the lost one.
     pub fn seed(&self, instance_id: &str, seq: u32) {
         let mut seqs = self.seqs.borrow_mut();
-        let slot = seqs.entry(instance_id.to_string()).or_insert(0);
-        *slot = (*slot).max(seq);
+        let slot = seqs.entry(instance_id.to_string()).or_default();
+        slot.seq = seq;
+        // A seed begins a pass: its events belong to a new attempt.
+        slot.attempt = None;
     }
 
     /// The current per-instance seq high-water (0 when the instance is unseen). The engine
@@ -441,7 +309,23 @@ impl AuditListener {
     /// actor thread — to persist into the snapshot's `audit_seq`, so a later resume can seed
     /// continuity.
     pub fn seq_for(&self, instance_id: &str) -> u32 {
-        self.seqs.borrow().get(instance_id).copied().unwrap_or(0)
+        self.seqs.borrow().get(instance_id).map_or(0, |s| s.seq)
+    }
+
+    /// [`Self::seq_for`], and forget the instance: its high-water now travels with the snapshot
+    /// (or chain) the caller is building, and the next pass of the instance, on this lane or
+    /// another, seeds from that. The engine calls it where it persists or hands off the seq.
+    pub fn take_seq(&self, instance_id: &str) -> u32 {
+        self.seqs
+            .borrow_mut()
+            .remove(instance_id)
+            .map_or(0, |s| s.seq)
+    }
+
+    /// How many instances this listener holds a seq for (tests and diagnostics): the instances
+    /// mid-pass on this lane, not every instance it has seen.
+    pub fn tracked_instances(&self) -> usize {
+        self.seqs.borrow().len()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -457,12 +341,16 @@ impl AuditListener {
         payload_json: Option<String>,
         correlation: &std::collections::BTreeMap<String, String>,
     ) {
+        let (seq, attempt) = self.next_seq(deployment, instance_id);
+        if let (Some(tracker), Some(a)) = (&self.tracker, &attempt) {
+            tracker.observe(&a.id, seq, event_type);
+        }
         let event = AuditEvent {
             sink,
             deployment_id: deployment.to_string(),
             tenant: tenant.to_string(),
             instance_id: instance_id.to_string(),
-            seq: self.next_seq(instance_id),
+            seq,
             at: (self.clock)(),
             event_type: event_type.to_string(),
             node_id,
@@ -472,9 +360,10 @@ impl AuditListener {
             // node (the default) carries `"{}"`.
             payload_json: payload_json.unwrap_or_else(|| "{}".to_string()),
             correlation: correlation.clone(),
+            attempt,
         };
-        // Best-effort: a full/closed channel means the dispatcher is gone — drop silently.
-        let _ = self.tx.send(event);
+        // Never blocks; the step's commit waits for the spool's sync (the bridge's barrier).
+        self.spool.append(event);
     }
 
     fn tenant_of(event: &InstanceEvent) -> &str {
@@ -517,6 +406,8 @@ impl ExecutionListener for AuditListener {
             None,
             &e.correlation,
         );
+        // The instance is finished: nothing emits for it again.
+        self.seqs.borrow_mut().remove(&e.instance_id);
     }
     fn on_instance_suspended(&self, e: &InstanceEvent) {
         let Some(sink) = e.audit_sink.clone() else {
@@ -606,6 +497,41 @@ impl ExecutionListener for AuditListener {
 mod tests {
     use super::*;
 
+    use crate::audit_spool::{AuditSpool, AuditSpoolConfig};
+
+    /// A spool in a fresh temporary directory that takes every store's events.
+    fn test_spool() -> (AuditSpool, std::path::PathBuf) {
+        let dir =
+            std::env::temp_dir().join(format!("sutra-audit-listener-{}", uuid::Uuid::new_v4()));
+        let spool = AuditSpool::open(AuditSpoolConfig {
+            dir: dir.clone(),
+            sync_linger: std::time::Duration::ZERO,
+            sinks: ["jsonl", "sql", "otel"]
+                .map(String::from)
+                .into_iter()
+                .collect(),
+            ..AuditSpoolConfig::default()
+        })
+        .unwrap();
+        (spool, dir)
+    }
+
+    /// Everything appended to `spool` so far, once it is synced.
+    fn spooled(spool: &AuditSpool) -> Vec<AuditEvent> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        runtime.block_on(spool.sender().barrier()).unwrap();
+        spool
+            .reader(0)
+            .next_batch(10_000, spool.durable_through())
+            .unwrap()
+            .into_iter()
+            .map(|r| r.event)
+            .collect()
+    }
+
     fn sample() -> AuditEvent {
         AuditEvent {
             sink: "sql".into(),
@@ -620,6 +546,7 @@ mod tests {
             diagnostic_json: None,
             payload_json: "{\"amount\":10}".into(),
             correlation: Default::default(),
+            attempt: None,
         }
     }
 
@@ -643,95 +570,6 @@ mod tests {
         e.payload_json = "not json".into();
         let v: serde_json::Value = serde_json::from_str(&e.to_jsonl()).unwrap();
         assert_eq!(v["payload"], "not json");
-    }
-
-    #[test]
-    fn registry_resolves_by_name_and_lists_sorted() {
-        let dir = std::env::temp_dir().join(format!("audit-reg-{}", std::process::id()));
-        let sink = Arc::new(JsonlAuditSink::open(dir.join("a.jsonl")).unwrap());
-        let mut reg = AuditSinkRegistry::new();
-        assert!(reg.is_empty());
-        reg.register(sink);
-        assert_eq!(reg.names(), vec!["jsonl".to_string()]);
-        assert!(reg.get("jsonl").is_some());
-        assert!(reg.get("sql").is_none());
-        assert_eq!(reg.all().len(), 1);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test]
-    async fn jsonl_sink_appends_a_line_per_event() {
-        let dir = std::env::temp_dir().join(format!("audit-jsonl-{}", std::process::id()));
-        let path = dir.join("audit.jsonl");
-        let sink = JsonlAuditSink::open(&path).unwrap();
-        sink.emit(&sample()).await.unwrap();
-        let mut second = sample();
-        second.seq = 4;
-        second.event_type = "NODE_LEFT".into();
-        sink.emit(&second).await.unwrap();
-
-        let body = std::fs::read_to_string(&path).unwrap();
-        let lines: Vec<&str> = body.lines().collect();
-        assert_eq!(lines.len(), 2);
-        let first: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
-        let last: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
-        assert_eq!(first["seq"], 3);
-        assert_eq!(last["eventType"], "NODE_LEFT");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Many writers at once — several sinks on the same file (one per executor lane), each driven
-    /// from its own thread — never leave two events on one line or tear one: every line parses
-    /// as exactly one JSON event and every event is present once.
-    #[test]
-    fn concurrent_jsonl_writers_leave_exactly_one_event_per_line() {
-        const SINKS: usize = 8;
-        const WRITERS_PER_SINK: usize = 4;
-        const EVENTS_PER_WRITER: usize = 250;
-        let dir = std::env::temp_dir().join(format!("audit-jsonl-many-{}", std::process::id()));
-        let path = dir.join("audit.jsonl");
-        let _ = std::fs::remove_file(&path);
-        let sinks: Vec<Arc<JsonlAuditSink>> = (0..SINKS)
-            .map(|_| Arc::new(JsonlAuditSink::open(&path).unwrap()))
-            .collect();
-        // A payload long enough that a torn or split write would show.
-        let payload = format!("{{\"note\":\"{}\"}}", "x".repeat(512));
-        let mut threads = Vec::new();
-        for (s, sink) in sinks.iter().enumerate() {
-            for w in 0..WRITERS_PER_SINK {
-                let sink = Arc::clone(sink);
-                let payload = payload.clone();
-                threads.push(std::thread::spawn(move || {
-                    let rt = tokio::runtime::Builder::new_current_thread()
-                        .build()
-                        .unwrap();
-                    for n in 0..EVENTS_PER_WRITER {
-                        let mut e = sample();
-                        e.instance_id = format!("i-{s}-{w}");
-                        e.seq = n as u32;
-                        e.payload_json = payload.clone();
-                        rt.block_on(sink.emit(&e)).unwrap();
-                    }
-                }));
-            }
-        }
-        for t in threads {
-            t.join().unwrap();
-        }
-        let body = std::fs::read_to_string(&path).unwrap();
-        let mut seen = std::collections::HashSet::new();
-        for (i, line) in body.lines().enumerate() {
-            let v: serde_json::Value = serde_json::from_str(line)
-                .unwrap_or_else(|e| panic!("line {i} is not one JSON event ({e}): {line:.200}"));
-            let key = (
-                v["instanceId"].as_str().unwrap().to_string(),
-                v["seq"].as_u64().unwrap(),
-            );
-            assert!(seen.insert(key), "event written twice at line {i}");
-        }
-        assert_eq!(seen.len(), SINKS * WRITERS_PER_SINK * EVENTS_PER_WRITER);
-        assert!(body.ends_with('\n'));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -776,14 +614,18 @@ mod tests {
             payload_json: None,
             correlation: keys.clone(),
         };
-        let (tx, mut rx) = audit_channel();
-        let listener = AuditListener::new(tx, || "t".to_string());
+        let (spool, dir) = test_spool();
+        let listener = AuditListener::new(spool.sender(), || "t".to_string());
         listener.on_instance_started(&inst);
         listener.on_token_entered(&token);
         listener.on_instance_completed(&inst);
-        for _ in 0..3 {
-            assert_eq!(rx.try_recv().unwrap().correlation, keys);
+        let events = spooled(&spool);
+        assert_eq!(events.len(), 3);
+        for event in events {
+            assert_eq!(event.correlation, keys);
         }
+        drop(spool);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -817,8 +659,8 @@ mod tests {
         };
 
         // First pass: STARTED=1, NODE_ENTERED=2, SUSPENDED=3 — the persisted high-water is 3.
-        let (tx, _rx) = audit_channel();
-        let first = AuditListener::new(tx, || "t".to_string());
+        let (spool, dir) = test_spool();
+        let first = AuditListener::new(spool.sender(), || "t".to_string());
         first.on_instance_started(&inst);
         first.on_token_entered(&token);
         first.on_instance_suspended(&inst);
@@ -830,8 +672,7 @@ mod tests {
 
         // Restart / deploy-flip: a FRESH listener has no memory — unseeded it would restart at 1
         // and collide with the rows seq 1..3 already persisted.
-        let (tx2, _rx2) = audit_channel();
-        let resumed = AuditListener::new(tx2, || "t".to_string());
+        let resumed = AuditListener::new(spool.sender(), || "t".to_string());
         assert_eq!(
             resumed.seq_for("i-1"),
             0,
@@ -848,11 +689,109 @@ mod tests {
             "RESUMED continues the seq, never collides"
         );
         resumed.on_instance_completed(&inst);
-        assert_eq!(resumed.seq_for("i-1"), 5);
+        let seqs: Vec<u32> = spooled(&spool).iter().map(|e| e.seq).collect();
+        assert_eq!(seqs, vec![1, 2, 3, 4, 5], "COMPLETED takes the next seq");
+        assert_eq!(
+            resumed.tracked_instances(),
+            0,
+            "a completed instance is forgotten"
+        );
+        drop(spool);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
-        // Seeding never regresses the counter (idempotent re-seed within one engine life).
-        resumed.seed("i-1", 2);
-        assert_eq!(resumed.seq_for("i-1"), 5);
+    /// A pass's events share one attempt, opened by its first event with the seq before
+    /// it as the base; a seed begins a new attempt (a re-run from the same snapshot gets a new
+    /// id and the same base), and a hand-off ends the pass.
+    #[test]
+    fn attempt_opens_at_first_event_and_closes_at_handoff() {
+        use sutra_executor::listener::{ExecutionListener, InstanceEvent};
+        use sutra_executor::DeploymentId;
+
+        let inst = InstanceEvent {
+            deployment: DeploymentId::of("dep-000000000000000000000001").unwrap(),
+            labels: Default::default(),
+            instance_id: "i-1".into(),
+            process_id: "p".into(),
+            module_version: "1.0".into(),
+            audit_sink: Some("jsonl".to_string()),
+            correlation: Default::default(),
+        };
+        let (spool, dir) = test_spool();
+        let lane = AuditListener::new(spool.sender(), || "2026-11-24T10:00:00Z".to_string())
+            .with_attempt_tracker(crate::audit_attempts::AuditAttemptTracker::new());
+        lane.on_instance_started(&inst);
+        lane.on_instance_suspended(&inst);
+        assert_eq!(lane.take_seq("i-1"), 2);
+        // First resume from the snapshot (seq 2): its commit is lost.
+        lane.seed("i-1", 2);
+        lane.on_instance_resumed(&inst);
+        // The re-run from the same snapshot.
+        lane.seed("i-1", 2);
+        lane.on_instance_resumed(&inst);
+        lane.on_instance_completed(&inst);
+        let events = spooled(&spool);
+        let attempts: Vec<(u32, u32, String)> = events
+            .iter()
+            .map(|e| {
+                let a = e.attempt.clone().expect("every pass event has an attempt");
+                (e.seq, a.base, a.id)
+            })
+            .collect();
+        assert_eq!(attempts.len(), 5);
+        assert_eq!((attempts[0].0, attempts[0].1), (1, 0));
+        assert_eq!(attempts[0].2, attempts[1].2, "one attempt per pass");
+        assert_eq!((attempts[2].0, attempts[2].1), (3, 2), "the lost pass");
+        assert_eq!(
+            (attempts[3].0, attempts[3].1),
+            (3, 2),
+            "the re-run: same seq, same base"
+        );
+        assert_ne!(attempts[2].2, attempts[3].2, "a new attempt id");
+        assert_eq!(attempts[3].2, attempts[4].2);
+        drop(spool);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The per-instance seq map holds only the instances mid-pass: an instance that parks (its
+    /// high-water taken into the snapshot) and later resumes and completes on ANOTHER lane leaves
+    /// nothing behind on either, however many instances run. Unbounded before 0.8.6: one entry per
+    /// instance ever started, for the life of the process.
+    #[test]
+    fn the_seq_map_is_empty_after_many_instances_park_resume_elsewhere_and_complete() {
+        use sutra_executor::listener::{ExecutionListener, InstanceEvent};
+        use sutra_executor::DeploymentId;
+
+        let dep = DeploymentId::of("dep-000000000000000000000001").unwrap();
+        let (spool, dir) = test_spool();
+        let start_lane = AuditListener::new(spool.sender(), || "t".to_string());
+        let owner_lane = AuditListener::new(spool.sender(), || "t".to_string());
+        for n in 0..10_000 {
+            let inst = InstanceEvent {
+                deployment: dep.clone(),
+                labels: Default::default(),
+                instance_id: format!("i-{n}"),
+                process_id: "p".into(),
+                module_version: "1.0".into(),
+                audit_sink: Some("jsonl".to_string()),
+                correlation: Default::default(),
+            };
+            start_lane.on_instance_started(&inst);
+            start_lane.on_instance_suspended(&inst);
+            // The suspend snapshot takes the high-water, as the dispatcher does.
+            let persisted = start_lane.take_seq(&inst.instance_id);
+            assert_eq!(persisted, 2);
+            owner_lane.seed(&inst.instance_id, persisted);
+            owner_lane.on_instance_resumed(&inst);
+            owner_lane.on_instance_completed(&inst);
+        }
+        assert_eq!(start_lane.tracked_instances(), 0);
+        assert_eq!(owner_lane.tracked_instances(), 0);
+        // And the seqs stayed continuous: STARTED 1, SUSPENDED 2, RESUMED 3, COMPLETED 4.
+        let seqs: Vec<u32> = spooled(&spool).iter().take(4).map(|e| e.seq).collect();
+        assert_eq!(seqs, vec![1, 2, 3, 4]);
+        drop(spool);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -861,8 +800,8 @@ mod tests {
         use sutra_executor::listener::{ExecutionListener, TokenEvent};
         use sutra_executor::DeploymentId;
 
-        let (tx, mut rx) = audit_channel();
-        let listener = AuditListener::new(tx, || "t".to_string());
+        let (spool, dir) = test_spool();
+        let listener = AuditListener::new(spool.sender(), || "t".to_string());
         let dep = DeploymentId::of("dep-000000000000000000000001").unwrap();
         let labels: BTreeMap<String, String> = [("tenant".to_string(), "acme".to_string())]
             .into_iter()
@@ -883,271 +822,14 @@ mod tests {
         // NODE_LEFT is metadata-level regardless — it records "{}".
         listener.on_token_left(&token);
 
-        let entered = rx.try_recv().unwrap();
+        let mut events = spooled(&spool).into_iter();
+        let entered = events.next().unwrap();
         assert_eq!(entered.event_type, "NODE_ENTERED");
         assert_eq!(entered.payload_json, captured);
-        let left = rx.try_recv().unwrap();
+        let left = events.next().unwrap();
         assert_eq!(left.event_type, "NODE_LEFT");
         assert_eq!(left.payload_json, "{}");
-    }
-
-    #[tokio::test]
-    async fn listener_emits_lifecycle_events_through_the_dispatcher_to_jsonl() {
-        use std::collections::BTreeMap;
-        use sutra_executor::listener::{InstanceEvent, TokenEvent};
-        use sutra_executor::DeploymentId;
-
-        let dir = std::env::temp_dir().join(format!("audit-listener-{}", std::process::id()));
-        let path = dir.join("audit.jsonl");
-        let mut registry = AuditSinkRegistry::new();
-        registry.register(Arc::new(JsonlAuditSink::open(&path).unwrap()));
-        let (tx, rx) = audit_channel();
-        let handle = spawn_audit_dispatcher(&tokio::runtime::Handle::current(), rx, registry);
-
-        let dep = DeploymentId::of("dep-000000000000000000000001").unwrap();
-        let labels: BTreeMap<String, String> = [("tenant".to_string(), "acme".to_string())]
-            .into_iter()
-            .collect();
-        let listener = AuditListener::new(tx, || "2026-07-19T00:00:00Z".to_string());
-
-        let inst = InstanceEvent {
-            deployment: dep.clone(),
-            labels: labels.clone(),
-            instance_id: "i-1".into(),
-            process_id: "p".into(),
-            module_version: "1.0".into(),
-            audit_sink: Some("jsonl".to_string()),
-            correlation: Default::default(),
-        };
-        let token = TokenEvent {
-            deployment: dep.clone(),
-            labels: labels.clone(),
-            instance_id: "i-1".into(),
-            node_id: "Start".into(),
-            node_type: "startEvent".into(),
-            audit_sink: Some("jsonl".to_string()),
-            payload_json: None,
-            correlation: Default::default(),
-        };
-        listener.on_instance_started(&inst);
-        listener.on_token_entered(&token);
-        listener.on_instance_completed(&inst);
-        drop(listener); // drops the only sender → the dispatcher drains + exits.
-        handle.await.unwrap();
-
-        let body = std::fs::read_to_string(&path).unwrap();
-        let events: Vec<serde_json::Value> = body
-            .lines()
-            .map(|l| serde_json::from_str(l).unwrap())
-            .collect();
-        assert_eq!(events.len(), 3);
-        // Per-instance monotonic seq, in lifecycle order.
-        assert_eq!(events[0]["eventType"], "INSTANCE_STARTED");
-        assert_eq!(events[0]["seq"], 1);
-        assert_eq!(events[0]["tenant"], "acme");
-        assert_eq!(events[1]["eventType"], "NODE_ENTERED");
-        assert_eq!(events[1]["seq"], 2);
-        assert_eq!(events[1]["nodeId"], "Start");
-        assert_eq!(events[2]["eventType"], "INSTANCE_COMPLETED");
-        assert_eq!(events[2]["seq"], 3);
-        assert_eq!(events[2]["deploymentId"], "dep-000000000000000000000001");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// A sink that records the `(routed-sink, event_type)` of every event it receives.
-    struct RecordingSink {
-        name: String,
-        seen: Arc<Mutex<Vec<(String, String)>>>,
-    }
-
-    impl AuditSink for RecordingSink {
-        fn name(&self) -> &str {
-            &self.name
-        }
-        fn emit<'a>(&'a self, e: &'a AuditEvent) -> BoxFuture<'a, Result<(), Diagnostic>> {
-            self.seen
-                .lock()
-                .unwrap()
-                .push((e.sink.clone(), e.event_type.clone()));
-            Box::pin(async { Ok(()) })
-        }
-    }
-
-    /// Single source of truth: the dispatcher delivers each event to the ONE sink it names, never
-    /// fanned; an event naming an unregistered sink falls back to a registered one (never dropped).
-    #[tokio::test]
-    async fn dispatcher_routes_to_the_named_sink_only_with_fallback() {
-        let sql_seen = Arc::new(Mutex::new(Vec::new()));
-        let jsonl_seen = Arc::new(Mutex::new(Vec::new()));
-        let mut registry = AuditSinkRegistry::new();
-        registry.register(Arc::new(RecordingSink {
-            name: "sql".into(),
-            seen: Arc::clone(&sql_seen),
-        }));
-        registry.register(Arc::new(RecordingSink {
-            name: "jsonl".into(),
-            seen: Arc::clone(&jsonl_seen),
-        }));
-        let (tx, rx) = audit_channel();
-        let handle = spawn_audit_dispatcher(&tokio::runtime::Handle::current(), rx, registry);
-
-        let event = |sink: &str, event_type: &str| AuditEvent {
-            sink: sink.into(),
-            deployment_id: "dep-000000000000000000000001".into(),
-            tenant: "acme".into(),
-            instance_id: "i-1".into(),
-            seq: 1,
-            at: "t".into(),
-            event_type: event_type.into(),
-            node_id: None,
-            diagnostic_code: None,
-            diagnostic_json: None,
-            payload_json: "{}".into(),
-            correlation: Default::default(),
-        };
-        tx.send(event("sql", "A")).unwrap();
-        tx.send(event("jsonl", "B")).unwrap();
-        // "otel" is not registered → falls back to the first registered sink (sorted: "jsonl").
-        tx.send(event("otel", "C")).unwrap();
-        drop(tx);
-        handle.await.unwrap();
-
-        // Each named sink saw ONLY its own event — never fanned.
-        assert_eq!(
-            *sql_seen.lock().unwrap(),
-            vec![("sql".to_string(), "A".to_string())]
-        );
-        // jsonl saw its own "B" plus the fallback "C" (routed by name "otel", absent).
-        assert_eq!(
-            *jsonl_seen.lock().unwrap(),
-            vec![
-                ("jsonl".to_string(), "B".to_string()),
-                ("otel".to_string(), "C".to_string())
-            ]
-        );
-    }
-
-    /// A sink that records each `emit_batch` it is handed (the event types, in order) and fails
-    /// every event whose type is `"BAD"`.
-    struct BatchRecordingSink {
-        name: String,
-        batches: Arc<Mutex<Vec<Vec<String>>>>,
-    }
-
-    impl AuditSink for BatchRecordingSink {
-        fn name(&self) -> &str {
-            &self.name
-        }
-        fn emit<'a>(&'a self, _e: &'a AuditEvent) -> BoxFuture<'a, Result<(), Diagnostic>> {
-            Box::pin(async { panic!("the dispatcher writes through emit_batch") })
-        }
-        fn emit_batch<'a>(
-            &'a self,
-            events: &'a [AuditEvent],
-        ) -> BoxFuture<'a, Vec<(usize, Diagnostic)>> {
-            self.batches
-                .lock()
-                .unwrap()
-                .push(events.iter().map(|e| e.event_type.clone()).collect());
-            let failed = events
-                .iter()
-                .enumerate()
-                .filter(|(_, e)| e.event_type == "BAD")
-                .map(|(i, _)| (i, Diagnostic::error(AUDIT_SINK_WRITE_FAILED, "bad")))
-                .collect();
-            Box::pin(async move { failed })
-        }
-    }
-
-    fn numbered(sink: &str, seq: u32, event_type: &str) -> AuditEvent {
-        AuditEvent {
-            sink: sink.into(),
-            deployment_id: "dep-000000000000000000000001".into(),
-            tenant: "acme".into(),
-            instance_id: "i-1".into(),
-            seq,
-            at: "t".into(),
-            event_type: event_type.into(),
-            node_id: None,
-            diagnostic_code: None,
-            diagnostic_json: None,
-            payload_json: "{}".into(),
-            correlation: Default::default(),
-        }
-    }
-
-    /// What queued while the dispatcher was busy goes out as batches of at most
-    /// [`AUDIT_BATCH_MAX`], every event exactly once and in channel order; a failed event is
-    /// logged and the rest of its batch and the batches after it still go out.
-    #[tokio::test]
-    async fn dispatcher_batches_the_backlog_in_order_up_to_the_cap() {
-        let batches = Arc::new(Mutex::new(Vec::new()));
-        let mut registry = AuditSinkRegistry::new();
-        registry.register(Arc::new(BatchRecordingSink {
-            name: "sql".into(),
-            batches: Arc::clone(&batches),
-        }));
-        let (tx, rx) = audit_channel();
-        let total = AUDIT_BATCH_MAX * 2 + 7;
-        for i in 0..total {
-            let kind = if i == 3 {
-                "BAD".to_string()
-            } else {
-                format!("E{i}")
-            };
-            tx.send(numbered("sql", i as u32 + 1, &kind)).unwrap();
-        }
-        drop(tx);
-        // Spawned after the backlog is queued, so the first receive sees all of it.
-        spawn_audit_dispatcher(&tokio::runtime::Handle::current(), rx, registry)
-            .await
-            .unwrap();
-
-        let batches = batches.lock().unwrap().clone();
-        let sizes: Vec<usize> = batches.iter().map(Vec::len).collect();
-        assert_eq!(sizes, vec![AUDIT_BATCH_MAX, AUDIT_BATCH_MAX, 7]);
-        let flat: Vec<String> = batches.into_iter().flatten().collect();
-        let expected: Vec<String> = (0..total)
-            .map(|i| {
-                if i == 3 {
-                    "BAD".to_string()
-                } else {
-                    format!("E{i}")
-                }
-            })
-            .collect();
-        assert_eq!(flat, expected);
-    }
-
-    /// A batch never mixes sinks: consecutive events for one sink travel together, and a change of
-    /// sink starts a new run, so each sink still sees its own events in channel order.
-    #[tokio::test]
-    async fn deliver_audit_events_splits_a_batch_into_runs_per_sink() {
-        let sql = Arc::new(Mutex::new(Vec::new()));
-        let jsonl = Arc::new(Mutex::new(Vec::new()));
-        let mut registry = AuditSinkRegistry::new();
-        registry.register(Arc::new(BatchRecordingSink {
-            name: "sql".into(),
-            batches: Arc::clone(&sql),
-        }));
-        registry.register(Arc::new(BatchRecordingSink {
-            name: "jsonl".into(),
-            batches: Arc::clone(&jsonl),
-        }));
-        let events = vec![
-            numbered("sql", 1, "A"),
-            numbered("sql", 2, "B"),
-            numbered("jsonl", 3, "C"),
-            // Unregistered → the fallback ("jsonl", first sorted), so it joins C's run.
-            numbered("otel", 4, "D"),
-            numbered("sql", 5, "E"),
-        ];
-        deliver_audit_events(&registry, &events).await;
-        let owned = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        assert_eq!(
-            *sql.lock().unwrap(),
-            vec![owned(&["A", "B"]), owned(&["E"])]
-        );
-        assert_eq!(*jsonl.lock().unwrap(), vec![owned(&["C", "D"])]);
+        drop(spool);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

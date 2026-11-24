@@ -6,3 +6,5 @@ labels:
   "version": "1.0.0"
 engine:
   minContract: 1
+audit:
+  sink: "jsonl"

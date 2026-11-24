@@ -132,6 +132,10 @@ RUN apt-get update \
 # after the certificate; the bundle is built from those files.
 RUN ! ls /usr/share/ca-certificates/mozilla | grep -E 'Comodo_AAA|emSign_ECC_Root_CA_-_G3' \
     || { echo "a distrusted root is still in the CA bundle" >&2; exit 1; }
+# The audit spool's default directory (`sutra.audit.spool.dir`), owned by the engine user. The
+# distroless runtime has no shell to create it, so it is made here and copied over. No VOLUME:
+# mount a volume here to keep the spool across container replacements.
+RUN mkdir -p /var/lib/sutra/audit-spool && chmod 0700 /var/lib/sutra/audit-spool
 
 # ---- runtime (distroless) ----------------------------------------------------
 # gcr.io/distroless/cc-debian12 — glibc + libgcc + libstdc++ + CA certs, no shell/package
@@ -149,6 +153,7 @@ RUN ! ls /usr/share/ca-certificates/mozilla | grep -E 'Comodo_AAA|emSign_ECC_Roo
 FROM gcr.io/distroless/cc-debian12@sha256:e8e7ee4b8b106d4c5fde9e422a321b2b8a2d5cca546c97adcce927f3e1d36e36
 COPY --from=builder /build/sutra-engine /usr/local/bin/sutra-engine
 COPY --from=certs /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=certs --chown=10001:10001 /var/lib/sutra /var/lib/sutra
 
 # The engine-internal migration SQL — now Rust-owned under
 # sutra-persistence/migrations: shipped/{core,audit} are byte-identical copies of the

@@ -11,7 +11,7 @@
                   id="Definitions_uncorrelated"
                   targetNamespace="urn:sutra:module:uncorrelated:1.0.0">
   <bpmn:process id="plain-order" name="Plain order" isExecutable="true">
-    <bpmn:extensionElements><q:audit capture="metadata"/></bpmn:extensionElements>
+    <bpmn:extensionElements><q:audit events="all" capture="metadata"/></bpmn:extensionElements>
     <bpmn:startEvent id="PlainStart">
       <bpmn:extensionElements>
         <q:source channel="plain-start"/>
@@ -29,7 +29,7 @@
   </bpmn:process>
 
   <bpmn:process id="routed-order" name="Routed order" isExecutable="true">
-    <bpmn:extensionElements><q:audit capture="metadata"/></bpmn:extensionElements>
+    <bpmn:extensionElements><q:audit events="all" capture="metadata"/></bpmn:extensionElements>
     <bpmn:startEvent id="RoutedStart">
       <bpmn:extensionElements>
         <q:source channel="routed-start"/>
@@ -48,7 +48,7 @@
 
   <bpmn:process id="late-answer" name="An answer for no waiting order" isExecutable="true">
     <bpmn:extensionElements>
-      <q:audit capture="metadata"/>
+      <q:audit events="all" capture="metadata"/>
       <q:variables>
         <q:variable name="lateKey" type="string"/>
         <q:variable name="lateEnded" type="boolean"/>

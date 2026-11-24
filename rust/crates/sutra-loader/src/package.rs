@@ -81,8 +81,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use sutra_bpmn::loader::BpmnModelLoader;
-use sutra_bpmn::model::{Node, ProcessAudit};
-use sutra_bpmn::qbindings::AuditCapture;
+use sutra_bpmn::model::Node;
 use sutra_executor::deployment::DeploymentId;
 
 use crate::archive::{
@@ -188,10 +187,10 @@ pub struct PackageConfig {
     /// Optional override of the derived entry-process index; every id must name a
     /// process the package defines.
     pub entry_processes: Option<Vec<String>>,
-    /// B1 — the deployment-wide audit default (`audit.{sink,capture}`), emitted into the sealed
-    /// `manifest.yaml`. Identity-bearing: changing it remints the deploymentId (consistent with a
-    /// process/node `<q:audit>` change, which already does via the `.bpmn` artifact hash).
-    pub audit: Option<ProcessAudit>,
+    /// `audit` — where the package's audited processes send their events (`sink`, `sinks`),
+    /// emitted into the sealed `manifest.yaml`. Identity-bearing: changing it remints the
+    /// deploymentId. Never turns audit on (see [`crate::archive::ManifestAudit`]).
+    pub audit: Option<crate::archive::ManifestAudit>,
     /// `properties:` — the deployment configuration (key → UNRESOLVED text), sealed into the
     /// manifest and read by timer expressions as `config.<key>` (see [`crate::properties`]).
     pub properties: BTreeMap<String, String>,
@@ -281,34 +280,9 @@ impl PackageConfig {
             }
         }
 
-        // B1 — the deployment audit default (sink + capture); absent ⇒ None.
-        let audit = if let Some(value) = root.get(serde_yaml::Value::from("audit")) {
-            let map = value
-                .as_mapping()
-                .ok_or_else(|| invalid("audit must be a mapping".to_string()))?;
-            let sink = map
-                .get(serde_yaml::Value::from("sink"))
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-                .unwrap_or("sql")
-                .to_string();
-            let capture = match map
-                .get(serde_yaml::Value::from("capture"))
-                .and_then(|v| v.as_str())
-            {
-                None | Some("") | Some("metadata") => AuditCapture::Metadata,
-                Some("payload") => AuditCapture::Payload,
-                Some("none") => AuditCapture::None,
-                Some("media") => AuditCapture::Media,
-                Some(other) => {
-                    return Err(invalid(format!(
-                        "audit.capture '{other}' is not one of metadata|payload|none|media"
-                    )))
-                }
-            };
-            Some(ProcessAudit { sink, capture })
-        } else {
-            None
+        let audit = match root.get(serde_yaml::Value::from("audit")) {
+            Some(value) => Some(crate::archive::ManifestAudit::parse(value, &invalid)?),
+            None => None,
         };
 
         let properties = match root.get(serde_yaml::Value::from("properties")) {
@@ -352,10 +326,7 @@ impl PackageConfig {
             }
         }
         if let Some(audit) = &self.audit {
-            let capture = audit.capture.as_str();
-            out.push_str("audit:\n");
-            out.push_str(&format!("  sink: {}\n", quote(&audit.sink)));
-            out.push_str(&format!("  capture: {}\n", quote(capture)));
+            audit.push_yaml(&mut out);
         }
         crate::properties::push_properties(&mut out, &self.properties);
         out
@@ -568,6 +539,11 @@ fn validate_package(package_dir: &Path, scanned: &ScannedPackage) -> LintReport 
         }
     }
 
+    if let Some(audit) = &scanned.config.audit {
+        out.extend(audit.ignored_capture());
+        out.extend(audit.unknown_processes(&scanned.deployment));
+    }
+
     let mut manifests = ValidationManifests::default();
     manifests.absorb_dir(package_dir, &mut out);
     validate_deployment_with_manifests(&scanned.deployment, &manifests, &mut out);
@@ -696,7 +672,7 @@ fn seal_deployment(
     labels: BTreeMap<String, String>,
     engine_min_contract: u64,
     entry_processes: Vec<String>,
-    audit: Option<ProcessAudit>,
+    audit: Option<crate::archive::ManifestAudit>,
     properties: BTreeMap<String, String>,
     schema_emitter: Option<&dyn CompiledSchemaEmitter>,
 ) -> Result<(ArchiveManifest, Vec<u8>), LoaderError> {
@@ -838,6 +814,7 @@ fn entry_processes(deployment: &LoadedDeployment) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sutra_bpmn::qbindings::AuditCapture;
 
     /// A relative `.` and a trailing `..` name the folder they resolve to, and the resolved path
     /// carries no Windows `\\?\` verbatim prefix (that half only means something on Windows,
@@ -889,9 +866,10 @@ mod tests {
             ]),
             engine_min_contract: Some(1),
             entry_processes: Some(vec!["p".to_string()]),
-            audit: Some(ProcessAudit {
-                sink: "jsonl".to_string(),
-                capture: AuditCapture::Payload,
+            audit: Some(crate::archive::ManifestAudit {
+                sink: Some("jsonl".to_string()),
+                sinks: BTreeMap::from([("p".to_string(), "sql".to_string())]),
+                capture: Some(AuditCapture::Payload),
             }),
             properties: BTreeMap::from([
                 ("listenWindow".to_string(), "PT10M".to_string()),
@@ -909,9 +887,9 @@ mod tests {
         assert!(PackageConfig::parse("entryProcesses: nope\n").is_err());
         // Audit capture is validated against the closed enum.
         assert!(PackageConfig::parse("audit:\n  sink: sql\n  capture: bogus\n").is_err());
-        // A bare audit block defaults sink=sql, capture=metadata.
+        // An audit block names a destination only: no capture is implied.
         let bare = PackageConfig::parse("audit:\n  sink: sql\n").unwrap();
-        assert_eq!(bare.audit.unwrap().capture, AuditCapture::Metadata);
+        assert_eq!(bare.audit.unwrap().capture, None);
         // Empty document = all defaults.
         assert_eq!(PackageConfig::parse("").unwrap(), PackageConfig::default());
     }

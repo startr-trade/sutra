@@ -11,6 +11,12 @@
 //! (`SUTRA_DB_URL` / `SUTRA_DB_USERNAME` / `SUTRA_DB_PASSWORD` / `SUTRA_DB_SCHEMA`), so
 //! the binary drops into the pre-deploy migration Job unchanged.
 //!
+//! The engine database takes every migration family except the audit one (V200–V299): audit
+//! lives in a database of its own. `--audit-url` applies the audit family to that database in the
+//! same run; without it only the engine family is applied. `status` and `verify` read the engine
+//! family (an engine database migrated before 0.9 still lists V2xx rows in its ledger; they are
+//! not checked).
+//!
 //! PostgreSQL only for now — `--dialect` arrives once further dialects land.
 
 use std::collections::BTreeSet;
@@ -21,7 +27,7 @@ use sqlx::postgres::PgConnectOptions;
 use sqlx::{Connection, PgConnection};
 use sutra_persistence::migrate::{
     apply_migrations, collect_migrations, read_ledger, script_checksum, LedgerEntry,
-    MigrationScript,
+    MigrationFamily, MigrationScript,
 };
 
 use crate::embedded;
@@ -48,6 +54,12 @@ pub struct MigrateArgs {
     /// Plan only: report what would be applied without touching the schema.
     #[arg(long)]
     pub dry_run: bool,
+
+    /// URL (postgres://…) of the separate audit database: the audit migrations (V200–V299) are
+    /// applied there. Its credentials come from the URL. Without it only the engine migrations
+    /// are applied (to --url).
+    #[arg(long, value_name = "URL")]
+    pub audit_url: Option<String>,
 
     #[command(subcommand)]
     pub action: Option<MigrateAction>,
@@ -116,7 +128,13 @@ pub fn execute(args: MigrateArgs, global: &GlobalArgs, io: &mut Io<'_>) -> i32 {
         }
     };
     match args.action {
-        None => run_apply(&args.conn, args.dry_run, format, io),
+        None => run_apply_all(
+            &args.conn,
+            args.audit_url.as_deref(),
+            args.dry_run,
+            format,
+            io,
+        ),
         Some(MigrateAction::Status(status)) => run_status(&status.conn, format, io),
         Some(MigrateAction::Verify(verify)) => {
             run_verify(&verify.conn, verify.expected_head, format, io)
@@ -126,10 +144,48 @@ pub fn execute(args: MigrateArgs, global: &GlobalArgs, io: &mut Io<'_>) -> i32 {
 
 // ----- apply (+ --dry-run) -----
 
-fn run_apply(conn: &ConnectionArgs, dry_run: bool, format: ReportFormat, io: &mut Io<'_>) -> i32 {
-    let scripts = match load_scripts(conn, io) {
+/// The engine family to `--url` (unless only `--audit-url` was given), then the audit family to
+/// `--audit-url` when it is set. Stops at the first failure.
+fn run_apply_all(
+    conn: &ConnectionArgs,
+    audit_url: Option<&str>,
+    dry_run: bool,
+    format: ReportFormat,
+    io: &mut Io<'_>,
+) -> i32 {
+    if conn.url.is_some() || audit_url.is_none() {
+        let code = run_apply(conn, MigrationFamily::Engine, dry_run, format, io);
+        if code != exit::OK {
+            return code;
+        }
+    }
+    let Some(audit_url) = audit_url else {
+        return exit::OK;
+    };
+    let audit = ConnectionArgs {
+        url: Some(audit_url.to_owned()),
+        user: None,
+        password: None,
+        schema: conn.schema.clone(),
+        migrations: conn.migrations.clone(),
+    };
+    run_apply(&audit, MigrationFamily::Audit, dry_run, format, io)
+}
+
+fn run_apply(
+    conn: &ConnectionArgs,
+    family: MigrationFamily,
+    dry_run: bool,
+    format: ReportFormat,
+    io: &mut Io<'_>,
+) -> i32 {
+    let scripts = match load_scripts(conn, family, io) {
         Ok(s) => s,
         Err(code) => return code,
+    };
+    let database = match family {
+        MigrationFamily::Engine => "engine",
+        MigrationFamily::Audit => "audit",
     };
     let head = scripts.last().map(|s| s.version).unwrap_or_default();
 
@@ -159,7 +215,7 @@ fn run_apply(conn: &ConnectionArgs, dry_run: bool, format: ReportFormat, io: &mu
                 ReportFormat::Text => {
                     let _ = writeln!(
                         io.out,
-                        "Pending migrations ({} of {} available):",
+                        "Pending {database} migrations ({} of {} available):",
                         pending.len(),
                         scripts.len()
                     );
@@ -170,6 +226,7 @@ fn run_apply(conn: &ConnectionArgs, dry_run: bool, format: ReportFormat, io: &mu
                 }
                 ReportFormat::Json => {
                     let payload = serde_json::json!({
+                        "database": database,
                         "dryRun": true,
                         "available": scripts.len(),
                         "pending": pending.iter().map(|s| serde_json::json!({
@@ -190,17 +247,21 @@ fn run_apply(conn: &ConnectionArgs, dry_run: bool, format: ReportFormat, io: &mu
                         if applied == 0 {
                             let _ = writeln!(
                                 io.out,
-                                "Nothing to apply — schema is up to date (head V{head})"
+                                "Nothing to apply — {database} schema is up to date (head V{head})"
                             );
                         } else {
                             let _ = writeln!(
                                 io.out,
-                                "Applied {applied} migration(s); head is now V{head}"
+                                "Applied {applied} {database} migration(s); head is now V{head}"
                             );
                         }
                     }
                     ReportFormat::Json => {
-                        let payload = serde_json::json!({ "applied": applied, "head": head });
+                        let payload = serde_json::json!({
+                            "database": database,
+                            "applied": applied,
+                            "head": head,
+                        });
                         let _ = writeln!(io.out, "{payload}");
                     }
                 }
@@ -218,7 +279,7 @@ fn run_apply(conn: &ConnectionArgs, dry_run: bool, format: ReportFormat, io: &mu
 // ----- status -----
 
 fn run_status(conn: &ConnectionArgs, format: ReportFormat, io: &mut Io<'_>) -> i32 {
-    let scripts = match load_scripts(conn, io) {
+    let scripts = match load_scripts(conn, MigrationFamily::Engine, io) {
         Ok(s) => s,
         Err(code) => return code,
     };
@@ -232,7 +293,7 @@ fn run_status(conn: &ConnectionArgs, format: ReportFormat, io: &mut Io<'_>) -> i
             }
         };
         let ledger = match read_ledger(&mut db).await {
-            Ok(l) => l,
+            Ok(l) => engine_ledger(l),
             Err(e) => {
                 let _ = writeln!(io.err, "migrate status: {e}");
                 return exit::USAGE;
@@ -323,7 +384,7 @@ fn run_verify(
     format: ReportFormat,
     io: &mut Io<'_>,
 ) -> i32 {
-    let scripts = match load_scripts(conn, io) {
+    let scripts = match load_scripts(conn, MigrationFamily::Engine, io) {
         Ok(s) => s,
         Err(code) => return code,
     };
@@ -337,7 +398,7 @@ fn run_verify(
             }
         };
         let ledger = match read_ledger(&mut db).await {
-            Ok(l) => l,
+            Ok(l) => engine_ledger(l),
             Err(e) => {
                 let _ = writeln!(io.err, "migrate verify: {e}");
                 return exit::USAGE;
@@ -479,15 +540,39 @@ fn short(checksum: &str) -> &str {
 
 // ----- shared plumbing -----
 
-fn load_scripts(conn: &ConnectionArgs, io: &mut Io<'_>) -> Result<Vec<MigrationScript>, i32> {
+/// The scripts of one family, from `--migrations` or the embedded set.
+fn load_scripts(
+    conn: &ConnectionArgs,
+    family: MigrationFamily,
+    io: &mut Io<'_>,
+) -> Result<Vec<MigrationScript>, i32> {
     let loaded = match &conn.migrations {
         Some(dir) => collect_migrations(&[dir.as_path()]),
         None => embedded::engine_scripts(),
     };
-    loaded.map_err(|e| {
-        let _ = writeln!(io.err, "migrate: {e}");
-        exit::USAGE
-    })
+    match loaded {
+        Ok(all) => Ok(family_scripts(all, family)),
+        Err(e) => {
+            let _ = writeln!(io.err, "migrate: {e}");
+            Err(exit::USAGE)
+        }
+    }
+}
+
+/// The scripts of `family` among `all`, in order.
+pub fn family_scripts(all: Vec<MigrationScript>, family: MigrationFamily) -> Vec<MigrationScript> {
+    all.into_iter()
+        .filter(|s| family.includes(s.version))
+        .collect()
+}
+
+/// An engine database's ledger without the audit family's rows: a database migrated before 0.9
+/// keeps them, and they are not the engine's to check any more.
+fn engine_ledger(ledger: Vec<LedgerEntry>) -> Vec<LedgerEntry> {
+    ledger
+        .into_iter()
+        .filter(|e| MigrationFamily::Engine.includes(e.version))
+        .collect()
 }
 
 async fn connect(conn: &ConnectionArgs) -> Result<PgConnection, String> {
@@ -639,6 +724,28 @@ mod tests {
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].code, codes::CHECKSUM_DRIFT);
         assert!(findings[0].message.contains("checksum drift for V101"));
+    }
+
+    #[test]
+    fn families_split_the_embedded_set_at_v2xx() {
+        let all = embedded::engine_scripts().unwrap();
+        let engine = family_scripts(all.clone(), MigrationFamily::Engine);
+        let audit = family_scripts(all.clone(), MigrationFamily::Audit);
+        assert_eq!(engine.len() + audit.len(), all.len());
+        assert!(audit.iter().all(|s| (200..300).contains(&s.version)));
+        assert!(audit.iter().any(|s| s.version == 205), "V205 ships");
+        assert!(engine.iter().all(|s| !(200..300).contains(&s.version)));
+    }
+
+    #[test]
+    fn a_pre_0_9_engine_ledger_verifies_without_its_audit_rows() {
+        let scripts = vec![script(101, "a", "SELECT 1;"), script(301, "c", "SELECT 3;")];
+        let ledger = engine_ledger(vec![
+            entry(101, "a", "SELECT 1;"),
+            entry(201, "audit", "SELECT 2;"),
+            entry(301, "c", "SELECT 3;"),
+        ]);
+        assert!(verify_findings(&scripts, &ledger, 301).is_empty());
     }
 
     #[test]

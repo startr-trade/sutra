@@ -901,11 +901,14 @@ where
                 let local = tokio::task::LocalSet::new();
                 runtime.block_on(local.run_until(async move {
                     while let Some(request) = rx.recv().await {
+                        // Whether the request succeeded: settles the audit attempts it left open.
+                        let mut audit_ok = true;
                         lane_metrics.dequeued();
                         match request {
                             EngineRequest::Dispatch { message, respond } => {
                                 lane_metrics.dispatched();
                                 let outcome = catch_actor_panic(engine.dispatch(&message)).await;
+                                audit_ok = outcome.is_ok();
                                 let _ = respond.send(outcome);
                             }
                             EngineRequest::DispatchDeferred {
@@ -917,23 +920,27 @@ where
                                 let outcome =
                                     catch_actor_panic(engine.dispatch_deferred(&message, settle))
                                         .await;
+                                audit_ok = outcome.is_ok();
                                 let _ = respond.send(outcome);
                             }
                             EngineRequest::FireTimer { fire, respond } => {
                                 lane_metrics.dispatched();
                                 let outcome = catch_actor_panic(engine.fire_timer(&fire)).await;
+                                audit_ok = outcome.is_ok();
                                 let _ = respond.send(outcome);
                             }
                             EngineRequest::StartScheduled { fire, respond } => {
                                 lane_metrics.dispatched();
                                 let outcome =
                                     catch_actor_panic(engine.fire_scheduled_start(&fire)).await;
+                                audit_ok = outcome.is_ok();
                                 let _ = respond.send(outcome);
                             }
                             EngineRequest::FailChannelCall { fire, respond } => {
                                 lane_metrics.dispatched();
                                 let outcome =
                                     catch_actor_panic(engine.fail_channel_call(&fire)).await;
+                                audit_ok = outcome.is_ok();
                                 let _ = respond.send(outcome);
                             }
                             EngineRequest::Update { apply, respond } => {
@@ -942,12 +949,14 @@ where
                                     Ok(())
                                 })
                                 .await;
+                                audit_ok = outcome.is_ok();
                                 let _ = respond.send(outcome);
                             }
                             EngineRequest::ResumeResolved { resolved, respond } => {
                                 lane_metrics.dispatched();
                                 let outcome =
                                     catch_actor_panic(engine.resume_resolved(&resolved)).await;
+                                audit_ok = outcome.is_ok();
                                 let _ = respond.send(outcome);
                             }
                             EngineRequest::ResumeInMemory {
@@ -968,6 +977,14 @@ where
                                         completed: false,
                                     }
                                 });
+                                // A chain going on has not finished its pass: its attempts stay open
+                                // only within this request, so they settle as this request did.
+                                audit_ok = match &step {
+                                    crate::inline_chain::InlineStep::More { .. } => true,
+                                    crate::inline_chain::InlineStep::Done { outcome, .. } => {
+                                        outcome.is_ok()
+                                    }
+                                };
                                 let _ = respond.send(step);
                             }
                             EngineRequest::RefreshClaim {
@@ -981,6 +998,10 @@ where
                                 .await;
                             }
                         }
+                        // An attempt still open never reached a commit: the request needed no
+                        // database write. It happened if the request succeeded (its records
+                        // ship), and did not if it failed (they are dropped).
+                        engine.settle_unfinished_audit_attempts(audit_ok);
                     }
                 }));
             })

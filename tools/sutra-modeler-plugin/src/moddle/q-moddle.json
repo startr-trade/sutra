@@ -103,9 +103,8 @@
         ]
       },
       "properties": [
-        { "name": "sink", "isAttr": true, "type": "String", "default": "sql" },
-        { "name": "target", "isAttr": true, "type": "String" },
-        { "name": "capture", "isAttr": true, "type": "String", "default": "payload" }
+        { "name": "events", "isAttr": true, "type": "String", "default": "points" },
+        { "name": "capture", "isAttr": true, "type": "String", "default": "metadata" }
       ]
     },
     {

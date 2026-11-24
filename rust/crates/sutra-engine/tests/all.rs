@@ -52,6 +52,8 @@ mod incident_dead_letter_it;
 mod instance_migration_it;
 #[path = "all/leadership_it.rs"]
 mod leadership_it;
+#[path = "all/load_support.rs"]
+mod load_support;
 #[path = "all/otel_it.rs"]
 mod otel_it;
 #[path = "all/outbox_burst_it.rs"]

@@ -1,0 +1,70 @@
+{
+  "processId": "flow",
+  "declared": {
+    "events": "instance",
+    "capture": "metadata"
+  },
+  "pool": "instance · metadata",
+  "elements": [
+    {
+      "id": "A",
+      "disposition": "notAudited",
+      "rule": "events=instance"
+    },
+    {
+      "id": "E",
+      "disposition": "notAudited",
+      "rule": "events=instance"
+    },
+    {
+      "id": "F",
+      "disposition": "notAudited",
+      "rule": "events=instance"
+    },
+    {
+      "id": "G",
+      "disposition": "notAudited",
+      "rule": "events=instance"
+    },
+    {
+      "id": "J",
+      "disposition": "notAudited",
+      "rule": "events=instance"
+    },
+    {
+      "id": "M",
+      "disposition": "notAudited",
+      "rule": "events=instance"
+    },
+    {
+      "id": "S",
+      "disposition": "notAudited",
+      "rule": "events=instance"
+    },
+    {
+      "id": "SE",
+      "disposition": "notAudited",
+      "rule": "events=instance"
+    },
+    {
+      "id": "SS",
+      "disposition": "notAudited",
+      "rule": "events=instance"
+    },
+    {
+      "id": "Sub",
+      "disposition": "notAudited",
+      "rule": "events=instance"
+    },
+    {
+      "id": "T",
+      "disposition": "notAudited",
+      "rule": "events=instance"
+    },
+    {
+      "id": "X",
+      "disposition": "notAudited",
+      "rule": "events=instance"
+    }
+  ]
+}

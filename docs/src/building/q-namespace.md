@@ -32,7 +32,7 @@ and the same XSD drives the `sutra-modeler-plugin` property panels.
 | `q:variables` / `q:variable` | `bpmn:process` | Declared process variables — type or schema, `transient` / `sensitive` / `source`. |
 | `q:onValidation` | `bpmn:process` | The structural-failure policy (`route` / `reject` / `error`). |
 | `q:process` | `bpmn:process` | The retry-safety (idempotency) assertion. |
-| `q:audit` | `bpmn:process` | Audit capture level (`none` / `metadata` / `payload` / `media`) and data-class tagging. |
+| `q:audit` | `bpmn:process` | Declares that the process is audited: `events` (`points` / `all`) and `capture` (`none` / `metadata` / `payload` / `media`), plus data-class tagging. See [Declaring audit](#declaring-audit-qaudit). |
 | `q:coverage` | `bpmn:process` | An opt-in tracked compliance path. |
 
 ```mermaid
@@ -686,6 +686,39 @@ counter increment does not — and no assertion makes it so. Declaring `idempote
 effects that do not converge does not make replay safe; it only changes what happens after a
 failure.
 
+## Declaring audit: `q:audit`
+
+The BPMN is the only switch for audit. A process is audited if, and only if, it carries `<q:audit>`;
+**no tag, no audit** (from 0.9). The package manifest and the engine configuration say *where* audit
+goes (`audit.sink`, `audit.sinks`, `sutra.audit.default-sink`), never *whether*.
+
+```xml
+<bpmn:process id="transfer" isExecutable="true">
+  <bpmn:extensionElements>
+    <q:audit/>                                  <!-- same as events="points" capture="metadata" -->
+    <!-- <q:audit events="all" capture="payload"/> -->
+  </bpmn:extensionElements>
+```
+
+| Attribute | Values | Default | Meaning |
+|---|---|---|---|
+| `events` | `points`, `all` | `points` | `points` records the nodes where something observable happens (events, waits, message exchanges, calls) and not routing gateways or local computation; `sutra lint --audit` lists the verdict for each element. `all` records every element (the 0.8 trail). Anything else is the load error `SUTRA.BPMN.AUDIT.EVENTS_INVALID`. |
+| `capture` | `none`, `metadata`, `payload`, `media` | `metadata` | What each event carries. An empty value means `metadata`. |
+
+A bare `<q:audit/>` is therefore `events="points" capture="metadata"`. `sutra lint --audit` and
+the deploy response print the effective values for each process.
+
+**Removed in 0.9: `sink` and `target`.** Where a process's audit is stored is a package or
+deployment decision, not part of the flow. A `sink` or `target` attribute, on the process or on an
+element, is the load error `SUTRA.BPMN.AUDIT.SINK_REMOVED`. Move the value to the manifest's
+`audit.sink` / `audit.sinks`; `sutra lint --fix audit` does it. The manifest's `audit.capture` is
+ignored: capture is the BPMN's.
+
+A process with no `<q:audit>` is deployed and runs, silent; deploy logs one info line
+(`SUTRA.DEPLOY.AUDIT.NOT_DECLARED`) per such process. `sutra lint --fix audit` adds the tag. See
+[Upgrading to 0.9](../operating/upgrading-0-9.md) and [Recording audit
+points](recording-audit-points.md).
+
 ## `q:variables`, `q:audit`, `q:coverage`
 
 - **`q:variables`** — declares process variables up front (name + scalar type or a schema
@@ -695,8 +728,9 @@ failure.
   scratch that is re-derived, never for anything the flow still needs on the other side),
   `sensitive` (persisted but redacted downstream), or `source`-bound (payload-initialized from a
   named channel).
-- **`q:audit`** — per-process audit sink/target/capture-level configuration. `capture` is `none`,
-  `metadata`, `payload` (the default) or, since 0.6, `media`: metadata-level events that carry the
+- **`q:audit`** — declares that the process is audited and how much; see
+  [Declaring audit](#declaring-audit-qaudit). `capture` is `none`,
+  `metadata` (the default since the 0.9 documentation; it always was the engine's), `payload` or, since 0.6, `media`: metadata-level events that carry the
   media references found among the variables, never the media (see
   [Recordings and media references](recordings-and-media.md#the-audit-trail-carries-references-never-media)).
 - **`q:coverage`** — declares one tracked compliance route (`path` id + the ordered `flows` it must

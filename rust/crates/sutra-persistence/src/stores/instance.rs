@@ -402,6 +402,37 @@ impl PgInstanceStore {
         self.purge_terminal_except(deployment, retention, &[]).await
     }
 
+    /// For each of `instances` that has a row under `deployment`: whether it is a retained
+    /// terminal row older than `retention` (`true`) or still within it or running (`false`). An
+    /// instance with no row is absent from the map. The engine-database half of the retention
+    /// sweeper's "is this instance's media due" question; the audit half is in the audit database.
+    pub async fn terminal_retention_states(
+        &self,
+        deployment: &DeploymentId,
+        instances: &[Uuid],
+        retention: std::time::Duration,
+    ) -> Result<std::collections::HashMap<Uuid, bool>> {
+        if instances.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let mut tx = begin_deployment_tx(&self.pool, deployment).await?;
+        let rows: Vec<(Uuid, bool)> = sqlx::query_as(
+            "SELECT instance_id, (terminal_at IS NOT NULL \
+                                  AND terminal_at <= now() - make_interval(secs => $3)) \
+             FROM instance_state WHERE deployment_id = $1 AND instance_id = ANY($2)",
+        )
+        .bind(deployment.as_str())
+        .bind(instances)
+        .bind(retention.as_secs_f64())
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(PersistenceError::db("instance terminal retention states"))?;
+        tx.commit().await.map_err(PersistenceError::db(
+            "instance terminal retention states commit",
+        ))?;
+        Ok(rows.into_iter().collect())
+    }
+
     /// [`Self::purge_terminal`], keeping the rows of `keep` — the instances whose recorded media
     /// could not be deleted yet, which stay retained so the next sweep retries them.
     pub async fn purge_terminal_except(

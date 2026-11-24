@@ -312,7 +312,7 @@ pub struct ChannelEngine {
     /// durable incident store wired (the failure is still logged at error level).
     incidents: Option<Rc<dyn IncidentSink>>,
     /// A typed handle to the audit listener registered on the executor (`None` when no
-    /// audit sink is wired). Used on the actor thread to READ the per-instance seq high-water
+    /// audit sink is wired). Used on the actor thread to TAKE the per-instance seq high-water
     /// at suspend (persisted into the snapshot's `audit_seq`) and to SEED it back before a
     /// resume, so the per-instance audit seq stays monotonic across suspend/resume + restart.
     audit_listener: Option<Rc<crate::audit::AuditListener>>,
@@ -471,12 +471,22 @@ impl ChannelEngine {
         std::sync::Arc::clone(&self.shard_metrics)
     }
 
-    /// The audit listener's current per-instance seq high-water (0 when no listener is
-    /// wired, or the instance is unseen). Read at suspend to persist into the snapshot.
-    fn audit_seq_for(&self, instance_id: &str) -> u32 {
+    /// The lane finished a request: settle the audit attempts still open (a pass that wrote
+    /// nothing to the database): committed when the request succeeded, aborted otherwise.
+    pub fn settle_unfinished_audit_attempts(&self, succeeded: bool) {
+        if let Some(l) = &self.audit_listener {
+            l.settle_open_attempts(succeeded);
+        }
+    }
+
+    /// The audit listener's per-instance seq high-water (0 when no listener is wired, or the
+    /// instance is unseen), taken out of the listener: read where a pass hands the instance off
+    /// (a suspend snapshot, an inline chain), and every later pass seeds it back
+    /// ([`Self::seed_audit`]). Taking it keeps the listener's map to the instances mid-pass.
+    fn take_audit_seq(&self, instance_id: &str) -> u32 {
         self.audit_listener
             .as_ref()
-            .map(|l| l.seq_for(instance_id))
+            .map(|l| l.take_seq(instance_id))
             .unwrap_or(0)
     }
 
@@ -2326,7 +2336,7 @@ impl ChannelEngine {
                                 dedup_keys: self.dispatch_dedup.borrow_mut().drain(..).collect(),
                                 in_flight: BTreeSet::new(),
                                 visited: completed_nodes.iter().cloned().collect(),
-                                audit_seq: self.audit_seq_for(&instance_id),
+                                audit_seq: self.take_audit_seq(&instance_id),
                                 early_reply: None,
                                 fresh_waits: fresh_waits.clone(),
                             });
@@ -2373,7 +2383,7 @@ impl ChannelEngine {
                     retry_backoff,
                     // `on_instance_suspended` has fired synchronously on this thread; the
                     // listener's per-instance seq is now the high-water to persist.
-                    audit_seq: self.audit_seq_for(&instance_id),
+                    audit_seq: self.take_audit_seq(&instance_id),
                     // The migration-stable crypto anchor is the channel's tenant.
                     key_id: binding.tenant().to_string(),
                     encrypt_names: pv.encrypt_names,
@@ -3792,7 +3802,7 @@ impl ChannelEngine {
                     // outbox rows inside this same step transaction.
                     retry_backoff,
                     // The resume pass re-parked; carry the fresh seq high-water forward.
-                    audit_seq: self.audit_seq_for(&instance_id),
+                    audit_seq: self.take_audit_seq(&instance_id),
                     // Preserve the ORIGINAL keyId (the migration-stable tenant anchor) the
                     // instance was first parked under; the resume path has no channel binding, so
                     // it flows from the loaded prior snapshot (stable across re-parks).
@@ -5406,7 +5416,7 @@ impl ChannelEngine {
                 chain.retry_attempts = retry_attempts;
                 chain.retry_backoff = retry_backoff;
                 chain.pending_timers.extend(timer_waits);
-                chain.audit_seq = self.audit_seq_for(&chain.instance_id);
+                chain.audit_seq = chain.audit_seq.max(self.take_audit_seq(&chain.instance_id));
                 // Respond-and-continue reached mid-chain: the caller is still waiting on the
                 // chain, so the reply is held and returned when the chain ends.
                 if detached_reply && chain.early_reply.is_none() {
@@ -5606,7 +5616,9 @@ impl ChannelEngine {
             coverage: chain.coverage.clone(),
             retry_attempts: chain.retry_attempts.clone(),
             retry_backoff: chain.retry_backoff.clone(),
-            audit_seq: self.audit_seq_for(&chain.instance_id),
+            // The chain's own high-water (taken at its last quiescent point) or what the
+            // listener still holds, whichever is later.
+            audit_seq: chain.audit_seq.max(self.take_audit_seq(&chain.instance_id)),
             // A stored instance keeps the key id it was first parked under.
             key_id: match &chain.stored {
                 Some(stored) => stored.prior.key_id.clone(),
@@ -6056,7 +6068,7 @@ impl ChannelEngine {
             settle: None,
             dedup_keys: self.dispatch_dedup.borrow_mut().drain(..).collect(),
             in_flight: BTreeSet::new(),
-            audit_seq: self.audit_seq_for(&pass.instance_id),
+            audit_seq: self.take_audit_seq(&pass.instance_id),
             early_reply: None,
             stored: Some(StoredChain {
                 claim_scope: claim_scope.clone(),
@@ -7962,12 +7974,13 @@ fn stamp_audit_journal(process: &ProcessDefinition, emission: &mut sutra_executo
 
 /// The [`crate::transport_audit::AUDIT_JOURNAL_HEADER`] value of `process`'s requests.
 fn audit_journal_policy(process: &ProcessDefinition) -> String {
+    // A process without `<q:audit>` is not audited, so its transports journal nothing either.
     match process.audit.as_ref() {
         Some(audit) => {
-            crate::transport_audit::journal_policy_value(audit.capture, Some(&audit.sink))
+            crate::transport_audit::journal_policy_value(audit.capture, audit.sink.as_deref())
         }
         None => crate::transport_audit::journal_policy_value(
-            sutra_bpmn::qbindings::AuditCapture::Metadata,
+            sutra_bpmn::qbindings::AuditCapture::None,
             None,
         ),
     }

@@ -68,6 +68,27 @@ pub struct LintArgs {
         default_value = "X-API-Key"
     )]
     pub api_key_header: String,
+
+    /// Print each process's audit plan: every element, whether it is audited and why, and the
+    /// effective `events · capture` of the process. With `--format json`, the plans as JSON.
+    #[arg(long = "audit")]
+    pub audit: bool,
+
+    /// Rewrite the package in place to fix a class of findings, printing the unified diff.
+    /// `audit`: every process gets an explicit `<q:audit events capture>`, `sink` / `target`
+    /// move from the BPMN into the manifest's `audit.sink` / `audit.sinks`, and the manifest's
+    /// ignored `audit.capture` goes. Idempotent.
+    #[arg(long = "fix", value_name = "FIX", value_parser = ["audit"])]
+    pub fix: Option<String>,
+
+    /// With `--fix audit`: the event scope written where a process has none. `all` (the
+    /// default) reproduces exactly the trail 0.8 recorded.
+    #[arg(long = "events", value_name = "SCOPE", value_parser = ["all", "points"])]
+    pub events: Option<String>,
+
+    /// With `--fix`: print the diff, write nothing.
+    #[arg(long = "dry-run")]
+    pub dry_run: bool,
 }
 
 /// Convert a loader diagnostic into the CLI's one printable finding shape.
@@ -91,6 +112,9 @@ pub fn execute(args: LintArgs, global: &GlobalArgs, io: &mut Io<'_>) -> i32 {
             return exit::USAGE;
         }
     };
+    if args.fix.is_some() || args.audit {
+        return execute_audit(&args, format, io);
+    }
     let mut manifest = None;
     if crate::manifest::is_manifest_path(&args.package_dir) {
         match crate::manifest::load(&args.package_dir, &args.overlay) {
@@ -136,6 +160,18 @@ pub fn execute(args: LintArgs, global: &GlobalArgs, io: &mut Io<'_>) -> i32 {
     let mut diagnostics: Vec<Diagnostic> = report.diagnostics.iter().map(diagnostic_of).collect();
     let mut errors = report.errors().count();
     let mut warnings = report.warnings().count();
+    // The audit declarations' warnings (a version-only pin, payloads into the file store). Their
+    // errors are already the load failures above.
+    if manifest.is_none() && args.overlay.is_empty() {
+        if let Ok(audit) = crate::commands::lint_audit::report_of(&args.package_dir) {
+            for d in crate::commands::lint_audit::diagnostics_of(&audit, false) {
+                if d.severity == Severity::Warn {
+                    warnings += 1;
+                    diagnostics.push(d);
+                }
+            }
+        }
+    }
     // The target checks judge the sealed result, so they only run on a package that seals.
     if errors == 0 {
         match target_findings(&args, manifest.as_ref()) {
@@ -176,6 +212,76 @@ pub fn execute(args: LintArgs, global: &GlobalArgs, io: &mut Io<'_>) -> i32 {
         }
     }
     if errors > 0 {
+        exit::FINDINGS
+    } else {
+        exit::OK
+    }
+}
+
+/// `sutra lint --audit` and `sutra lint --fix audit`, over one package directory.
+fn execute_audit(args: &LintArgs, format: ReportFormat, io: &mut Io<'_>) -> i32 {
+    use crate::commands::lint_audit;
+    if !args.package_dir.is_dir() {
+        let _ = writeln!(
+            io.err,
+            "lint: package directory not found: {}",
+            args.package_dir.display()
+        );
+        return exit::USAGE;
+    }
+    if args.fix.is_some() {
+        let events = args.events.as_deref().unwrap_or("all");
+        let outcome = match lint_audit::fix_package(&args.package_dir, events) {
+            Ok(outcome) => outcome,
+            Err(msg) => {
+                let _ = writeln!(io.err, "lint: --fix audit: {msg}");
+                return exit::USAGE;
+            }
+        };
+        let _ = write!(io.out, "{}", outcome.diff);
+        if !args.dry_run {
+            for (path, text) in &outcome.changed {
+                if let Err(e) = std::fs::write(path, text) {
+                    let _ = writeln!(io.err, "lint: --fix audit: {}: {e}", path.display());
+                    return exit::USAGE;
+                }
+            }
+        }
+        let verb = if args.dry_run {
+            "would change"
+        } else {
+            "changed"
+        };
+        let _ = writeln!(
+            io.out,
+            "--fix audit: {verb} {} file(s)",
+            outcome.changed.len()
+        );
+        return exit::OK;
+    }
+    let report = match lint_audit::report_of(&args.package_dir) {
+        Ok(report) => report,
+        Err(msg) => {
+            let _ = writeln!(io.err, "lint: {msg}");
+            return exit::USAGE;
+        }
+    };
+    match format {
+        ReportFormat::Text => {
+            let _ = write!(io.out, "{}", lint_audit::render_text(&report));
+            for d in lint_audit::diagnostics_of(&report, true) {
+                let _ = writeln!(io.out, "{}", d.render_text());
+            }
+        }
+        ReportFormat::Json => {
+            let _ = writeln!(
+                io.out,
+                "{}",
+                lint_audit::render_json(&args.package_dir, &report)
+            );
+        }
+    }
+    if report.has_errors() {
         exit::FINDINGS
     } else {
         exit::OK

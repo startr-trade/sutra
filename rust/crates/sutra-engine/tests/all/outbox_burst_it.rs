@@ -1,8 +1,12 @@
 //! Tier 2: an outbound burst against PostgreSQL and two in-test HTTP destinations, one answering
-//! at once and one after 500 ms. The fast destination's rows go out within the lag budget while
-//! the slow one drains at its per-destination bound; and rows queued in memory behind a slow send
-//! keep their claim lease past `CLAIM_LEASE`, so a second dispatcher on the same database never
-//! delivers them too.
+//! at once and one after a delay `D` (500 ms). The point is isolation: the fast destination's
+//! rows are not held up by the slow one. That is stated relative to the slow delay and to the
+//! same machine's own fast-only figure, never as an absolute latency: the fast p99 stays within
+//! `max(D/2, 4 x fast_baseline_p50)`, where `fast_baseline_p50` is the p50 of the same fast rows
+//! sent as a burst with no slow traffic, measured first in the same test. The slow destination
+//! drains at its per-destination bound; and rows queued in memory behind a slow send keep their
+//! claim lease past `CLAIM_LEASE`, so a second dispatcher on the same database never delivers
+//! them too.
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -20,6 +24,7 @@ use sutra_engine::outbox::PgOutboxRows;
 use sutra_persistence::stores::{OutboxStore, PgOutboxStore};
 use uuid::Uuid;
 
+use crate::load_support::perf_line;
 use crate::outbox_it::{channel_dep, entry, fresh_pool};
 
 /// `(path, body, received at)` of every request.
@@ -67,6 +72,47 @@ fn percentile(sorted: &[Duration], p: f64) -> Duration {
     sorted[idx.min(sorted.len() - 1)]
 }
 
+/// The concurrency both bursts run with.
+const BURST_CONCURRENCY: OutboxConcurrency = OutboxConcurrency {
+    workers: 64,
+    per_destination: 16,
+    max_buffered: 4096,
+};
+
+/// Stamp every queued row due now, start a dispatcher and wait (at most 60 s: a hang detector,
+/// not a performance figure) until `expected` requests arrived across `received`. Returns the
+/// instant the burst started.
+async fn drain_burst(pool: &sqlx::PgPool, received: &[&Received], expected: usize) -> Instant {
+    // The burst is "enqueued" now: lag is measured from here.
+    sqlx::query("UPDATE outbox_entry SET created_at = now(), next_attempt_at = now()")
+        .execute(pool)
+        .await
+        .expect("stamp the burst");
+    let started = Instant::now();
+    let signal = OutboxSignal::new();
+    let handle = spawn_concurrent_dispatch_loop(
+        &tokio::runtime::Handle::current(),
+        dispatcher(pool.clone()),
+        LiveDeploymentSet::new(vec![channel_dep()]),
+        Duration::from_millis(200),
+        BURST_CONCURRENCY,
+        signal.clone(),
+    );
+    signal.wake();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while received
+        .iter()
+        .map(|r| r.lock().unwrap().len())
+        .sum::<usize>()
+        < expected
+    {
+        assert!(Instant::now() < deadline, "the burst did not drain in 60 s");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    handle.shutdown().await;
+    started
+}
+
 async fn wait_for(received: &Received, n: usize, bound: Duration) {
     let started = Instant::now();
     while received.lock().unwrap().len() < n {
@@ -88,6 +134,31 @@ async fn a_burst_on_two_destinations_drains_within_budget() {
     // Two destination authorities (the bound is per scheme + host + port, not per path).
     let (fast_addr, received) = destinations(Duration::from_millis(slow_ms)).await;
     let (slow_addr, slow_received) = destinations(Duration::from_millis(slow_ms)).await;
+    // The baseline: the same fast rows (210 instances, two rows each) as a burst with no slow
+    // traffic, on its own destination. It also warms the pool and the HTTP connections.
+    let (base_addr, base_received) = destinations(Duration::from_millis(slow_ms)).await;
+    let mut base_expected = 0;
+    for i in 0..210 {
+        let instance = Uuid::new_v4();
+        for seq in 0..2 {
+            let mut e = entry(&format!("http://{base_addr}/fast"));
+            e.instance_id = instance;
+            e.outbox_key = format!("base-{instance}-{seq}");
+            e.body = format!("base-{i}-{seq}").into_bytes().into();
+            store.enqueue(&e).await.expect("enqueue");
+            base_expected += 1;
+        }
+    }
+    let base_started = drain_burst(&pool, &[&base_received], base_expected).await;
+    let mut base: Vec<Duration> = base_received
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(_, _, at)| at.duration_since(base_started))
+        .collect();
+    base.sort();
+    let fast_baseline_p50 = percentile(&base, 50.0);
+
     // 300 instances emitting two rows each; 30% of them to the slow destination.
     let mut expected = 0;
     for i in 0..300 {
@@ -107,33 +178,7 @@ async fn a_burst_on_two_destinations_drains_within_budget() {
             expected += 1;
         }
     }
-    // The burst is "enqueued" now: lag is measured from here.
-    sqlx::query("UPDATE outbox_entry SET created_at = now(), next_attempt_at = now()")
-        .execute(&pool)
-        .await
-        .expect("stamp the burst");
-    let started = Instant::now();
-    let signal = OutboxSignal::new();
-    let handle = spawn_concurrent_dispatch_loop(
-        &tokio::runtime::Handle::current(),
-        dispatcher(pool.clone()),
-        LiveDeploymentSet::new(vec![channel_dep()]),
-        Duration::from_millis(200),
-        OutboxConcurrency {
-            workers: 64,
-            per_destination: 16,
-            max_buffered: 4096,
-        },
-        signal.clone(),
-    );
-    signal.wake();
-    let all = Arc::clone(&received);
-    let deadline = Instant::now() + Duration::from_secs(60);
-    while all.lock().unwrap().len() + slow_received.lock().unwrap().len() < expected {
-        assert!(Instant::now() < deadline, "the burst did not drain in 60 s");
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    handle.shutdown().await;
+    let started = drain_burst(&pool, &[&received, &slow_received], expected).await;
 
     let mut rows = received.lock().unwrap().clone();
     rows.extend(slow_received.lock().unwrap().iter().cloned());
@@ -149,13 +194,19 @@ async fn a_burst_on_two_destinations_drains_within_budget() {
         .map(|(_, _, at)| *at)
         .collect();
     let (p99, max) = (percentile(&fast, 99.0), *fast.last().unwrap());
-    assert!(p99 <= Duration::from_secs(2), "fast p99 lag {p99:?}");
-    assert!(max <= Duration::from_secs(5), "fast max lag {max:?}");
+    let fast_bound = (Duration::from_millis(slow_ms) / 2).max(fast_baseline_p50 * 4);
+    perf_line("outbox_burst", "fast_p99_ms", p99.as_secs_f64() * 1000.0);
+    assert!(
+        p99 <= fast_bound,
+        "the slow destination held the fast one up: fast p99 lag {p99:?} (max {max:?}) over \
+         max(D/2, 4 x fast-only p50 {fast_baseline_p50:?}) = {fast_bound:?}"
+    );
     let slow_span = slow.iter().max().unwrap().duration_since(started);
     let rate = slow.len() as f64 / slow_span.as_secs_f64();
     let floor = 0.9 * 16.0 / (slow_ms as f64 / 1000.0);
     eprintln!(
-        "burst: fast p99 {p99:?} max {max:?}; slow {} rows at {rate:.1} rows/s (floor {floor:.1})",
+        "burst: fast-only p50 {fast_baseline_p50:?}; fast p99 {p99:?} max {max:?}; \
+         slow {} rows at {rate:.1} rows/s (floor {floor:.1})",
         slow.len()
     );
     assert!(

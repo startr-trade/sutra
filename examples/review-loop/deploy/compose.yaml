@@ -12,7 +12,7 @@ name: sutra-review-loop
 services:
   engine:
     # 0.6.0 or later. Override with SUTRA_ENGINE_IMAGE to run a locally built tag.
-    image: ${SUTRA_ENGINE_IMAGE:-ghcr.io/startr-trade/sutra:0.8.5}
+    image: ${SUTRA_ENGINE_IMAGE:-ghcr.io/startr-trade/sutra:0.9.0}
     environment:
       SUTRA_DEPLOYMENTS_DIR: /deployments
       SUTRA_HTTP_PORT: "8080"
@@ -22,7 +22,12 @@ services:
       SUTRA_DATASOURCE_PASSWORD: ${ENGINE_DB_PASSWORD:-sutra-dev-only}
 
       # The SQL audit sink: GET /admin/instances/{id}/history reads it.
-      SUTRA_AUDIT_SQL: "true"
+      # The audit store is a database of its own (here a second database on the same server, so the
+      # engine logs a warning; production uses a separate server). Needs `sutra.audit.spool.dir` on a
+      # volume to be durable across restarts.
+      SUTRA_AUDIT_SQL_URL: postgres://engine-db:5432/sutra_audit
+      SUTRA_AUDIT_SQL_USERNAME: ${ENGINE_DB_USER:-sutra_engine}
+      SUTRA_AUDIT_SQL_PASSWORD: ${ENGINE_DB_PASSWORD:-sutra-dev-only}
       # DEV ONLY: /admin/* without authentication. Never in anything real.
       SUTRA_ADMIN_OIDC_DEV_DISABLED: "true"
 

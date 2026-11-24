@@ -126,11 +126,10 @@ export const Q_ELEMENTS: readonly ElementSpec[] = [
   },
   {
     localName: 'audit',
-    doc: 'Per-process audit configuration.',
+    doc: 'Audit configuration. A process-level `<q:audit/>` turns audit on.',
     attributes: [
-      { name: 'sink', required: false, doc: 'Audit sink name (defaults to `sql`). Must resolve to a registered audit sink.' },
-      { name: 'target', required: false, doc: 'Sink-specific target (e.g. table name for sql, file path for jsonl).' },
-      { name: 'capture', required: false, enumValues: ['none', 'metadata', 'payload'], doc: 'How much to capture per event. Defaults to `payload`.' },
+      { name: 'events', required: false, enumValues: ['points', 'all', 'instance'], doc: 'Which events are audited: `points` (declared audit points only, default), `all` (every engine event) or `instance` (instance lifecycle only). Process scope.' },
+      { name: 'capture', required: false, enumValues: ['none', 'metadata', 'payload'], doc: 'How much to capture per event. Defaults to `metadata`. A node-level `capture="none"` only opts that node out. Storage is chosen in the package manifest (`audit.sink`), not here; `sink`/`target` are removed.' },
       { name: 'version', required: false, doc: 'Existing process-level audit version pin.' },
     ],
   },

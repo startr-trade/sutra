@@ -20,6 +20,8 @@ tests are the tier-2 set; `--ignored` runs *only* them, `--include-ignored` runs
 make test                      # tier-1: no docker, the default gate while iterating
 make test-docker               # tier-2: every docker suite in the workspace
 make test-docker P=sutra-persistence   # tier-2, one crate only
+make test-perf                 # tier-2 load tests, alone, one at a time (test-docker skips them)
+make perf-ab                   # load figures vs the previous release, on this machine
 make test-all                  # tier-1 + tier-2 (cargo test --workspace -- --include-ignored)
 make test-k8s                  # tier-3: the k8s conformance suites (cluster must be up)
 make docker-clean              # reap leaked fixtures (see "Reaper" below)
@@ -58,6 +60,36 @@ SUTRA_CONFORMANCE_SHARDS=4 make test-docker P=sutra-conformance
 `/sutra/health/ready` → `checks[0].data.shards` (read off the running router, not echoed from
 config); `tc_shard_lanes` asserts it. Rebuild the image first (`make image`) — the tag is
 mutable, and an N-lane run against yesterday's binary proves nothing.
+
+### Load tests
+
+A load test measures the machine as much as the code, so none of them asserts an absolute
+time: the same code passes on a quiet workstation and fails on a loaded CI runner. Four classes,
+by what they assert:
+
+| Class | Asserts | Runs |
+|---|---|---|
+| Work count | Counted work per unit of load, from the engine's own counters (`RunningEngine::work_counters()` → `EngineWorkSnapshot { outbox, timer }`; subtract two snapshots for a run's work). Exact, or with a fixed bound derived from the batch size and tick. | With the load tests |
+| Keeps up | `load_support::keeps_up`: delivered rate ≥ 0.9 × offered, and the last third's p90 lag ≤ 2 × the first third's + 500 ms. `outbox_burst` asserts isolation instead: fast p99 ≤ max(D/2, 4 × fast-only p50), both measured in the same test. | `make test-perf`, nightly |
+| A/B | `scripts/perf-ab.sh`: the candidate's median of every `PERF` metric is no more than `PERF_AB_TOLERANCE` (0.2) worse than the base release's, both built and run on the same machine in one job. One re-run before it fails. | `make perf-ab`, nightly |
+| Benchmark | Absolute numbers, printed only: `amqp_intake_bench` (`SUTRA_AMQP_INTAKE_BENCH=1`), `TIMER_LAG_P99_BAR_MS` on `timer_fire_lag`, and `tools/sutra-load-test/relay-bench.sh`. | On demand, on known hardware |
+
+`PERF_TESTS` in the root `Makefile` lists the load tests' filters: `make test-docker` passes a
+`--skip` for each, and `make test-perf` runs only them with `--test-threads=1`. A new load test
+adds its filter there, takes its measurements through `tests/all/load_support.rs`, and prints
+its headline figure with `perf_line(test, metric, value)` (a metric ending `_ms` is
+lower-is-better, any other higher-is-better) so the A/B script picks it up.
+
+```bash
+make test-perf
+make perf-ab                       # BASE=<rev> (default: the previous tag), RUNS=<n> (default 3)
+PERF_AB_SELFTEST=1 scripts/perf-ab.sh   # the comparison itself, on fixed inputs; builds nothing
+```
+
+A base release that prints no `PERF` lines (any release before the load tests did) is reported
+as "no baseline" and passes. When a keeps-up check fails on CI, reproduce it with
+`make test-perf`; if it passes locally, `make perf-ab` on the same machine decides whether the
+code regressed.
 
 ## Test layout & filters
 

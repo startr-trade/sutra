@@ -1,0 +1,44 @@
+{
+  "processId": "flow",
+  "declared": {
+    "events": "points",
+    "capture": "metadata"
+  },
+  "pool": "points · metadata",
+  "elements": [
+    {
+      "id": "B",
+      "disposition": "desugared",
+      "rule": "boundary event",
+      "entered": false
+    },
+    {
+      "id": "EErr",
+      "disposition": "desugared",
+      "rule": "end event",
+      "entered": false
+    },
+    {
+      "id": "ENormal",
+      "disposition": "desugared",
+      "rule": "end event",
+      "entered": false
+    },
+    {
+      "id": "R",
+      "disposition": "notAudited",
+      "rule": "unbound service task (not a point)"
+    },
+    {
+      "id": "S",
+      "disposition": "desugared",
+      "rule": "start event",
+      "entered": false
+    },
+    {
+      "id": "T",
+      "disposition": "notAudited",
+      "rule": "unbound service task (not a point)"
+    }
+  ]
+}

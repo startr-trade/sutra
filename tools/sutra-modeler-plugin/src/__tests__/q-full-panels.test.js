@@ -26,7 +26,7 @@ const BPMN_WITH_ALL_PANELS = `<?xml version="1.0" encoding="UTF-8"?>
                   targetNamespace="http://example.com/test">
   <bpmn:process id="orders" isExecutable="true">
     <bpmn:extensionElements>
-      <q:audit sink="sql" target="ORDERS_AUDIT" capture="metadata"/>
+      <q:audit events="all" capture="metadata"/>
     </bpmn:extensionElements>
     <bpmn:startEvent id="start1">
       <bpmn:extensionElements>
@@ -125,23 +125,17 @@ describe('QAliasGroup', () => {
 });
 
 describe('QAuditGroup', () => {
-  it('reads sink + target + capture from q:audit on the process (xsd/q.xsd AuditType)', () => {
+  it('reads events + capture from q:audit on the process (xsd/q.xsd AuditType)', () => {
     const process = definitions.rootElements[0];
     const group = QAuditGroup({ businessObject: process }, translate);
     expect(group.id).toBe('q-audit');
     const ids = group.entries.map((e) => e.id);
     expect(ids).toEqual([
-      'q-audit-sink',
-      'q-audit-sink-custom',
-      'q-audit-target',
+      'q-audit-events',
       'q-audit-capture'
     ]);
-    // sink=sql -> built-in, surfaced as "sql", custom field empty
-    expect(group.entries[0].get().value).toBe('sql');
-    expect(group.entries[1].get().value).toBe('');
-    // target = event-type override
-    expect(group.entries[2].get().value).toBe('ORDERS_AUDIT');
-    expect(group.entries[3].get().value).toBe('metadata');
+    expect(group.entries[0].get().value).toBe('all');
+    expect(group.entries[1].get().value).toBe('metadata');
   });
 });
 

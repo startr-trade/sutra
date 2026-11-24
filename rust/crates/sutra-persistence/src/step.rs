@@ -329,6 +329,48 @@ pub async fn commit_step_with_timers_releasing_retiring(
     claim_owner: Option<&str>,
     retired_aliases: &[(String, String)],
 ) -> Result<()> {
+    commit_step_with_timers_releasing_retiring_gated(
+        pool,
+        step,
+        timer_waits,
+        claim_owner,
+        retired_aliases,
+        &NoGate,
+    )
+    .await
+}
+
+/// What a caller runs inside a step transaction, after its writes and right before `COMMIT`
+/// (the engine's audit spool: it records the transaction id and waits for its sync). An error
+/// rolls the transaction back.
+pub trait CommitGate: Send + Sync {
+    fn before_commit<'a>(
+        &'a self,
+        conn: &'a mut sqlx::PgConnection,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>>;
+}
+
+/// A gate that lets every commit through.
+pub struct NoGate;
+
+impl CommitGate for NoGate {
+    fn before_commit<'a>(
+        &'a self,
+        _conn: &'a mut sqlx::PgConnection,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+/// [`commit_step_with_timers_releasing_retiring`] with `gate` run right before `COMMIT`.
+pub async fn commit_step_with_timers_releasing_retiring_gated(
+    pool: &sqlx::PgPool,
+    step: &StepWrite,
+    timer_waits: &[StepTimerWait],
+    claim_owner: Option<&str>,
+    retired_aliases: &[(String, String)],
+    gate: &dyn CommitGate,
+) -> Result<()> {
     for entry in &step.outbox {
         if entry.deployment != step.deployment || entry.instance_id != step.instance_id {
             return Err(PersistenceError::InvalidArgument(format!(
@@ -355,6 +397,7 @@ pub async fn commit_step_with_timers_releasing_retiring(
     if let Some(owner) = claim_owner {
         PgInstanceStore::release_in(&mut tx, &step.deployment, step.instance_id, owner).await?;
     }
+    gate.before_commit(&mut tx).await?;
     tx.commit()
         .await
         .map_err(PersistenceError::db("step commit"))
@@ -430,13 +473,6 @@ pub struct InstanceMigration {
     /// The move DROPS the claim with the source row, so the migrated row lands unowned and
     /// immediately resumable.
     pub claim_owner: String,
-    /// Carry the instance's `audit_event` journal across the pin. `true` unless an operator
-    /// deliberately wants the trail left behind — see [`commit_instance_migration`].
-    pub carry_journal: bool,
-    /// The migration's own audit row, written LAST under the target scope so the migrated
-    /// instance's journal opens with the record of how it got there. `None` when the caller has no
-    /// journal to write to.
-    pub audit: Option<AuditEventRow>,
 }
 
 const SQL_MIGRATE_DELETE_WAITS: &str =
@@ -459,7 +495,9 @@ pub struct InstanceMigrationOutcome {
     pub alias_rows: u64,
     /// `subject_index` blind-index rows carried over (GDPR erasure must keep finding it).
     pub subject_rows: u64,
-    /// `audit_event` rows carried over (0 when `carry_journal` is false or the journal is empty).
+    /// `audit_event` rows carried over. Always 0 from [`commit_instance_migration`]: the journal
+    /// lives in the separate audit database and moves with [`carry_instance_journal`], whose
+    /// count the caller records here.
     pub audit_rows: u64,
     /// Parks re-armed by the migrate-then-resume convenience (`rearm_parks`) — rows that landed
     /// under the target pin as WAITING although the failure commit had resolved them. 0 for every
@@ -467,8 +505,9 @@ pub struct InstanceMigrationOutcome {
     pub rearmed_rows: u64,
 }
 
-/// Move one instance — its snapshot, its wait rows, its aliases, its blind-index rows and (by
-/// default) its audit journal — from one deployment pin to another, in ONE transaction.
+/// Move one instance — its snapshot, its wait rows, its aliases and its blind-index rows — from
+/// one deployment pin to another, in ONE transaction. Its audit journal is in the separate audit
+/// database and moves after this commit, with [`carry_instance_journal`].
 ///
 /// # The two-scope problem, and why the GUC is set twice
 ///
@@ -516,10 +555,7 @@ pub struct InstanceMigrationOutcome {
 /// * **Alias rows** and **blind-index rows** move verbatim: they name business keys, not nodes.
 ///   Aliases MUST move or relay correlation would stop resolving the instance; blind-index rows
 ///   MUST move or a GDPR erasure would stop finding it.
-/// * **Audit rows** move verbatim, `node_id` INCLUDED. The trail records what happened at the node
-///   it happened at, under the graph that was live then; rewriting those ids would falsify it. Only
-///   the scope column changes, because the instance-history endpoint resolves scope from the row's
-///   owning deployment and a journal left behind would be silently unreachable.
+/// * **Audit rows** are not in this database: see [`carry_instance_journal`].
 /// * **Outbox rows are NOT moved.** A pending emission was minted by the SOURCE deployment's
 ///   channel bindings and is dispatched against them; the dispatcher covers draining deployments,
 ///   so those rows drain where they were made. Moving them would re-target a message at bindings
@@ -635,29 +671,6 @@ pub async fn commit_instance_migration(
     .await
     .map_err(PersistenceError::db("migration read subject rows"))?;
 
-    type JournalRowColumns = (
-        i32,
-        time::OffsetDateTime,
-        String,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        String,
-    );
-    let journal: Vec<JournalRowColumns> = if migration.carry_journal {
-        sqlx::query_as(
-            "SELECT seq, at, event_type, node_id, diagnostic_code, diagnostic_json, payload_json \
-             FROM audit_event WHERE deployment_id = $1 AND instance_id = $2 ORDER BY seq",
-        )
-        .bind(migration.from.as_str())
-        .bind(migration.instance_id)
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(PersistenceError::db("migration read journal rows"))?
-    } else {
-        Vec::new()
-    };
-
     for (sql, operation) in [
         (SQL_MIGRATE_DELETE_WAITS, "migration delete source waits"),
         (
@@ -680,15 +693,6 @@ pub async fn commit_instance_migration(
             .await
             .map_err(PersistenceError::db(operation))?;
     }
-    if !journal.is_empty() {
-        sqlx::query(SQL_MIGRATE_DELETE_JOURNAL)
-            .bind(migration.from.as_str())
-            .bind(migration.instance_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(PersistenceError::db("migration delete source journal"))?;
-    }
-
     // ---- phase 2: the TARGET scope — write the rewritten rows -------------------------------
     set_deployment_guc(&mut tx, &migration.to).await?;
 
@@ -801,30 +805,96 @@ pub async fn commit_instance_migration(
         outcome.subject_rows += 1;
     }
 
-    for (seq, at, event_type, node_id, diagnostic_code, diagnostic_json, payload_json) in &journal {
-        let row = AuditEventRow {
-            deployment: migration.to.clone(),
-            instance_id: Some(migration.instance_id),
-            seq: *seq,
-            at: *at,
-            event_type: event_type.clone(),
-            // Verbatim: an audit row names the node the move HAPPENED at, under the graph that was
-            // live then. Remapping it would rewrite history rather than relocate it.
-            node_id: node_id.clone(),
-            diagnostic_code: diagnostic_code.clone(),
-            diagnostic_json: diagnostic_json.clone(),
-            payload_json: payload_json.clone(),
-        };
-        PgAuditEventStore::insert_in(&mut tx, &row).await?;
-        outcome.audit_rows += 1;
-    }
-
-    if let Some(event) = &migration.audit {
-        PgAuditEventStore::insert_in(&mut tx, event).await?;
-    }
-
     tx.commit()
         .await
         .map_err(PersistenceError::db("instance migration commit"))?;
     Ok(outcome)
+}
+
+/// The journal rows a carry reads under the source scope.
+type JournalRowColumns = (
+    i32,
+    time::OffsetDateTime,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    String,
+    Option<String>,
+);
+
+/// Move one instance's audit journal from one deployment pin to another in the AUDIT database, in
+/// one transaction of that database, and return the number of rows moved. The engine calls it
+/// after [`commit_instance_migration`] has committed, once the SQL audit store has shipped
+/// everything the audit spool had made durable, so the journal it moves is complete.
+///
+/// The same two-scope shape as the instance move: under the `from` scope it reads every row of
+/// the instance and deletes them; under the `to` scope it inserts them again. Rows move verbatim,
+/// `node_id` INCLUDED: the trail records what happened at the node it happened at, under the graph
+/// that was live then, and rewriting those ids would falsify it. Only the scope column changes,
+/// because the instance-history endpoint resolves scope from the row's owning deployment and a
+/// journal left behind would be silently unreachable. A row keeps its `spool_ref`, so a late
+/// re-ship of it is still dropped under the target.
+pub async fn carry_instance_journal(
+    audit: &sqlx::PgPool,
+    from: &DeploymentId,
+    to: &DeploymentId,
+    instance: Uuid,
+) -> Result<u64> {
+    if from == to {
+        return Err(PersistenceError::InvalidArgument(format!(
+            "instance {instance}'s journal is already under {to} — a carry must name a different \
+             target"
+        )));
+    }
+    let mut tx = audit
+        .begin()
+        .await
+        .map_err(PersistenceError::db("begin journal carry transaction"))?;
+
+    set_deployment_guc(&mut tx, from).await?;
+    let journal: Vec<JournalRowColumns> = sqlx::query_as(
+        "SELECT seq, at, event_type, node_id, diagnostic_code, diagnostic_json, payload_json, \
+         spool_ref FROM audit_event WHERE deployment_id = $1 AND instance_id = $2 ORDER BY seq",
+    )
+    .bind(from.as_str())
+    .bind(instance)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(PersistenceError::db("journal carry read rows"))?;
+    if journal.is_empty() {
+        return Ok(0);
+    }
+    sqlx::query(SQL_MIGRATE_DELETE_JOURNAL)
+        .bind(from.as_str())
+        .bind(instance)
+        .execute(&mut *tx)
+        .await
+        .map_err(PersistenceError::db("journal carry delete source rows"))?;
+
+    set_deployment_guc(&mut tx, to).await?;
+    let mut moved = 0u64;
+    for (seq, at, event_type, node_id, diagnostic_code, diagnostic_json, payload_json, spool_ref) in
+        journal
+    {
+        let row = AuditEventRow {
+            deployment: to.clone(),
+            instance_id: Some(instance),
+            seq,
+            at,
+            event_type,
+            node_id,
+            diagnostic_code,
+            diagnostic_json,
+            payload_json,
+            spool_ref,
+            attempt: None,
+        };
+        PgAuditEventStore::insert_in(&mut tx, &row).await?;
+        moved += 1;
+    }
+    tx.commit()
+        .await
+        .map_err(PersistenceError::db("journal carry commit"))?;
+    Ok(moved)
 }

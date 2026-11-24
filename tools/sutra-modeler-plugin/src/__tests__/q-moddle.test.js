@@ -15,7 +15,7 @@ const SAMPLE_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
     targetNamespace="urn:sutra:test">
   <bpmn:process id="P1" isExecutable="true">
     <bpmn:extensionElements>
-      <q:audit sink="sql" target="audit_events" capture="metadata"/>
+      <q:audit events="all" capture="metadata"/>
     </bpmn:extensionElements>
     <bpmn:startEvent id="Start_1">
       <bpmn:extensionElements>
@@ -126,8 +126,7 @@ describe('q-moddle descriptor', () => {
 
     expect(ext).toHaveLength(1);
     expect(ext[0].$type).toBe('q:Audit');
-    expect(ext[0].get('sink')).toBe('sql');
-    expect(ext[0].get('target')).toBe('audit_events');
+    expect(ext[0].get('events')).toBe('all');
     expect(ext[0].get('capture')).toBe('metadata');
   });
 

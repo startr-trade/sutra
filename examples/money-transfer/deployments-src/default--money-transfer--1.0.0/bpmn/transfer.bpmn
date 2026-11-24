@@ -40,6 +40,8 @@
          declared here so the deploy-time template/FEEL validators know them (object -> ANY, which
          permits field navigation like fromAccount.balance / account.balance). -->
     <bpmn:extensionElements>
+  <!-- Audit is declared here, in the process: no tag, no audit. A bare tag means events="points" capture="metadata". -->
+  <q:audit/>
       <q:variables>
         <q:variable name="fromAccount" type="object"/>  <!-- {balance, frozen} read from the store -->
         <q:variable name="toAccount"   type="object"/>

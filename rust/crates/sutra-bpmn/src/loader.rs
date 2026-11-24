@@ -21,10 +21,10 @@ use crate::model::{
     STORE_QUERY_DEFAULT_LIMIT, STORE_QUERY_MAX_LIMIT,
 };
 use crate::qbindings::{
-    AckMode, AliasBinding, AliasConflict, AuditBinding, AuditCapture, CaseEntry, DataClass,
-    DispatchTable, HeaderAttr, NodeBindings, OnNoMatch, OnValidationBinding, OnValidationMode,
-    OutboundAuthScheme, OutputBinding, ReplyBinding, ReplyMode, RetryBinding, SendBinding,
-    SimpleValidator, SourceBinding, TimeoutBinding,
+    AckMode, AliasBinding, AliasConflict, AuditBinding, AuditCapture, AuditEventScope, CaseEntry,
+    DataClass, DispatchTable, HeaderAttr, NodeBindings, OnNoMatch, OnValidationBinding,
+    OnValidationMode, OutboundAuthScheme, OutputBinding, ReplyBinding, ReplyMode, RetryBinding,
+    SendBinding, SimpleValidator, SourceBinding, TimeoutBinding,
 };
 use crate::xml::{self, XmlElement};
 
@@ -77,7 +77,7 @@ struct DocScan {
     /// carried for the `sutra lint` advisory, since the loader has no warning channel.
     shadowed_variables_by_process_id: HashMap<String, Vec<ShadowedBpmnVariable>>,
     coverage_paths_by_process_id: HashMap<String, Vec<CoveragePath>>,
-    /// B1 — process-level `<q:audit sink capture>` policy (single sink + capture level).
+    /// The process-level `<q:audit>` declaration (event scope + capture level).
     audit_by_process_id: HashMap<String, ProcessAudit>,
     /// Process-level `<q:process idempotent>` assertion (absent ⇒ fail-closed `false`).
     idempotent_by_process_id: HashMap<String, bool>,
@@ -270,9 +270,10 @@ impl BpmnModelLoader {
             }
             // The PROCESS-LEVEL <q:audit> (a direct child of the process extensionElements — NOT a
             // node's, which is why we don't recurse) carries both the module-version pin (`version`)
-            // and, B1, the audit policy (`sink` + `capture`). A `<q:audit>` that names a sink or a
-            // capture declares the process's single audit sink; `version`-only is just the pin.
-            'exts: for ext in process.children_ns(BPMN_NS, "extensionElements") {
+            // and the audit declaration. ANY process-level `<q:audit>` declares audit — bare,
+            // with attributes, or version-only — so a visible tag always means "audited". The
+            // first one is the declaration; `version` is read from every one, as before.
+            for ext in process.children_ns(BPMN_NS, "extensionElements") {
                 for audit in ext.children_ns(Q_NS, "audit") {
                     if version_tag.trim().is_empty() {
                         let version = audit.attr_or_empty("version");
@@ -282,24 +283,33 @@ impl BpmnModelLoader {
                                 .or_insert_with(|| version.to_string());
                         }
                     }
-                    let sink_attr = audit.attr_or_empty("sink");
-                    let capture_attr = audit.attr_or_empty("capture");
-                    if !sink_attr.trim().is_empty() || !capture_attr.trim().is_empty() {
-                        // Process-level capture defaults to METADATA (light/safe); `payload` is
-                        // opt-in. Sink defaults to the XSD `"sql"`.
-                        let capture = if capture_attr.trim().is_empty() {
-                            AuditCapture::Metadata
-                        } else {
-                            parse_audit_capture(capture_attr)?
-                        };
-                        let sink = if sink_attr.trim().is_empty() {
-                            "sql".to_string()
-                        } else {
-                            sink_attr.to_string()
-                        };
-                        audit_by_process_id.insert(id.to_string(), ProcessAudit { sink, capture });
-                        break 'exts;
+                    reject_audit_sink_attributes(audit, id)?;
+                    if audit_by_process_id.contains_key(id) {
+                        continue;
                     }
+                    let events_attr = audit.attr_or_empty("events");
+                    let events = if events_attr.trim().is_empty() {
+                        AuditEventScope::default()
+                    } else {
+                        AuditEventScope::parse(events_attr).ok_or_else(|| {
+                            err(
+                                codes::BPMN_AUDIT_EVENTS_INVALID,
+                                format!(
+                                    "process '{id}': q:audit events='{events_attr}' is not one \
+                                     of all, points, instance"
+                                ),
+                            )
+                        })?
+                    };
+                    let capture = parse_audit_capture(audit.attr_or_empty("capture"))?;
+                    audit_by_process_id.insert(
+                        id.to_string(),
+                        ProcessAudit {
+                            events,
+                            capture,
+                            sink: None,
+                        },
+                    );
                 }
             }
 
@@ -474,8 +484,8 @@ impl BpmnModelLoader {
         } else {
             process.with_coverage_paths(paths)
         };
-        // B1 — the process-level `<q:audit>` policy (single sink + capture); `None` leaves the
-        // process unaudited pending the deployment-manifest default (applied at resolution).
+        // The process-level `<q:audit>` declaration; `None` = the process is not audited. The
+        // destination is filled at deploy from the package manifest.
         let audit = scan.audit_by_process_id.get(&id).cloned();
         // The process-level idempotency assertion (`<q:process idempotent>`); absent ⇒ false.
         let idempotent = scan
@@ -2560,7 +2570,7 @@ fn collect_node_bindings(
             reply: parse_reply(ext, host_id)?,
             send: parse_send(ext, host_id)?,
             aliases: parse_aliases(ext, host_id)?,
-            audit: parse_per_node_audit(ext)?,
+            audit: parse_per_node_audit(ext, host_id)?,
             timeout: parse_timeout(ext, host_id)?,
             output: parse_output(ext, host_id)?,
             retry: parse_retry(ext, host_id)?,
@@ -3157,20 +3167,36 @@ fn parse_send(ext: &XmlElement, host_id: &str) -> Result<Option<SendBinding>, Su
     }))
 }
 
-fn parse_per_node_audit(ext: &XmlElement) -> Result<Option<AuditBinding>, SutraError> {
+fn parse_per_node_audit(
+    ext: &XmlElement,
+    host_id: &str,
+) -> Result<Option<AuditBinding>, SutraError> {
     let Some(a) = ext.children_ns(Q_NS, "audit").next() else {
         return Ok(None);
     };
-    let sink = a.attr_or_empty("sink");
+    reject_audit_sink_attributes(a, host_id)?;
     Ok(Some(AuditBinding {
-        sink: if sink.trim().is_empty() {
-            "sql".to_string()
-        } else {
-            sink.to_string()
-        },
-        target: opt_attr(a, "target"),
         capture: parse_audit_capture(a.attr_or_empty("capture"))?,
     }))
+}
+
+/// `sink` and `target` on `<q:audit>` were removed in 0.9 (the storage choice is the
+/// deployment's, never the BPMN's). Refused rather than ignored: ignoring them would silently
+/// send the trail somewhere other than where the author wrote.
+fn reject_audit_sink_attributes(audit: &XmlElement, host_id: &str) -> Result<(), SutraError> {
+    for attr in ["sink", "target"] {
+        if audit.attr(None, attr).is_some() {
+            return Err(err(
+                codes::BPMN_AUDIT_SINK_REMOVED,
+                format!(
+                    "'{host_id}': q:audit {attr}= was removed in 0.9; where audit is stored is \
+                     set in the package manifest (audit.sink / audit.sinks). Run \
+                     `sutra lint --fix audit` to move it there"
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 // ---- process-level intake inheritance -------------------------------------------
@@ -3886,11 +3912,13 @@ fn parse_alias_conflict(s: &str) -> Result<Option<AliasConflict>, SutraError> {
     }
 }
 
+/// An absent or empty `capture` is `metadata`, the documented default (`xsd/q.xsd#AuditType`):
+/// payload capture is always an explicit opt-in.
 fn parse_audit_capture(s: &str) -> Result<AuditCapture, SutraError> {
-    match s {
-        "" | "payload" => Ok(AuditCapture::Payload),
+    match s.trim() {
+        "" | "metadata" => Ok(AuditCapture::Metadata),
+        "payload" => Ok(AuditCapture::Payload),
         "none" => Ok(AuditCapture::None),
-        "metadata" => Ok(AuditCapture::Metadata),
         "media" => Ok(AuditCapture::Media),
         _ => Err(err(
             codes::PARSE_QXSD_INVALID_SOURCE,

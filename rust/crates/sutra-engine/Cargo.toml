@@ -6,6 +6,11 @@ edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[features]
+# Fault injection for out-of-crate tests (the in-crate tests always have it): a kill point between
+# the audit spool sync and the step commit. Never enabled in a shipped build.
+test-hooks = []
+
 [dependencies]
 # The inbox owner key (`deployment_owner_id`).
 sha2 = { workspace = true }

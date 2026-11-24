@@ -5,21 +5,37 @@ use std::collections::HashMap;
 
 use crate::codes;
 use crate::error::SutraError;
-use crate::qbindings::{AuditCapture, NodeBindings};
+use crate::qbindings::{AuditCapture, AuditEventScope, NodeBindings};
 
-/// Process-level `<q:audit>` policy (B1): the SINGLE sink a flow's audit events route to plus the
-/// capture level. Resolved as process-level `<q:audit>` → deployment-manifest default; `None` on a
-/// [`ProcessDefinition`] means the process is not audited (no process-level `<q:audit>` and no
-/// manifest default). Node-level `<q:audit>` may ONLY suppress (`capture="none"`) — it never
-/// overrides the sink or the capture level.
+/// Process-level `<q:audit>` policy. A process is audited only when it declares a process-level
+/// `<q:audit>` (bare, with attributes, or version-only); `None` on a [`ProcessDefinition`] means
+/// it is not audited, whatever the deployment says. The deployment decides only WHERE the events
+/// go ([`ProcessAudit::sink`]), never whether or what. A node-level `<q:audit>` may ONLY opt its
+/// node out (`capture="none"`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessAudit {
-    /// The single sink name events route to (`"sql"` | `"jsonl"` | `"otel"`) — one source of truth.
-    pub sink: String,
-    /// Capture level for the whole process: `Metadata` (default) or `Payload` (redacted variable
-    /// snapshot on `NODE_ENTERED`). `None` switches the whole process's execution audit off (every
-    /// `INSTANCE_*` and `NODE_*` event); on a node it suppresses that node's events only.
+    /// Which events are recorded (`events`, default [`AuditEventScope::Points`]).
+    pub events: AuditEventScope,
+    /// Capture level for the whole process: `Metadata` (the default) or `Payload` (redacted
+    /// variable snapshot on `NODE_ENTERED`). `None` switches the whole process's execution audit
+    /// off (every `INSTANCE_*` and `NODE_*` event); on a node it suppresses that node's events.
     pub capture: AuditCapture,
+    /// The audit store the events go to, filled at deploy by
+    /// [`ProcessModule::with_audit_destinations`]; `None` = unresolved (the events are counted
+    /// as undeliverable, never re-routed).
+    pub sink: Option<String>,
+}
+
+impl ProcessAudit {
+    /// The documented defaults of a bare `<q:audit/>`: `events="points"`, `capture="metadata"`,
+    /// no destination yet.
+    pub fn declared_default() -> ProcessAudit {
+        ProcessAudit {
+            events: AuditEventScope::Points,
+            capture: AuditCapture::Metadata,
+            sink: None,
+        }
+    }
 }
 
 /// The throw flavour of an intermediate throw event. `None` = a bare throw with no
@@ -617,6 +633,20 @@ impl Node {
     }
 }
 
+/// The process a node embeds, mutably (a loop wrapper is looked through).
+fn inner_definition_mut(node: &mut Node) -> Option<&mut ProcessDefinition> {
+    match node {
+        Node::SubProcess { inner, .. }
+        | Node::TransactionSubProcess { inner, .. }
+        | Node::AdHocSubProcess { inner, .. }
+        | Node::EventSubProcess { inner, .. } => Some(inner),
+        Node::MultiInstance { inner, .. } | Node::StandardLoop { inner, .. } => {
+            inner_definition_mut(inner)
+        }
+        _ => None,
+    }
+}
+
 /// One FEEL timer expression in a process ([`ProcessDefinition::node_timer_expressions`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TimerExpressionSite {
@@ -653,9 +683,12 @@ pub struct ProcessDefinition {
     pub shadowed_bpmn_variables: Vec<ShadowedBpmnVariable>,
     /// Path-coverage metric — the tracked routes declared by `<q:coverage>` on this process.
     pub coverage_paths: Vec<CoveragePath>,
-    /// Process-level `<q:audit>` policy (single sink + capture level). `None` = the process
-    /// declares no `<q:audit>`; the deployment-manifest default (if any) is applied at resolution.
+    /// Process-level `<q:audit>` declaration. `None` = the process declares no `<q:audit>` and is
+    /// not audited.
     pub audit: Option<ProcessAudit>,
+    /// Which element records what, derived from [`Self::audit`] and the node-level opt-outs;
+    /// rebuilt whenever the declaration changes. Read it through [`Self::audit_plan`].
+    audit_plan: crate::audit_plan::AuditPlan,
     /// The process-level idempotency ASSERTION (`<q:process idempotent="true|false">`).
     /// `true` means the author asserts re-executing this process on the same input converges to a
     /// single end state, so the inbound is **safe to retry any number of times**; `false` (the
@@ -751,8 +784,14 @@ impl ProcessDefinition {
                 v
             }
         };
-        Ok(ProcessDefinition {
-            id: id.into(),
+        let id: String = id.into();
+        let audit_plan = crate::audit_plan::AuditPlan {
+            process_id: id.clone(),
+            declared: None,
+            elements: std::collections::BTreeMap::new(),
+        };
+        let mut process = ProcessDefinition {
+            id,
             name,
             is_executable,
             module_version,
@@ -765,9 +804,12 @@ impl ProcessDefinition {
             shadowed_bpmn_variables: Vec::new(),
             coverage_paths: Vec::new(),
             audit: None,
+            audit_plan,
             idempotent: false,
             receipt_attributes: Vec::new(),
-        })
+        };
+        process.audit_plan = crate::audit_plan::AuditPlan::build(&process);
+        Ok(process)
     }
 
     /// A copy of this process with its BPMN/`q:` declaration collisions recorded (applied by the
@@ -788,12 +830,42 @@ impl ProcessDefinition {
         self
     }
 
-    /// A copy of this process with its process-level `<q:audit>` policy set (B1) — applied by the
-    /// parser after assembly, like coverage. `None` leaves the process unaudited pending a
-    /// deployment-manifest default.
+    /// A copy of this process with its process-level `<q:audit>` declaration set — applied by the
+    /// parser after assembly, like coverage. `None` = the process is not audited.
+    ///
+    /// The declaration also covers the process's embedded sub-processes: their nodes run under
+    /// the enclosing process's declaration, so each inner definition carries it too.
     pub fn with_audit(mut self, audit: Option<ProcessAudit>) -> ProcessDefinition {
-        self.audit = audit;
+        self.set_audit(audit);
         self
+    }
+
+    fn set_audit(&mut self, audit: Option<ProcessAudit>) {
+        for node in &mut self.nodes {
+            if let Some(inner) = inner_definition_mut(node) {
+                inner.set_audit(audit.clone());
+            }
+        }
+        self.audit = audit;
+        self.audit_plan = crate::audit_plan::AuditPlan::build(self);
+    }
+
+    /// Set the destination of an audited process and its embedded sub-processes (no-op on an
+    /// unaudited one).
+    pub fn set_audit_sink(&mut self, sink: Option<String>) {
+        for node in &mut self.nodes {
+            if let Some(inner) = inner_definition_mut(node) {
+                inner.set_audit_sink(sink.clone());
+            }
+        }
+        if let Some(audit) = self.audit.as_mut() {
+            audit.sink = sink;
+        }
+    }
+
+    /// Which element records what (see [`crate::audit_plan::AuditPlan`]).
+    pub fn audit_plan(&self) -> &crate::audit_plan::AuditPlan {
+        &self.audit_plan
     }
 
     /// A copy of this process with its `<q:process idempotent>` assertion set (applied by
@@ -1161,21 +1233,29 @@ impl ProcessModule {
         self.processes.iter().map(|p| p.id.as_str()).collect()
     }
 
-    /// B1 — desugar a deployment-level audit default (from `manifest.yaml`) onto this module's
-    /// processes: every process that declares NO process-level `<q:audit>` inherits `default` (as
-    /// if it had declared it). A process with its own `<q:audit>` keeps it (author override). `None`
-    /// leaves the module untouched. This is the whole runtime meaning of the manifest default —
-    /// after desugaring, each process carries its effective [`ProcessAudit`] and the executor reads
-    /// it directly (no per-deployment resolution needed).
+    /// This module with each AUDITED process's destination set from `destinations`: the
+    /// process's own entry in `per_process`, else `default`. A process that declares no
+    /// `<q:audit>` is left unaudited — a destination never turns audit on. A process neither
+    /// names keeps `sink: None` (unresolved).
     #[must_use]
-    pub fn with_audit_default(mut self, default: &Option<ProcessAudit>) -> ProcessModule {
-        if let Some(default) = default {
-            for process in &mut self.processes {
-                if process.audit.is_none() {
-                    process.audit = Some(default.clone());
-                }
-            }
+    pub fn with_audit_destinations(mut self, destinations: &AuditDestinations) -> ProcessModule {
+        for process in &mut self.processes {
+            let sink = destinations
+                .per_process
+                .get(&process.id)
+                .or(destinations.default.as_ref())
+                .cloned();
+            process.set_audit_sink(sink);
         }
         self
     }
+}
+
+/// Where each audited process of a package sends its audit events: the manifest's
+/// `audit.sinks` (`per_process`, process id → store name) over its `audit.sink` (`default`).
+/// Destination only — it never decides whether a process is audited.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AuditDestinations {
+    pub default: Option<String>,
+    pub per_process: std::collections::BTreeMap<String, String>,
 }

@@ -40,6 +40,8 @@ use std::collections::BTreeMap;
 
 use serde::Deserialize;
 
+pub mod audit;
+
 pub use sutra_loader::lint::{
     validate_deployment, validate_deployment_with_manifests, LintDiagnostic, LintReport,
     LintSeverity,

@@ -38,7 +38,7 @@ pub mod selector;
 
 pub use archive::{
     deployment_from_entries, deployment_id_of_manifest, read_archive, read_archive_expecting,
-    read_archive_file, write_archive, ArchiveManifest, ArtifactEntry, LoadedArchive,
+    read_archive_file, write_archive, ArchiveManifest, ArtifactEntry, LoadedArchive, ManifestAudit,
 };
 pub use coverage::{
     parse_requirements_map, BusinessCorrelation, CoverageFile, CoverageRoute, Hop, RequirementsMap,

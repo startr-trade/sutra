@@ -11,7 +11,12 @@
 #   `statement` is the reason, in full. If you cannot write one, the entry does not belong here.
 #
 # RENEWAL
-#   Last re-triaged 2026-11-03 for 0.6.17, against the 0.6.17 engine binary.
+#   Last re-triaged 2026-11-24 for 0.8.6, against the 0.8.6 engine binary and Trivy DB
+#   UpdatedAt 2026-11-24T01:05:31Z (RELEASE=1 refetch). The cc-debian12 base was re-pulled: the
+#   current digest is sha256:e5d81ddd…, which ships an OLDER ca-certificates than the pinned one
+#   (it adds DLA-4845-1), so the pin stays. Seven entries that no longer match a finding were
+#   removed; Debian has published libssl3 3.0.22 and tzdata fixes that the distroless base does
+#   not carry yet, so those entries are renewed, not taken.
 #   These expire together, on purpose: one dated re-triage of the whole file beats fifteen
 #   staggered reminders. On expiry, for each entry: check whether a fixed version is now
 #   reachable (`cargo update`, or a fresh base-image digest), take it if so, and only renew
@@ -24,55 +29,55 @@ vulnerabilities:
   # RENEWAL CHECK: pull the base fresh and re-scan — a fixed version appearing means take it.
   - id: CVE-2010-4756
     statement: "libc6 (glibc) glob; not imported by the engine (readelf --dyn-syms, 0.6.17 binary). Debian ships no fixed package."
-    expired_at: 2026-12-09
+    expired_at: 2026-12-29
   - id: CVE-2018-20796
     statement: "libc6 (glibc) regexec recursion. The engine DOES import regcomp and regexec, through the bundled Kafka client (librdkafka's rdregex), which compiles a pattern only when a subscribed topic starts with ^. The flaw needs a crafted pattern with back-references; the pattern comes from the deployment's own channel configuration, never from a message, and the engine's own patterns use the Rust regex crates. Debian ships no fixed package."
-    expired_at: 2026-12-09
+    expired_at: 2026-12-29
   - id: CVE-2019-1010022
     statement: "libc6 (glibc) stack-guard bypass: not a flaw by itself, only a way to widen a separate stack overflow, and treated upstream as a non-security bug. No reachable defect to fix. Debian ships no fixed package."
-    expired_at: 2026-12-09
+    expired_at: 2026-12-29
   - id: CVE-2019-1010023
     statement: "libc6 (glibc) ld.so re-mapping via a malicious ELF run under ldd; treated upstream as a non-security bug. The image has no ldd, no shell and no way to introduce an ELF. Debian ships no fixed package."
-    expired_at: 2026-12-09
+    expired_at: 2026-12-29
   - id: CVE-2019-1010024
     statement: "libc6 (glibc) ASLR bypass through the thread stack cache: not a flaw by itself, and treated upstream as a non-security bug. No reachable defect to fix. Debian ships no fixed package."
-    expired_at: 2026-12-09
+    expired_at: 2026-12-29
   - id: CVE-2019-1010025
     statement: "libc6 (glibc) pthread heap address guessing; the vendor's position is that an ASLR bypass alone is not a vulnerability. No reachable defect to fix. Debian ships no fixed package."
-    expired_at: 2026-12-09
+    expired_at: 2026-12-29
   - id: CVE-2019-9192
     statement: "libc6 (glibc) regexec recursion, disputed upstream. The engine DOES import regcomp and regexec, through the bundled Kafka client (librdkafka's rdregex), which compiles a pattern only when a subscribed topic starts with ^. The flaw needs a crafted pattern with back-references; the pattern comes from the deployment's own channel configuration, never from a message, and the engine's own patterns use the Rust regex crates. Debian ships no fixed package."
-    expired_at: 2026-12-09
+    expired_at: 2026-12-29
   - id: CVE-2026-5435
     statement: "libc6 (glibc) deprecated ns_printrrf, ns_printrr and fp_nquery; not imported by the engine (readelf --dyn-syms, 0.6.17 binary). Debian ships no fixed package."
-    expired_at: 2026-12-09
+    expired_at: 2026-12-29
   - id: CVE-2026-5450
     statement: "libc6 (glibc) scanf family with %mc and an explicit width over 1024. The engine DOES import sscanf, through bundled C code, but formats are compiled in, not input, and the binary contains no such format (strings: no %<width>mc). Debian ships no fixed package."
-    expired_at: 2026-12-09
+    expired_at: 2026-12-29
   - id: CVE-2026-5928
     statement: "libc6 (glibc) ungetwc on a wide stream; not imported by the engine (readelf --dyn-syms, 0.6.17 binary). Debian ships no fixed package."
-    expired_at: 2026-12-09
+    expired_at: 2026-12-29
   - id: CVE-2026-6238
     statement: "libc6 (glibc) deprecated ns_printrrf, ns_printrr and fp_nquery on a crafted DNS response; not imported by the engine (readelf --dyn-syms, 0.6.17 binary), so a DNS answer never reaches them. Debian ships no fixed package."
-    expired_at: 2026-12-09
+    expired_at: 2026-12-29
   - id: CVE-2026-84243
     statement: "libc6 (glibc) in the distroless base; Debian ships no fixed package (2.36-9+deb12u14, status affected, 2026-10-31). Not reachable: the flaw is in message-catalog lookup driven by the LANGUAGE variable, which glibc consults only after setlocale() selects a non-C locale; the engine binary imports no setlocale, gettext or textdomain symbol (readelf --dyn-syms), so it runs in the C locale, and the base image carries no locale data. The variable is also set by the operator, not by input."
-    expired_at: 2026-12-09
+    expired_at: 2026-12-29
   - id: CVE-2026-125709
     statement: "libstdc++ streambuf left inconsistent after an I/O error on overflow, reported against gcc-12-base / libgcc-s1 / libgomp1 / libstdc++6 in the distroless base (MEDIUM). Not reachable: the engine binary does not link libstdc++ or libgomp (readelf -d on the 0.6.23 binary: NEEDED is only libgcc_s, libm, libc, ld-linux; readelf --dyn-syms imports no std:: symbol), and libgcc_s carries no streambuf. Debian ships no fixed package."
-    expired_at: 2026-12-16
+    expired_at: 2026-12-29
   - id: CVE-2026-115456
     statement: "libstdc++ std::from_chars out-of-bounds read, reported against gcc-12-base / libgcc-s1 / libgomp1 / libstdc++6 in the distroless base (LOW). Not reachable: the engine binary does not link libstdc++ or libgomp at all (readelf -d: NEEDED is only libgcc_s, libm, libc, ld-linux; 0.6.20 binary), and libgcc_s carries no from_chars. Debian ships no fixed package."
-    expired_at: 2026-12-10
+    expired_at: 2026-12-29
   - id: CVE-2022-27943
     statement: "libiberty rust-demangle stack consumption, reported against gcc-12-base / libgcc-s1 / libgomp1 / libstdc++6. The engine links libgcc_s, which exports no demangler (readelf --dyn-syms), and no tool that demangles is in the image. Debian ships no fixed package."
-    expired_at: 2026-12-09
+    expired_at: 2026-12-29
   - id: CVE-2025-27587
     statement: "libssl3 Minerva timing attack on PowerPC only; the published images are linux/amd64 and linux/arm64, and the engine never loads libssl3 (readelf -d lists no libssl). Debian ships no fixed package."
-    expired_at: 2026-12-09
+    expired_at: 2026-12-29
   - id: CVE-2026-42767
     statement: "libssl3 (OpenSSL 3.0.x as Debian ships it) in the distroless base; Debian has since published 3.0.22-1~deb12u1, but the distroless base still ships 3.0.20 and has no package manager, so the fix arrives only when the base image is rebuilt (re-pulled 2026-11-03: the current cc-debian12 digest carries the same libssl3)."
-    expired_at: 2026-12-09
+    expired_at: 2026-12-29
 
   # ---- Published since the 2026-08-09 triage: same base, same position -------------------
   # Checked against the shipped binary's own tables, not only against Debian's "no fix" status:
@@ -80,50 +85,50 @@ vulnerabilities:
   # RENEWAL CHECK: pull the base fresh and re-scan; repeat both readelf checks on a new binary.
   - id: CVE-2026-63072
     statement: "libssl3 (CMS key unwrapping) in the distroless base; the engine never loads libssl3 (readelf -d lists no libssl). Debian has since published 3.0.22-1~deb12u1, but the distroless base still ships 3.0.20 and has no package manager, so the fix arrives only when the base image is rebuilt (re-pulled 2026-11-03: the current cc-debian12 digest carries the same libssl3)."
-    expired_at: 2026-12-09
+    expired_at: 2026-12-29
   - id: CVE-2026-63076
     statement: "libssl3 (CMP server) in the distroless base; never loaded by the engine (readelf -d lists no libssl). Debian has since published 3.0.22-1~deb12u1, but the distroless base still ships 3.0.20 and has no package manager, so the fix arrives only when the base image is rebuilt (re-pulled 2026-11-03: the current cc-debian12 digest carries the same libssl3)."
-    expired_at: 2026-12-09
+    expired_at: 2026-12-29
   - id: CVE-2026-54874
     statement: "libssl3 (DTLS record buffering) in the distroless base; never loaded by the engine (readelf -d lists no libssl). Debian has since published 3.0.22-1~deb12u1, but the distroless base still ships 3.0.20 and has no package manager, so the fix arrives only when the base image is rebuilt (re-pulled 2026-11-03: the current cc-debian12 digest carries the same libssl3)."
-    expired_at: 2026-12-09
+    expired_at: 2026-12-29
   - id: CVE-2026-63074
     statement: "libssl3 (CMP ExtraCerts cache) in the distroless base; never loaded by the engine (readelf -d lists no libssl). Debian has since published 3.0.22-1~deb12u1, but the distroless base still ships 3.0.20 and has no package manager, so the fix arrives only when the base image is rebuilt (re-pulled 2026-11-03: the current cc-debian12 digest carries the same libssl3)."
-    expired_at: 2026-12-09
+    expired_at: 2026-12-29
   - id: CVE-2026-75803
     statement: "libssl3 (ChaCha20-Poly1305 / AES-OCB decryption) in the distroless base; never loaded by the engine (readelf -d lists no libssl). Debian has since published 3.0.22-1~deb12u1, but the distroless base still ships 3.0.20 and has no package manager, so the fix arrives only when the base image is rebuilt (re-pulled 2026-11-03: the current cc-debian12 digest carries the same libssl3)."
-    expired_at: 2026-12-09
+    expired_at: 2026-12-29
   - id: CVE-2026-80489
     statement: "glibc iconv EUC-JISX0213 converter; the engine imports no iconv symbol. Debian ships no fixed package."
-    expired_at: 2026-12-09
+    expired_at: 2026-12-29
   - id: CVE-2026-77117
     statement: "glibc iconv SHIFT_JISX0213 converter; the engine imports no iconv symbol. Debian ships no fixed package."
-    expired_at: 2026-12-09
+    expired_at: 2026-12-29
   - id: CVE-2026-18374
     statement: "glibc fopen mode-string parsing; needs an attacker-controlled mode string, and the engine imports no fopen (its only stdio open import is fdopen). Debian ships no fixed package."
-    expired_at: 2026-12-09
+    expired_at: 2026-12-29
   - id: CVE-2026-19499
     statement: "glibc strfmon; not imported by the engine. Debian ships no fixed package."
-    expired_at: 2026-12-09
+    expired_at: 2026-12-29
   - id: CVE-2026-19542
     statement: "glibc tdelete; not imported by the engine. Debian ships no fixed package."
-    expired_at: 2026-12-09
+    expired_at: 2026-12-29
   - id: CVE-2026-6791
     statement: "glibc tilde expansion (wordexp / glob); neither is imported by the engine. Debian ships no fixed package."
-    expired_at: 2026-12-09
+    expired_at: 2026-12-29
   - id: CVE-2026-6368
     statement: "glibc wordexp; not imported by the engine. Debian ships no fixed package."
-    expired_at: 2026-12-09
+    expired_at: 2026-12-29
   - id: CVE-2026-89092
     statement: "glibc nscd (the name-service cache daemon); nscd is not in the image and the engine does not use it. Debian ships no fixed package."
-    expired_at: 2026-12-09
+    expired_at: 2026-12-29
 
   # ---- Published since the 2026-09-12 triage ---------------------------------------------
   # Unlike the batch above, this one IS reachable: the engine imports getaddrinfo, so glibc's DNS
   # stub resolver runs whenever it resolves a broker, database or HTTP host.
   - id: CVE-2026-8674
     statement: "glibc DNS stub resolver DoS via an overlong search domain. REACHABLE (the engine resolves hostnames through getaddrinfo), but per the advisory the trigger is the resolver's configured search list (resolv.conf), which the deployment platform controls, not a network peer. Debian defers the fix (fix_deferred); no patched package exists."
-    expired_at: 2026-12-09
+    expired_at: 2026-12-29
 
   # ---- Published since the 2026-09-12 triage; triaged 2026-10-12 for the 0.2.0-rc.3 cut -----
   # Re-verified against THIS release's binary, not inherited from the previous triage:
@@ -143,61 +148,58 @@ vulnerabilities:
   # copy; it is tracked through rust/Cargo.lock by `make audit` and `make scan-deps`.
   - id: CVE-2026-84782
     statement: "libssl3 (DTLS handshake retransmission information disclosure; rated HIGH) in the distroless base. The engine never loads libssl3: readelf -d names no OpenSSL library, the binary contains no libssl name for dlopen, and its only OPENSSL_ imports are unresolved weak hooks of the statically linked AWS-LC its rustls uses. It speaks no DTLS. Debian has since published 3.0.22-1~deb12u2, but the distroless base still ships 3.0.20 and has no package manager, so the fix arrives only when the base image is rebuilt (re-pulled 2026-11-03: neither the pinned digest nor the current cc-debian12 digest sha256:e5d81ddd… carries it)."
-    expired_at: 2026-12-09
+    expired_at: 2026-12-29
   - id: CVE-2026-54872
     statement: "libssl3 (ECDSA/SM2 nonce timing side-channel in generic EC scalar multiplication) in the distroless base; never loaded by the engine (readelf -d lists no libssl). Debian has since published 3.0.22-1~deb12u2, but the distroless base still ships 3.0.20 and has no package manager, so the fix arrives only when the base image is rebuilt (re-pulled 2026-11-03: neither the pinned digest nor the current cc-debian12 digest sha256:e5d81ddd… carries it)."
-    expired_at: 2026-12-09
+    expired_at: 2026-12-29
   - id: CVE-2026-77696
     statement: "libssl3 (SM2 signing timing side-channel) in the distroless base; never loaded by the engine (readelf -d lists no libssl), and the engine uses no SM2 at any layer. Debian has since published 3.0.22-1~deb12u2, but the distroless base still ships 3.0.20 and has no package manager, so the fix arrives only when the base image is rebuilt (re-pulled 2026-11-03: neither the pinned digest nor the current cc-debian12 digest sha256:e5d81ddd… carries it)."
-    expired_at: 2026-12-09
+    expired_at: 2026-12-29
   - id: CVE-2026-75805
     statement: "libssl3 (NULL dereference on a crafted CMP revocation response) in the distroless base; never loaded by the engine (readelf -d lists no libssl), which is no CMP client. Debian has since published 3.0.22-1~deb12u2, but the distroless base still ships 3.0.20 and has no package manager, so the fix arrives only when the base image is rebuilt (re-pulled 2026-11-03: neither the pinned digest nor the current cc-debian12 digest sha256:e5d81ddd… carries it)."
-    expired_at: 2026-12-09
+    expired_at: 2026-12-29
   - id: CVE-2026-75806
     statement: "libssl3 (DTLS 1.2 association terminated by an undersized record) in the distroless base; never loaded by the engine (readelf -d lists no libssl), which speaks no DTLS. Debian has since published 3.0.22-1~deb12u2, but the distroless base still ships 3.0.20 and has no package manager, so the fix arrives only when the base image is rebuilt (re-pulled 2026-11-03: neither the pinned digest nor the current cc-debian12 digest sha256:e5d81ddd… carries it)."
-    expired_at: 2026-12-09
+    expired_at: 2026-12-29
   - id: CVE-2026-35189
     statement: "libssl3 (heap growth caching X.509 CRL distribution points) in the distroless base; never loaded by the engine (readelf -d lists no libssl). Debian has since published 3.0.22-1~deb12u2, but the distroless base still ships 3.0.20 and has no package manager, so the fix arrives only when the base image is rebuilt (re-pulled 2026-11-03: neither the pinned digest nor the current cc-debian12 digest sha256:e5d81ddd… carries it)."
-    expired_at: 2026-12-09
+    expired_at: 2026-12-29
 
   # glibc — the dynamic loader and one architecture-specific string routine.
   - id: CVE-2026-86805
     statement: "glibc ld.so TOCTOU on $ORIGIN expansion in DT_RPATH, exploitable only against a setuid/setgid (AT_SECURE) program by a local attacker. The image contains no setuid/setgid binary and no shell or package manager with which to introduce one, and the engine runs as USER 10001. Debian ships no fixed package."
-    expired_at: 2026-12-09
+    expired_at: 2026-12-29
   - id: CVE-2026-95818
     statement: "glibc ld.so stack-based buffer overflow on a DT_RPATH/DT_RUNPATH prefix, again only against a setuid/setgid (AT_SECURE) program by a local attacker. Same position as CVE-2026-86805: no such program exists in this image. Debian ships no fixed package."
-    expired_at: 2026-12-09
+    expired_at: 2026-12-29
   - id: CVE-2026-97399
     statement: "glibc strncasecmp one-byte over-read. The engine DOES import strncasecmp, but the defect is in the Power8-optimized implementation (ppc64le); the published images are linux/amd64 and linux/arm64, which use a different code path. Debian ships no fixed package."
-    expired_at: 2026-12-09
+    expired_at: 2026-12-29
 
   # libstdc++ / libgomp — shipped in the base, not linked by a Rust binary.
   - id: CVE-2026-102010
     statement: "libstdc++ use-after-free in binary-heap erase_if, reported against gcc-12-base / libgcc-s1 / libgomp1 / libstdc++6. The engine links libgcc_s only — no libstdc++6, no libgomp1 — and imports no C++ symbol, so neither the container nor the erase_if code path is reachable. Debian will not fix (status: will_not_fix)."
-    expired_at: 2026-12-09
+    expired_at: 2026-12-29
   - id: CVE-2026-95619
     statement: "libstdc++ integer overflow in the aligned operator new. Same position as CVE-2026-102010: the engine links no libstdc++ and calls no C++ allocator. Debian defers the fix (status: fix_deferred)."
-    expired_at: 2026-12-09
+    expired_at: 2026-12-29
   - id: CVE-2026-114690
     statement: "libstdc++ out-of-bounds read/write in a parallel-mode algorithm, reported against gcc-12-base / libgcc-s1 / libgomp1 / libstdc++6. Same position as CVE-2026-102010: readelf on the 0.6.17 engine shows libgcc_s, libm, libc and the loader as its only libraries, and no GLIBCXX, CXXABI or GOMP import. Debian ships no fixed package (status: affected)."
-    expired_at: 2026-12-09
+    expired_at: 2026-12-29
   - id: CVE-2026-114691
     statement: "libstdc++ integer wrap, reported against the same four packages. Same position as CVE-2026-114690: the engine links no libstdc++ and imports no C++ symbol. Debian ships no fixed package (status: affected)."
-    expired_at: 2026-12-09
-  - id: CVE-2026-115455
-    statement: "libstdc++ stack overflow in std::bitset, reported against the same four packages. Same position as CVE-2026-114690: the engine links no libstdc++ and imports no C++ symbol. Debian ships no fixed package (status: affected)."
-    expired_at: 2026-12-09
+    expired_at: 2026-12-29
 
   # tzdata — a data refresh, and the only finding here with a fix we would take if we could.
   - id: DLA-4792-1
     statement: "tzdata 2026b in the distroless base; 2026c-0+deb12u1 exists. A timezone-data refresh, not an exploitable code path, and a distroless image has no package manager. The pinned digest and the current cc-debian12 digest (re-pulled 2026-11-03, sha256:e5d81ddd…) both ship 2026b, so a base bump does not clear it. The engine does not read this package either: it imports no localtime, tzset or mktime and contains no zoneinfo path, and its time-zone rules come from the database compiled into the binary."
-    expired_at: 2026-12-09
+    expired_at: 2026-12-29
   - id: DLA-4854-1
     statement: "tzdata 2026b in the distroless base; 2026e-0+deb12u1 exists. Same position as DLA-4792-1: not an exploitable code path, and a distroless image has no package manager. The pinned digest and the current cc-debian12 digest (re-pulled 2026-11-03, sha256:e5d81ddd…) both ship 2026b, so a base bump does not clear it. The engine does not read this package either: it imports no localtime, tzset or mktime and contains no zoneinfo path, and its time-zone rules come from the database compiled into the binary."
-    expired_at: 2026-12-09
+    expired_at: 2026-12-29
   - id: DLA-4867-1
     statement: "tzdata 2026b in the distroless base; 2026f-0+deb12u1 exists. Same position as DLA-4792-1: not an exploitable code path, and a distroless image has no package manager. The pinned digest and the current cc-debian12 digest (re-pulled 2026-11-03, sha256:e5d81ddd…) both ship 2026b, so a base bump does not clear it. The engine does not read this package either: it imports no localtime, tzset or mktime and contains no zoneinfo path, and its time-zone rules come from the database compiled into the binary."
-    expired_at: 2026-12-09
+    expired_at: 2026-12-29
 
   # ---- Published since the 2026-11-03 triage; triaged 2026-11-13 for the 0.6.21 cut ---------
   # Re-checked on the 0.6.21 binary: `readelf -d` lists libgcc_s, libm, libc and the loader only;
@@ -208,25 +210,13 @@ vulnerabilities:
   # RENEWAL CHECK: re-pull the base and re-scan; check for a newer openssl-src 300.x.
   - id: CVE-2026-100290
     statement: "libc6 (glibc) regcomp/regexec double free when an allocation fails mid-compile. The engine imports regcomp and regexec only through the bundled Kafka client (librdkafka's rdregex), which compiles a pattern only when a subscribed topic starts with ^; the pattern comes from the deployment's own channel configuration, never from a message. Reaching it also needs an allocation failure at a specific point (memory exhaustion), so the worst case is a crash of an engine already out of memory. Debian ships no fixed package."
-    expired_at: 2026-12-09
+    expired_at: 2026-12-29
   - id: CVE-2026-115819
     statement: "libc6 (glibc) wide scanf (%s/%[ into a char array) writes one null byte past the destination. The engine imports no wide-scanf function (readelf --dyn-syms); its only scanf import is the narrow sscanf, which the advisory states is not affected. Debian ships no fixed package."
-    expired_at: 2026-12-09
+    expired_at: 2026-12-29
   - id: CVE-2026-107496
     statement: "libssl3 CMS_encrypt infinite loop on an EC recipient certificate with group order 1. The engine never loads libssl3 (readelf -d lists no libssl), and neither it nor the Kafka client's compiled-in OpenSSL 3.6.3 performs CMS encryption; the advisory states TLS does not use this path. Debian ships no fixed package."
-    expired_at: 2026-12-09
-  - id: CVE-2026-88822
-    statement: "libssl3 QUIC peer-address auto-detection leaks uninitialised stack data. The engine never loads libssl3 (readelf -d lists no libssl), and the Kafka client's compiled-in OpenSSL 3.6.3 runs TLS over TCP only, never QUIC. Debian ships no fixed package."
-    expired_at: 2026-12-09
-  - id: CVE-2026-88823
-    statement: "libssl3 AES-GCM-SIV treats an empty AAD update as a reset. The engine never loads libssl3 (readelf -d lists no libssl); no TLS cipher suite uses AES-GCM-SIV, and neither the engine nor the Kafka client's compiled-in OpenSSL 3.6.3 calls it directly. Debian ships no fixed package."
-    expired_at: 2026-12-09
-  - id: CVE-2026-95691
-    statement: "libssl3 QUIC client use-after-free on a retransmitted CRYPTO frame. The engine never loads libssl3 (readelf -d lists no libssl), and the Kafka client's compiled-in OpenSSL 3.6.3 runs TLS over TCP only, never QUIC. Debian ships no fixed package."
-    expired_at: 2026-12-09
-  - id: CVE-2026-95692
-    statement: "libssl3 AES-GCM-SIV out-of-bounds read on a short IV via EVP_CipherInit_ex. The engine never loads libssl3 (readelf -d lists no libssl); no TLS cipher suite uses AES-GCM-SIV, and neither the engine nor the Kafka client's compiled-in OpenSSL 3.6.3 calls it directly. Debian ships no fixed package."
-    expired_at: 2026-12-09
+    expired_at: 2026-12-29
 
   # ---- Published 2026-11-17; triaged 2026-11-19 for the 0.6.25 cut --------------------------
   # Checked on the 0.6.25 binary: `readelf -d` lists libgcc_s, libm, libc and the loader only (no
@@ -237,22 +227,16 @@ vulnerabilities:
   # SSL_ or PEM_ import (only the four weak AWS-LC OPENSSL_memory_* hooks), no libssl name.
   - id: CVE-2026-121757
     statement: "libc6 (glibc) iconv CP949 decoder over-read with //IGNORE. The engine imports no iconv function (readelf --dyn-syms: no iconv, iconv_open or gconv symbol); its text decoding is Rust code compiled into the binary. Debian ships no fixed package."
-    expired_at: 2026-12-16
+    expired_at: 2026-12-29
   - id: CVE-2026-121758
     statement: "libc6 (glibc) iconv ISO-2022-CN-EXT decoder over-read. Same position as CVE-2026-121757: the engine imports no iconv function. Debian ships no fixed package."
-    expired_at: 2026-12-16
+    expired_at: 2026-12-29
   - id: CVE-2026-124024
     statement: "libc6 (glibc) iconv UCS-4 to IBM1390/IBM1399 encoder over-read. Same position as CVE-2026-121757: the engine imports no iconv function. Debian ships no fixed package."
-    expired_at: 2026-12-16
+    expired_at: 2026-12-29
   - id: CVE-2026-107493
     statement: "libssl3 PEM_X509_INFO_read_bio_ex frees entries of a caller-supplied stack on a failed read. The engine never loads libssl3 (readelf -d lists no libssl). The Kafka client's compiled-in OpenSSL 3.6.3 is only reached through librdkafka, which never calls PEM_X509_INFO_read_bio_ex, and the advisory states OpenSSL itself never passes an existing stack. Debian ships no fixed package."
-    expired_at: 2026-12-16
-  - id: CVE-2026-124709
-    statement: "libssl3 QUIC server retains rejected stream state. The engine never loads libssl3 (readelf -d lists no libssl), and the Kafka client's compiled-in OpenSSL 3.6.3 runs TLS over TCP as a client only, never QUIC and never a server. Debian ships no fixed package."
-    expired_at: 2026-12-16
-  - id: CVE-2026-35190
-    statement: "libssl3 TLS 1.3 server with the Suite B certificate flag over-reads a group list. The engine never loads libssl3 (readelf -d lists no libssl), and the Kafka client's compiled-in OpenSSL 3.6.3 is a TLS client only; librdkafka never calls SSL_CTX_set_cert_flags. Debian ships no fixed package."
-    expired_at: 2026-12-16
+    expired_at: 2026-12-29
 
   # ---- Published 2026-11-19, after the 0.7.0 cut; triaged 2026-11-19 for the 0.8.0 cut ---------
   # It stopped the 0.7.0 release run at the image scan, so 0.7.0 published no image. Checked on the
@@ -261,13 +245,13 @@ vulnerabilities:
   # the 0.8.3 binary (2026-11-22), with the same result.
   - id: CVE-2026-126765
     statement: "libc6 (glibc) glob functions, in the distroless base. The engine does not import glob, glob64, globfree or fnmatch: readelf --dyn-syms on the 0.8.3 binary lists none of them (it links libgcc_s, libm, libc and the loader only), and the image has no shell or other program that would call them. Debian ships no fixed package (status: affected)."
-    expired_at: 2026-12-16
+    expired_at: 2026-12-29
   - id: CVE-2026-84786
     statement: "libssl3 (a DANE-enabled TLS client may dereference a NULL pointer) in the distroless base. The engine never loads libssl3: readelf -d on the 0.8.1 binary names libgcc_s, libm, libc and the loader only, and the binary contains no libssl or libcrypto name for dlopen. Nothing in it enables DANE: rustls has no DANE, and the Kafka client's compiled-in OpenSSL 3.6.3 is used only by librdkafka 2.12.1, which never calls SSL_dane_enable or SSL_CTX_dane_enable (no DANE reference in its source), and no workspace crate uses the openssl bindings. Debian ships no fixed package (status: affected)."
-    expired_at: 2026-12-16
+    expired_at: 2026-12-29
   - id: CVE-2026-95690
     statement: "libssl3 (crafted out-of-sequence DTLS handshake fragments) in the distroless base. The engine never loads libssl3: readelf -d on the 0.8.0 binary names libgcc_s, libm, libc and the loader only, and the binary contains no libssl or libcrypto name for dlopen. Nothing in it speaks DTLS: rustls has no DTLS, and the Kafka client's compiled-in OpenSSL 3.6.3 runs TLS over TCP as a client only. Debian ships no fixed package (status: affected)."
-    expired_at: 2026-12-16
+    expired_at: 2026-12-29
 
   # ---- Published by the Trivy DB of 2026-11-22; triaged 2026-11-22 for the 0.8.3 cut -----------
   # Found by the 0.8.3 release image scan (DB UpdatedAt 2026-11-22T01:10:45Z). Checked on the 0.8.3
@@ -278,7 +262,17 @@ vulnerabilities:
   # parts of a few hundred bytes. Expires with the 0.6.25 batch.
   - id: CVE-2026-121482
     statement: "libssl3 denial of service on a crafted CMS or PKCS#7 SignedData message, in the distroless base. The engine never loads libssl3: readelf -d on the 0.8.3 binary names libgcc_s, libm, libc and the loader only, and the binary holds no libssl or libcrypto name for dlopen. Nothing in it parses CMS or PKCS#7: rustls does not, and the Kafka client's compiled-in OpenSSL is used by librdkafka, which calls no PKCS7_ or CMS_ function. Debian ships no fixed package (status: affected)."
-    expired_at: 2026-12-16
+    expired_at: 2026-12-29
   - id: CVE-2026-121481
     statement: "libssl3 out-of-bounds write through an integer overflow in EVP_EncodeBlock, in the distroless base. The engine never loads libssl3: readelf -d on the 0.8.3 binary names libgcc_s, libm, libc and the loader only, and the binary holds no libssl or libcrypto name for dlopen. The Kafka client's compiled-in OpenSSL is reached only through librdkafka's rd_base64_encode, which refuses input over INT_MAX and encodes SASL/SCRAM proofs and OAUTHBEARER token parts of a few hundred bytes, far below an overflowing length. Debian ships no fixed package (status: affected)."
-    expired_at: 2026-12-16
+    expired_at: 2026-12-29
+
+  # ---- Published by the Trivy DB of 2026-11-24; triaged 2026-11-24 for the 0.8.6 cut -----------
+  # libssl3 3.0.20 in the distroless base, status affected, no Debian fix. Checked on the 0.8.6
+  # binary: `readelf -d` lists libgcc_s, libm, libc and the loader only, and the binary holds no
+  # libssl or libcrypto name to load at run time. The Kafka client's compiled-in OpenSSL is a TLS
+  # client over TCP and runs no QUIC.
+  # RENEWAL CHECK: re-pull the base and re-scan; repeat the readelf checks on the new binary.
+  - id: CVE-2026-107494
+    statement: "libssl3 unbounded QUIC frame queueing (HIGH). Not reachable: the engine never loads the base image's libssl3 (readelf -d on the 0.8.6 binary lists libgcc_s, libm, libc and the loader only) and implements no QUIC listener; the Kafka client's compiled-in OpenSSL is a TCP TLS client. Debian ships no fixed package."
+    expired_at: 2026-12-29

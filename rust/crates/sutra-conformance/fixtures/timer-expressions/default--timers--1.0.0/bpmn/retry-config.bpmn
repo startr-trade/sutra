@@ -5,7 +5,7 @@
   <!-- A channel-call nobody answers: its route-less q:timeout (PT1S) is a retryable failure, and
        the backoff before the second attempt is config.retryDelay. Two attempts, then FAILED. -->
   <bpmn:process id="te-retry-config" isExecutable="true">
-    <bpmn:extensionElements><q:audit capture="metadata"/></bpmn:extensionElements>
+    <bpmn:extensionElements><q:audit events="all" capture="metadata"/></bpmn:extensionElements>
     <bpmn:startEvent id="RetryStart">
       <bpmn:extensionElements>
         <q:source channel="te-retry"/>

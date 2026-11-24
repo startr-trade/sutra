@@ -3,6 +3,8 @@
 #[path = "all/common/mod.rs"]
 mod common;
 
+#[path = "all/audit_plan_runtime.rs"]
+mod audit_plan_runtime;
 #[path = "all/channel_call_retry_test.rs"]
 mod channel_call_retry_test;
 #[path = "all/channel_call_timer_test.rs"]

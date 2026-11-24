@@ -31,8 +31,9 @@
 //!
 //! The instance-HISTORY route is admin-only for the same reason: an audit row can carry the
 //! payload a process captured at a node. It reads the `audit_event` journal the engine has always
-//! written and never exposed; the journal itself stays opt-in (`sutra.audit.sql` + `<q:audit>`),
-//! and an empty page names which switch left it empty rather than implying history was lost.
+//! written and never exposed, from the SQL audit store's own database (`sutra.audit.sql.url`;
+//! `409` without one), and an empty page names why it is empty rather than implying history was
+//! lost.
 //!
 //! **Descoped (documented):** deployment *retire/undeploy* is intentionally NOT an admin control.
 //! The Rust engine's deployment lifecycle is filesystem-driven — the sealed-`.sutra` directory is
@@ -629,8 +630,8 @@ async fn admin_instance_by_alias(
 
 /// `GET /admin/instances/{id}/history` — one page of the instance's `audit_event` journal
 /// (`?afterOrdinal=` cursor, or the legacy `?afterSeq=`; `?limit=`). Admin-only: audit rows carry captured business
-/// payloads. The journal is OPT-IN (`sutra.audit.sql` + `<q:audit>`); an empty page says which
-/// switch left it empty rather than implying the history was lost.
+/// payloads. Read from the SQL audit store (`409` without one); an empty page says why it is
+/// empty rather than implying the history was lost.
 async fn admin_instance_history(
     State(state): State<AppState>,
     Path(id): Path<String>,

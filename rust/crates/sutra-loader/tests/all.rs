@@ -25,6 +25,8 @@ mod lint_navigation_test;
 mod lint_never_init_test;
 #[path = "all/lint_output_conformance_test.rs"]
 mod lint_output_conformance_test;
+#[path = "all/lint_queue_dedup_test.rs"]
+mod lint_queue_dedup_test;
 #[path = "all/lint_raw_body_test.rs"]
 mod lint_raw_body_test;
 #[path = "all/lint_receipt_attribute_test.rs"]
@@ -59,8 +61,8 @@ mod lint_variable_nav_test;
 mod lint_variable_schema_test;
 #[path = "all/lint_variable_spelling_test.rs"]
 mod lint_variable_spelling_test;
-#[path = "all/package_audit_default.rs"]
-mod package_audit_default;
+#[path = "all/manifest_audit.rs"]
+mod manifest_audit;
 #[path = "all/package_examples.rs"]
 mod package_examples;
 #[path = "all/package_overlay_test.rs"]

@@ -9,6 +9,7 @@
 
 pub mod admin;
 pub mod assembly;
+pub(crate) mod audit_recovery;
 pub mod audit_sinks;
 pub mod bridge;
 pub mod capacity;
@@ -53,4 +54,30 @@ pub use otel::{Telemetry, TelemetryConfig};
 pub use server::{serve, RunningEngine};
 pub use sweeper::{StuckInstanceScanner, StuckInstanceScannerConfig, INSTANCE_SWEEPER_ROLE};
 pub use test_clock::{fast_forward_until, TestClock};
-pub use timer::{spawn_timer_poller, TimerPollerConfig, TIMER_LEADER_ROLE};
+pub use timer::{
+    spawn_timer_poller, TimerPollerConfig, TimerWorkCounters, TimerWorkSnapshot, TIMER_LEADER_ROLE,
+};
+
+/// The engine's work counts, both background loops at once: the outbox dispatcher's claims,
+/// sends and deliveries, and the timer poller's claims and fires. Read it with
+/// [`RunningEngine::work_counters`]; subtract two for the work done in between. A loop the
+/// engine did not start (no persistence) reads all zeros.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EngineWorkSnapshot {
+    /// The outbox dispatcher's counts.
+    pub outbox: sutra_channels::OutboxWorkSnapshot,
+    /// The timer poller's counts.
+    pub timer: TimerWorkSnapshot,
+}
+
+impl std::ops::Sub for EngineWorkSnapshot {
+    type Output = EngineWorkSnapshot;
+
+    /// The work done between `rhs` (earlier) and `self` (later).
+    fn sub(self, rhs: EngineWorkSnapshot) -> EngineWorkSnapshot {
+        EngineWorkSnapshot {
+            outbox: self.outbox - rhs.outbox,
+            timer: self.timer - rhs.timer,
+        }
+    }
+}

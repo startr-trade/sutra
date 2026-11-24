@@ -125,6 +125,35 @@ pub fn release_network(network: &str) -> bool {
     remove_network(network)
 }
 
+/// A docker network owned by one test, removed when the test ends (pass, fail or panic), not only
+/// when the process exits. Many per-test networks in one process otherwise exhaust the daemon's
+/// address pools. Still registered for the exit hook, as a backstop. Only for a network the test
+/// created itself: everything attached to it is removed with it.
+#[derive(Debug)]
+pub struct NetworkGuard {
+    name: String,
+}
+
+impl NetworkGuard {
+    /// Take ownership of the already created network `name`.
+    pub fn new(name: impl Into<String>) -> Self {
+        let name = name.into();
+        reap_network_on_exit(name.clone());
+        Self { name }
+    }
+
+    /// The network's name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+impl Drop for NetworkGuard {
+    fn drop(&mut self) {
+        release_network(&self.name);
+    }
+}
+
 fn remove_network(network: &str) -> bool {
     let attached = Command::new("docker")
         .args(["ps", "-aq", "--filter", &format!("network={network}")])

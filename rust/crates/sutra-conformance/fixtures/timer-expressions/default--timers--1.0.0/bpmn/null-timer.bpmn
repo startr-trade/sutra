@@ -5,7 +5,7 @@
   <!-- A first literal wait, then a timer whose expression reads a field the request never has:
        it is null when armed, so the instance fails once. -->
   <bpmn:process id="te-null-timer" isExecutable="true">
-    <bpmn:extensionElements><q:audit capture="metadata"/></bpmn:extensionElements>
+    <bpmn:extensionElements><q:audit events="all" capture="metadata"/></bpmn:extensionElements>
     <bpmn:startEvent id="NullStart">
       <bpmn:extensionElements>
         <q:source channel="te-null"/>

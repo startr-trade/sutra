@@ -4,7 +4,7 @@
 //! and per-element `<q:audit>` — well-formed parses plus the `SUTRA.PARSE.Q_*` diagnostics.
 
 use sutra_bpmn::qbindings::{
-    AckMode, AliasConflict, AuditCapture, DataClass, OnNoMatch, OnValidationMode,
+    AckMode, AliasConflict, AuditCapture, AuditEventScope, DataClass, OnNoMatch, OnValidationMode,
     OutboundAuthScheme, ReplyMode,
 };
 use sutra_bpmn::{codes, BpmnModelLoader, ProcessModule, SutraError};
@@ -812,48 +812,165 @@ fn header_without_value_emits_diagnostic() {
 
 // ===== per-element <q:audit> =====
 
-#[test]
-fn parses_per_node_audit() {
-    let bpmn = r#"<?xml version="1.0"?>
+fn audit_process(process_ext: &str, node_ext: &str) -> String {
+    format!(
+        r#"<?xml version="1.0"?>
         <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
                           xmlns:q="urn:sutra:q:1.0">
           <bpmn:process id="p1">
+            <bpmn:extensionElements>{process_ext}</bpmn:extensionElements>
             <bpmn:startEvent id="S"/>
-            <bpmn:serviceTask id="Sensitive" implementation="${redactor}">
-              <bpmn:extensionElements>
-                <q:audit sink="kafka" target="audit.sensitive" capture="metadata"/>
-              </bpmn:extensionElements>
+            <bpmn:serviceTask id="T" implementation="${{t}}">
+              <bpmn:extensionElements>{node_ext}</bpmn:extensionElements>
             </bpmn:serviceTask>
             <bpmn:endEvent id="E"/>
-            <bpmn:sequenceFlow id="f1" sourceRef="S" targetRef="Sensitive"/>
-            <bpmn:sequenceFlow id="f2" sourceRef="Sensitive" targetRef="E"/>
+            <bpmn:sequenceFlow id="f1" sourceRef="S" targetRef="T"/>
+            <bpmn:sequenceFlow id="f2" sourceRef="T" targetRef="E"/>
           </bpmn:process>
-        </bpmn:definitions>"#;
-    let module = load(bpmn).unwrap();
+        </bpmn:definitions>"#
+    )
+}
+
+#[test]
+fn parses_per_node_audit() {
+    let module = load(&audit_process("", r#"<q:audit capture="none"/>"#)).unwrap();
     let process = module.process("p1").unwrap();
-    let audit = process.bindings_for("Sensitive").audit.clone().unwrap();
-    assert_eq!(audit.sink, "kafka");
-    assert_eq!(audit.target.as_deref(), Some("audit.sensitive"));
-    assert_eq!(audit.capture, AuditCapture::Metadata);
+    let audit = process.bindings_for("T").audit.clone().unwrap();
+    assert_eq!(audit.capture, AuditCapture::None);
+    // A node-level q:audit declares nothing for the process.
+    assert!(process.audit.is_none());
 }
 
 #[test]
 fn process_audit_capture_media_parses() {
-    let bpmn = r#"<?xml version="1.0"?>
-        <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
-                          xmlns:q="urn:sutra:q:1.0">
-          <bpmn:process id="p1">
-            <bpmn:extensionElements><q:audit capture="media"/></bpmn:extensionElements>
-            <bpmn:startEvent id="S"/>
-            <bpmn:endEvent id="E"/>
-            <bpmn:sequenceFlow id="f1" sourceRef="S" targetRef="E"/>
-          </bpmn:process>
-        </bpmn:definitions>"#;
-    let module = load(bpmn).unwrap();
+    let module = load(&audit_process(r#"<q:audit capture="media"/>"#, "")).unwrap();
     let audit = module.process("p1").unwrap().audit.clone().unwrap();
     assert_eq!(audit.capture, AuditCapture::Media);
     assert_eq!(audit.capture.as_str(), "media");
-    assert_eq!(audit.sink, "sql");
+    // The destination is the deployment's, resolved at deploy.
+    assert_eq!(audit.sink, None);
+}
+
+/// A bare `<q:audit/>` declares audit with the documented defaults.
+#[test]
+fn bare_audit_defaults_points_metadata() {
+    let module = load(&audit_process("<q:audit/>", "")).unwrap();
+    let audit = module.process("p1").unwrap().audit.clone().unwrap();
+    assert_eq!(audit.events, AuditEventScope::Points);
+    assert_eq!(audit.capture, AuditCapture::Metadata);
+    assert_eq!(audit.sink, None);
+    assert_eq!(audit, sutra_bpmn::ProcessAudit::declared_default());
+}
+
+#[test]
+fn audit_events_attribute_parses() {
+    for (text, scope) in [
+        ("all", AuditEventScope::All),
+        ("points", AuditEventScope::Points),
+        ("instance", AuditEventScope::Instance),
+    ] {
+        let ext = format!(r#"<q:audit events="{text}"/>"#);
+        let module = load(&audit_process(&ext, "")).unwrap();
+        let audit = module.process("p1").unwrap().audit.clone().unwrap();
+        assert_eq!(audit.events, scope, "{text}");
+        assert_eq!(scope.as_str(), text);
+        assert_eq!(AuditEventScope::parse(&format!(" {text} ")), Some(scope));
+    }
+    assert_eq!(AuditEventScope::parse(""), None);
+}
+
+#[test]
+fn audit_events_invalid_rejected() {
+    assert_load_fails_with_code(
+        &audit_process(r#"<q:audit events="some"/>"#, ""),
+        codes::BPMN_AUDIT_EVENTS_INVALID,
+    );
+}
+
+#[test]
+fn audit_sink_attribute_rejected() {
+    let e = load(&audit_process(r#"<q:audit sink="jsonl"/>"#, "")).unwrap_err();
+    assert_eq!(e.code, codes::BPMN_AUDIT_SINK_REMOVED, "{e}");
+    assert!(e.to_string().contains("sutra lint --fix audit"), "{e}");
+}
+
+#[test]
+fn audit_target_attribute_rejected() {
+    assert_load_fails_with_code(
+        &audit_process(r#"<q:audit target="audit.topic"/>"#, ""),
+        codes::BPMN_AUDIT_SINK_REMOVED,
+    );
+}
+
+#[test]
+fn node_audit_sink_rejected() {
+    assert_load_fails_with_code(
+        &audit_process("", r#"<q:audit sink="sql" capture="none"/>"#),
+        codes::BPMN_AUDIT_SINK_REMOVED,
+    );
+}
+
+/// A version-only `<q:audit>` is still the pin, and now also declares audit.
+#[test]
+fn version_only_audit_declares_audit() {
+    let module = load(&audit_process(r#"<q:audit version="2.0"/>"#, "")).unwrap();
+    let process = module.process("p1").unwrap();
+    assert_eq!(process.module_version, "2.0");
+    assert_eq!(
+        process.audit.clone(),
+        Some(sutra_bpmn::ProcessAudit::declared_default())
+    );
+    let sources =
+        sutra_bpmn::scan_audit_sources(audit_process(r#"<q:audit version="2.0"/>"#, "").as_bytes())
+            .unwrap();
+    assert!(sources[0].is_version_only());
+}
+
+/// An empty `capture` is `metadata`, at the process and on a node.
+#[test]
+fn empty_capture_is_metadata() {
+    let module = load(&audit_process(
+        r#"<q:audit capture=""/>"#,
+        r#"<q:audit capture=""/>"#,
+    ))
+    .unwrap();
+    let process = module.process("p1").unwrap();
+    assert_eq!(
+        process.audit.as_ref().unwrap().capture,
+        AuditCapture::Metadata
+    );
+    assert_eq!(
+        process.bindings_for("T").audit.as_ref().unwrap().capture,
+        AuditCapture::Metadata
+    );
+}
+
+/// The XSD's documented `capture` default is the loader's.
+#[test]
+fn xsd_capture_default_matches_loader() {
+    let xsd = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../xsd/q.xsd"),
+    )
+    .expect("xsd/q.xsd");
+    let start = xsd.find(r#"<xsd:complexType name="AuditType">"#).unwrap();
+    let body = &xsd[start..start + xsd[start..].find("</xsd:complexType>").unwrap()];
+    let attr = &body[body.find(r#"name="capture""#).unwrap()..];
+    let default = attr
+        .split("default=\"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .expect("capture has a default");
+    let module = load(&audit_process("<q:audit/>", "")).unwrap();
+    let loader_default = module
+        .process("p1")
+        .unwrap()
+        .audit
+        .as_ref()
+        .unwrap()
+        .capture;
+    assert_eq!(default, loader_default.as_str());
+    let events = &body[body.find(r#"name="events""#).unwrap()..];
+    assert!(events.contains(r#"default="points""#), "{events}");
 }
 
 #[test]
@@ -879,10 +996,11 @@ fn per_node_audit_does_not_collide_with_process_level_audit_version() {
     let module = load(bpmn).unwrap();
     let process = module.process("p1").unwrap();
     assert_eq!(process.module_version, "3.2.1");
+    // The version-only process-level tag also declares audit.
+    assert!(process.audit.is_some());
     let node_audit = process.bindings_for("T").audit.clone().unwrap();
     assert_eq!(node_audit.capture, AuditCapture::None);
-    assert_eq!(node_audit.sink, "sql"); // default per xsd/q.xsd#AuditType
-                                        // The Start event has no per-node q:audit overlay — its bindings are empty.
+    // The Start event has no per-node q:audit overlay — its bindings are empty.
     assert!(process.bindings_for("S").audit.is_none());
 }
 
@@ -899,7 +1017,7 @@ fn multiple_q_elements_on_one_start_event_coexist() {
                 <q:source channel="orders.in" ack="on-complete" dataClass="financial"/>
                 <q:onValidation mode="reject"/>
                 <q:alias name="orderId" expression="payload.orderId" unique="true"/>
-                <q:audit sink="sql" capture="payload"/>
+                <q:audit capture="payload"/>
               </bpmn:extensionElements>
             </bpmn:startEvent>
             <bpmn:endEvent id="End"/>

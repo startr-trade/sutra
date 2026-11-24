@@ -2,6 +2,13 @@
 //! stream (one JSON object per line: `instanceId`, `tenant`, `eventType`, `at`, `nodeId`)
 //! so an operator can retrace a production run locally. Reads a file or a directory of
 //! `.jsonl` files; database-backed sources ride the later admin surface.
+//!
+//! Unknown keys are ignored. An event appears once even if the files hold it twice (a record
+//! shipped twice): lines are deduplicated on `(deploymentId, instanceId, seq, attemptId)`, the
+//! first occurrence winning. A step re-run after a failed or lost commit re-emits its seqs under
+//! a new attempt; per `(deploymentId, attemptBase)` only the latest attempt's lines are shown
+//! (`attemptAt`, then `attemptId`): an earlier attempt from the same base never committed. A line
+//! without a positive `seq` (a transport event) is never deduplicated or superseded.
 
 use std::path::{Path, PathBuf};
 
@@ -62,9 +69,15 @@ pub fn execute(args: AuditReplayArgs, global: &GlobalArgs, io: &mut Io<'_>) -> i
         }
     };
 
-    let mut events: Vec<AuditEvent> = Vec::new();
-    let mut stopped = false;
-    'files: for file in &files {
+    // Every matching line first: which attempt wins is known only once all files are read.
+    struct Line {
+        deployment: String,
+        attempt: Option<sutra_channels::AuditAttempt>,
+        event: AuditEvent,
+    }
+    let mut lines: Vec<Line> = Vec::new();
+    let mut seen: std::collections::HashSet<(String, u64, String)> = Default::default();
+    for file in &files {
         let body = match std::fs::read_to_string(file) {
             Ok(b) => b,
             Err(e) => {
@@ -92,28 +105,65 @@ pub fn execute(args: AuditReplayArgs, global: &GlobalArgs, io: &mut Io<'_>) -> i
                     continue;
                 }
             }
-            let event = AuditEvent {
-                at: value
-                    .get("at")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("-")
-                    .to_owned(),
-                event_type: value
-                    .get("eventType")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("-")
-                    .to_owned(),
-                node_id: value
-                    .get("nodeId")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_owned),
+            let text = |key: &str| value.get(key).and_then(|v| v.as_str()).map(str::to_owned);
+            let deployment = text("deploymentId").unwrap_or_default();
+            let seq = value.get("seq").and_then(|v| v.as_u64()).filter(|s| *s > 0);
+            let attempt = match (text("attemptId"), seq) {
+                (Some(id), Some(_)) => Some(sutra_channels::AuditAttempt {
+                    id,
+                    base: value
+                        .get("attemptBase")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as u32,
+                    at: text("attemptAt").unwrap_or_default(),
+                }),
+                _ => None,
             };
-            let hit_until = args.until.as_deref() == Some(event.event_type.as_str());
-            events.push(event);
-            if hit_until {
-                stopped = true;
-                break 'files;
+            if let Some(seq) = seq {
+                let attempt_id = attempt.as_ref().map(|a| a.id.clone()).unwrap_or_default();
+                if !seen.insert((deployment.clone(), seq, attempt_id)) {
+                    continue;
+                }
             }
+            lines.push(Line {
+                deployment,
+                attempt,
+                event: AuditEvent {
+                    at: text("at").unwrap_or_else(|| "-".to_owned()),
+                    event_type: text("eventType").unwrap_or_else(|| "-".to_owned()),
+                    node_id: text("nodeId"),
+                },
+            });
+        }
+    }
+    // The latest attempt per (deployment, base): the others never committed.
+    let mut latest: std::collections::HashMap<(String, u32), sutra_channels::AuditAttempt> =
+        Default::default();
+    for line in &lines {
+        if let Some(a) = &line.attempt {
+            let key = (line.deployment.clone(), a.base);
+            match latest.get(&key) {
+                Some(current) if !a.is_later_than(current) => {}
+                _ => {
+                    latest.insert(key, a.clone());
+                }
+            }
+        }
+    }
+    let mut events: Vec<AuditEvent> = Vec::new();
+    let mut stopped = false;
+    for line in lines {
+        if let Some(a) = &line.attempt {
+            let winner = latest.get(&(line.deployment.clone(), a.base));
+            if winner.is_some_and(|w| w.id != a.id) {
+                continue;
+            }
+        }
+        let hit_until = args.until.as_deref() == Some(line.event.event_type.as_str());
+        events.push(line.event);
+        if hit_until {
+            stopped = true;
+            break;
         }
     }
 
@@ -305,5 +355,87 @@ mod tests {
         });
         assert_eq!(code, crate::exit::OK);
         assert!(out.contains("(1 events shown)"), "{out}");
+    }
+
+    #[test]
+    fn audit_replay_ignores_unknown_keys() {
+        let jsonl = scratch_file(
+            "unknown-keys.jsonl",
+            concat!(
+                "{\"instanceId\":\"inst-4\",\"deploymentId\":\"dep-1\",\"seq\":1,\"eventType\":\"INSTANCE_STARTED\",\"at\":\"t1\",\"spoolRef\":\"s:1\",\"diagnosticJson\":null,\"future\":{\"x\":1}}\n",
+                "{\"instanceId\":\"inst-4\",\"deploymentId\":\"dep-1\",\"seq\":2,\"eventType\":\"INSTANCE_COMPLETED\",\"at\":\"t2\",\"spoolRef\":\"s:2\"}\n",
+            ),
+        );
+        let (code, out, _) = run(AuditReplayArgs {
+            instance_id: "inst-4".into(),
+            from_jsonl: Some(jsonl),
+            tenant: None,
+            until: None,
+        });
+        assert_eq!(code, crate::exit::OK);
+        assert!(out.contains("(2 events shown)"), "{out}");
+    }
+
+    #[test]
+    fn audit_replay_dedups_seq() {
+        let jsonl = scratch_file(
+            "dedup.jsonl",
+            concat!(
+                "{\"instanceId\":\"inst-5\",\"deploymentId\":\"dep-1\",\"seq\":1,\"eventType\":\"INSTANCE_STARTED\",\"at\":\"first\"}\n",
+                "{\"instanceId\":\"inst-5\",\"deploymentId\":\"dep-1\",\"seq\":1,\"eventType\":\"INSTANCE_STARTED\",\"at\":\"replayed\"}\n",
+                "{\"instanceId\":\"inst-5\",\"deploymentId\":\"dep-2\",\"seq\":1,\"eventType\":\"INSTANCE_STARTED\",\"at\":\"other-deployment\"}\n",
+                "{\"instanceId\":\"inst-5\",\"deploymentId\":\"dep-1\",\"seq\":0,\"eventType\":\"media.CALL\",\"at\":\"transport-a\"}\n",
+                "{\"instanceId\":\"inst-5\",\"deploymentId\":\"dep-1\",\"seq\":0,\"eventType\":\"media.CALL\",\"at\":\"transport-b\"}\n",
+            ),
+        );
+        let (code, out, _) = run(AuditReplayArgs {
+            instance_id: "inst-5".into(),
+            from_jsonl: Some(jsonl),
+            tenant: None,
+            until: None,
+        });
+        assert_eq!(code, crate::exit::OK);
+        assert!(out.contains("first"), "{out}");
+        assert!(
+            !out.contains("replayed"),
+            "the first occurrence wins: {out}"
+        );
+        assert!(out.contains("other-deployment"), "{out}");
+        assert!(
+            out.contains("transport-a") && out.contains("transport-b"),
+            "{out}"
+        );
+        assert!(out.contains("(4 events shown)"), "{out}");
+    }
+
+    /// A step re-run after a lost commit took another path. The files hold both attempts;
+    /// the replay shows only the later (committed) one, and a record shipped twice once.
+    #[test]
+    fn replayed_step_with_different_path_keeps_committed_audit() {
+        let jsonl = scratch_file(
+            "attempts.jsonl",
+            concat!(
+                "{\"instanceId\":\"inst-7\",\"deploymentId\":\"dep-1\",\"seq\":1,\"eventType\":\"INSTANCE_STARTED\",\"at\":\"start\",\"attemptId\":\"a0\",\"attemptBase\":0,\"attemptAt\":\"2026-11-24T10:00:00Z\"}\n",
+                "{\"instanceId\":\"inst-7\",\"deploymentId\":\"dep-1\",\"seq\":2,\"eventType\":\"INSTANCE_SUSPENDED\",\"at\":\"park\",\"attemptId\":\"a0\",\"attemptBase\":0,\"attemptAt\":\"2026-11-24T10:00:00Z\"}\n",
+                "{\"instanceId\":\"inst-7\",\"deploymentId\":\"dep-1\",\"seq\":3,\"eventType\":\"NODE_LEFT\",\"nodeId\":\"TimerPath\",\"at\":\"lost-1\",\"attemptId\":\"a1\",\"attemptBase\":2,\"attemptAt\":\"2026-11-24T10:01:00Z\"}\n",
+                "{\"instanceId\":\"inst-7\",\"deploymentId\":\"dep-1\",\"seq\":4,\"eventType\":\"NODE_LEFT\",\"nodeId\":\"TimerPath2\",\"at\":\"lost-2\",\"attemptId\":\"a1\",\"attemptBase\":2,\"attemptAt\":\"2026-11-24T10:01:00Z\"}\n",
+                "{\"instanceId\":\"inst-7\",\"deploymentId\":\"dep-1\",\"seq\":3,\"eventType\":\"NODE_LEFT\",\"nodeId\":\"ReplyPath\",\"at\":\"kept\",\"attemptId\":\"a2\",\"attemptBase\":2,\"attemptAt\":\"2026-11-24T10:02:00.5Z\"}\n",
+                "{\"instanceId\":\"inst-7\",\"deploymentId\":\"dep-1\",\"seq\":3,\"eventType\":\"NODE_LEFT\",\"nodeId\":\"ReplyPath\",\"at\":\"kept-twice\",\"attemptId\":\"a2\",\"attemptBase\":2,\"attemptAt\":\"2026-11-24T10:02:00.5Z\"}\n",
+                "{\"instanceId\":\"inst-7\",\"deploymentId\":\"dep-1\",\"seq\":0,\"eventType\":\"media.CALL\",\"at\":\"transport\"}\n",
+            ),
+        );
+        let (code, out, _) = run(AuditReplayArgs {
+            instance_id: "inst-7".into(),
+            from_jsonl: Some(jsonl),
+            tenant: None,
+            until: None,
+        });
+        assert_eq!(code, crate::exit::OK);
+        assert!(out.contains("start") && out.contains("park"), "{out}");
+        assert!(out.contains("kept"), "{out}");
+        assert!(!out.contains("lost-1") && !out.contains("lost-2"), "{out}");
+        assert!(!out.contains("kept-twice"), "{out}");
+        assert!(out.contains("transport"), "{out}");
+        assert!(out.contains("(4 events shown)"), "{out}");
     }
 }

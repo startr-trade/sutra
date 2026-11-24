@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Sutra engine — platform / system API
-  version: 0.8.5
+  version: 0.9.0
   description: |
     The **platform (system) API** the Sutra engine serves on its own HTTP port — distinct from the
     per-deployment channel endpoints (those are generated per archive). This surface is the
@@ -513,10 +513,11 @@ paths:
         letter's bytes get; there is deliberately no `/sutra/*` twin.
 
 
-        **The journal is OPT-IN and this route only reads it**: it is enabled engine-wide by
-        `sutra.audit.sql` and per-process by `<q:audit>`. With either switch off there are no rows,
-        so the response always carries `auditEnabled`, and an empty page carries a `note` naming
-        the reason — an empty journal is never reported as a lost one.
+        **The journal is read from the SQL audit store**, a database of its own
+        (`sutra.audit.sql.url`), never the engine's. With no SQL audit store the route answers
+        `409` (`SUTRA.ADMIN.AUDIT.NO_SQL_STORE`). A process without `<q:audit>` has no rows, so an
+        empty page carries a `note` naming the reason — an empty journal is never reported as a
+        lost one.
 
 
         The journal is NOT purged by `sutra.instance.retention`, so an instance whose snapshot has
@@ -547,6 +548,7 @@ paths:
         "401": { $ref: "#/components/responses/AdminUnauthorized" }
         "403": { $ref: "#/components/responses/AdminForbidden" }
         "404": { description: No such instance — the id owns no row and appears in no journal., content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "409": { description: "The engine has no SQL audit store (`sutra.audit.sql.url`), so there is no journal to read (`SUTRA.ADMIN.AUDIT.NO_SQL_STORE`).", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "503": { $ref: "#/components/responses/AdminUnconfigured" }
   /admin/instances/{id}/cancel:
     post:
@@ -1058,8 +1060,8 @@ components:
         limit: { type: integer }
         nextAfterOrdinal: { type: [integer, "null"], description: Ordinal cursor for the next page; null when this page was the last one. }
         nextAfterSeq: { type: [integer, "null"], description: Legacy seq cursor for the next page; null when this page was the last one. }
-        auditEnabled: { type: boolean, description: Whether the durable journal is switched on engine-wide (`sutra.audit.sql`). }
-        note: { type: string, description: "Present only on an EMPTY page: why it is empty (journal disabled, no `<q:audit>`, or a cursor past the end) — so an empty journal is never mistaken for a lost one." }
+        auditEnabled: { type: boolean, description: Always true on a 200 — the engine has a SQL audit store (`sutra.audit.sql.url`); without one the route answers 409. }
+        note: { type: string, description: "Present only on an EMPTY page: why it is empty (no `<q:audit>`, audit going to another store, or a cursor past the end) — so an empty journal is never mistaken for a lost one." }
     MigrationFinding:
       type: object
       description: One machine-readable violation or warning from a migration validation.

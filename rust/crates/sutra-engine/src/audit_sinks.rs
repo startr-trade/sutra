@@ -111,23 +111,56 @@ impl sutra_channels::AuditSink for OtelAuditSink {
         "otel"
     }
 
-    fn emit<'a>(
+    /// Emit each record, then force-flush the pipeline: `Ok` only when the flush is. OTLP export
+    /// cannot be idempotent, so a re-shipped batch is exported again (at least once); every
+    /// record carries `sutra.audit.spool_ref` for a consumer to dedup on.
+    fn ship<'a>(
         &'a self,
-        e: &'a sutra_channels::AuditEvent,
+        spool_id: &'a str,
+        records: &'a [sutra_channels::SpoolRecord],
     ) -> sutra_channels::BoxFuture<'a, Result<(), sutra_channels::Diagnostic>> {
         Box::pin(async move {
-            if let Some(Some(provider)) = AUDIT_LOGGER.get() {
-                emit_audit_log(provider, e);
-            }
-            Ok(())
+            let Some(Some(provider)) = AUDIT_LOGGER.get() else {
+                return Err(sutra_channels::Diagnostic::error(
+                    sutra_channels::AUDIT_SINK_WRITE_FAILED,
+                    "the dedicated audit OTLP pipeline is not initialised",
+                ));
+            };
+            ship_audit_logs(provider, spool_id, records)
         })
     }
+}
+
+/// Emit `records` on `provider` and flush it (the body of [`OtelAuditSink::ship`], testable
+/// against an in-memory provider).
+fn ship_audit_logs(
+    provider: &SdkLoggerProvider,
+    spool_id: &str,
+    records: &[sutra_channels::SpoolRecord],
+) -> Result<(), sutra_channels::Diagnostic> {
+    for record in records {
+        emit_audit_log(
+            provider,
+            &record.event,
+            Some(&format!("{spool_id}:{}", record.n)),
+        );
+    }
+    provider.force_flush().map_err(|e| {
+        sutra_channels::Diagnostic::error(
+            sutra_channels::AUDIT_SINK_WRITE_FAILED,
+            format!("audit OTLP flush failed: {e}"),
+        )
+    })
 }
 
 /// Emit one audit event as an OTLP log record on the `sutra.audit` scope, with the audit context as
 /// attributes (the cull-out "baggage"). A free function so it is testable against an in-memory
 /// provider — no module static, no live collector.
-fn emit_audit_log(provider: &SdkLoggerProvider, e: &sutra_channels::AuditEvent) {
+fn emit_audit_log(
+    provider: &SdkLoggerProvider,
+    e: &sutra_channels::AuditEvent,
+    spool_ref: Option<&str>,
+) {
     let logger = provider.logger("sutra.audit");
     let mut record = logger.create_log_record();
     record.set_severity_number(Severity::Info);
@@ -145,48 +178,57 @@ fn emit_audit_log(provider: &SdkLoggerProvider, e: &sutra_channels::AuditEvent) 
     for (name, value) in &e.correlation {
         record.add_attribute(format!("correlation.{name}"), value.clone());
     }
+    if let Some(spool_ref) = spool_ref {
+        record.add_attribute("sutra.audit.spool_ref", spool_ref.to_string());
+    }
+    // The pass that emitted it: per (deployment_id, instance_id, attempt_base) a reader keeps
+    // the records of the latest attempt_at (then attempt_id); an earlier attempt from the same
+    // base never committed.
+    if let Some(a) = &e.attempt {
+        record.add_attribute("sutra.audit.attempt_id", a.id.clone());
+        record.add_attribute("sutra.audit.attempt_base", i64::from(a.base));
+        record.add_attribute("sutra.audit.attempt_at", a.at.clone());
+    }
     logger.emit(record);
 }
 
 // ---------------------------------------------------------------------------------------------
-// SQL sink — the durable audit of record (the `<q:audit>` default sink, `"sql"`).
+// SQL store — the durable audit of record (`"sql"`), on the audit database.
 // ---------------------------------------------------------------------------------------------
 
-/// The SQL audit sink — persists each [`sutra_channels::AuditEvent`] into the shipped
-/// `audit_event` table via [`sutra_persistence::stores::PgAuditEventStore`]. Registered by the
-/// assembly when `sutra.audit.sql` is set AND a datasource pool is configured (pg-only, like the
-/// engine's other system stores). The write is deployment-scoped (RLS) and idempotent per
-/// `(deployment_id, instance_id, seq)` — a mid-flight-restart / concurrent-replica re-emit is a
-/// no-op, which is why the per-instance seq must stay monotonic across suspend/resume (see
-/// [`sutra_channels::AuditListener::seed`]). Best-effort: a write error is a [`Diagnostic`] the
-/// dispatcher logs, never an execution failure.
+/// The SQL audit store: ships spool records into the `audit_event` table of the audit database
+/// (`sutra.audit.sql.url`), a database of its own — audit never shares the engine's operational
+/// database. Built by the assembly on the audit pool when that URL is set.
 ///
-/// The dispatcher hands it everything that queued while its previous write ran
-/// ([`sutra_channels::AuditSink::emit_batch`]); those events go into the table as one transaction
-/// per deployment, a multi-row insert with one commit, instead of a transaction and a commit per
-/// event — on a durable database the commit is most of the cost of an audit row. Should a batch
-/// fail, nothing of it was committed and its events are written again one by one, so one bad row
-/// costs only itself.
-pub struct SqlAuditSink {
+/// Each shipped batch is ONE transaction ([`sutra_persistence::stores::PgAuditEventStore::insert_shipped`]),
+/// re-scoped per deployment for row-level security, and every row carries its spool reference
+/// `<spoolId>:<n>` (V205). A record shipped twice — the shipper re-sends a batch after a crash
+/// between its write and its checkpoint, or after a failed call — is dropped by that reference or
+/// by the `(deployment, instance, seq)` index, first writer wins, so the store is idempotent per
+/// record. A database error fails the whole batch (nothing committed) and the shipper retries it.
+/// `recover` is the default `None`: the shipper's checkpoint plus that dedup are enough.
+pub struct SqlAuditStore {
     store: sutra_persistence::stores::PgAuditEventStore,
 }
 
-impl SqlAuditSink {
-    /// Wrap a datasource pool as the audit store.
-    pub fn new(pool: sqlx::PgPool) -> SqlAuditSink {
-        SqlAuditSink {
-            store: sutra_persistence::stores::PgAuditEventStore::new(pool),
+impl SqlAuditStore {
+    /// Wrap the audit database's pool as the SQL store.
+    pub fn new(audit_pool: sqlx::PgPool) -> SqlAuditStore {
+        SqlAuditStore {
+            store: sutra_persistence::stores::PgAuditEventStore::new(audit_pool),
         }
     }
 
-    /// Map a channel [`AuditEvent`](sutra_channels::AuditEvent) onto a persistence row: parse the
-    /// instance id to a UUID (`None` when it is not one — still recorded, best-effort), the
-    /// RFC 3339 `at` to an `OffsetDateTime` (falling back to now on a malformed value), and
-    /// saturate the `u32` seq into the table's `INTEGER`. The deployment id parse is the only
-    /// hard failure — a non-`dep-…` id cannot be RLS-scoped, so it is a logged `Err`.
+    /// Map one spool record onto a row: parse the instance id to a UUID (`None` when it is not
+    /// one — still recorded), the RFC 3339 `at` to an `OffsetDateTime` (falling back to now on a
+    /// malformed value), saturate the `u32` seq into the table's `INTEGER`, and stamp the spool
+    /// reference. The deployment id parse is the only hard failure: a non-`dep-…` id cannot be
+    /// RLS-scoped.
     fn to_row(
-        e: &sutra_channels::AuditEvent,
+        spool_id: &str,
+        record: &sutra_channels::SpoolRecord,
     ) -> Result<sutra_persistence::stores::AuditEventRow, sutra_channels::Diagnostic> {
+        let e = &record.event;
         let deployment =
             sutra_persistence::DeploymentId::new(e.deployment_id.clone()).map_err(|err| {
                 sutra_channels::Diagnostic::error(
@@ -209,83 +251,62 @@ impl SqlAuditSink {
             diagnostic_code: e.diagnostic_code.clone(),
             diagnostic_json: e.diagnostic_json.clone(),
             payload_json: e.payload_json.clone(),
+            spool_ref: Some(format!("{spool_id}:{}", record.n)),
+            // The pass the event came from. `at` is kept to the microsecond, the
+            // column's precision, so the batch's own comparison agrees with the database's.
+            attempt: e.attempt.as_ref().map(|a| {
+                let at = time::OffsetDateTime::parse(
+                    &a.at,
+                    &time::format_description::well_known::Rfc3339,
+                )
+                .unwrap_or(at);
+                let micros = at.nanosecond() / 1_000 * 1_000;
+                sutra_persistence::stores::AuditRowAttempt {
+                    id: a.id.clone(),
+                    base: a.base.min(i32::MAX as u32) as i32,
+                    at: at.replace_nanosecond(micros).unwrap_or(at),
+                }
+            }),
         })
     }
 }
 
-impl sutra_channels::AuditSink for SqlAuditSink {
+impl sutra_channels::AuditSink for SqlAuditStore {
     fn name(&self) -> &str {
         "sql"
     }
 
-    fn emit<'a>(
+    /// One transaction for the batch. A record whose deployment id cannot be scoped can never be
+    /// written, by this attempt or any retry, so it is logged (ERROR, with its spool reference)
+    /// and left out; every other failure fails the batch for the shipper to retry.
+    fn ship<'a>(
         &'a self,
-        e: &'a sutra_channels::AuditEvent,
+        spool_id: &'a str,
+        records: &'a [sutra_channels::SpoolRecord],
     ) -> sutra_channels::BoxFuture<'a, Result<(), sutra_channels::Diagnostic>> {
         Box::pin(async move {
-            let row = Self::to_row(e)?;
-            // `false` = the (deployment, instance, seq) row already exists — an idempotent
-            // replay, not an error. A DB error IS surfaced (logged best-effort by the dispatcher).
+            let mut rows = Vec::with_capacity(records.len());
+            for record in records {
+                match Self::to_row(spool_id, record) {
+                    Ok(row) => rows.push(row),
+                    Err(d) => tracing::error!(
+                        code = d.code.as_str(),
+                        spool_ref = %format!("{spool_id}:{}", record.n),
+                        "{}",
+                        d.message
+                    ),
+                }
+            }
             self.store
-                .insert(&row)
+                .insert_shipped(&rows)
                 .await
                 .map(|_inserted| ())
                 .map_err(|err| {
                     sutra_channels::Diagnostic::error(
                         sutra_channels::AUDIT_SINK_WRITE_FAILED,
-                        format!("audit_event insert failed: {err}"),
+                        format!("audit_event shipped batch failed: {err}"),
                     )
                 })
-        })
-    }
-
-    fn emit_batch<'a>(
-        &'a self,
-        events: &'a [sutra_channels::AuditEvent],
-    ) -> sutra_channels::BoxFuture<'a, Vec<(usize, sutra_channels::Diagnostic)>> {
-        Box::pin(async move {
-            let mut failed = Vec::new();
-            // One group per deployment (the RLS scope of a transaction), in first-seen order; each
-            // group keeps the events' order, which is all the per-instance ordering needs.
-            type Group = (Vec<usize>, Vec<sutra_persistence::stores::AuditEventRow>);
-            let mut groups: Vec<Group> = Vec::new();
-            for (i, event) in events.iter().enumerate() {
-                match Self::to_row(event) {
-                    Ok(row) => match groups
-                        .iter_mut()
-                        .find(|(_, rows)| rows[0].deployment == row.deployment)
-                    {
-                        Some((indexes, rows)) => {
-                            indexes.push(i);
-                            rows.push(row);
-                        }
-                        None => groups.push((vec![i], vec![row])),
-                    },
-                    Err(d) => failed.push((i, d)),
-                }
-            }
-            for (indexes, rows) in groups {
-                let Err(err) = self.store.insert_batch(&rows).await else {
-                    continue;
-                };
-                tracing::warn!(
-                    events = rows.len(),
-                    "audit_event batch insert failed, writing its events one by one: {err}"
-                );
-                for (i, row) in indexes.into_iter().zip(&rows) {
-                    if let Err(err) = self.store.insert(row).await {
-                        failed.push((
-                            i,
-                            sutra_channels::Diagnostic::error(
-                                sutra_channels::AUDIT_SINK_WRITE_FAILED,
-                                format!("audit_event insert failed: {err}"),
-                            ),
-                        ));
-                    }
-                }
-            }
-            failed.sort_by_key(|(i, _)| *i);
-            failed
         })
     }
 }
@@ -317,6 +338,11 @@ mod tests {
             ]
             .into_iter()
             .collect(),
+            attempt: Some(sutra_channels::AuditAttempt {
+                id: "a-1".into(),
+                base: 2,
+                at: "2026-07-19T12:00:00Z".into(),
+            }),
         }
     }
 
@@ -333,7 +359,7 @@ mod tests {
             .with_simple_exporter(exporter.clone())
             .build();
 
-        emit_audit_log(&provider, &sample());
+        emit_audit_log(&provider, &sample(), Some("spool-a:9"));
         let _ = provider.force_flush();
 
         let logs = exporter.get_emitted_logs().expect("emitted logs");
@@ -360,8 +386,28 @@ mod tests {
         assert!(has("seq", "3"));
         assert!(has("deployment_id", "dep-000000000000000000000001"));
         assert!(has("node_id", "Start"));
+        assert!(has("sutra.audit.attempt_id", "a-1"));
+        assert!(has("sutra.audit.attempt_base", "2"));
         assert!(has("correlation.orderRef", "R-1"));
         assert!(has("correlation.holder", sutra_bpmn::REDACTED_PLACEHOLDER));
+        assert!(has("sutra.audit.spool_ref", "spool-a:9"));
+    }
+
+    /// A shipped batch is every record exported, then flushed; `Ok` once the flush is.
+    #[test]
+    fn otel_ship_exports_each_record_and_flushes() {
+        use opentelemetry_sdk::logs::in_memory_exporter::InMemoryLogExporter;
+
+        let exporter = InMemoryLogExporter::default();
+        let provider = SdkLoggerProvider::builder()
+            .with_batch_exporter(exporter.clone())
+            .build();
+        let records: Vec<sutra_channels::SpoolRecord> = (1..=3)
+            .map(|n| sutra_channels::SpoolRecord { n, event: sample() })
+            .collect();
+        ship_audit_logs(&provider, "spool-a", &records).unwrap();
+        let logs = exporter.get_emitted_logs().expect("emitted logs");
+        assert_eq!(logs.len(), 3, "the flush exported the whole batch");
     }
 
     /// The bug 0.6.9 fixes: an executor lane builds its sinks on a plain OS thread with no tokio

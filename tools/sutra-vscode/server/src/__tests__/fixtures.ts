@@ -62,7 +62,7 @@ export const AUDIT_PROCESS = `<?xml version="1.0" encoding="UTF-8"?>
 <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/2.0" xmlns:q="urn:sutra:q:1.0">
   <bpmn:process id="audited">
     <bpmn:extensionElements>
-      <q:audit sink="jsonl" target="/var/log/sutra/audit.jsonl" capture="metadata"/>
+      <q:audit events="all" capture="metadata"/>
     </bpmn:extensionElements>
   </bpmn:process>
 </bpmn:definitions>

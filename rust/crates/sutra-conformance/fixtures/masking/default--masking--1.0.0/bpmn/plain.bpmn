@@ -6,7 +6,7 @@
                   targetNamespace="urn:sutra:module:masking:1.0.0">
   <bpmn:process id="plain" name="Plain" isExecutable="true">
     <bpmn:extensionElements>
-      <q:audit sink="jsonl" capture="payload"/>
+      <q:audit events="all" capture="payload"/>
     </bpmn:extensionElements>
     <bpmn:startEvent id="Start">
       <bpmn:extensionElements>

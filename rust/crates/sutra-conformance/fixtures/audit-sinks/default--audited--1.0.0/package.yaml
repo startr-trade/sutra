@@ -7,3 +7,7 @@ labels:
   "version": "1.0.0"
 engine:
   minContract: 1
+audit:
+  sinks:
+    "audited-jsonl": "jsonl"
+    "audited-otel": "otel"

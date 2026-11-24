@@ -187,6 +187,34 @@ pub fn datasource_url(pg: &PgFixture) -> String {
     )
 }
 
+/// The database the conformance engines' SQL audit store writes to, on the suite's own
+/// PostgreSQL container: audit never shares the engine's database, and a second database on the
+/// same server is what a test stack uses (the engine warns that production needs its own
+/// instance).
+pub const AUDIT_DATABASE: &str = "sutra_audit";
+
+/// Create [`AUDIT_DATABASE`] on `pg` (once; an existing one is kept) and return the SQL audit
+/// store URL the engine reaches it at.
+pub fn audit_database_url(pg: &PgFixture) -> String {
+    let _ = std::process::Command::new("docker")
+        .args([
+            "exec",
+            pg.container.id(),
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "postgres",
+            "-tAc",
+            &format!("CREATE DATABASE {AUDIT_DATABASE}"),
+        ])
+        .output();
+    format!(
+        "postgres://postgres:postgres@{}:5432/{AUDIT_DATABASE}",
+        pg.container_name
+    )
+}
+
 /// A running engine container. Kept alive for the fixture's lifetime; the atexit reaper
 /// ([`crate::reap_on_exit`]) removes it on process exit.
 ///
@@ -261,6 +289,13 @@ impl EngineBuilder {
     pub fn env(mut self, key: &str, value: impl Into<String>) -> Self {
         self.env.push((key.to_string(), value.into()));
         self
+    }
+
+    /// Turn the SQL audit store on, in [`AUDIT_DATABASE`] on `pg` (created here): the journal
+    /// suites read `audit_event` there, never in the engine's database.
+    pub fn sql_audit(self, pg: &PgFixture) -> Self {
+        let url = audit_database_url(pg);
+        self.env("SUTRA_AUDIT_SQL_URL", url)
     }
 
     /// Pin this container's shard-router lane count (`sutra.engine.shards`), overriding the

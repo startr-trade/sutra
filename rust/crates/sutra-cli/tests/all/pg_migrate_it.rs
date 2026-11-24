@@ -121,13 +121,13 @@ fn apply_args(db: &str, dry_run: bool) -> MigrateArgs {
     MigrateArgs {
         conn: conn_args(db, false),
         dry_run,
+        audit_url: None,
         action: None,
     }
 }
 
-const EXPECTED_TABLES: [&str; 10] = [
+const EXPECTED_TABLES: [&str; 9] = [
     "alias_index",
-    "audit_event",
     "inbox_seen",
     "instance_state",
     "lease",
@@ -167,7 +167,9 @@ fn migrate_apply_status_verify_and_drift_detection() {
         .to_string();
     assert!(n >= 20, "embedded migration set unexpectedly shrank: {n}");
     assert!(
-        out.contains(&format!("Pending migrations ({n} of {n} available):")),
+        out.contains(&format!(
+            "Pending engine migrations ({n} of {n} available):"
+        )),
         "{out}"
     );
     assert!(out.contains("--dry-run: no changes applied"), "{out}");
@@ -181,7 +183,9 @@ fn migrate_apply_status_verify_and_drift_detection() {
     let (code, out, _) = run(apply_args(db, false));
     assert_eq!(code, exit::OK);
     assert!(
-        out.contains(&format!("Applied {n} migration(s); head is now {head}")),
+        out.contains(&format!(
+            "Applied {n} engine migration(s); head is now {head}"
+        )),
         "{out}"
     );
 
@@ -190,11 +194,21 @@ fn migrate_apply_status_verify_and_drift_detection() {
         let count = query_scalar_i64(db, &format!("SELECT COUNT(*) FROM {table}"));
         assert_eq!(count, 0, "{table} exists and is empty");
     }
+    // The audit family is not the engine database's: no audit_event table there.
+    assert_eq!(
+        query_scalar_i64(
+            db,
+            "SELECT COUNT(*) FROM pg_tables WHERE tablename = 'audit_event'"
+        ),
+        0,
+        "audit never shares the engine database"
+    );
 
     // Second run is an idempotent no-op (exercised through the credential-flag form).
     let (code, out, _) = run(MigrateArgs {
         conn: conn_args(db, true),
         dry_run: false,
+        audit_url: None,
         action: None,
     });
     assert_eq!(code, exit::OK);
@@ -204,6 +218,7 @@ fn migrate_apply_status_verify_and_drift_detection() {
     let (code, out, _) = run(MigrateArgs {
         conn: conn_args(db, false),
         dry_run: false,
+        audit_url: None,
         action: Some(MigrateAction::Status(StatusArgs {
             conn: conn_args(db, false),
         })),
@@ -220,6 +235,7 @@ fn migrate_apply_status_verify_and_drift_detection() {
     let (code, out, _) = run(MigrateArgs {
         conn: conn_args(db, false),
         dry_run: false,
+        audit_url: None,
         action: Some(MigrateAction::Verify(VerifyArgs {
             conn: conn_args(db, false),
             expected_head: None,
@@ -239,6 +255,7 @@ fn migrate_apply_status_verify_and_drift_detection() {
     let (code, out, _) = run(MigrateArgs {
         conn: conn_args(db, false),
         dry_run: false,
+        audit_url: None,
         action: Some(MigrateAction::Verify(VerifyArgs {
             conn: conn_args(db, false),
             expected_head: None,
@@ -262,6 +279,7 @@ fn verify_on_a_virgin_database_fails_closed_and_migrations_dir_overrides() {
     let (code, out, _) = run(MigrateArgs {
         conn: conn_args(db, false),
         dry_run: false,
+        audit_url: None,
         action: Some(MigrateAction::Verify(VerifyArgs {
             conn: conn_args(db, false),
             expected_head: None,
@@ -283,11 +301,12 @@ fn verify_on_a_virgin_database_fails_closed_and_migrations_dir_overrides() {
     let (code, out, _) = run(MigrateArgs {
         conn,
         dry_run: false,
+        audit_url: None,
         action: None,
     });
     assert_eq!(code, exit::OK);
     assert!(
-        out.contains("Applied 1 migration(s); head is now V1"),
+        out.contains("Applied 1 engine migration(s); head is now V1"),
         "{out}"
     );
     let count = query_scalar_i64(db, "SELECT COUNT(*) FROM probe_table");
@@ -301,8 +320,54 @@ fn missing_url_is_a_usage_error() {
     let (code, _, err) = run(MigrateArgs {
         conn: ConnectionArgs::default(),
         dry_run: false,
+        audit_url: None,
         action: None,
     });
     assert_eq!(code, exit::USAGE);
     assert!(err.contains("--url (or SUTRA_DB_URL) is required"), "{err}");
+}
+
+/// `--audit-url` applies the audit family (V2xx) to the separate audit database, and only that.
+#[ignore = "docker"]
+#[test]
+fn migrate_audit_url_applies_only_the_audit_family() {
+    let db = "sutra_cli_it_engine2";
+    let audit = "sutra_cli_it_audit";
+    create_database(db);
+    create_database(audit);
+    let (code, out, err) = run(MigrateArgs {
+        conn: conn_args(db, false),
+        dry_run: false,
+        audit_url: Some(db_url(audit)),
+        action: None,
+    });
+    assert_eq!(code, exit::OK, "{out}{err}");
+    assert!(out.contains("audit migration(s)"), "{out}");
+    assert_eq!(
+        query_scalar_i64(audit, "SELECT COUNT(*) FROM audit_event"),
+        0,
+        "audit_event exists in the audit database"
+    );
+    assert_eq!(
+        query_scalar_i64(
+            audit,
+            "SELECT COUNT(*) FROM sutra_schema_history WHERE version < 200 OR version >= 300"
+        ),
+        0,
+        "the audit database takes the audit family only"
+    );
+    assert_eq!(
+        query_scalar_i64(
+            audit,
+            "SELECT COUNT(*) FROM sutra_schema_history WHERE version = 205"
+        ),
+        1
+    );
+    assert_eq!(
+        query_scalar_i64(
+            db,
+            "SELECT COUNT(*) FROM pg_tables WHERE tablename = 'audit_event'"
+        ),
+        0
+    );
 }

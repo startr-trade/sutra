@@ -17,6 +17,8 @@ rustls = { workspace = true }
 sutra-bpmn = { path = "../sutra-bpmn" }
 sutra-feel = { path = "../sutra-feel" }
 sutra-loader = { path = "../sutra-loader" }
+# `sutra lint --audit`: the audit plan report (the same I/O-free core the editor runs).
+sutra-lint-core = { path = "../sutra-lint-core" }
 # `sutra openapi` emits a deployment's generated OpenAPI surface offline (the same
 # projection the engine serves live). The generator + its input types (channels / datastore).
 sutra-openapi = { path = "../sutra-openapi" }

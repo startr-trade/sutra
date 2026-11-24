@@ -7,7 +7,7 @@
   <bpmn:dataStore id="outcomesStore" name="outcomes"/>
   <bpmn:process id="held" isExecutable="true">
     <bpmn:extensionElements>
-      <q:audit sink="jsonl" capture="payload"/>
+      <q:audit events="all" capture="payload"/>
       <q:variables>
         <q:variable name="rawText" type="string" sensitive="true"/>
         <q:variable name="ref" type="string"/>

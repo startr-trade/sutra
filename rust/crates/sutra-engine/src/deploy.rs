@@ -36,6 +36,7 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use sqlx::PgPool;
+use sutra_bpmn::ProcessModule;
 use sutra_channels::http::EngineHandle;
 use sutra_channels::{
     describe_endpoint_refusal, find_endpoint_collisions, ChannelDefinition, DeclaredEndpoint,
@@ -370,6 +371,8 @@ pub(crate) struct DeploymentDirectory {
     /// Retired here lately: their plans stay prepared until a sweep lets them go, so one an
     /// instance landed on after all can be opened again.
     recently_retired: RecentlyRetired,
+    /// The audit stores each archive's audited processes resolve their destination against.
+    audit_stores: AuditStores,
 }
 
 impl DeploymentDirectory {
@@ -384,6 +387,7 @@ impl DeploymentDirectory {
         dir: PathBuf,
         holders: Option<(PgEndpointHolderStore, Handle)>,
         persistence: bool,
+        audit_stores: AuditStores,
     ) -> Result<DeploymentDirectory, Box<dyn std::error::Error>> {
         if !dir.is_dir() {
             return Err(format!(
@@ -423,6 +427,7 @@ impl DeploymentDirectory {
             already_shared_reported: Vec::new(),
             draining_instances: BTreeMap::new(),
             recently_retired: RecentlyRetired::default(),
+            audit_stores,
         };
         directory.scan();
         if directory.unsettled {
@@ -484,7 +489,7 @@ impl DeploymentDirectory {
             }
             // New or changed content — prepare fully off-line; rejection changes NOTHING.
             self.unsettled = true;
-            match prepare_archive(&path, host) {
+            match prepare_archive(&path, host, &self.audit_stores) {
                 Ok(plan) => {
                     // A new verdict replaces any earlier refusal of this path's old bytes.
                     self.held_back.remove(&path);
@@ -1304,11 +1309,16 @@ fn stamp_of(path: &Path) -> Option<FileStamp> {
 fn prepare_archive(
     path: &Path,
     host: sutra_transport_spi::PreflightHost,
+    stores: &AuditStores,
 ) -> Result<DeploymentPlan, ArchiveRejection> {
-    let archive = sutra_loader::read_archive_file(path).map_err(|e| ArchiveRejection {
+    let mut archive = sutra_loader::read_archive_file(path).map_err(|e| ArchiveRejection {
         reason: format!("{e}"),
         unjudged: Some(UnjudgedClaim::Unreadable),
     })?;
+    // A folder deploy is the file appearing (or changing), so its findings are logged here.
+    for diagnostic in apply_audit_destinations(&mut archive, stores) {
+        diagnostic.log(&path.display().to_string());
+    }
     // A folder can't say whether a file was ever deployed. Refusing could strand instances parked
     // on one that was, so it loads, and the log says what it dedupes.
     report_unrecognised_dedup_keys(&archive.deployment);
@@ -1338,11 +1348,253 @@ fn prepare_archive(
     Ok(plan)
 }
 
+// ---- audit destinations (resolved once per deploy, per audited process) ----------------
+
+/// A process declares no `<q:audit>`, so it is not audited (INFO).
+pub const DEPLOY_AUDIT_NOT_DECLARED: &str = "SUTRA.DEPLOY.AUDIT.NOT_DECLARED";
+/// No destination was named, and the engine has exactly one audit store, which is used (INFO).
+pub const DEPLOY_AUDIT_SINK_DEFAULTED: &str = "SUTRA.DEPLOY.AUDIT.SINK_DEFAULTED";
+/// An audited process's destination is not a store this engine has, or none resolves. The deploy
+/// goes ahead; the process runs, and its audit events are counted as undeliverable (WARN).
+pub const DEPLOY_AUDIT_SINK_MISSING: &str = "SUTRA.DEPLOY.AUDIT.SINK_MISSING";
+/// A process's only `<q:audit>` carries just `version`: written as a module-version pin, it now
+/// also turns audit on (INFO). `versionTag` is the pin that does not.
+pub const DEPLOY_AUDIT_VERSION_PIN_AUDITS: &str = "SUTRA.DEPLOY.AUDIT.VERSION_PIN_AUDITS";
+
+/// How loud a deploy diagnostic is. None of them refuses a deploy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DeploySeverity {
+    Info,
+    Warn,
+}
+
+impl DeploySeverity {
+    fn as_str(self) -> &'static str {
+        match self {
+            DeploySeverity::Info => "info",
+            DeploySeverity::Warn => "warn",
+        }
+    }
+}
+
+/// One finding about a deploy that never refuses it: the deploy response's `diagnostics` entry
+/// and a log line.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DeployDiagnostic {
+    pub(crate) severity: DeploySeverity,
+    pub(crate) code: String,
+    pub(crate) message: String,
+}
+
+impl DeployDiagnostic {
+    fn info(code: &str, message: String) -> DeployDiagnostic {
+        DeployDiagnostic {
+            severity: DeploySeverity::Info,
+            code: code.to_string(),
+            message,
+        }
+    }
+
+    fn warn(code: &str, message: String) -> DeployDiagnostic {
+        DeployDiagnostic {
+            severity: DeploySeverity::Warn,
+            code: code.to_string(),
+            message,
+        }
+    }
+
+    pub(crate) fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "severity": self.severity.as_str(),
+            "code": self.code,
+            "message": self.message,
+        })
+    }
+
+    /// Write this finding to the log at its own level.
+    pub(crate) fn log(&self, deployment: &str) {
+        match self.severity {
+            DeploySeverity::Info => info!(code = %self.code, deployment, "{}", self.message),
+            DeploySeverity::Warn => warn!(code = %self.code, deployment, "{}", self.message),
+        }
+    }
+}
+
+/// The audit stores this engine has, which a deploy resolves each audited process's destination
+/// against: their names, and the engine's own default destination.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct AuditStores {
+    pub(crate) default_sink: Option<String>,
+    pub(crate) configured: BTreeSet<String>,
+}
+
+impl AuditStores {
+    /// The stores `audit` configures, and the engine default (`sutra.audit.default-sink`). The
+    /// SQL store is the audit database (`sutra.audit.sql.url`), never the engine's own; the JSONL
+    /// store is the rotated directory or the legacy single file.
+    pub(crate) fn of_config(audit: &crate::config::AuditConfig) -> AuditStores {
+        let mut configured = BTreeSet::new();
+        if audit.sql.enabled() {
+            configured.insert("sql".to_string());
+        }
+        if audit.spool.files.is_some() || audit.jsonl_path.is_some() {
+            configured.insert("jsonl".to_string());
+        }
+        if audit.otel_endpoint.is_some() {
+            configured.insert("otel".to_string());
+        }
+        AuditStores {
+            default_sink: audit.spool.default_sink.clone(),
+            configured,
+        }
+    }
+}
+
+/// Resolve where each process of `module` sends its audit events, once, at deploy:
+/// the manifest's `audit.sinks[<processId>]`, then its `audit.sink`, then the engine default;
+/// when none of those names one and the engine has exactly ONE audit store, that store. Nothing
+/// else is ever chosen. A destination never turns audit on: a process without `<q:audit>` stays
+/// unaudited and earns an INFO line. A destination that is not a configured store (or none at
+/// all) earns a WARN, and the process still deploys and runs — its events are counted as
+/// undeliverable, never re-routed.
+pub(crate) fn resolve_audit_destinations(
+    module: ProcessModule,
+    manifest: &sutra_bpmn::AuditDestinations,
+    engine_default: Option<&str>,
+    configured: &BTreeSet<String>,
+) -> (ProcessModule, Vec<DeployDiagnostic>) {
+    let mut diagnostics = Vec::new();
+    let mut resolved = sutra_bpmn::AuditDestinations::default();
+    let stores = || {
+        if configured.is_empty() {
+            "none".to_string()
+        } else {
+            configured.iter().cloned().collect::<Vec<_>>().join(", ")
+        }
+    };
+    for process in module.processes() {
+        let pid = &process.id;
+        if process.audit.is_none() {
+            diagnostics.push(DeployDiagnostic::info(
+                DEPLOY_AUDIT_NOT_DECLARED,
+                format!(
+                    "process `{pid}` declares no `<q:audit>`: not audited (add `<q:audit/>` or \
+                     run `sutra lint --fix audit`)"
+                ),
+            ));
+            continue;
+        }
+        let named = manifest
+            .per_process
+            .get(pid)
+            .map(String::as_str)
+            .or(manifest.default.as_deref())
+            .or(engine_default);
+        let sink = match named {
+            Some(name) => Some(name.to_string()),
+            None if configured.len() == 1 => {
+                let only = configured.iter().next().cloned().unwrap_or_default();
+                diagnostics.push(DeployDiagnostic::info(
+                    DEPLOY_AUDIT_SINK_DEFAULTED,
+                    format!(
+                        "process `{pid}` names no audit store: using `{only}`, the only one \
+                         this engine has"
+                    ),
+                ));
+                Some(only)
+            }
+            None => None,
+        };
+        let usable = sink.as_ref().is_some_and(|s| configured.contains(s));
+        if !usable {
+            let message = if configured.is_empty() {
+                format!(
+                    "process `{pid}` is audited into `{}`, but not recorded: no audit store on \
+                     this engine",
+                    sink.as_deref().unwrap_or("<none>")
+                )
+            } else {
+                format!(
+                    "process `{pid}` is audited into `{}`, which is not a configured audit store \
+                     (configured: {}); its audit events are counted as undeliverable",
+                    sink.as_deref().unwrap_or("<none>"),
+                    stores()
+                )
+            };
+            diagnostics.push(DeployDiagnostic::warn(DEPLOY_AUDIT_SINK_MISSING, message));
+        }
+        if let Some(sink) = sink {
+            resolved.per_process.insert(pid.clone(), sink);
+        }
+    }
+    (module.with_audit_destinations(&resolved), diagnostics)
+}
+
+/// Resolve the audit destinations of every module of `archive` in place
+/// ([`resolve_audit_destinations`]), returning the findings: those, the version-only
+/// `<q:audit>` pins, and an ignored manifest `audit.capture`.
+pub(crate) fn apply_audit_destinations(
+    archive: &mut sutra_loader::LoadedArchive,
+    stores: &AuditStores,
+) -> Vec<DeployDiagnostic> {
+    let manifest_audit = archive.manifest.audit.clone().unwrap_or_default();
+    let destinations = manifest_audit.destinations();
+    let mut diagnostics = Vec::new();
+    if let Some(ignored) = manifest_audit.ignored_capture() {
+        diagnostics.push(DeployDiagnostic::warn(&ignored.code, ignored.message));
+    }
+    let deployment = &mut archive.deployment;
+    for file in deployment.process_files.values() {
+        for source in sutra_bpmn::scan_audit_sources(file.content.as_bytes()).unwrap_or_default() {
+            if source.is_version_only() {
+                diagnostics.push(DeployDiagnostic::info(
+                    DEPLOY_AUDIT_VERSION_PIN_AUDITS,
+                    format!(
+                        "process `{}`: its only `<q:audit>` carries `version`, which now also \
+                         turns audit on; use `versionTag` for the pin",
+                        source.process_id
+                    ),
+                ));
+            }
+        }
+    }
+    let mut replaced: Vec<(Arc<ProcessModule>, Arc<ProcessModule>)> = Vec::new();
+    for module in deployment.processes.values_mut() {
+        if let Some((_, new)) = replaced.iter().find(|(old, _)| Arc::ptr_eq(old, module)) {
+            *module = Arc::clone(new);
+            continue;
+        }
+        let (resolved, found) = resolve_audit_destinations(
+            (**module).clone(),
+            &destinations,
+            stores.default_sink.as_deref(),
+            &stores.configured,
+        );
+        diagnostics.extend(found);
+        let new = Arc::new(resolved);
+        replaced.push((Arc::clone(module), Arc::clone(&new)));
+        *module = new;
+    }
+    for file in deployment.process_files.values_mut() {
+        if let Some((_, new)) = replaced
+            .iter()
+            .find(|(old, _)| Arc::ptr_eq(old, &file.module))
+        {
+            file.module = Arc::clone(new);
+        }
+    }
+    diagnostics
+}
+
 /// Verify + prepare a [`DeploymentPlan`] from in-memory archive bytes — the DB/API-source
 /// analogue of [`prepare_archive`] (which reads a file). Fully off-line: a bad archive is a
 /// rejected `Err`, never a panic.
-pub(crate) fn prepare_archive_bytes(bytes: &[u8]) -> Result<DeploymentPlan, String> {
-    let archive = sutra_loader::read_archive(bytes).map_err(|e| format!("{e}"))?;
+pub(crate) fn prepare_archive_bytes(
+    bytes: &[u8],
+    stores: &AuditStores,
+) -> Result<DeploymentPlan, String> {
+    let mut archive = sutra_loader::read_archive(bytes).map_err(|e| format!("{e}"))?;
+    apply_audit_destinations(&mut archive, stores);
     report_unrecognised_dedup_keys(&archive.deployment);
     report_send_faults(&archive.deployment);
     plan_deployment(&archive.deployment).map_err(|e| format!("{e}"))
@@ -1411,10 +1663,13 @@ pub(crate) fn refuse_unrecognised_dedup_keys(
 /// prepare each, logging REGISTERED / rejected exactly as the dir scan does. A bad row is dropped
 /// (logged), never fatal — the engine serves the rest. This is the `db` deployment source's
 /// boot-load (the dir source's [`DeploymentDirectory::open`] analogue).
-pub(crate) fn plans_from_store(archives: Vec<(String, Vec<u8>)>) -> Vec<DeploymentPlan> {
+pub(crate) fn plans_from_store(
+    archives: Vec<(String, Vec<u8>)>,
+    stores: &AuditStores,
+) -> Vec<DeploymentPlan> {
     let mut plans = Vec::new();
     for (store_id, bytes) in archives {
-        match prepare_archive_bytes(&bytes) {
+        match prepare_archive_bytes(&bytes, stores) {
             Ok(plan) => {
                 info!(
                     deployment = plan.dep.value(),
@@ -1447,6 +1702,7 @@ pub(crate) struct SettledStoreSet {
 /// answer. A row that loses goes to draining rather than away, because instances may be parked on it.
 pub(crate) async fn settled_store_set(
     store: &sutra_persistence::stores::PgDeploymentArchiveStore,
+    stores: &AuditStores,
 ) -> Result<SettledStoreSet, String> {
     let served = store
         .list_active_and_draining()
@@ -1484,8 +1740,8 @@ pub(crate) async fn settled_store_set(
             .map(|row| (row.archive.deployment_id, row.archive.bytes))
             .collect::<Vec<_>>()
     };
-    let mut plans = plans_from_store(bytes_of(active_rows));
-    let mut draining = plans_from_store(bytes_of(draining_rows));
+    let mut plans = plans_from_store(bytes_of(active_rows), stores);
+    let mut draining = plans_from_store(bytes_of(draining_rows), stores);
     for plan in &mut draining {
         plan.retains_channels = retaining.contains(plan.dep.value());
     }
@@ -1773,7 +2029,6 @@ pub(crate) struct ActivationHooks {
     pub(crate) engine: EngineHandle,
     pub(crate) deployments: LiveDeploymentSet,
     pub(crate) pool: Option<PgPool>,
-    pub(crate) runtime: Handle,
     pub(crate) metrics_labels: Option<Vec<String>>,
     /// Global inbound payload-cap ceiling (`sutra.codec.max-payload-bytes`) rebuilt into
     /// each activated engine so a flip keeps the boot-time policy.
@@ -1810,10 +2065,12 @@ pub(crate) struct ActivationHooks {
     /// `POST /admin/instances/{id}/migrate` validates against the graphs that are live RIGHT NOW
     /// rather than against whatever a re-parse of a sealed archive would produce.
     pub(crate) node_indexes: crate::migrate::SharedNodeIndex,
-    /// The composable audit-sink config (JSONL + OTel-log), re-applied to the rebuilt
-    /// engine on every flip so the audit trail survives activation changes (`Default` = no
-    /// engine-global audit sink).
-    pub(crate) audit: crate::config::AuditConfig,
+    /// The process's audit spool and default store, re-applied to the rebuilt engine on every
+    /// flip so the audit trail survives activation changes (`None` = no audit store).
+    pub(crate) audit: Option<crate::assembly::AuditLink>,
+    /// The audit stores this engine has and its default destination, which every deploy
+    /// resolves destinations against ([`AuditStores::of_config`]).
+    pub(crate) audit_stores: AuditStores,
     /// TEST-ONLY (P1-7 time-skipping test runtime): `EngineConfig::now_override`, re-applied to
     /// the rebuilt executor on every flip AND used (instead of the real wall clock) as the
     /// arming instant for the flip's timer-START schedules. `None` on every production boot.
@@ -1963,7 +2220,6 @@ pub(crate) async fn activate_plans(
     let shared = crate::assembly::build_shared_registries(&active, &draining);
 
     let pool = hooks.pool.clone();
-    let runtime = hooks.runtime.clone();
     let labels = hooks.metrics_labels.clone();
     let payload_cap_bytes = hooks.payload_cap_bytes;
     let audit = hooks.audit.clone();
@@ -1987,7 +2243,6 @@ pub(crate) async fn activate_plans(
             let draining = std::sync::Arc::clone(&draining);
             let shared = std::sync::Arc::clone(&shared);
             let pool = pool.clone();
-            let runtime = runtime.clone();
             let labels = labels.clone();
             let audit = audit.clone();
             let key_provider = key_provider.clone();
@@ -2008,7 +2263,6 @@ pub(crate) async fn activate_plans(
                     draining,
                     shared,
                     pool,
-                    runtime,
                     labels,
                     payload_cap_bytes,
                     audit,
@@ -2159,6 +2413,8 @@ pub(crate) struct DeployOutcome {
     pub(crate) slot: String,
     pub(crate) revision: i64,
     pub(crate) warnings: Vec<DeployWarning>,
+    /// Findings that never refuse a deploy, at their own level (the audit destinations).
+    pub(crate) diagnostics: Vec<DeployDiagnostic>,
 }
 
 /// The result of an ACCEPTED async deploy (`202`) — the row is durably stored ACTIVE and marked
@@ -2169,6 +2425,8 @@ pub(crate) struct DeployAccepted {
     pub(crate) slot: String,
     pub(crate) revision: i64,
     pub(crate) warnings: Vec<DeployWarning>,
+    /// Findings that never refuse a deploy, at their own level (the audit destinations).
+    pub(crate) diagnostics: Vec<DeployDiagnostic>,
 }
 
 /// A warning an upgrade owes about an older version of the candidate's owner, before its parked
@@ -2343,6 +2601,11 @@ impl DeployController {
         }
     }
 
+    /// The audit stores a deploy resolves destinations against.
+    fn audit_stores(&self) -> AuditStores {
+        self.hooks.audit_stores.clone()
+    }
+
     /// Recheck the rows this sweep retired lately: one an instance landed on after all is opened
     /// again, and the flip that follows serves it. Returns how many opened.
     async fn recheck_retired(&self) -> Result<usize, String> {
@@ -2397,7 +2660,8 @@ impl DeployController {
     /// fail-closed, store the row ACTIVE for its slot, re-activate the whole active set (the
     /// flip), and refresh the projections. Returns id/slot/revision once ACTIVE.
     pub(crate) async fn deploy(&self, bytes: Vec<u8>) -> Result<DeployOutcome, String> {
-        let (deployment_id, slot, revision, warnings) = self.admit_and_store(bytes).await?;
+        let (deployment_id, slot, revision, warnings, diagnostics) =
+            self.admit_and_store(bytes).await?;
         self.reactivate_from_store()
             .await
             .map_err(|e| flip_failed_after_store(&slot, &e))?;
@@ -2407,6 +2671,7 @@ impl DeployController {
             slot,
             revision,
             warnings,
+            diagnostics,
         })
     }
 
@@ -2420,12 +2685,23 @@ impl DeployController {
     async fn admit_and_store(
         &self,
         bytes: Vec<u8>,
-    ) -> Result<(String, String, i64, Vec<DeployWarning>), String> {
-        let archive = sutra_loader::read_archive(&bytes).map_err(|e| format!("{e}"))?;
+    ) -> Result<
+        (
+            String,
+            String,
+            i64,
+            Vec<DeployWarning>,
+            Vec<DeployDiagnostic>,
+        ),
+        String,
+    > {
+        let mut archive = sutra_loader::read_archive(&bytes).map_err(|e| format!("{e}"))?;
         refuse_unrecognised_dedup_keys(&archive.deployment)?;
         refuse_send_faults(&archive.deployment)?;
+        let stores = self.audit_stores();
+        let diagnostics = apply_audit_destinations(&mut archive, &stores);
         // A bad candidate is refused here rather than stored and then dropped from every flip.
-        let plan = prepare_archive_bytes(&bytes)?;
+        let plan = prepare_archive_bytes(&bytes, &stores)?;
         let dep = &archive.deployment;
         let deployment_id = dep.id.value().to_string();
         let (tenant, module, version) =
@@ -2499,7 +2775,10 @@ impl DeployController {
         .await
         .map_err(|e| e.to_string())?;
         tx.commit().await.map_err(|e| e.to_string())?;
-        Ok((deployment_id, slot, revision, warnings))
+        for diagnostic in &diagnostics {
+            diagnostic.log(&deployment_id);
+        }
+        Ok((deployment_id, slot, revision, warnings, diagnostics))
     }
 
     /// Judge a planned candidate against the store's other rows: refuse an endpoint collision, and
@@ -2620,7 +2899,8 @@ impl DeployController {
         // Validate fail-closed and store ACTIVE — the same durable write the sync path does, so a
         // pod restart mid-flip boots the row from the store and pg LISTEN/NOTIFY converges the
         // fleet. Only the in-process flip is deferred.
-        let (deployment_id, slot, revision, warnings) = self.admit_and_store(bytes).await?;
+        let (deployment_id, slot, revision, warnings, diagnostics) =
+            self.admit_and_store(bytes).await?;
         // Publish the PENDING marker so a poller sees the accepted id before the flip lands (unless
         // a concurrent flip already made it active).
         if let Ok(mut s) = self.hooks.status.write() {
@@ -2671,6 +2951,7 @@ impl DeployController {
             slot,
             revision,
             warnings,
+            diagnostics,
         })
     }
 
@@ -2786,7 +3067,7 @@ impl DeployController {
             draining: draining_plans,
             id_slots,
             refused,
-        } = settled_store_set(&self.store).await?;
+        } = settled_store_set(&self.store, &self.audit_stores()).await?;
         let facts: Vec<DeploymentFacts> = plans
             .iter()
             .map(|p| {
@@ -3709,5 +3990,162 @@ mod retained_tests {
         assert!(reopen.is_empty());
         assert_eq!(let_go, vec![quiet]);
         assert!(recent.ids().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod audit_destination_tests {
+    use super::*;
+
+    const BPMN: &str = r#"<?xml version="1.0"?>
+        <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                          xmlns:q="urn:sutra:q:1.0">
+          <bpmn:process id="audited">
+            <bpmn:extensionElements><q:audit/></bpmn:extensionElements>
+            <bpmn:startEvent id="S"/>
+            <bpmn:endEvent id="E"/>
+            <bpmn:sequenceFlow id="f1" sourceRef="S" targetRef="E"/>
+          </bpmn:process>
+          <bpmn:process id="plain">
+            <bpmn:startEvent id="S2"/>
+            <bpmn:endEvent id="E2"/>
+            <bpmn:sequenceFlow id="f2" sourceRef="S2" targetRef="E2"/>
+          </bpmn:process>
+        </bpmn:definitions>"#;
+
+    fn loaded() -> ProcessModule {
+        sutra_bpmn::BpmnModelLoader::new()
+            .load(BPMN.as_bytes())
+            .expect("loads")
+    }
+
+    fn stores(names: &[&str]) -> BTreeSet<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn manifest(default: Option<&str>) -> sutra_bpmn::AuditDestinations {
+        sutra_bpmn::AuditDestinations {
+            default: default.map(str::to_string),
+            per_process: BTreeMap::new(),
+        }
+    }
+
+    fn sink_of(module: &ProcessModule, id: &str) -> Option<Option<String>> {
+        module
+            .process(id)
+            .unwrap()
+            .audit
+            .as_ref()
+            .map(|a| a.sink.clone())
+    }
+
+    fn codes(diagnostics: &[DeployDiagnostic]) -> Vec<(&str, DeploySeverity)> {
+        diagnostics
+            .iter()
+            .map(|d| (d.code.as_str(), d.severity))
+            .collect()
+    }
+
+    /// A manifest destination routes an audited process and never enables an undeclared one.
+    #[test]
+    fn manifest_sink_routes_without_enabling() {
+        let (module, diagnostics) = resolve_audit_destinations(
+            loaded(),
+            &manifest(Some("jsonl")),
+            None,
+            &stores(&["jsonl", "sql"]),
+        );
+        assert_eq!(sink_of(&module, "audited"), Some(Some("jsonl".to_string())));
+        assert_eq!(sink_of(&module, "plain"), None);
+        assert!(!codes(&diagnostics).contains(&(DEPLOY_AUDIT_SINK_MISSING, DeploySeverity::Warn)));
+    }
+
+    /// A destination the engine has no store for warns and still deploys.
+    #[test]
+    fn sink_missing_warns_not_refused() {
+        let (module, diagnostics) =
+            resolve_audit_destinations(loaded(), &manifest(Some("otel")), None, &stores(&["sql"]));
+        assert!(codes(&diagnostics).contains(&(DEPLOY_AUDIT_SINK_MISSING, DeploySeverity::Warn)));
+        let missing = diagnostics
+            .iter()
+            .find(|d| d.code == DEPLOY_AUDIT_SINK_MISSING)
+            .unwrap();
+        assert!(
+            missing.message.contains("audited") && missing.message.contains("otel"),
+            "{}",
+            missing.message
+        );
+        // The process keeps its declaration; the name rides its events and is counted.
+        assert_eq!(sink_of(&module, "audited"), Some(Some("otel".to_string())));
+
+        // No audit store at all: the warning says it is not recorded.
+        let (_, none) = resolve_audit_destinations(loaded(), &manifest(None), None, &stores(&[]));
+        let message = &none
+            .iter()
+            .find(|d| d.code == DEPLOY_AUDIT_SINK_MISSING)
+            .unwrap()
+            .message;
+        assert!(
+            message.contains("no audit store on this engine"),
+            "{message}"
+        );
+    }
+
+    /// Nothing named and exactly one store: that store, with an INFO line.
+    #[test]
+    fn sink_defaulted_to_only_store() {
+        let (module, diagnostics) =
+            resolve_audit_destinations(loaded(), &manifest(None), None, &stores(&["jsonl"]));
+        assert_eq!(sink_of(&module, "audited"), Some(Some("jsonl".to_string())));
+        assert!(codes(&diagnostics).contains(&(DEPLOY_AUDIT_SINK_DEFAULTED, DeploySeverity::Info)));
+        assert!(!codes(&diagnostics).contains(&(DEPLOY_AUDIT_SINK_MISSING, DeploySeverity::Warn)));
+
+        // The engine default wins over the single-store rule, and needs no INFO line.
+        let (module, diagnostics) = resolve_audit_destinations(
+            loaded(),
+            &manifest(None),
+            Some("jsonl"),
+            &stores(&["jsonl"]),
+        );
+        assert_eq!(sink_of(&module, "audited"), Some(Some("jsonl".to_string())));
+        assert!(!codes(&diagnostics).contains(&(DEPLOY_AUDIT_SINK_DEFAULTED, DeploySeverity::Info)));
+    }
+
+    /// Several stores and nothing named: no silent pick, the process is unresolved.
+    #[test]
+    fn several_stores_no_default_is_missing() {
+        let (module, diagnostics) =
+            resolve_audit_destinations(loaded(), &manifest(None), None, &stores(&["jsonl", "sql"]));
+        assert_eq!(sink_of(&module, "audited"), Some(None));
+        assert!(codes(&diagnostics).contains(&(DEPLOY_AUDIT_SINK_MISSING, DeploySeverity::Warn)));
+        let missing = diagnostics
+            .iter()
+            .find(|d| d.code == DEPLOY_AUDIT_SINK_MISSING)
+            .unwrap();
+        assert!(missing.message.contains("<none>"), "{}", missing.message);
+        assert!(
+            missing.message.contains("jsonl, sql"),
+            "{}",
+            missing.message
+        );
+    }
+
+    /// One INFO line per process that declares no `<q:audit>`.
+    #[test]
+    fn not_declared_info_per_process() {
+        let (_, diagnostics) =
+            resolve_audit_destinations(loaded(), &manifest(Some("sql")), None, &stores(&["sql"]));
+        let not_declared: Vec<&DeployDiagnostic> = diagnostics
+            .iter()
+            .filter(|d| d.code == DEPLOY_AUDIT_NOT_DECLARED)
+            .collect();
+        assert_eq!(not_declared.len(), 1, "{diagnostics:?}");
+        assert_eq!(not_declared[0].severity, DeploySeverity::Info);
+        assert!(
+            not_declared[0].message.contains("`plain`")
+                && not_declared[0].message.contains("sutra lint --fix audit"),
+            "{}",
+            not_declared[0].message
+        );
     }
 }

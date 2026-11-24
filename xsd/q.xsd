@@ -813,10 +813,49 @@
   <xsd:element name="audit" type="q:AuditType"/>
 
   <xsd:complexType name="AuditType">
-    <xsd:attribute name="sink" type="xsd:string" default="sql"/>
-    <xsd:attribute name="target" type="xsd:string"/>
-    <xsd:attribute name="capture" type="q:AuditCapture" default="payload"/>
+    <xsd:annotation>
+      <xsd:documentation>
+        On a process (a direct child of its extensionElements): declares that the process is
+        audited. Any process-level q:audit does so, a bare one included; a process without one is
+        not audited, whatever the deployment configures. Where the events are stored is a
+        deployment setting (the package manifest's audit.sink and audit.sinks), never a BPMN one:
+        the sink and target attributes were removed in 0.9 and are now a load error. On a flow
+        node: only capture="none" has an effect, and it opts that node out.
+      </xsd:documentation>
+    </xsd:annotation>
+    <xsd:attribute name="events" type="q:AuditEventScope" default="points"/>
+    <xsd:attribute name="capture" type="q:AuditCapture" default="metadata"/>
+    <xsd:attribute name="version" type="xsd:string">
+      <xsd:annotation>
+        <xsd:documentation>
+          The process's module-version pin, read when the process has no versionTag. Prefer
+          versionTag: this attribute sits on q:audit, so writing it also turns audit on.
+        </xsd:documentation>
+      </xsd:annotation>
+    </xsd:attribute>
   </xsd:complexType>
+
+  <xsd:simpleType name="AuditEventScope">
+    <xsd:annotation>
+      <xsd:documentation>
+        Which execution events an audited process records. instance: the instance lifecycle
+        only (started, suspended, resumed, completed, failed). points (the default): the
+        instance lifecycle plus every audit point, a node where something observable happens:
+        start, end, intermediate and boundary events; receive, send and user tasks; event-based
+        gateways; call activities and sub-processes; and any node bound to q:send, q:reply or
+        q:source. A point records the node being left, and a wait node also records it being
+        entered, so the time spent parked shows. Exclusive, parallel and inclusive gateways,
+        script tasks, plain tasks and unbound service tasks are not points. all: the instance
+        lifecycle and every node entered and left. A node-level capture="none" opts any node
+        out under every scope.
+      </xsd:documentation>
+    </xsd:annotation>
+    <xsd:restriction base="xsd:string">
+      <xsd:enumeration value="all"/>
+      <xsd:enumeration value="points"/>
+      <xsd:enumeration value="instance"/>
+    </xsd:restriction>
+  </xsd:simpleType>
 
   <xsd:simpleType name="AuditCapture">
     <xsd:annotation>

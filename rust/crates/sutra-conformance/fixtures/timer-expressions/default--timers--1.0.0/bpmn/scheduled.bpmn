@@ -5,7 +5,7 @@
   <!-- A timer START event armed from the deployment configuration: config.startAfter after the
        deployment activates, the process runs once. -->
   <bpmn:process id="te-scheduled" isExecutable="true">
-    <bpmn:extensionElements><q:audit capture="metadata"/></bpmn:extensionElements>
+    <bpmn:extensionElements><q:audit events="all" capture="metadata"/></bpmn:extensionElements>
     <bpmn:startEvent id="Tick">
       <bpmn:timerEventDefinition><bpmn:timeDuration>config.startAfter</bpmn:timeDuration></bpmn:timerEventDefinition>
     </bpmn:startEvent>

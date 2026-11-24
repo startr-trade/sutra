@@ -67,8 +67,8 @@ pub struct TransportAuditContext {
     pub instance_id: String,
     /// The instance's process audit level.
     pub capture: AuditCapture,
-    /// The audit sink the process names (`<q:audit sink>`); `None` routes to the engine's
-    /// default sink.
+    /// The audit destination the deploy resolved for the process; `None` when it resolved none
+    /// (the event is then counted as undeliverable, never re-routed).
     pub sink: Option<String>,
 }
 

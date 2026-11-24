@@ -109,6 +109,16 @@ instance variables plus `config` (the `package.yaml` `properties:`). A result th
 not a usable interval fails the instance once with
 `SUTRA.RUNTIME.TIMER.EXPRESSION_INVALID`.
 
+Audit is declared in the BPMN and nowhere else: a process is audited only when it
+carries a process-level `<q:audit>`, and a process without one emits no audit event,
+whatever the engine or the package configure. A bare `<q:audit/>` means
+`events="points"` (the audit points listed in `xsd/audit-point-rules.json`) and
+`capture="metadata"`; `events="all"` records every node and `events="instance"`
+the lifecycle only. A node-level `<q:audit capture="none"/>` opts that node out. The
+element has no `sink` or `target`: where audit is stored is chosen by the package
+(`audit.sink`, `audit.sinks`) and the engine, and a BPMN that still carries either
+attribute fails to load with `SUTRA.BPMN.AUDIT.SINK_REMOVED`.
+
 One of those contracts changes what a transport does, so it is stated here: a process's
 `<q:audit capture>` is `none`, `metadata` (the default), `payload` (events carry the
 redacted variable snapshot) or `media` (metadata-level events, every request the process

@@ -42,7 +42,29 @@
 //! | `sutra.audit.jsonl.path`          | `SUTRA_AUDIT_JSONL`               |
 //! | `sutra.audit.otel.endpoint`       | `SUTRA_AUDIT_OTEL_ENDPOINT`       |
 //! | `sutra.audit.otel.service-name`   | `SUTRA_AUDIT_OTEL_SERVICE_NAME`   |
-//! | `sutra.audit.sql`                 | `SUTRA_AUDIT_SQL`                 |
+//! | `sutra.audit.sql` (deprecated)    | `SUTRA_AUDIT_SQL`                 |
+//! | `sutra.audit.sql.url`             | `SUTRA_AUDIT_SQL_URL`             |
+//! | `sutra.audit.sql.username`        | `SUTRA_AUDIT_SQL_USERNAME`        |
+//! | `sutra.audit.sql.password`        | `SUTRA_AUDIT_SQL_PASSWORD`        |
+//! | `sutra.audit.sql.max-connections` | `SUTRA_AUDIT_SQL_MAX_CONNECTIONS` |
+//! | `sutra.audit.retention`           | `SUTRA_AUDIT_RETENTION`           |
+//! | `sutra.audit.retention-sweep-interval` | `SUTRA_AUDIT_RETENTION_SWEEP_INTERVAL` |
+//! | `sutra.audit.retention-batch`     | `SUTRA_AUDIT_RETENTION_BATCH`     |
+//! | `sutra.audit.spool.dir`           | `SUTRA_AUDIT_SPOOL_DIR`           |
+//! | `sutra.audit.spool.segment-bytes` | `SUTRA_AUDIT_SPOOL_SEGMENT_BYTES` |
+//! | `sutra.audit.spool.sync-linger-ms` | `SUTRA_AUDIT_SPOOL_SYNC_LINGER_MS` |
+//! | `sutra.audit.spool.max-bytes`     | `SUTRA_AUDIT_SPOOL_MAX_BYTES`     |
+//! | `sutra.audit.spool.sync-timeout`  | `SUTRA_AUDIT_SPOOL_SYNC_TIMEOUT`  |
+//! | `sutra.audit.spool.retain`        | `SUTRA_AUDIT_SPOOL_RETAIN`        |
+//! | `sutra.audit.batch-linger-ms`     | `SUTRA_AUDIT_BATCH_LINGER_MS`     |
+//! | `sutra.audit.batch-max`           | `SUTRA_AUDIT_BATCH_MAX`           |
+//! | `sutra.audit.jsonl.dir`           | `SUTRA_AUDIT_JSONL_DIR`           |
+//! | `sutra.audit.jsonl.rotate-bytes`  | `SUTRA_AUDIT_JSONL_ROTATE_BYTES`  |
+//! | `sutra.audit.jsonl.rotate-interval` | `SUTRA_AUDIT_JSONL_ROTATE_INTERVAL` |
+//! | `sutra.audit.jsonl.dedup-window`  | `SUTRA_AUDIT_JSONL_DEDUP_WINDOW`  |
+//! | `sutra.audit.jsonl.retention`     | `SUTRA_AUDIT_JSONL_RETENTION`     |
+//! | `sutra.audit.default-sink`        | `SUTRA_AUDIT_DEFAULT_SINK`        |
+//! | `sutra.audit.shutdown-timeout`    | `SUTRA_AUDIT_SHUTDOWN_TIMEOUT`    |
 //! | `sutra.admin.oidc.issuer`         | `SUTRA_ADMIN_OIDC_ISSUER`         |
 //! | `sutra.admin.oidc.audience`       | `SUTRA_ADMIN_OIDC_AUDIENCE`       |
 //! | `sutra.admin.oidc.jwks`           | `SUTRA_ADMIN_OIDC_JWKS`           |
@@ -224,10 +246,9 @@ pub struct EngineConfig {
     /// (`sutra.persistence.rls-bypass-check.enabled`). Default `true` (fail-closed). Setting
     /// it `false` acknowledges the risk and downgrades the refusal to a WARNING (dev only).
     pub rls_bypass_check_enabled: bool,
-    /// The engine-global audit sinks (JSONL file + OTel-log). Both compose — each
-    /// enabled sink is registered on the per-activation [`sutra_channels::AuditSinkRegistry`], and
-    /// the `AuditListener` is wired only when at least one is active. A best-effort trail — it
-    /// never blocks or fails execution; the per-deployment DB sink is the follow-on.
+    /// The engine's audit stores (SQL, JSONL files, OTel-log) and the durable spool every audit
+    /// event passes through. The `AuditListener` is wired only when at least one store is
+    /// configured; a step commit then waits for the spool's sync.
     pub audit: AuditConfig,
     /// OTLP telemetry keys (endpoint / service-name / temporality / label
     /// allowlist — table in [`crate::otel::TelemetryConfig`]). Resolved from the SAME
@@ -402,10 +423,9 @@ impl Default for RetryConfig {
     }
 }
 
-/// The composable engine-global audit-sink config. Each field enables one built-in
-/// [`sutra_channels::AuditSink`]; the assembly registers every enabled sink on one
-/// [`sutra_channels::AuditSinkRegistry`], so JSONL and OTel compose (the DB sink is the follow-on).
-/// `Default` = every sink off (`<q:audit>` has no engine-global target — audit emission is a no-op).
+/// The engine's audit-store config. Each store field enables one built-in
+/// [`sutra_channels::AuditSink`]; the assembly opens the spool when at least one is enabled and
+/// starts one shipper per store. `Default` = every store off (no spool, no audit emission).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AuditConfig {
     /// `sutra.audit.jsonl.path` — when set, the JSONL sink appends per-instance/per-node events to
@@ -425,10 +445,174 @@ pub struct AuditConfig {
     /// audit pipeline's resource too, over `OTEL_RESOURCE_ATTRIBUTES` — so audit records name the
     /// same deployment or run as the engine telemetry.
     pub otel_resource_attributes: Vec<(String, String)>,
-    /// `sutra.audit.sql` — when true AND a datasource pool is configured, the SQL sink writes each
-    /// event to the shipped `audit_event` table (the `<q:audit>` default sink). Idempotent per
-    /// `(deployment_id, instance_id, seq)`; the durable audit of record.
-    pub sql: bool,
+    /// `sutra.audit.sql.*` — the SQL audit store, on a database of its own: audit never shares
+    /// the engine's operational database.
+    pub sql: AuditSqlConfig,
+    /// `sutra.audit.retention*` — how long audit is kept.
+    pub retention: AuditRetentionConfig,
+    /// The durable spool every audit event passes through, its shippers, the JSONL file store,
+    /// the engine's default store and the shutdown budget.
+    pub spool: AuditSpoolSettings,
+}
+
+/// The audit spool and what ships it (`sutra.audit.spool.*`, `sutra.audit.jsonl.*`,
+/// `sutra.audit.batch-*`, `sutra.audit.default-sink`, `sutra.audit.shutdown-timeout`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditSpoolSettings {
+    /// The spool. Its `sinks` are filled in by the assembly from the stores it builds.
+    pub spool: sutra_channels::AuditSpoolConfig,
+    /// `sutra.audit.batch-max` and `sutra.audit.batch-linger-ms`.
+    pub shipper: sutra_channels::ShipperConfig,
+    /// The JSONL file store, when `sutra.audit.jsonl.dir` is set.
+    pub files: Option<sutra_channels::AuditFilesConfig>,
+    /// `sutra.audit.default-sink`: the store a process audits into when neither its package
+    /// manifest names one nor exactly one store is configured.
+    pub default_sink: Option<String>,
+    /// `sutra.audit.shutdown-timeout`: how long shutdown waits for each store to ship what the
+    /// spool holds. What is left ships at the next start.
+    pub shutdown_timeout: std::time::Duration,
+}
+
+impl Default for AuditSpoolSettings {
+    fn default() -> AuditSpoolSettings {
+        AuditSpoolSettings {
+            spool: sutra_channels::AuditSpoolConfig::default(),
+            shipper: sutra_channels::ShipperConfig::default(),
+            files: None,
+            default_sink: None,
+            shutdown_timeout: std::time::Duration::from_secs(10),
+        }
+    }
+}
+
+/// `SUTRA.CONFIG.AUDIT.SQL_URL_REQUIRED`: the deprecated `sutra.audit.sql=true` with no
+/// `sutra.audit.sql.url`. Refuses startup: SQL audit now needs a database of its own.
+pub const AUDIT_SQL_URL_REQUIRED: &str = "SUTRA.CONFIG.AUDIT.SQL_URL_REQUIRED";
+/// `SUTRA.CONFIG.AUDIT.SQL_CONFLICT`: `sutra.audit.sql=false` together with a
+/// `sutra.audit.sql.url`. Refuses startup: the two settings contradict each other.
+pub const AUDIT_SQL_CONFLICT: &str = "SUTRA.CONFIG.AUDIT.SQL_CONFLICT";
+/// `SUTRA.CONFIG.AUDIT.SHARES_ENGINE_DB`: the audit URL names the engine datasource's host, port
+/// and database. Refuses startup.
+pub const AUDIT_SHARES_ENGINE_DB: &str = "SUTRA.CONFIG.AUDIT.SHARES_ENGINE_DB";
+/// `SUTRA.CONFIG.AUDIT.SAME_SERVER`: the audit database is on the engine datasource's server
+/// (same host and port, another database). A warning: production needs a separate instance.
+pub const AUDIT_SAME_SERVER: &str = "SUTRA.CONFIG.AUDIT.SAME_SERVER";
+
+/// The SQL audit store's database (`sutra.audit.sql.*`). The store is on when `url` is set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditSqlConfig {
+    /// `sutra.audit.sql.url` — a `postgres://` URL of the audit database. `None` = no SQL store.
+    pub url: Option<String>,
+    /// `sutra.audit.sql.username` — overrides the URL's user. A secret reference (`env:`,
+    /// `secret:`, …), resolved when the pool is opened.
+    pub username: Option<String>,
+    /// `sutra.audit.sql.password` — overrides the URL's password. A secret reference, resolved
+    /// when the pool is opened.
+    pub password: Option<String>,
+    /// `sutra.audit.sql.max-connections` — the audit pool's size. Default 4.
+    pub max_connections: u32,
+    /// The deprecated `sutra.audit.sql` boolean, when it was set. `Some(true)` with a URL is
+    /// accepted with a deprecation warning; the other combinations are refused at load.
+    pub legacy_flag: Option<bool>,
+}
+
+impl Default for AuditSqlConfig {
+    fn default() -> Self {
+        AuditSqlConfig {
+            url: None,
+            username: None,
+            password: None,
+            max_connections: 4,
+            legacy_flag: None,
+        }
+    }
+}
+
+impl AuditSqlConfig {
+    /// Whether the SQL audit store is configured.
+    pub fn enabled(&self) -> bool {
+        self.url.is_some()
+    }
+}
+
+/// Where the audit database sits relative to the engine's own datasource.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuditDbPlacement {
+    /// Another server (host or port differs), or the engine has no datasource.
+    Separate,
+    /// The engine datasource's server, another database: allowed, with
+    /// [`AUDIT_SAME_SERVER`] logged.
+    SameServer,
+}
+
+/// Compare the audit URL with the engine datasource URL by host, port and database (the
+/// database defaulting to the user name, as PostgreSQL does). The same database is
+/// [`AUDIT_SHARES_ENGINE_DB`], an error. Host aliases (`localhost` against `127.0.0.1`) are not
+/// resolved, which is why the same server is only a warning, never a refusal.
+pub fn audit_db_placement(
+    engine_url: Option<&str>,
+    engine_username: Option<&str>,
+    audit_url: &str,
+    audit_username: Option<&str>,
+) -> Result<AuditDbPlacement, ConfigError> {
+    use std::str::FromStr as _;
+    let parse = |key: &str, url: &str, user: Option<&str>| {
+        sqlx::postgres::PgConnectOptions::from_str(url)
+            .map(|o| match user {
+                Some(user) => o.username(user),
+                None => o,
+            })
+            .map_err(|e| ConfigError(format!("{key}: '{url}' is not a PostgreSQL URL: {e}")))
+    };
+    let audit = parse("sutra.audit.sql.url", audit_url, audit_username)?;
+    let Some(engine_url) = engine_url else {
+        return Ok(AuditDbPlacement::Separate);
+    };
+    let engine = parse("sutra.datasource.url", engine_url, engine_username)?;
+    let server =
+        |o: &sqlx::postgres::PgConnectOptions| (o.get_host().to_ascii_lowercase(), o.get_port());
+    let database = |o: &sqlx::postgres::PgConnectOptions| {
+        o.get_database()
+            .unwrap_or_else(|| o.get_username())
+            .to_string()
+    };
+    if server(&audit) != server(&engine) {
+        return Ok(AuditDbPlacement::Separate);
+    }
+    if database(&audit) == database(&engine) {
+        return Err(ConfigError(format!(
+            "{AUDIT_SHARES_ENGINE_DB}: sutra.audit.sql.url names the engine's own database \
+             ({}:{}/{}) — audit never shares the engine's operational database; point it at a \
+             database of its own",
+            audit.get_host(),
+            audit.get_port(),
+            database(&audit)
+        )));
+    }
+    Ok(AuditDbPlacement::SameServer)
+}
+
+/// Audit retention (`sutra.audit.retention*`). The audit database's sweeper deletes rows older
+/// than `retention`, batch by batch; the JSONL file store's timer runs on `sweep_interval` too.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditRetentionConfig {
+    /// `sutra.audit.retention` — how long an audit row is kept in the audit database. `None`
+    /// (the default) keeps it forever.
+    pub retention: Option<std::time::Duration>,
+    /// `sutra.audit.retention-sweep-interval` — how often retention runs. Default PT10M.
+    pub sweep_interval: std::time::Duration,
+    /// `sutra.audit.retention-batch` — rows deleted per statement. Default 10000.
+    pub batch: u32,
+}
+
+impl Default for AuditRetentionConfig {
+    fn default() -> Self {
+        AuditRetentionConfig {
+            retention: None,
+            sweep_interval: std::time::Duration::from_secs(600),
+            batch: 10_000,
+        }
+    }
 }
 
 /// KEK-wrap envelope key source (`sutra.crypto.envelope.*`). When
@@ -1057,6 +1241,14 @@ impl EngineConfig {
                 ));
             }
         }
+        let datasource_url = value("sutra.datasource.url", "SUTRA_DATASOURCE_URL")?;
+        let datasource_username = value("sutra.datasource.username", "SUTRA_DATASOURCE_USERNAME")?;
+        let audit_sql = parse_audit_sql(
+            &value,
+            datasource_url.as_deref(),
+            datasource_username.as_deref(),
+        )?;
+        let audit_retention = parse_audit_retention(&value)?;
         let incident_sql = match value("sutra.incident.sql", "SUTRA_INCIDENT_SQL")? {
             None => false,
             Some(raw) => parse_bool(&raw, "sutra.incident.sql")?,
@@ -1076,8 +1268,8 @@ impl EngineConfig {
             deployments_poll_interval,
             http_port,
             http_max_body_bytes,
-            datasource_url: value("sutra.datasource.url", "SUTRA_DATASOURCE_URL")?,
-            datasource_username: value("sutra.datasource.username", "SUTRA_DATASOURCE_USERNAME")?,
+            datasource_url,
+            datasource_username,
             datasource_password: value("sutra.datasource.password", "SUTRA_DATASOURCE_PASSWORD")?,
             crypto_master_key,
             crypto_envelope,
@@ -1107,10 +1299,9 @@ impl EngineConfig {
                 .filter(|s| !s.is_empty()),
                 otel_resource_attributes: crate::otel::TelemetryConfig::from_sources(file, env)
                     .resource_attributes,
-                sql: match value("sutra.audit.sql", "SUTRA_AUDIT_SQL")? {
-                    None => false,
-                    Some(raw) => parse_bool(&raw, "sutra.audit.sql")?,
-                },
+                sql: audit_sql,
+                spool: parse_audit_spool(&value, &audit_retention)?,
+                retention: audit_retention,
             },
             telemetry: crate::otel::TelemetryConfig::from_sources(file, env),
             admin_auth: AdminAuthConfig {
@@ -1451,6 +1642,123 @@ fn parse_duration(raw: &str) -> Result<std::time::Duration, String> {
     Ok(std::time::Duration::from_millis(total_ms))
 }
 
+/// A config lookup: file key and canonical env name to the resolved value.
+type ConfigValue<'a> = dyn Fn(&str, &str) -> Result<Option<String>, ConfigError> + 'a;
+
+/// The SQL audit store's keys (`sutra.audit.sql.*` and the deprecated `sutra.audit.sql` flag),
+/// with the refusals that keep audit out of the engine's own database.
+fn parse_audit_sql(
+    value: &ConfigValue,
+    engine_url: Option<&str>,
+    engine_username: Option<&str>,
+) -> Result<AuditSqlConfig, ConfigError> {
+    let defaults = AuditSqlConfig::default();
+    let non_blank =
+        |raw: Option<String>| raw.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let url = non_blank(value("sutra.audit.sql.url", "SUTRA_AUDIT_SQL_URL")?);
+    let legacy_flag = match value("sutra.audit.sql", "SUTRA_AUDIT_SQL")? {
+        None => None,
+        Some(raw) => Some(parse_bool(&raw, "sutra.audit.sql")?),
+    };
+    match (legacy_flag, url.is_some()) {
+        (Some(true), false) => {
+            return Err(ConfigError(format!(
+                "{AUDIT_SQL_URL_REQUIRED}: sutra.audit.sql=true needs sutra.audit.sql.url \
+                 (SUTRA_AUDIT_SQL_URL): SQL audit is written to a database of its own, never to \
+                 the engine's datasource. Set the URL of the audit database, or remove \
+                 sutra.audit.sql"
+            )))
+        }
+        (Some(false), true) => {
+            return Err(ConfigError(format!(
+                "{AUDIT_SQL_CONFLICT}: sutra.audit.sql=false contradicts sutra.audit.sql.url; \
+                 the URL alone turns the SQL audit store on. Remove one of them"
+            )))
+        }
+        _ => {}
+    }
+    let max_connections = match value(
+        "sutra.audit.sql.max-connections",
+        "SUTRA_AUDIT_SQL_MAX_CONNECTIONS",
+    )? {
+        None => defaults.max_connections,
+        Some(raw) => raw
+            .trim()
+            .parse::<u32>()
+            .ok()
+            .filter(|n| *n >= 1)
+            .ok_or_else(|| {
+                ConfigError(format!(
+                    "sutra.audit.sql.max-connections: '{raw}' is not a positive integer"
+                ))
+            })?,
+    };
+    let username = value("sutra.audit.sql.username", "SUTRA_AUDIT_SQL_USERNAME")?
+        .filter(|s| !s.trim().is_empty());
+    if let Some(url) = url.as_deref() {
+        // The username can be a secret reference; only a plain one takes part in the comparison
+        // (a reference resolves later, when the pool opens, and the URL's user stands in).
+        let plain_user = username
+            .as_deref()
+            .filter(|u| !u.contains(':') && !u.contains("${"));
+        audit_db_placement(engine_url, engine_username, url, plain_user)?;
+    }
+    Ok(AuditSqlConfig {
+        url,
+        username,
+        // NOT trimmed — resolved whole-value (`secret:`/`env:`/…) when the pool opens.
+        password: value("sutra.audit.sql.password", "SUTRA_AUDIT_SQL_PASSWORD")?
+            .filter(|s| !s.is_empty()),
+        max_connections,
+        legacy_flag,
+    })
+}
+
+/// The audit retention keys (`sutra.audit.retention*`).
+fn parse_audit_retention(value: &ConfigValue) -> Result<AuditRetentionConfig, ConfigError> {
+    let defaults = AuditRetentionConfig::default();
+    let duration = |key: &str, raw: &str| {
+        parse_duration(raw).map_err(|e| ConfigError(format!("{key}: '{raw}' — {e}")))
+    };
+    let retention = match value("sutra.audit.retention", "SUTRA_AUDIT_RETENTION")? {
+        None => None,
+        Some(raw) if raw.trim().is_empty() => None,
+        Some(raw) => Some(duration("sutra.audit.retention", &raw)?),
+    };
+    let sweep_interval = match value(
+        "sutra.audit.retention-sweep-interval",
+        "SUTRA_AUDIT_RETENTION_SWEEP_INTERVAL",
+    )? {
+        None => defaults.sweep_interval,
+        Some(raw) => duration("sutra.audit.retention-sweep-interval", &raw)?,
+    };
+    if sweep_interval.is_zero() {
+        return Err(ConfigError(
+            "sutra.audit.retention-sweep-interval must be positive (a zero interval would \
+             hot-loop the audit retention sweep)"
+                .to_string(),
+        ));
+    }
+    let batch = match value("sutra.audit.retention-batch", "SUTRA_AUDIT_RETENTION_BATCH")? {
+        None => defaults.batch,
+        Some(raw) => raw
+            .trim()
+            .parse::<u32>()
+            .ok()
+            .filter(|n| *n >= 1)
+            .ok_or_else(|| {
+                ConfigError(format!(
+                    "sutra.audit.retention-batch: '{raw}' is not a positive integer"
+                ))
+            })?,
+    };
+    Ok(AuditRetentionConfig {
+        retention,
+        sweep_interval,
+        batch,
+    })
+}
+
 /// Parse a lenient boolean (`true`/`false`/`1`/`0`/`yes`/`no`/`on`/`off`, case-insensitive).
 fn parse_bool(raw: &str, key: &str) -> Result<bool, ConfigError> {
     match raw.trim().to_ascii_lowercase().as_str() {
@@ -1478,6 +1786,143 @@ fn duration_key(
             parse_duration(&raw).map_err(|e| ConfigError(format!("{file_key}: '{raw}' — {e}")))
         }
     }
+}
+
+/// Parse the audit spool, shipper and JSONL file-store keys. A malformed value is a startup error
+/// naming its key; so is setting both the deprecated `sutra.audit.jsonl.path` and
+/// `sutra.audit.jsonl.dir`.
+#[allow(clippy::type_complexity)]
+fn parse_audit_spool(
+    value: &dyn Fn(&str, &str) -> Result<Option<String>, ConfigError>,
+    retention: &AuditRetentionConfig,
+) -> Result<AuditSpoolSettings, ConfigError> {
+    let defaults = AuditSpoolSettings::default();
+    let number = |file_key: &str, canonical: &str, default: u64| -> Result<u64, ConfigError> {
+        match value(file_key, canonical)? {
+            None => Ok(default),
+            Some(raw) => raw
+                .trim()
+                .parse::<u64>()
+                .map_err(|_| ConfigError(format!("{file_key}: '{raw}' is not a whole number"))),
+        }
+    };
+    let positive = |file_key: &str, canonical: &str, default: u64| -> Result<u64, ConfigError> {
+        let n = number(file_key, canonical, default)?;
+        if n == 0 {
+            return Err(ConfigError(format!("{file_key} must be positive")));
+        }
+        Ok(n)
+    };
+    let text = |file_key: &str, canonical: &str| -> Result<Option<String>, ConfigError> {
+        Ok(value(file_key, canonical)?
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()))
+    };
+    let spool_defaults = &defaults.spool;
+    let spool = sutra_channels::AuditSpoolConfig {
+        dir: text("sutra.audit.spool.dir", "SUTRA_AUDIT_SPOOL_DIR")?
+            .map(PathBuf::from)
+            .unwrap_or_else(|| spool_defaults.dir.clone()),
+        segment_bytes: positive(
+            "sutra.audit.spool.segment-bytes",
+            "SUTRA_AUDIT_SPOOL_SEGMENT_BYTES",
+            spool_defaults.segment_bytes,
+        )?,
+        sync_linger: std::time::Duration::from_millis(number(
+            "sutra.audit.spool.sync-linger-ms",
+            "SUTRA_AUDIT_SPOOL_SYNC_LINGER_MS",
+            spool_defaults.sync_linger.as_millis() as u64,
+        )?),
+        max_bytes: positive(
+            "sutra.audit.spool.max-bytes",
+            "SUTRA_AUDIT_SPOOL_MAX_BYTES",
+            spool_defaults.max_bytes,
+        )?,
+        retain: duration_key(
+            value,
+            "sutra.audit.spool.retain",
+            "SUTRA_AUDIT_SPOOL_RETAIN",
+            spool_defaults.retain,
+        )?,
+        sync_timeout: duration_key(
+            value,
+            "sutra.audit.spool.sync-timeout",
+            "SUTRA_AUDIT_SPOOL_SYNC_TIMEOUT",
+            spool_defaults.sync_timeout,
+        )?,
+        sinks: Default::default(),
+    };
+    let shipper = sutra_channels::ShipperConfig {
+        batch_max: positive(
+            "sutra.audit.batch-max",
+            "SUTRA_AUDIT_BATCH_MAX",
+            defaults.shipper.batch_max as u64,
+        )? as usize,
+        batch_linger: std::time::Duration::from_millis(number(
+            "sutra.audit.batch-linger-ms",
+            "SUTRA_AUDIT_BATCH_LINGER_MS",
+            defaults.shipper.batch_linger.as_millis() as u64,
+        )?),
+        backoff_max: defaults.shipper.backoff_max,
+    };
+    let files = match text("sutra.audit.jsonl.dir", "SUTRA_AUDIT_JSONL_DIR")? {
+        None => None,
+        Some(dir) => {
+            if text("sutra.audit.jsonl.path", "SUTRA_AUDIT_JSONL")?.is_some() {
+                return Err(ConfigError(
+                    "sutra.audit.jsonl.path (deprecated) and sutra.audit.jsonl.dir are both set; \
+                     set only sutra.audit.jsonl.dir"
+                        .to_string(),
+                ));
+            }
+            let file_defaults = sutra_channels::AuditFilesConfig::new(&dir);
+            Some(sutra_channels::AuditFilesConfig {
+                rotate_bytes: positive(
+                    "sutra.audit.jsonl.rotate-bytes",
+                    "SUTRA_AUDIT_JSONL_ROTATE_BYTES",
+                    file_defaults.rotate_bytes,
+                )?,
+                rotate_interval: duration_key(
+                    value,
+                    "sutra.audit.jsonl.rotate-interval",
+                    "SUTRA_AUDIT_JSONL_ROTATE_INTERVAL",
+                    file_defaults.rotate_interval,
+                )?,
+                retention: match value(
+                    "sutra.audit.jsonl.retention",
+                    "SUTRA_AUDIT_JSONL_RETENTION",
+                )? {
+                    None => None,
+                    Some(raw) => Some(parse_duration(&raw).map_err(|e| {
+                        ConfigError(format!("sutra.audit.jsonl.retention: '{raw}' — {e}"))
+                    })?),
+                },
+                dedup_window: duration_key(
+                    value,
+                    "sutra.audit.jsonl.dedup-window",
+                    "SUTRA_AUDIT_JSONL_DEDUP_WINDOW",
+                    file_defaults.dedup_window,
+                )?,
+                // One retention-sweep key for every audit store: the database sweeper and
+                // this file timer both read `sutra.audit.retention-sweep-interval`, parsed (and
+                // checked positive) once into `AuditRetentionConfig`.
+                retention_sweep_interval: retention.sweep_interval,
+                ..file_defaults
+            })
+        }
+    };
+    Ok(AuditSpoolSettings {
+        spool,
+        shipper,
+        files,
+        default_sink: text("sutra.audit.default-sink", "SUTRA_AUDIT_DEFAULT_SINK")?,
+        shutdown_timeout: duration_key(
+            value,
+            "sutra.audit.shutdown-timeout",
+            "SUTRA_AUDIT_SHUTDOWN_TIMEOUT",
+            defaults.shutdown_timeout,
+        )?,
+    })
 }
 
 /// Parse a `sutra.<service>.retry.*` block into a [`RetryConfig`] (the generalized retry
@@ -2315,6 +2760,80 @@ mod tests {
     }
 
     #[test]
+    fn audit_spool_keys_default_parse_and_fail_closed() {
+        use std::time::Duration;
+        let mut file = BTreeMap::new();
+        file.insert("sutra.deployments.dir".to_string(), "/r".to_string());
+        let c = EngineConfig::from_sources(&file, &|_| None).unwrap();
+        let s = &c.audit.spool;
+        assert_eq!(s.spool.dir, PathBuf::from("/var/lib/sutra/audit-spool"));
+        assert_eq!(s.spool.segment_bytes, 67_108_864);
+        assert_eq!(s.spool.sync_linger, Duration::from_millis(5));
+        assert_eq!(s.spool.max_bytes, 8_589_934_592);
+        assert_eq!(s.spool.sync_timeout, Duration::from_secs(30));
+        assert_eq!(s.spool.retain, Duration::from_secs(3600));
+        assert_eq!(s.shipper.batch_max, 256);
+        assert_eq!(s.shipper.batch_linger, Duration::from_millis(5));
+        assert_eq!(s.files, None, "the file store is off without a directory");
+        assert_eq!(s.default_sink, None);
+        assert_eq!(s.shutdown_timeout, Duration::from_secs(10));
+
+        let mut set = file.clone();
+        for (k, v) in [
+            ("sutra.audit.spool.dir", "/data/spool"),
+            ("sutra.audit.spool.sync-linger-ms", "0"),
+            ("sutra.audit.spool.sync-timeout", "PT5S"),
+            ("sutra.audit.batch-max", "64"),
+            ("sutra.audit.batch-linger-ms", "2"),
+            ("sutra.audit.jsonl.dir", "/data/audit"),
+            ("sutra.audit.jsonl.rotate-interval", "PT10M"),
+            ("sutra.audit.jsonl.retention", "P30D"),
+            ("sutra.audit.default-sink", "jsonl"),
+            ("sutra.audit.shutdown-timeout", "PT2S"),
+        ] {
+            set.insert(k.to_string(), v.to_string());
+        }
+        let c = EngineConfig::from_sources(&set, &|name| {
+            (name == "SUTRA_AUDIT_SPOOL_MAX_BYTES").then(|| "1024".to_string())
+        })
+        .unwrap();
+        let s = &c.audit.spool;
+        assert_eq!(s.spool.dir, PathBuf::from("/data/spool"));
+        assert_eq!(s.spool.sync_linger, Duration::ZERO);
+        assert_eq!(s.spool.sync_timeout, Duration::from_secs(5));
+        assert_eq!(s.spool.max_bytes, 1024);
+        assert_eq!(s.shipper.batch_max, 64);
+        assert_eq!(s.shipper.batch_linger, Duration::from_millis(2));
+        let files = s.files.as_ref().expect("the file store is on");
+        assert_eq!(files.dir, PathBuf::from("/data/audit"));
+        assert_eq!(files.rotate_interval, Duration::from_secs(600));
+        assert_eq!(files.rotate_bytes, 268_435_456);
+        assert_eq!(files.retention, Some(Duration::from_secs(30 * 86_400)));
+        assert_eq!(files.dedup_window, Duration::from_secs(900));
+        assert_eq!(files.retention_sweep_interval, Duration::from_secs(600));
+        assert_eq!(s.default_sink.as_deref(), Some("jsonl"));
+        assert_eq!(s.shutdown_timeout, Duration::from_secs(2));
+
+        // A bad value is a startup error naming its key.
+        for (key, bad) in [
+            ("sutra.audit.spool.segment-bytes", "lots"),
+            ("sutra.audit.spool.sync-timeout", "soon"),
+            ("sutra.audit.batch-max", "0"),
+        ] {
+            let mut broken = file.clone();
+            broken.insert(key.to_string(), bad.to_string());
+            let err = EngineConfig::from_sources(&broken, &|_| None).unwrap_err();
+            assert!(err.0.contains(key), "{key}: {}", err.0);
+        }
+        // The deprecated single file and the directory exclude each other.
+        let mut both = file.clone();
+        both.insert("sutra.audit.jsonl.dir".to_string(), "/a".to_string());
+        both.insert("sutra.audit.jsonl.path".to_string(), "/b.jsonl".to_string());
+        let err = EngineConfig::from_sources(&both, &|_| None).unwrap_err();
+        assert!(err.0.contains("sutra.audit.jsonl.dir"), "{}", err.0);
+    }
+
+    #[test]
     fn audit_jsonl_path_is_off_by_default_and_parses_from_env_or_file() {
         let mut file = BTreeMap::new();
         file.insert("sutra.deployments.dir".to_string(), "/r".to_string());
@@ -2323,7 +2842,7 @@ mod tests {
         let c = EngineConfig::from_sources(&file, &|_| None).unwrap();
         assert_eq!(c.audit.jsonl_path, None);
         assert_eq!(c.audit.otel_endpoint, None);
-        assert!(!c.audit.sql);
+        assert!(!c.audit.sql.enabled());
 
         // Canonical env activates the JSONL sink.
         let c = EngineConfig::from_sources(&file, &|name| {
@@ -2367,17 +2886,169 @@ mod tests {
         let c = EngineConfig::from_sources(&file, &|_| None).unwrap();
         assert_eq!(c.audit.otel_endpoint, None);
 
-        // The SQL sink is the third composable toggle (`sutra.audit.sql`) — default false,
-        // activated by env/file, lenient-boolean parsed. Registration is additionally gated on
-        // a datasource pool being present (see the assembly).
+        // The SQL store is on when its database URL is set (`sutra.audit.sql.url`).
         let c = EngineConfig::from_sources(&file, &|name| {
-            (name == "SUTRA_AUDIT_SQL").then(|| "true".to_string())
+            (name == "SUTRA_AUDIT_SQL_URL").then(|| "postgres://audit-db:5432/audit".to_string())
         })
         .unwrap();
-        assert!(c.audit.sql);
+        assert!(c.audit.sql.enabled());
+        assert_eq!(c.audit.sql.max_connections, 4);
+        assert_eq!(c.audit.sql.legacy_flag, None);
+        // The deprecated flag set to true alongside a URL is accepted (a warning at startup).
         file.insert("sutra.audit.sql".to_string(), "1".to_string());
+        file.insert(
+            "sutra.audit.sql.url".to_string(),
+            "postgres://audit-db/audit".to_string(),
+        );
         let c = EngineConfig::from_sources(&file, &|_| None).unwrap();
-        assert!(c.audit.sql);
+        assert!(c.audit.sql.enabled());
+        assert_eq!(c.audit.sql.legacy_flag, Some(true));
+    }
+
+    fn audit_file(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        let mut file = BTreeMap::new();
+        file.insert("sutra.deployments.dir".to_string(), "/r".to_string());
+        for (k, v) in pairs {
+            file.insert((*k).to_string(), (*v).to_string());
+        }
+        file
+    }
+
+    /// The deprecated flag on its own no longer turns SQL audit on — there is no
+    /// database to write it to — and refuses startup; `false` with a URL contradicts it.
+    #[test]
+    fn sql_true_without_url_refused() {
+        let err =
+            EngineConfig::from_sources(&audit_file(&[("sutra.audit.sql", "true")]), &|_| None)
+                .unwrap_err();
+        assert!(err.0.contains(AUDIT_SQL_URL_REQUIRED), "{}", err.0);
+        let err = EngineConfig::from_sources(
+            &audit_file(&[
+                ("sutra.audit.sql", "false"),
+                ("sutra.audit.sql.url", "postgres://audit-db/audit"),
+            ]),
+            &|_| None,
+        )
+        .unwrap_err();
+        assert!(err.0.contains(AUDIT_SQL_CONFLICT), "{}", err.0);
+        // `false` alone is just off.
+        let c = EngineConfig::from_sources(&audit_file(&[("sutra.audit.sql", "false")]), &|_| None)
+            .unwrap();
+        assert!(!c.audit.sql.enabled());
+    }
+
+    /// An audit URL naming the engine's own database refuses startup, whatever the
+    /// spelling of the database (explicit, or defaulted to the user name).
+    #[test]
+    fn audit_url_equal_to_engine_refused() {
+        let err = EngineConfig::from_sources(
+            &audit_file(&[
+                (
+                    "sutra.datasource.url",
+                    "postgres://sutra@db.internal:5432/sutra",
+                ),
+                (
+                    "sutra.audit.sql.url",
+                    "postgres://auditor@DB.internal/sutra",
+                ),
+            ]),
+            &|_| None,
+        )
+        .unwrap_err();
+        assert!(err.0.contains(AUDIT_SHARES_ENGINE_DB), "{}", err.0);
+        let err = EngineConfig::from_sources(
+            &audit_file(&[
+                ("sutra.datasource.url", "postgres://sutra@db.internal/"),
+                (
+                    "sutra.audit.sql.url",
+                    "postgres://sutra@db.internal:5432/sutra",
+                ),
+            ]),
+            &|_| None,
+        )
+        .unwrap_err();
+        assert!(err.0.contains(AUDIT_SHARES_ENGINE_DB), "{}", err.0);
+    }
+
+    /// The same server with another database is allowed (test stacks need it) and is
+    /// reported as [`AuditDbPlacement::SameServer`], which startup logs as a warning.
+    #[test]
+    fn audit_url_same_server_warns() {
+        let c = EngineConfig::from_sources(
+            &audit_file(&[
+                (
+                    "sutra.datasource.url",
+                    "postgres://sutra@db.internal:5432/sutra",
+                ),
+                (
+                    "sutra.audit.sql.url",
+                    "postgres://sutra@db.internal:5432/sutra_audit",
+                ),
+            ]),
+            &|_| None,
+        )
+        .unwrap();
+        assert!(c.audit.sql.enabled());
+        assert_eq!(
+            audit_db_placement(
+                c.datasource_url.as_deref(),
+                None,
+                c.audit.sql.url.as_deref().unwrap(),
+                None
+            )
+            .unwrap(),
+            AuditDbPlacement::SameServer
+        );
+        assert_eq!(
+            audit_db_placement(
+                Some("postgres://sutra@db.internal:5432/sutra"),
+                None,
+                "postgres://sutra@audit.internal:5432/sutra",
+                None
+            )
+            .unwrap(),
+            AuditDbPlacement::Separate,
+            "another host is a separate instance, even with the same database name"
+        );
+        assert_eq!(
+            audit_db_placement(None, None, "postgres://audit/a", None).unwrap(),
+            AuditDbPlacement::Separate
+        );
+    }
+
+    /// Audit retention is off by default and parses its three keys.
+    #[test]
+    fn audit_retention_defaults_and_parses() {
+        let c = EngineConfig::from_sources(&audit_file(&[]), &|_| None).unwrap();
+        assert_eq!(c.audit.retention, AuditRetentionConfig::default());
+        assert_eq!(c.audit.retention.retention, None);
+        assert_eq!(c.audit.retention.sweep_interval.as_secs(), 600);
+        assert_eq!(c.audit.retention.batch, 10_000);
+        let c = EngineConfig::from_sources(
+            &audit_file(&[
+                ("sutra.audit.retention", "P30D"),
+                ("sutra.audit.retention-sweep-interval", "PT1M"),
+                ("sutra.audit.retention-batch", "500"),
+            ]),
+            &|_| None,
+        )
+        .unwrap();
+        assert_eq!(
+            c.audit.retention.retention,
+            Some(std::time::Duration::from_secs(30 * 86_400))
+        );
+        assert_eq!(c.audit.retention.sweep_interval.as_secs(), 60);
+        assert_eq!(c.audit.retention.batch, 500);
+        for (key, bad) in [
+            ("sutra.audit.retention-sweep-interval", "PT0S"),
+            ("sutra.audit.retention-batch", "0"),
+            ("sutra.audit.retention", "soon"),
+        ] {
+            assert!(
+                EngineConfig::from_sources(&audit_file(&[(key, bad)]), &|_| None).is_err(),
+                "{key}={bad} is refused"
+            );
+        }
     }
 
     #[test]

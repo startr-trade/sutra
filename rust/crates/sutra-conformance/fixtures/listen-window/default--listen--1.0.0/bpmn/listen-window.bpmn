@@ -16,7 +16,7 @@
   <bpmn:process id="listen-window" name="Listen for a status, or time out" isExecutable="true">
     <bpmn:extensionElements>
       <!-- Metadata-level audit events: the suite reads which path each instance took. -->
-      <q:audit capture="metadata"/>
+      <q:audit events="all" capture="metadata"/>
       <q:variables>
         <q:variable name="rounds" type="number"/>
         <q:variable name="outcome" type="string"/>

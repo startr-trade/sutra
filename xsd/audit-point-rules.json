@@ -1,0 +1,275 @@
+{
+  "description": "Audit points: the nodes a process audited with events=\"points\" records. A point records NODE_LEFT; a wait node also records NODE_ENTERED. A node is bound when it carries q:send, q:reply or q:source, or is a channel: service task. A node-level q:audit capture=\"none\" opts any node out.",
+  "rules": [
+    {
+      "isPoint": true,
+      "rule": "ad-hoc sub-process boundary",
+      "variant": "AdHocSubProcess",
+      "whenBound": {
+        "isPoint": true,
+        "rule": "ad-hoc sub-process boundary"
+      }
+    },
+    {
+      "isPoint": true,
+      "rule": "boundary event",
+      "variant": "BoundaryEvent",
+      "whenBound": {
+        "isPoint": true,
+        "rule": "boundary event"
+      }
+    },
+    {
+      "isPoint": false,
+      "rule": "business rule task (not a point)",
+      "variant": "BusinessRuleTask",
+      "whenBound": {
+        "isPoint": true,
+        "rule": "node bound to q:send, q:reply or q:source"
+      }
+    },
+    {
+      "isPoint": true,
+      "rule": "call activity",
+      "variant": "CallActivity",
+      "whenBound": {
+        "isPoint": true,
+        "rule": "call activity"
+      }
+    },
+    {
+      "isPoint": true,
+      "rule": "cancel end event",
+      "variant": "CancelEndEvent",
+      "whenBound": {
+        "isPoint": true,
+        "rule": "cancel end event"
+      }
+    },
+    {
+      "isPoint": false,
+      "rule": "complex gateway (not a point)",
+      "variant": "ComplexGateway",
+      "whenBound": {
+        "isPoint": true,
+        "rule": "node bound to q:send, q:reply or q:source"
+      }
+    },
+    {
+      "isPoint": false,
+      "rule": "data task (not a point)",
+      "variant": "DataTask",
+      "whenBound": {
+        "isPoint": true,
+        "rule": "node bound to q:send, q:reply or q:source"
+      }
+    },
+    {
+      "isPoint": true,
+      "rule": "end event",
+      "variant": "EndEvent",
+      "whenBound": {
+        "isPoint": true,
+        "rule": "end event"
+      }
+    },
+    {
+      "isPoint": true,
+      "rule": "error end event",
+      "variant": "ErrorEvent",
+      "whenBound": {
+        "isPoint": true,
+        "rule": "error end event"
+      }
+    },
+    {
+      "isPoint": true,
+      "rule": "event-based gateway",
+      "variant": "EventBasedGateway",
+      "whenBound": {
+        "isPoint": true,
+        "rule": "event-based gateway"
+      }
+    },
+    {
+      "isPoint": true,
+      "rule": "event sub-process boundary",
+      "variant": "EventSubProcess",
+      "whenBound": {
+        "isPoint": true,
+        "rule": "event sub-process boundary"
+      }
+    },
+    {
+      "isPoint": false,
+      "rule": "exclusive gateway (not a point)",
+      "variant": "ExclusiveGateway",
+      "whenBound": {
+        "isPoint": true,
+        "rule": "node bound to q:send, q:reply or q:source"
+      }
+    },
+    {
+      "isPoint": false,
+      "rule": "inclusive gateway (not a point)",
+      "variant": "InclusiveGateway",
+      "whenBound": {
+        "isPoint": true,
+        "rule": "node bound to q:send, q:reply or q:source"
+      }
+    },
+    {
+      "isPoint": true,
+      "rule": "intermediate throw event",
+      "variant": "IntermediateThrowEvent",
+      "whenBound": {
+        "isPoint": true,
+        "rule": "intermediate throw event"
+      }
+    },
+    {
+      "isPoint": true,
+      "rule": "link catch event",
+      "variant": "LinkCatchEvent",
+      "whenBound": {
+        "isPoint": true,
+        "rule": "link catch event"
+      }
+    },
+    {
+      "isPoint": false,
+      "rule": "plain task (not a point)",
+      "variant": "ManualTask",
+      "whenBound": {
+        "isPoint": true,
+        "rule": "node bound to q:send, q:reply or q:source"
+      }
+    },
+    {
+      "isPoint": true,
+      "rule": "message catch event",
+      "variant": "MessageCatchEvent",
+      "whenBound": {
+        "isPoint": true,
+        "rule": "message catch event"
+      }
+    },
+    {
+      "isPoint": false,
+      "rule": "multi-instance: as the activity it wraps",
+      "variant": "MultiInstance",
+      "whenBound": {
+        "isPoint": true,
+        "rule": "node bound to q:send, q:reply or q:source"
+      }
+    },
+    {
+      "isPoint": false,
+      "rule": "parallel gateway (not a point)",
+      "variant": "ParallelGateway",
+      "whenBound": {
+        "isPoint": true,
+        "rule": "node bound to q:send, q:reply or q:source"
+      }
+    },
+    {
+      "isPoint": true,
+      "rule": "receive task",
+      "variant": "ReceiveTask",
+      "whenBound": {
+        "isPoint": true,
+        "rule": "receive task"
+      }
+    },
+    {
+      "isPoint": false,
+      "rule": "script task (not a point)",
+      "variant": "ScriptTask",
+      "whenBound": {
+        "isPoint": true,
+        "rule": "node bound to q:send, q:reply or q:source"
+      }
+    },
+    {
+      "isPoint": true,
+      "rule": "send task",
+      "variant": "SendTask",
+      "whenBound": {
+        "isPoint": true,
+        "rule": "send task"
+      }
+    },
+    {
+      "isPoint": false,
+      "rule": "unbound service task (not a point)",
+      "variant": "ServiceTask",
+      "whenBound": {
+        "isPoint": true,
+        "rule": "service task bound to a message exchange"
+      }
+    },
+    {
+      "isPoint": false,
+      "rule": "standard loop: as the activity it wraps",
+      "variant": "StandardLoop",
+      "whenBound": {
+        "isPoint": true,
+        "rule": "node bound to q:send, q:reply or q:source"
+      }
+    },
+    {
+      "isPoint": true,
+      "rule": "start event",
+      "variant": "StartEvent",
+      "whenBound": {
+        "isPoint": true,
+        "rule": "start event"
+      }
+    },
+    {
+      "isPoint": true,
+      "rule": "sub-process boundary",
+      "variant": "SubProcess",
+      "whenBound": {
+        "isPoint": true,
+        "rule": "sub-process boundary"
+      }
+    },
+    {
+      "isPoint": true,
+      "rule": "terminate end event",
+      "variant": "TerminateEndEvent",
+      "whenBound": {
+        "isPoint": true,
+        "rule": "terminate end event"
+      }
+    },
+    {
+      "isPoint": true,
+      "rule": "timer catch event",
+      "variant": "TimerCatchEvent",
+      "whenBound": {
+        "isPoint": true,
+        "rule": "timer catch event"
+      }
+    },
+    {
+      "isPoint": true,
+      "rule": "transaction sub-process boundary",
+      "variant": "TransactionSubProcess",
+      "whenBound": {
+        "isPoint": true,
+        "rule": "transaction sub-process boundary"
+      }
+    },
+    {
+      "isPoint": true,
+      "rule": "user task",
+      "variant": "UserTask",
+      "whenBound": {
+        "isPoint": true,
+        "rule": "user task"
+      }
+    }
+  ]
+}

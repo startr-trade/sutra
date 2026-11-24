@@ -11,6 +11,9 @@
 //! entities, and a `<!DOCTYPE>` declaration is rejected outright (see [`xml`]).
 #![forbid(unsafe_code)]
 
+pub mod audit_plan;
+pub mod audit_points;
+pub mod audit_source;
 pub mod codes;
 pub mod duration;
 pub mod error;
@@ -31,14 +34,20 @@ pub const REDACTED_PLACEHOLDER: &str = "***REDACTED***";
 /// sites (audit snapshot, inspect projection — which prefer it) agree on the name.
 pub const REDACTION_COMPANION_SUFFIX: &str = ".redacted";
 
+pub use audit_plan::{AuditPlan, ElementAuditDisposition};
+pub use audit_points::{audit_point_rule, audit_point_rules_json, is_audit_point, AuditPointRule};
+pub use audit_source::{
+    audit_edit_sites, scan_audit_sources, ProcessAuditEdits, ProcessAuditSource,
+};
 pub use error::SutraError;
 pub use loader::BpmnModelLoader;
 pub use model::{
-    BpmnDataSpelling, BpmnImport, CoveragePath, DataMapping, DeclaredVariable, FieldType, Node,
-    PredicateAlways, PredicateUnavailable, ProcessAudit, ProcessDefinition, ProcessModule,
-    SequenceFlow, ShadowedBpmnVariable, SourcePredicate, StoreAggregateFunction, StoreQuery,
-    StoreQueryAggregate, StoreQueryMode, TimerExpressionSite, DEFAULT_LOOP_ITEM_VARIABLE,
-    LOOP_COUNTER_VARIABLE, STORE_QUERY_DEFAULT_LIMIT, STORE_QUERY_MAX_LIMIT,
+    AuditDestinations, BpmnDataSpelling, BpmnImport, CoveragePath, DataMapping, DeclaredVariable,
+    FieldType, Node, PredicateAlways, PredicateUnavailable, ProcessAudit, ProcessDefinition,
+    ProcessModule, SequenceFlow, ShadowedBpmnVariable, SourcePredicate, StoreAggregateFunction,
+    StoreQuery, StoreQueryAggregate, StoreQueryMode, TimerExpressionSite,
+    DEFAULT_LOOP_ITEM_VARIABLE, LOOP_COUNTER_VARIABLE, STORE_QUERY_DEFAULT_LIMIT,
+    STORE_QUERY_MAX_LIMIT,
 };
 pub use timer::{
     TimerCycleSpec, TimerDefinition, TimerExpressionForm, TimerSpecRejection, TimerTextClass,

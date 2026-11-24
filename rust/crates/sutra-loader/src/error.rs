@@ -291,6 +291,14 @@ pub mod codes {
     /// one that does not starts a new instance.
     pub const CONFIG_CHANNEL_START_AND_WAIT: &str = "SUTRA.CONFIG.CHANNEL.START_AND_WAIT";
 
+    // ---- the manifest's `audit` block ----
+    /// The manifest's `audit.capture` is ignored from 0.9: the BPMN alone decides whether and
+    /// what a process audits (`<q:audit capture>`); the manifest says only where. A warning, not
+    /// an error. `sutra lint --fix audit` moves the value into each process it used to cover.
+    pub const MANIFEST_AUDIT_CAPTURE_IGNORED: &str = "SUTRA.MANIFEST.AUDIT.CAPTURE_IGNORED";
+    /// The manifest's `audit.sinks` names a process id that no BPMN in the package defines.
+    pub const MANIFEST_AUDIT_UNKNOWN_PROCESS: &str = "SUTRA.MANIFEST.AUDIT.UNKNOWN_PROCESS";
+
     // ---- the reserved SUTRA.DEPLOY.* family — the sealed-archive load checks ----
     /// The archive container is not a readable `.sutra` ZIP (open failure, non-UTF-8 or
     /// non-forward-slash entry name, nested archive, or a depth/entry-count limit breach).

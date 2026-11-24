@@ -20,6 +20,11 @@
                   targetNamespace="urn:sutra:module:approval:1.0.0">
 
   <bpmn:process id="approval-hold" name="Approval Hold" isExecutable="true">
+    <bpmn:extensionElements>
+      <!-- Audit is declared here, in the process: no tag, no audit. A bare tag means events="points" capture="metadata". -->
+      <q:audit/>
+    </bpmn:extensionElements>
+
 
     <bpmn:startEvent id="StartEvent_Request" name="ApprovalRequest received">
       <bpmn:extensionElements>

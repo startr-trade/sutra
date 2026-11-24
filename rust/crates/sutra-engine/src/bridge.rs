@@ -59,7 +59,7 @@ use sutra_persistence::snapshot::{InstanceSnapshot, RawSnapshot, SnapshotCrypto}
 
 use crate::snapshot_values;
 use sutra_persistence::step::{
-    commit_step_with_timers, commit_step_with_timers_releasing_retiring, StepAlias, StepSubject,
+    commit_step_with_timers_releasing_retiring_gated, CommitGate as _, StepAlias, StepSubject,
     StepTimerWait, StepWait, StepWrite,
 };
 use sutra_persistence::stores::{
@@ -144,6 +144,88 @@ pub struct PersistenceBridge {
     /// the same deployment writes them in its own transaction (so the record exists iff the
     /// step's effects do); `settle` writes or drops what no step consumed.
     pending_seen: std::sync::Mutex<Vec<sutra_channels::PendingDedup>>,
+    /// The durable audit spool. When set, every step commit first waits for the spool's group
+    /// sync ([`Self::audit_barrier`]), so a committed step's audit events are on disk; a spool
+    /// that cannot sync fails the commit, and the delivery is retried, instead of losing audit.
+    audit: Option<sutra_channels::AuditSpoolSender>,
+    /// Fault injection (tests and the `test-hooks` feature only, never a shipped build): when
+    /// set, the next step commit stops right after its audit sync, as a process killed between
+    /// the spool sync and the database commit would.
+    #[cfg(any(test, feature = "test-hooks"))]
+    crash_after_audit_sync: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Fault injection: when set, the next successful commit writes no outcome marker, as a
+    /// process killed right after its `COMMIT` would.
+    #[cfg(any(test, feature = "test-hooks"))]
+    crash_after_commit: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// The lane's audit attempt tracker (shared with its audit listener): every step commit
+    /// prepares and settles the attempts open on the lane.
+    attempts: Option<sutra_channels::AuditAttemptTracker>,
+    /// Where attempts go whose commit returned an error: the resolver decides them from their
+    /// transaction's status.
+    attempt_resolver: Option<crate::audit_recovery::ResolverTx>,
+}
+
+/// The audit side of one step commit, run inside the step transaction right before `COMMIT`:
+/// record the transaction id for the lane's open attempts (`PREPARED` markers), then wait for
+/// the spool's sync. A failure is kept so the caller reports it with its own code.
+struct AuditGate<'a> {
+    bridge: &'a PersistenceBridge,
+    failure: std::sync::Mutex<Option<Diagnostic>>,
+}
+
+impl sutra_persistence::step::CommitGate for AuditGate<'_> {
+    fn before_commit<'a>(
+        &'a self,
+        conn: &'a mut sqlx::PgConnection,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = sutra_persistence::Result<()>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            if let (Some(spool), Some(tracker)) = (&self.bridge.audit, &self.bridge.attempts) {
+                if tracker.has_open() {
+                    let xid: String = sqlx::query_scalar("SELECT pg_current_xact_id()::text")
+                        .fetch_one(&mut *conn)
+                        .await
+                        .map_err(PersistenceError::db("audit attempt transaction id"))?;
+                    tracker.prepare(spool, &xid);
+                }
+            }
+            match self.bridge.audit_barrier().await {
+                Ok(()) => Ok(()),
+                Err(d) => {
+                    let message = d.message.clone();
+                    *self.failure.lock().unwrap_or_else(|e| e.into_inner()) = Some(d);
+                    Err(PersistenceError::InvalidArgument(message))
+                }
+            }
+        })
+    }
+}
+
+/// The diagnostic a step commit stopped by the `test-hooks` kill point returns.
+#[cfg(any(test, feature = "test-hooks"))]
+pub const TEST_CRASH_AFTER_AUDIT_SYNC: &str = "SUTRA.TEST.CRASH_AFTER_AUDIT_SYNC";
+
+/// The step commit could not be made because the audit spool did not sync in time.
+pub const AUDIT_SPOOL_SYNC_FAILED: &str = sutra_channels::audit_spool::AUDIT_SPOOL_SYNC_FAILED;
+
+/// Wait for `spool`'s group sync of everything appended before this call (nothing to wait for
+/// without a spool). A spool that cannot sync within its `sync-timeout` is
+/// [`AUDIT_SPOOL_SYNC_FAILED`].
+pub(crate) async fn audit_barrier(
+    spool: Option<&sutra_channels::AuditSpoolSender>,
+) -> Result<(), Diagnostic> {
+    let Some(spool) = spool else {
+        return Ok(());
+    };
+    spool.barrier().await.map_err(|e| {
+        Diagnostic::error(
+            AUDIT_SPOOL_SYNC_FAILED,
+            format!(
+                "the step's audit events could not be made durable, so it does not commit: {e}"
+            ),
+        )
+    })
 }
 
 /// Rows a step commits that the in-process dispatcher can take straight from the commit:
@@ -172,6 +254,13 @@ impl PersistenceBridge {
             retention: DEFAULT_INSTANCE_RETENTION,
             outbox_signal: None,
             pending_seen: std::sync::Mutex::new(Vec::new()),
+            audit: None,
+            #[cfg(any(test, feature = "test-hooks"))]
+            crash_after_audit_sync: None,
+            #[cfg(any(test, feature = "test-hooks"))]
+            crash_after_commit: None,
+            attempts: None,
+            attempt_resolver: None,
         }
     }
 
@@ -183,6 +272,129 @@ impl PersistenceBridge {
             .partition(|p| p.deployment.value() == dep.as_str());
         *pending = rest;
         mine.into_iter().map(|p| (p.channel, p.event_id)).collect()
+    }
+
+    /// Wire the durable audit spool: every step commit waits for its sync first.
+    #[must_use]
+    pub fn with_audit_spool(
+        mut self,
+        spool: sutra_channels::AuditSpoolSender,
+    ) -> PersistenceBridge {
+        self.audit = Some(spool);
+        self
+    }
+
+    /// The audit barrier every step commit passes first (see [`audit_barrier`]).
+    async fn audit_barrier(&self) -> Result<(), Diagnostic> {
+        audit_barrier(self.audit.as_ref()).await?;
+        #[cfg(any(test, feature = "test-hooks"))]
+        if let Some(crash) = &self.crash_after_audit_sync {
+            if crash.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                return Err(Diagnostic::error(
+                    TEST_CRASH_AFTER_AUDIT_SYNC,
+                    "test hook: stopped between the audit sync and the step commit".to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Wire the lane's audit attempt tracker and the resolver for unknown commit outcomes.
+    #[must_use]
+    pub(crate) fn with_audit_attempts(
+        mut self,
+        tracker: sutra_channels::AuditAttemptTracker,
+        resolver: Option<crate::audit_recovery::ResolverTx>,
+    ) -> PersistenceBridge {
+        self.attempts = Some(tracker);
+        self.attempt_resolver = resolver;
+        self
+    }
+
+    fn audit_gate(&self) -> AuditGate<'_> {
+        AuditGate {
+            bridge: self,
+            failure: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// After a step commit: settle the lane's open attempts. A commit that succeeded marks
+    /// them `COMMITTED`; one whose audit sync failed (so `COMMIT` was never sent) `ABORTED`;
+    /// any other error leaves the outcome unknown, for the resolver. Returns the gate's own
+    /// failure, which the caller reports instead of the generic persistence error.
+    fn settle_attempts<T>(
+        &self,
+        gate: AuditGate<'_>,
+        outcome: &Result<T, PersistenceError>,
+    ) -> Option<Diagnostic> {
+        let failure = gate.failure.into_inner().unwrap_or_else(|e| e.into_inner());
+        #[cfg(any(test, feature = "test-hooks"))]
+        {
+            if failure
+                .as_ref()
+                .is_some_and(|d| d.code == TEST_CRASH_AFTER_AUDIT_SYNC)
+            {
+                return failure;
+            }
+            if outcome.is_ok() {
+                if let Some(crash) = &self.crash_after_commit {
+                    if crash.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                        return failure;
+                    }
+                }
+            }
+        }
+        if let (Some(spool), Some(tracker)) = (&self.audit, &self.attempts) {
+            match (outcome, &failure) {
+                (Ok(_), _) => {
+                    tracker.settle(spool, true);
+                }
+                (Err(_), Some(_)) => {
+                    tracker.settle(spool, false);
+                }
+                (Err(_), None) => {
+                    let unknown = tracker.take_unknown();
+                    if !unknown.is_empty() {
+                        match &self.attempt_resolver {
+                            Some(resolver) => {
+                                let _ = resolver.send(unknown);
+                            }
+                            // No resolver (tests): audit is never dropped on doubt.
+                            None => {
+                                for attempt in unknown {
+                                    spool.append(attempt.marker(true));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        failure
+    }
+
+    /// Arm the `test-hooks` kill point right after a commit: while `crash` is true, the next
+    /// successful commit writes no outcome marker (and clears it).
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[must_use]
+    pub fn with_crash_after_commit(
+        mut self,
+        crash: Arc<std::sync::atomic::AtomicBool>,
+    ) -> PersistenceBridge {
+        self.crash_after_commit = Some(crash);
+        self
+    }
+
+    /// Arm the `test-hooks` kill point: while `crash` is true, the next step commit stops right
+    /// after its audit sync (and clears it).
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[must_use]
+    pub fn with_crash_after_audit_sync(
+        mut self,
+        crash: Arc<std::sync::atomic::AtomicBool>,
+    ) -> PersistenceBridge {
+        self.crash_after_audit_sync = Some(crash);
+        self
     }
 
     /// Wire the runtime's outbox signal (wake on enqueue + the local hand-off).
@@ -607,12 +819,24 @@ impl InstanceBridge for PersistenceBridge {
         // instance is unreachable, which is a stronger guarantee than a claim. Ownership
         // only becomes meaningful from the first RESUME onwards, which is where the claim
         // is taken and `commit_repark` hands it back.
+        let gate = self.audit_gate();
         let committed = commit_riding_out_outage("park step commit", || {
-            commit_step_with_timers(&self.pool, &step, &timers)
+            commit_step_with_timers_releasing_retiring_gated(
+                &self.pool,
+                &step,
+                &timers,
+                None,
+                &[],
+                &gate,
+            )
         })
         .await;
+        let gate_failure = self.settle_attempts(gate, &committed);
         self.after_enqueue(deployment, &step.outbox, reserved, committed.is_ok())
             .await;
+        if let (Err(_), Some(d)) = (&committed, gate_failure) {
+            return Err(d);
+        }
         committed.map_err(|e| persistence_diag("park step commit failed", &e))?;
         info!(
             instance_id,
@@ -718,6 +942,7 @@ impl InstanceBridge for PersistenceBridge {
         // live wait behind and still never loses a send.
         // Taken once: every attempt below writes the same dedup keys.
         let pending = self.pending_for(&dep);
+        let gate = self.audit_gate();
         let attempt = || async {
             let mut tx = begin_deployment_tx(&self.pool, &dep).await?;
             sutra_persistence::step::record_inbox_seen_in(&mut tx, &dep, &pending, Some(instance))
@@ -790,14 +1015,19 @@ impl InstanceBridge for PersistenceBridge {
                 PgOutboxStore::enqueue_in(&mut tx, entry).await?;
             }
             PgInflightChainStore::clear_in(&mut tx, &dep, instance).await?;
+            gate.before_commit(&mut tx).await?;
             tx.commit()
                 .await
                 .map_err(PersistenceError::db("terminal step commit"))?;
             Ok::<bool, PersistenceError>(retained)
         };
         let retained = commit_riding_out_outage("terminal step commit", attempt).await;
+        let gate_failure = self.settle_attempts(gate, &retained);
         self.after_enqueue(deployment, &entries, reserved, retained.is_ok())
             .await;
+        if let (Err(_), Some(d)) = (&retained, gate_failure) {
+            return Err(d);
+        }
         let retained = retained.map_err(|e| persistence_diag("terminal step failed", &e))?;
         info!(
             instance_id,
@@ -890,18 +1120,24 @@ impl InstanceBridge for PersistenceBridge {
             .map(|a| (a.name.clone(), a.value.clone()))
             .collect();
         let reserved = self.reserve_local(&mut step.outbox);
+        let gate = self.audit_gate();
         let committed = commit_riding_out_outage("re-park step commit", || {
-            commit_step_with_timers_releasing_retiring(
+            commit_step_with_timers_releasing_retiring_gated(
                 &self.pool,
                 &step,
                 &timers,
                 Some(&self.claim_owner),
                 &retired,
+                &gate,
             )
         })
         .await;
+        let gate_failure = self.settle_attempts(gate, &committed);
         self.after_enqueue(deployment, &step.outbox, reserved, committed.is_ok())
             .await;
+        if let (Err(_), Some(d)) = (&committed, gate_failure) {
+            return Err(d);
+        }
         committed.map_err(|e| persistence_diag("re-park step commit failed", &e))?;
         info!(
             instance_id,
@@ -971,6 +1207,7 @@ impl InstanceBridge for PersistenceBridge {
         // UPSERT it back, and resolve every outstanding wait row so no timer refires and no relay
         // finds a live wait. Aliases stay LIVE on purpose (see the trait doc): the failed instance
         // keeps its business key so a relay correlates to it and gets INSTANCE_FAILED.
+        let gate = self.audit_gate();
         let marked = async {
             let mut tx = begin_deployment_tx(&self.pool, &dep).await?;
             // Row-locking read: the marker must not race a concurrent replica re-parking the
@@ -1001,13 +1238,18 @@ impl InstanceBridge for PersistenceBridge {
             .await
             .map_err(PersistenceError::db("failed-step wait resolveAll"))?;
             PgInflightChainStore::clear_in(&mut tx, &dep, instance).await?;
+            gate.before_commit(&mut tx).await?;
             tx.commit()
                 .await
                 .map_err(PersistenceError::db("failed step commit"))?;
             Ok::<bool, PersistenceError>(true)
         }
-        .await
-        .map_err(|e| persistence_diag("failed-state commit failed", &e))?;
+        .await;
+        let gate_failure = self.settle_attempts(gate, &marked);
+        if let (Err(_), Some(d)) = (&marked, gate_failure) {
+            return Err(d);
+        }
+        let marked = marked.map_err(|e| persistence_diag("failed-state commit failed", &e))?;
         if marked {
             warn!(
                 instance_id,
@@ -1081,7 +1323,27 @@ impl InstanceBridge for PersistenceBridge {
         emissions: &[OutboxEmission],
     ) -> Result<(), Diagnostic> {
         if emissions.is_empty() {
-            return Ok(());
+            // Nothing to write: the step is done once its audit is durable (no transaction,
+            // so no transaction id; audit is never dropped on doubt).
+            let gate = self.audit_gate();
+            if let (Some(spool), Some(tracker)) = (&self.audit, &self.attempts) {
+                if tracker.has_open() {
+                    tracker.prepare(spool, crate::audit_recovery::NO_TRANSACTION);
+                }
+            }
+            let synced: Result<(), PersistenceError> = match self.audit_barrier().await {
+                Ok(()) => Ok(()),
+                Err(d) => {
+                    let message = d.message.clone();
+                    *gate.failure.lock().unwrap_or_else(|e| e.into_inner()) = Some(d);
+                    Err(PersistenceError::InvalidArgument(message))
+                }
+            };
+            return match (self.settle_attempts(gate, &synced), synced) {
+                (_, Ok(())) => Ok(()),
+                (Some(d), Err(_)) => Err(d),
+                (None, Err(e)) => Err(persistence_diag("audit sync failed", &e)),
+            };
         }
         let dep = persist_dep(deployment)?;
         let mut entries = outbox_entries(&dep, emissions)?;
@@ -1090,6 +1352,7 @@ impl InstanceBridge for PersistenceBridge {
         // ONE deployment-scoped transaction — all rows, or none.
         // Taken once: every attempt below writes the same dedup keys.
         let pending = self.pending_for(&dep);
+        let gate = self.audit_gate();
         let attempt = || async {
             let mut tx = begin_deployment_tx(&self.pool, &dep).await?;
             sutra_persistence::step::record_inbox_seen_in(
@@ -1110,13 +1373,18 @@ impl InstanceBridge for PersistenceBridge {
             for instance in instances {
                 PgInflightChainStore::clear_in(&mut tx, &dep, instance).await?;
             }
+            gate.before_commit(&mut tx).await?;
             tx.commit()
                 .await
                 .map_err(PersistenceError::db("sync-path outbox commit"))
         };
         let committed = commit_riding_out_outage("sync-path outbox commit", attempt).await;
+        let gate_failure = self.settle_attempts(gate, &committed);
         self.after_enqueue(deployment, &entries, reserved, committed.is_ok())
             .await;
+        if let (Err(_), Some(d)) = (&committed, gate_failure) {
+            return Err(d);
+        }
         committed.map_err(|e| persistence_diag("sync-path outbox commit failed", &e))?;
         info!(
             deployment = deployment.value(),
@@ -1361,5 +1629,688 @@ mod dedup_tests {
     async fn a_forget_the_store_cannot_answer_says_so() {
         let bridge = bridge_with_no_database();
         assert!(!bridge.forget(&deployment(), "in", "evt-1").await);
+    }
+}
+
+#[cfg(test)]
+mod audit_durability_tests {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use sutra_channels::audit_spool::SpoolFaultInjector;
+    use sutra_channels::{AuditEvent, AuditSpool, AuditSpoolConfig};
+
+    use super::*;
+
+    fn bridge_with_no_database(spool: &AuditSpool) -> PersistenceBridge {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(Duration::from_millis(200))
+            .connect_lazy("postgres://sutra@127.0.0.1:1/none")
+            .expect("a lazy pool never connects here");
+        PersistenceBridge::new(pool).with_audit_spool(spool.sender())
+    }
+
+    fn spool_config(name: &str) -> AuditSpoolConfig {
+        AuditSpoolConfig {
+            dir: std::env::temp_dir().join(format!("sutra-{name}-{}", uuid::Uuid::new_v4())),
+            sync_linger: Duration::ZERO,
+            sinks: ["jsonl".to_string()].into_iter().collect(),
+            ..AuditSpoolConfig::default()
+        }
+    }
+
+    fn event() -> AuditEvent {
+        AuditEvent {
+            sink: "jsonl".into(),
+            deployment_id: "dep-0000000000000000000000d1".into(),
+            tenant: "t".into(),
+            instance_id: "11111111-1111-1111-1111-111111111111".into(),
+            seq: 1,
+            at: "2026-11-24T00:00:00Z".into(),
+            event_type: "INSTANCE_COMPLETED".into(),
+            node_id: None,
+            diagnostic_code: None,
+            diagnostic_json: None,
+            payload_json: "{}".into(),
+            correlation: Default::default(),
+            attempt: None,
+        }
+    }
+
+    fn deployment() -> sutra_executor::DeploymentId {
+        sutra_executor::DeploymentId::of("dep-0000000000000000000000d1").expect("valid")
+    }
+
+    /// The commit does not go ahead until the step's audit events are synced: with a 300 ms
+    /// linger and nothing else waiting, the event is not synced until the commit's barrier
+    /// asks for it (the linger would hold it), and it is durable when the commit returns.
+    #[tokio::test]
+    async fn step_commit_waits_for_spool() {
+        let cfg = AuditSpoolConfig {
+            sync_linger: Duration::from_millis(300),
+            ..spool_config("bridge-wait")
+        };
+        let dir = cfg.dir.clone();
+        let spool = AuditSpool::open(cfg).unwrap();
+        let bridge = bridge_with_no_database(&spool);
+        spool.sender().append(event());
+        assert_eq!(spool.durable_through(), 0);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            spool.durable_through(),
+            0,
+            "held by the linger until a barrier"
+        );
+        let started = Instant::now();
+        // An empty emissions commit writes nothing to the database: only the barrier runs.
+        bridge.commit_emissions(&deployment(), &[]).await.unwrap();
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "a lone step does not wait out the linger"
+        );
+        assert_eq!(
+            spool.durable_through(),
+            1,
+            "the step's event was synced first"
+        );
+        drop(bridge);
+        spool.shutdown().unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A spool that cannot sync fails the commit (the delivery is then retried); the event
+    /// stays queued and is written once the spool can sync again.
+    #[tokio::test]
+    async fn spool_failure_fails_commit_not_lost() {
+        let cfg = AuditSpoolConfig {
+            sync_timeout: Duration::from_millis(300),
+            ..spool_config("bridge-fail")
+        };
+        let dir = cfg.dir.clone();
+        let faults = Arc::new(SpoolFaultInjector::default());
+        let spool = AuditSpool::open_with_faults(cfg, Some(Arc::clone(&faults))).unwrap();
+        let bridge = bridge_with_no_database(&spool);
+        faults.fail_next_syncs(u64::MAX);
+        spool.sender().append(event());
+        let refused = bridge
+            .commit_emissions(&deployment(), &[])
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code, AUDIT_SPOOL_SYNC_FAILED);
+        assert!(
+            !spool.healthy(),
+            "readiness goes DOWN while the spool cannot sync"
+        );
+        // The disk is writable again: the spool recovers by itself and the commit goes ahead.
+        faults.fail_next_syncs(0);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !spool.healthy() {
+            assert!(Instant::now() < deadline, "the spool recovers");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        bridge.commit_emissions(&deployment(), &[]).await.unwrap();
+        let held = spool
+            .reader(0)
+            .next_batch(10, spool.durable_through())
+            .unwrap();
+        assert_eq!(held.len(), 1, "the audit event was never lost");
+        drop(bridge);
+        spool.shutdown().unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+/// Tier 2: the spool against real databases, an engine database and a separate audit database
+/// on one PostgreSQL container.
+#[cfg(test)]
+mod audit_durability_docker {
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::sync::{Arc, OnceLock};
+    use std::time::Duration;
+
+    use sqlx::postgres::PgPoolOptions;
+    use sqlx::PgPool;
+    use sutra_channels::{AuditEvent, AuditSpool, AuditSpoolConfig, ShipperConfig};
+    use sutra_persistence::migrate::MigrationFamily;
+
+    use super::*;
+
+    const DEP: &str = "dep-0000000000000000000000c7";
+    const STEPS: u32 = 40;
+
+    static CONTAINER: OnceLock<(
+        testcontainers::Container<testcontainers_modules::postgres::Postgres>,
+        u16,
+    )> = OnceLock::new();
+    static DB_SEQ: AtomicU32 = AtomicU32::new(0);
+
+    fn container_port() -> u16 {
+        let (_, port) = CONTAINER.get_or_init(|| {
+            std::thread::spawn(|| {
+                use testcontainers::runners::SyncRunner;
+                use testcontainers::ImageExt;
+                let container = testcontainers_modules::postgres::Postgres::default()
+                    .with_tag("16-alpine")
+                    .start()
+                    .expect("start postgres:16-alpine (docker required)");
+                sutra_testkit::reap_on_exit(container.id());
+                let port = container.get_host_port_ipv4(5432).expect("mapped 5432");
+                (container, port)
+            })
+            .join()
+            .expect("container bootstrap thread")
+        });
+        *port
+    }
+
+    /// A fresh database migrated with `family` only, as `serve` migrates each database. Returns
+    /// its URL.
+    async fn fresh_database(family: MigrationFamily) -> String {
+        let port = container_port();
+        let admin = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&format!(
+                "postgres://postgres:postgres@127.0.0.1:{port}/postgres"
+            ))
+            .await
+            .expect("admin pool");
+        let db = format!("durability_it_{}", DB_SEQ.fetch_add(1, Ordering::SeqCst));
+        sqlx::query(&format!("CREATE DATABASE {db}"))
+            .execute(&admin)
+            .await
+            .expect("create database");
+        drop(admin);
+        let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(3)
+            .expect("repo root")
+            .to_path_buf();
+        let roots = [
+            repo.join("rust/crates/sutra-persistence/migrations/shipped/core"),
+            repo.join("rust/crates/sutra-persistence/migrations/shipped/audit"),
+        ];
+        let root_refs: Vec<&std::path::Path> = roots.iter().map(PathBuf::as_path).collect();
+        let scripts =
+            sutra_persistence::migrate::collect_family(&root_refs, family).expect("collect");
+        let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/{db}");
+        let mut conn = <sqlx::PgConnection as sqlx::Connection>::connect(&url)
+            .await
+            .expect("migration connection");
+        sutra_persistence::migrate::apply_migrations(&mut conn, &scripts)
+            .await
+            .expect("apply migrations");
+        url
+    }
+
+    async fn pool(url: &str) -> PgPool {
+        PgPoolOptions::new()
+            .max_connections(4)
+            .connect(url)
+            .await
+            .expect("pool")
+    }
+
+    fn instance(step: u32) -> String {
+        format!("00000000-0000-0000-0000-{step:012}")
+    }
+
+    /// One pass of step `step` by process `tag` (its own attempt, base 0): STARTED and
+    /// COMPLETED, plus, on the `lost` path, a node the re-run never reaches.
+    fn step_events(step: u32, tag: &str, lost: bool) -> Vec<AuditEvent> {
+        let attempt = sutra_channels::AuditAttempt {
+            id: format!("{tag}-{step}"),
+            base: 0,
+            at: time::OffsetDateTime::now_utc()
+                .format(&time::format_description::well_known::Rfc3339)
+                .expect("rfc3339"),
+        };
+        let mut types = vec!["INSTANCE_STARTED", "INSTANCE_COMPLETED"];
+        if lost {
+            types.push("NODE_LEFT");
+        }
+        types
+            .into_iter()
+            .zip(1u32..)
+            .map(|(event_type, seq)| AuditEvent {
+                sink: "sql".into(),
+                deployment_id: DEP.into(),
+                tenant: "t".into(),
+                instance_id: instance(step),
+                seq,
+                at: "2026-11-24T00:00:00Z".into(),
+                event_type: event_type.into(),
+                node_id: Some(tag.to_string()),
+                diagnostic_code: None,
+                diagnostic_json: None,
+                payload_json: "{}".into(),
+                correlation: Default::default(),
+                attempt: Some(attempt.clone()),
+            })
+            .collect()
+    }
+
+    fn step_emission(instance_id: &str, key: &str) -> OutboxEmission {
+        OutboxEmission {
+            instance_id: instance_id.to_string(),
+            node_id: "Reply".to_string(),
+            destination: "http://example.invalid/ack".to_string(),
+            body: sutra_executor::Sensitive::new(b"{}".to_vec()),
+            content_type: Some("application/json".to_string()),
+            required: false,
+            mode: sutra_bpmn::qbindings::ReplyMode::Native,
+            outbox_key: format!("k-{key}"),
+            cloud_event_json: None,
+            auth_ref_json: None,
+            labels: Default::default(),
+            traceparent: None,
+            headers: Default::default(),
+        }
+    }
+
+    fn spool_config(dir: &std::path::Path) -> AuditSpoolConfig {
+        AuditSpoolConfig {
+            dir: dir.to_path_buf(),
+            sync_linger: Duration::from_millis(2),
+            sinks: ["sql".to_string()].into_iter().collect(),
+            ..AuditSpoolConfig::default()
+        }
+    }
+
+    /// Run `steps` through a bridge whose step commits pass the spool barrier; the step whose
+    /// number is `crash_at` stops between its audit sync and its commit, and the "process" dies
+    /// there: the spool is dropped unsynced and the runtime (with its shipper) is torn down.
+    /// With `crash_after_commit`, the process dies right after that step's commit, before the
+    /// shipper is waited for. `tag` names the process's attempts and marks its events' path.
+    /// Returns the steps that committed.
+    #[allow(clippy::too_many_arguments)]
+    fn run_process(
+        engine_url: &str,
+        audit_url: &str,
+        spool_dir: &std::path::Path,
+        steps: std::ops::Range<u32>,
+        crash_at: Option<u32>,
+        crash_after_commit: Option<u32>,
+        tag: &str,
+        instance_offset: u32,
+    ) -> Vec<u32> {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let spool = AuditSpool::open(spool_config(spool_dir)).expect("spool opens");
+        let (committed, crashed) = runtime.block_on(async {
+            let audit_pool = pool(audit_url).await;
+            let shipper = sutra_channels::spawn_audit_shipper(
+                &tokio::runtime::Handle::current(),
+                &spool,
+                Arc::new(crate::audit_sinks::SqlAuditStore::new(audit_pool)),
+                ShipperConfig::default(),
+            );
+            let engine_pool = pool(engine_url).await;
+            // Recovery of what a previous run left unmarked, and the resolver, as at start.
+            let resolver = crate::audit_recovery::spawn(
+                &tokio::runtime::Handle::current(),
+                &spool,
+                Some(engine_pool.clone()),
+            )
+            .expect("audit recovery");
+            let crash = Arc::new(AtomicBool::new(false));
+            let crash_committed = Arc::new(AtomicBool::new(false));
+            let tracker = sutra_channels::AuditAttemptTracker::new();
+            let bridge = PersistenceBridge::new(engine_pool)
+                .with_audit_spool(spool.sender())
+                .with_audit_attempts(tracker.clone(), Some(resolver))
+                .with_crash_after_audit_sync(Arc::clone(&crash))
+                .with_crash_after_commit(Arc::clone(&crash_committed));
+            let dep = sutra_executor::DeploymentId::of(DEP).expect("deployment id");
+            let mut committed = Vec::new();
+            for step in steps {
+                let instance_id = instance(step + instance_offset);
+                for mut event in step_events(step, tag, crash_at == Some(step)) {
+                    event.instance_id = instance_id.clone();
+                    let attempt = event.attempt.clone().expect("a pass event");
+                    if !tracker.is_open(&attempt.id) {
+                        tracker.register(DEP, &instance_id, &attempt);
+                    }
+                    tracker.observe(&attempt.id, event.seq, &event.event_type);
+                    spool.sender().append(event);
+                }
+                // A real transaction (one outbox row), so the attempt is prepared under its id.
+                let emission = step_emission(&instance_id, &format!("{tag}-{step}"));
+                if crash_at == Some(step) {
+                    crash.store(true, Ordering::SeqCst);
+                    let stopped = bridge
+                        .commit_emissions(&dep, std::slice::from_ref(&emission))
+                        .await
+                        .unwrap_err();
+                    assert_eq!(stopped.code, TEST_CRASH_AFTER_AUDIT_SYNC);
+                    // Killed here: no checkpoint, no clean shutdown.
+                    drop(shipper);
+                    return (committed, true);
+                }
+                if crash_after_commit == Some(step) {
+                    crash_committed.store(true, Ordering::SeqCst);
+                }
+                bridge
+                    .commit_emissions(&dep, std::slice::from_ref(&emission))
+                    .await
+                    .expect("step commits");
+                committed.push(step);
+                if crash_after_commit == Some(step) {
+                    drop(shipper);
+                    return (committed, true);
+                }
+            }
+            shipper
+                .ship_through(spool.durable_through(), Duration::from_secs(30))
+                .await
+                .expect("the SQL store catches up");
+            (committed, false)
+        });
+        drop(runtime);
+        if crashed {
+            spool.crash();
+        } else {
+            spool.shutdown().expect("spool closes");
+        }
+        committed
+    }
+
+    /// Kill the engine between the spool sync and the step commit, restart it,
+    /// re-run the step as a redelivery would, and every committed step's events are in the
+    /// audit database exactly once.
+    #[ignore = "docker"]
+    #[test]
+    fn audit_rows_survive_crash() {
+        let setup = tokio::runtime::Runtime::new().expect("runtime");
+        let (engine_url, audit_url) = setup.block_on(async {
+            (
+                fresh_database(MigrationFamily::Engine).await,
+                fresh_database(MigrationFamily::Audit).await,
+            )
+        });
+        let dir = std::env::temp_dir().join(format!("sutra-crash-it-{}", uuid::Uuid::new_v4()));
+        let crash_at = STEPS / 2;
+        let before = run_process(
+            &engine_url,
+            &audit_url,
+            &dir,
+            0..STEPS,
+            Some(crash_at),
+            None,
+            "first",
+            0,
+        );
+        assert_eq!(before, (0..crash_at).collect::<Vec<_>>());
+        // Restart: the crashed step is redelivered and runs again (another path: no NODE_LEFT),
+        // then the rest.
+        let after = run_process(
+            &engine_url,
+            &audit_url,
+            &dir,
+            crash_at..STEPS,
+            None,
+            None,
+            "restarted",
+            0,
+        );
+        assert_eq!(after, (crash_at..STEPS).collect::<Vec<_>>());
+
+        let rows: Vec<(String, i32, i64)> = setup.block_on(async {
+            sqlx::query_as(
+                "SELECT instance_id::text, seq, count(*) FROM audit_event \
+                 GROUP BY instance_id, seq ORDER BY instance_id, seq",
+            )
+            .fetch_all(&pool(&audit_url).await)
+            .await
+            .expect("audit rows")
+        });
+        let expected: Vec<(String, i32, i64)> = (0..STEPS)
+            .flat_map(|step| [(instance(step), 1, 1), (instance(step), 2, 1)])
+            .collect();
+        assert_eq!(
+            rows, expected,
+            "every committed step's events, exactly once"
+        );
+        // The crashed step's trail is the re-run's, the lost NODE_LEFT is gone.
+        let crashed: Vec<String> = setup.block_on(async {
+            sqlx::query_scalar(
+                "SELECT node_id FROM audit_event WHERE instance_id = $1::uuid ORDER BY seq",
+            )
+            .bind(instance(crash_at))
+            .fetch_all(&pool(&audit_url).await)
+            .await
+            .expect("crashed step rows")
+        });
+        assert_eq!(crashed, vec!["restarted", "restarted"]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The process dies right after a step's commit, before its events were shipped. The
+    /// redelivery is deduplicated, so the step does not run again: its committed attempt ships
+    /// at the restart, once.
+    #[ignore = "docker"]
+    #[test]
+    fn crash_after_commit_before_marker_sync_recovery_confirms() {
+        let setup = tokio::runtime::Runtime::new().expect("runtime");
+        let (engine_url, audit_url) = setup.block_on(async {
+            (
+                fresh_database(MigrationFamily::Engine).await,
+                fresh_database(MigrationFamily::Audit).await,
+            )
+        });
+        let dir =
+            std::env::temp_dir().join(format!("sutra-crash-after-it-{}", uuid::Uuid::new_v4()));
+        let crash_after = STEPS / 2;
+        let before = run_process(
+            &engine_url,
+            &audit_url,
+            &dir,
+            0..STEPS,
+            None,
+            Some(crash_after),
+            "first",
+            0,
+        );
+        assert_eq!(before, (0..=crash_after).collect::<Vec<_>>());
+        let after = run_process(
+            &engine_url,
+            &audit_url,
+            &dir,
+            crash_after + 1..STEPS,
+            None,
+            None,
+            "restarted",
+            0,
+        );
+        assert_eq!(after, (crash_after + 1..STEPS).collect::<Vec<_>>());
+        let rows: Vec<(String, i32, String)> = setup.block_on(async {
+            sqlx::query_as(
+                "SELECT instance_id::text, seq, node_id FROM audit_event \
+                 ORDER BY instance_id, seq",
+            )
+            .fetch_all(&pool(&audit_url).await)
+            .await
+            .expect("audit rows")
+        });
+        let expected: Vec<(String, i32, String)> = (0..STEPS)
+            .flat_map(|step| {
+                let tag = if step <= crash_after {
+                    "first"
+                } else {
+                    "restarted"
+                };
+                [
+                    (instance(step), 1, tag.to_string()),
+                    (instance(step), 2, tag.to_string()),
+                ]
+            })
+            .collect();
+        assert_eq!(rows, expected, "the committed attempts, exactly once");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The ids of the attempts the spool marks `ABORTED`.
+    fn aborted_in_spool(dir: &std::path::Path) -> Vec<String> {
+        let spool = AuditSpool::open(spool_config(dir)).expect("spool reopens");
+        let records = spool
+            .reader(0)
+            .next_batch(100_000, spool.durable_through())
+            .expect("spool reads");
+        spool.shutdown().expect("spool closes");
+        records
+            .into_iter()
+            .filter(|r| r.event.event_type == sutra_channels::audit_attempts::MARKER_ABORTED)
+            .filter_map(|r| r.event.attempt.map(|a| a.id))
+            .collect()
+    }
+
+    /// The process dies after the step's spool sync, before its `COMMIT`. Recovery finds
+    /// the attempt prepared under a transaction that aborted and marks it `ABORTED`.
+    #[ignore = "docker"]
+    #[test]
+    fn crash_after_spool_sync_before_commit_recovery_aborts() {
+        let setup = tokio::runtime::Runtime::new().expect("runtime");
+        let (engine_url, audit_url) = setup.block_on(async {
+            (
+                fresh_database(MigrationFamily::Engine).await,
+                fresh_database(MigrationFamily::Audit).await,
+            )
+        });
+        let dir = std::env::temp_dir().join(format!("sutra-abort-it-{}", uuid::Uuid::new_v4()));
+        run_process(
+            &engine_url,
+            &audit_url,
+            &dir,
+            0..3,
+            Some(1),
+            None,
+            "first",
+            0,
+        );
+        run_process(
+            &engine_url,
+            &audit_url,
+            &dir,
+            1..3,
+            None,
+            None,
+            "restarted",
+            0,
+        );
+        assert_eq!(aborted_in_spool(&dir), vec!["first-1".to_string()]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A start whose commit never happened is retried under a NEW instance id (the
+    /// re-run mints one). The orphan instance leaves no trail in the audit database.
+    #[ignore = "docker"]
+    #[test]
+    fn orphan_start_retried_under_a_new_instance_id_leaves_no_trail() {
+        let setup = tokio::runtime::Runtime::new().expect("runtime");
+        let (engine_url, audit_url) = setup.block_on(async {
+            (
+                fresh_database(MigrationFamily::Engine).await,
+                fresh_database(MigrationFamily::Audit).await,
+            )
+        });
+        let dir = std::env::temp_dir().join(format!("sutra-orphan-it-{}", uuid::Uuid::new_v4()));
+        run_process(
+            &engine_url,
+            &audit_url,
+            &dir,
+            0..1,
+            Some(0),
+            None,
+            "first",
+            0,
+        );
+        run_process(
+            &engine_url,
+            &audit_url,
+            &dir,
+            0..1,
+            None,
+            None,
+            "restarted",
+            500,
+        );
+        let instances: Vec<(String, i64)> = setup.block_on(async {
+            sqlx::query_as(
+                "SELECT instance_id::text, count(*) FROM audit_event GROUP BY instance_id",
+            )
+            .fetch_all(&pool(&audit_url).await)
+            .await
+            .expect("audit rows")
+        });
+        assert_eq!(
+            instances,
+            vec![(instance(500), 2)],
+            "only the committed re-run"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// With a SQL audit store, step commits write no audit to the engine's own
+    /// database; the audit database gets every row.
+    #[ignore = "docker"]
+    #[test]
+    fn engine_db_has_no_audit_writes() {
+        let setup = tokio::runtime::Runtime::new().expect("runtime");
+        let (engine_url, audit_url) = setup.block_on(async {
+            (
+                fresh_database(MigrationFamily::Engine).await,
+                fresh_database(MigrationFamily::Audit).await,
+            )
+        });
+        let dir =
+            std::env::temp_dir().join(format!("sutra-no-engine-audit-{}", uuid::Uuid::new_v4()));
+        run_process(
+            &engine_url,
+            &audit_url,
+            &dir,
+            0..STEPS,
+            None,
+            None,
+            "only",
+            0,
+        );
+        setup.block_on(async {
+            let engine = pool(&engine_url).await;
+            let engine_audit: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_user_tables WHERE relname LIKE 'audit%'",
+            )
+            .fetch_one(&engine)
+            .await
+            .expect("engine stats");
+            assert_eq!(
+                engine_audit, 0,
+                "the engine database has no audit table to write"
+            );
+            let audit = pool(&audit_url).await;
+            // Table statistics are flushed by each backend within about a second.
+            let mut inserted = 0i64;
+            for _ in 0..50 {
+                inserted = sqlx::query_scalar(
+                    "SELECT coalesce(sum(n_tup_ins), 0)::bigint FROM pg_stat_user_tables \
+                     WHERE relname = 'audit_event'",
+                )
+                .fetch_one(&audit)
+                .await
+                .expect("audit stats");
+                if inserted >= i64::from(STEPS * 2) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            assert_eq!(
+                inserted,
+                i64::from(STEPS * 2),
+                "every row went to the audit database"
+            );
+        });
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

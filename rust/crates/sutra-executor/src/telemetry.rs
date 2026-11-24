@@ -89,6 +89,29 @@ pub const METRIC_OUTBOX_DELIVERY_LAG: &str = "sutra.outbox.delivery.lag";
 pub const METRIC_OUTBOX_IN_FLIGHT: &str = "sutra.outbox.in-flight";
 /// Outbox rows held in memory right now, in flight or queued for delivery.
 pub const METRIC_OUTBOX_BUFFERED: &str = "sutra.outbox.buffered";
+/// Outbox claim statements issued (monotonic).
+pub const METRIC_OUTBOX_CLAIM_QUERIES: &str = "sutra.outbox.claim.queries";
+/// Rows the outbox claims returned (monotonic).
+pub const METRIC_OUTBOX_CLAIM_ROWS: &str = "sutra.outbox.claim.rows";
+/// Outbox claims that returned no row (monotonic).
+pub const METRIC_OUTBOX_CLAIM_EMPTY: &str = "sutra.outbox.claim.empty";
+/// Outbox rows handed straight from a step commit to the dispatcher, without a claim (monotonic).
+pub const METRIC_OUTBOX_HANDED_OFF: &str = "sutra.outbox.handed-off";
+/// Outbox send attempts (monotonic).
+pub const METRIC_OUTBOX_SENDS: &str = "sutra.outbox.sends";
+/// Outbox rows whose delivery committed (monotonic).
+pub const METRIC_OUTBOX_DELIVERED: &str = "sutra.outbox.delivered";
+
+// ---- timer poller meters
+
+/// Due-timer claim statements issued (monotonic).
+pub const METRIC_TIMER_CLAIM_QUERIES: &str = "sutra.timer.claim.queries";
+/// Timer rows the due-timer claims returned (monotonic).
+pub const METRIC_TIMER_CLAIM_ROWS: &str = "sutra.timer.claim.rows";
+/// Due-timer claims that returned no row (monotonic).
+pub const METRIC_TIMER_CLAIM_EMPTY: &str = "sutra.timer.claim.empty";
+/// Timers whose fire resumed their instance (monotonic).
+pub const METRIC_TIMER_FIRED: &str = "sutra.timer.fired";
 
 // ---- attribute / dimension keys --------------------------------------------------------
 
@@ -283,5 +306,23 @@ mod tests {
             "sutra.audit.transport.dropped"
         );
         assert_eq!(ATTR_CLAIM_BOUNCE_PATH, "path");
+    }
+
+    #[test]
+    fn work_counter_metric_names_are_pinned() {
+        for (name, expected) in [
+            (METRIC_OUTBOX_CLAIM_QUERIES, "sutra.outbox.claim.queries"),
+            (METRIC_OUTBOX_CLAIM_ROWS, "sutra.outbox.claim.rows"),
+            (METRIC_OUTBOX_CLAIM_EMPTY, "sutra.outbox.claim.empty"),
+            (METRIC_OUTBOX_HANDED_OFF, "sutra.outbox.handed-off"),
+            (METRIC_OUTBOX_SENDS, "sutra.outbox.sends"),
+            (METRIC_OUTBOX_DELIVERED, "sutra.outbox.delivered"),
+            (METRIC_TIMER_CLAIM_QUERIES, "sutra.timer.claim.queries"),
+            (METRIC_TIMER_CLAIM_ROWS, "sutra.timer.claim.rows"),
+            (METRIC_TIMER_CLAIM_EMPTY, "sutra.timer.claim.empty"),
+            (METRIC_TIMER_FIRED, "sutra.timer.fired"),
+        ] {
+            assert_eq!(name, expected);
+        }
     }
 }

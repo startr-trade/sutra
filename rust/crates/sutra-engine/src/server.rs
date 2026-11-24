@@ -74,11 +74,17 @@ pub(crate) struct AppState {
     /// deleted outright — the same decision the persistence bridge makes for `commit_complete`,
     /// so the two terminal paths never disagree about whether history exists.
     instance_retention: std::time::Duration,
-    /// Whether the durable audit journal is switched on (`sutra.audit.sql`). Read ONLY by the
-    /// instance-history endpoint, so an empty journal can be reported as "auditing is off" rather
-    /// than as "this instance did nothing" — the journal is opt-in and its absence must never be
-    /// mistaken for lost history.
-    audit_sql_enabled: bool,
+    /// The SQL audit store's pool — a database of its own (`sutra.audit.sql.url`), never the
+    /// engine's. The features that read or amend audit (instance history, erasure redaction, the
+    /// journal carry on migration) use it; `None` means there is no SQL audit store and they
+    /// report themselves unavailable.
+    audit_pool: Option<PgPool>,
+    /// The durable audit spool, when an audit store is configured. Readiness is DOWN while it
+    /// cannot sync (a step commit would fail): no new work is routed here until it recovers.
+    audit_spool: Option<sutra_channels::AuditSpoolSender>,
+    /// The SQL audit store's shipper progress (`None` = no SQL audit store). The journal carry on
+    /// migration waits for it to reach the spool's durable point first.
+    audit_sql_shipped: Option<sutra_channels::ShipperProgress>,
 }
 
 /// A running engine: the bound address (port `0` resolves here), the serve task, and —
@@ -95,6 +101,8 @@ pub struct RunningEngine {
     /// watch loop) — aborted on shutdown.
     deploy_sweep: Option<tokio::task::JoinHandle<()>>,
     timer_poller: Option<tokio::task::JoinHandle<()>>,
+    /// The timer poller's work counts; `None` without persistence (no poller).
+    timer_work: Option<Arc<crate::timer::TimerWorkCounters>>,
     /// The [`crate::sweeper::StuckInstanceScanner`] loop (`sutra.instance.sweep-interval`),
     /// leader-gated under [`crate::sweeper::INSTANCE_SWEEPER_ROLE`] — aborted on shutdown.
     instance_sweeper: Option<tokio::task::JoinHandle<()>>,
@@ -102,6 +110,10 @@ pub struct RunningEngine {
     /// (`sutra.instance.retention-sweep-interval`), leader-gated under
     /// [`crate::sweeper::RETENTION_SWEEPER_ROLE`] — aborted on shutdown.
     retention_sweeper: Option<tokio::task::JoinHandle<()>>,
+    /// The [`crate::sweeper::AuditRetentionSweeper`] loop (`sutra.audit.retention`), leader-gated
+    /// under [`crate::sweeper::AUDIT_RETENTION_ROLE`] — aborted on shutdown. `None` without a SQL
+    /// audit store or a retention.
+    audit_retention_sweeper: Option<tokio::task::JoinHandle<()>>,
     /// The deferred-ack `sweep_timeouts()` interval task
     /// (`sutra.ack.deferred.sweep-interval`) — aborted on shutdown.
     ack_sweep: tokio::task::JoinHandle<()>,
@@ -113,6 +125,8 @@ pub struct RunningEngine {
     /// refactor): each is stopped / lease-released on shutdown by iterating, so a successor
     /// replica takes the queues over immediately and the engine names no broker.
     transports: Vec<std::sync::Arc<dyn sutra_transport_spi::TransportChannels>>,
+    /// The durable audit spool and its shippers: drained, synced and shipped on shutdown.
+    audit: Option<crate::assembly::AuditRuntime>,
     runtime: tokio::runtime::Handle,
 }
 
@@ -185,6 +199,9 @@ impl RunningEngine {
         if let Some(sweeper) = self.retention_sweeper {
             sweeper.abort();
         }
+        if let Some(sweeper) = self.audit_retention_sweeper {
+            sweeper.abort();
+        }
         self.ack_sweep.abort();
         if let Some(election) = &self.timer_election {
             election.release_all().await;
@@ -192,9 +209,40 @@ impl RunningEngine {
         if let Some(outbox) = &self.outbox {
             outbox.drain();
         }
+        if let Some(audit) = self.audit {
+            audit.shutdown().await;
+        }
         crate::audit_sinks::flush_audit();
         crate::otel::flush_active();
         self.task.abort();
+    }
+
+    /// The engine's work counts so far: outbox claims, sends and deliveries, and timer claims
+    /// and fires. They are kept on every run, whether or not anything reads them, so a test can
+    /// assert the work a load took instead of how long it took.
+    ///
+    /// ```no_run
+    /// # async fn run(engine: sutra_engine::RunningEngine) {
+    /// let before = engine.work_counters();
+    /// // ... drive a load through the engine ...
+    /// let work = engine.work_counters() - before;
+    /// assert_eq!(work.outbox.sends, work.outbox.delivered, "no retries");
+    /// assert!(work.outbox.claim_rows + work.outbox.handed_off >= work.outbox.delivered);
+    /// # }
+    /// ```
+    pub fn work_counters(&self) -> crate::EngineWorkSnapshot {
+        crate::EngineWorkSnapshot {
+            outbox: self
+                .outbox
+                .as_ref()
+                .map(|o| o.work_counters().snapshot())
+                .unwrap_or_default(),
+            timer: self
+                .timer_work
+                .as_ref()
+                .map(|t| t.snapshot())
+                .unwrap_or_default(),
+        }
     }
 
     /// Drain hook: refuse further outbox ticks (the in-flight batch completes). No-op
@@ -233,12 +281,18 @@ impl RunningEngine {
         if let Some(sweeper) = self.retention_sweeper {
             sweeper.abort();
         }
+        if let Some(sweeper) = self.audit_retention_sweeper {
+            sweeper.abort();
+        }
         self.ack_sweep.abort();
         if let Some(election) = self.timer_election {
             election.release_all().await;
         }
         if let Some(outbox) = &self.outbox {
             outbox.drain();
+        }
+        if let Some(audit) = self.audit {
+            audit.shutdown().await;
         }
         crate::audit_sinks::flush_audit();
         crate::otel::flush_active();
@@ -307,12 +361,30 @@ pub async fn serve(config: EngineConfig) -> Result<RunningEngine, Box<dyn std::e
         None => (None, None),
     };
 
+    // ---- the SQL audit store: a database of its own, never the engine's ----------------------
+    // Configured (`sutra.audit.sql.url`) ⇒ open its pool and apply the audit migration family
+    // there. Not configured ⇒ no SQL audit store: history, erasure redaction and the journal carry
+    // report themselves unavailable.
+    let (audit_pool, audit_reachable) = match config.audit.sql.url.as_deref() {
+        Some(url) => {
+            let (pool, reachable) = connect_audit_pool(url, &config).await?;
+            (Some(pool), reachable)
+        }
+        None => (None, false),
+    };
+
     // ---- RLS-bypass posture check (the two-layer isolation model) -------
     // If the engine's DB role can bypass RLS (superuser / BYPASSRLS), the explicit
     // deployment-bind + RLS defence silently degrades to one layer. Refuse boot loudly
     // (the opt-out downgrades to a warning). A non-PG store / absent role soft-skips.
     if let Some(pool) = &pool {
         crate::rls_check::enforce_rls_bypass_posture(pool, config.rls_bypass_check_enabled).await?;
+    }
+    // The same posture on the audit database's role, when it answered at startup (an
+    // unreachable one is checked on the next start).
+    if let (Some(audit), true) = (&audit_pool, audit_reachable) {
+        crate::rls_check::enforce_audit_rls_bypass_posture(audit, config.rls_bypass_check_enabled)
+            .await?;
     }
 
     // ---- deployment source: `dir` folder-watch OR the DB-backed store -----
@@ -343,7 +415,11 @@ pub async fn serve(config: EngineConfig) -> Result<RunningEngine, Box<dyn std::e
                 draining: draining_plans,
                 id_slots,
                 refused,
-            } = crate::deploy::settled_store_set(&store).await?;
+            } = crate::deploy::settled_store_set(
+                &store,
+                &crate::deploy::AuditStores::of_config(&config.audit),
+            )
+            .await?;
             let specs = plans
                 .iter()
                 .chain(draining_plans.iter())
@@ -386,10 +462,16 @@ pub async fn serve(config: EngineConfig) -> Result<RunningEngine, Box<dyn std::e
                 None => None,
             };
             let persistence = pool.is_some();
+            let audit_stores = crate::deploy::AuditStores::of_config(&config.audit);
             let directory = tokio::task::spawn_blocking(
                 move || -> Result<crate::deploy::DeploymentDirectory, String> {
-                    crate::deploy::DeploymentDirectory::open(deployments_dir, holders, persistence)
-                        .map_err(|e| e.to_string())
+                    crate::deploy::DeploymentDirectory::open(
+                        deployments_dir,
+                        holders,
+                        persistence,
+                        audit_stores,
+                    )
+                    .map_err(|e| e.to_string())
                 },
             )
             .await??;
@@ -507,12 +589,6 @@ pub async fn serve(config: EngineConfig) -> Result<RunningEngine, Box<dyn std::e
     let initial_coverage =
         crate::assembly::seed_declared_coverage(&boot_plans, &boot_draining_plans).await;
 
-    // The dedicated audit OTLP pipeline: built once, here on the runtime, before the executor
-    // lanes start; every lane's sink registry then shares the one provider, and shutdown flushes it.
-    if config.audit.otel_endpoint.is_some() {
-        crate::audit_sinks::init_audit_otel(&handle, &config.audit);
-    }
-
     let outbox_signal = sutra_channels::OutboxSignal::new();
     let runtime = crate::assembly::build_engine_runtime(
         boot_plans,
@@ -536,6 +612,7 @@ pub async fn serve(config: EngineConfig) -> Result<RunningEngine, Box<dyn std::e
         outbox_signal.clone(),
         dispatch_pool.clone(),
         config.connectivity_events_channel.clone(),
+        audit_pool.clone(),
     )?;
     let crate::assembly::EngineRuntime {
         router: channel_routes,
@@ -544,12 +621,21 @@ pub async fn serve(config: EngineConfig) -> Result<RunningEngine, Box<dyn std::e
         external_tasks,
         outbox,
         transports,
+        audit,
     } = runtime;
+    let audit_link = audit.as_ref().map(crate::assembly::AuditRuntime::link);
+    if metrics_labels.is_some() {
+        if let Some(audit) = &audit {
+            let (spool, replay_duplicates) = audit.metrics();
+            crate::otel::register_audit_spool_meters(spool, audit.link().spool, replay_duplicates);
+        }
+    }
 
     // The shard router's per-lane meters (`sutra.engine.shard.*`, execution scale-out
     // §6.1) — registered ONCE per boot (the counter registry is router-owned and
     // survives activation flips), and only when telemetry metrics are wired, in parity
     // with the execution-listener wiring above.
+    let metrics_wired = metrics_labels.is_some();
     if metrics_labels.is_some() {
         crate::otel::register_shard_router_meters(engine_handle.shard_metrics());
         crate::otel::register_transport_audit_meters();
@@ -585,14 +671,14 @@ pub async fn serve(config: EngineConfig) -> Result<RunningEngine, Box<dyn std::e
         engine: engine_handle.clone(),
         deployments: live_deployments.clone(),
         pool: pool.clone(),
-        runtime: handle.clone(),
         metrics_labels,
         payload_cap_bytes: config.payload_cap_bytes,
         transports: transports.clone(),
         status: deploy_status.clone(),
         specs: api_specs.clone(),
         node_indexes: node_indexes.clone(),
-        audit: config.audit.clone(),
+        audit: audit_link.clone(),
+        audit_stores: crate::deploy::AuditStores::of_config(&config.audit),
         key_provider: key_provider.clone(),
         incident_sql: config.incident_sql,
         instance_retention: config.instance_retention.retention,
@@ -660,7 +746,14 @@ pub async fn serve(config: EngineConfig) -> Result<RunningEngine, Box<dyn std::e
     // The `AlwaysLeading` default stays for injected/pool-less use, which never reaches here.
     // One immediate poll per role at boot so a single replica leads without waiting a full poll
     // interval.
-    let (timer_poller, timer_election, instance_sweeper, retention_sweeper) = match pool {
+    let (
+        timer_poller,
+        timer_work,
+        timer_election,
+        instance_sweeper,
+        retention_sweeper,
+        audit_retention_sweeper,
+    ) = match pool {
         Some(pool) => {
             let poller_config = crate::timer::TimerPollerConfig {
                 tick: std::time::Duration::from_millis(
@@ -675,6 +768,7 @@ pub async fn serve(config: EngineConfig) -> Result<RunningEngine, Box<dyn std::e
                 now_override: config.now_override.clone(),
                 ..Default::default()
             };
+            let timer_work = Arc::clone(&poller_config.work);
             let election = Arc::new(crate::leadership::DbLeaderElection::with_defaults(
                 Arc::new(crate::leadership::PgLeaseHandle(
                     sutra_persistence::stores::PgLeaseStore::new(pool.clone()),
@@ -734,11 +828,43 @@ pub async fn serve(config: EngineConfig) -> Result<RunningEngine, Box<dyn std::e
             );
             let retention = crate::sweeper::TerminalRetentionSweeper::new(
                 pool.clone(),
+                audit_pool.clone(),
                 live_deployments.clone(),
                 retention_gate,
                 config.instance_retention.clone(),
             )
             .spawn();
+
+            // The audit retention sweep (`sutra.audit.retention`): deletes old rows from the SQL
+            // audit store's database. Its own lease role; the lease is in the engine database.
+            let audit_retention = match &audit_pool {
+                Some(audit) if config.audit.retention.retention.is_some() => {
+                    let gate = election.gate(crate::sweeper::AUDIT_RETENTION_ROLE);
+                    election
+                        .poll_now(crate::sweeper::AUDIT_RETENTION_ROLE)
+                        .await;
+                    info!(
+                        interval_s = config.audit.retention.sweep_interval.as_secs(),
+                        retention_s = config
+                            .audit
+                            .retention
+                            .retention
+                            .map(|r| r.as_secs())
+                            .unwrap_or_default(),
+                        role = crate::sweeper::AUDIT_RETENTION_ROLE,
+                        leading = gate.is_leading(),
+                        "audit retention sweeper starting (DB-lease leader-gated)"
+                    );
+                    crate::sweeper::AuditRetentionSweeper::new(
+                        audit.clone(),
+                        live_deployments.clone(),
+                        gate,
+                        config.audit.retention.clone(),
+                    )
+                    .map(crate::sweeper::AuditRetentionSweeper::spawn)
+                }
+                _ => None,
+            };
 
             let poller = crate::timer::spawn_timer_poller(
                 dispatch_pool.clone().unwrap_or(pool),
@@ -747,10 +873,23 @@ pub async fn serve(config: EngineConfig) -> Result<RunningEngine, Box<dyn std::e
                 gate,
                 poller_config,
             );
-            (Some(poller), Some(election), Some(sweeper), Some(retention))
+            (
+                Some(poller),
+                Some(timer_work),
+                Some(election),
+                Some(sweeper),
+                Some(retention),
+                audit_retention,
+            )
         }
-        None => (None, None, None, None),
+        None => (None, None, None, None, None, None),
     };
+    if metrics_wired {
+        crate::otel::register_work_meters(
+            outbox.as_ref().map(|o| o.work_counters()),
+            timer_work.clone(),
+        );
+    }
 
     // The GDPR erasure surface recomputes subject blind indexes with the SAME key provider the
     // persist path used (built once above; None ⇒ blind-indexing off). Move it into the AppState.
@@ -765,7 +904,11 @@ pub async fn serve(config: EngineConfig) -> Result<RunningEngine, Box<dyn std::e
         key_provider,
         engine: Some(engine_handle.clone()),
         instance_retention: config.instance_retention.retention,
-        audit_sql_enabled: config.audit.sql,
+        audit_pool: audit_pool.clone(),
+        audit_spool: audit_link.as_ref().map(|link| link.spool.clone()),
+        audit_sql_shipped: audit_link
+            .as_ref()
+            .and_then(|link| link.sql_shipped.clone()),
     };
 
     // The `/admin/*` OIDC gate, resolved from config (fail-closed). A bad JWKS / OIDC
@@ -821,11 +964,14 @@ pub async fn serve(config: EngineConfig) -> Result<RunningEngine, Box<dyn std::e
         deployments_watch,
         deploy_sweep,
         timer_poller,
+        timer_work,
         instance_sweeper,
         retention_sweeper,
+        audit_retention_sweeper,
         ack_sweep,
         timer_election,
         transports,
+        audit,
         runtime: handle,
     })
 }
@@ -869,10 +1015,9 @@ async fn init_engine_db(
 
     // `SUTRA_DB_MIGRATIONS` accepts a ':'-separated ROOT LIST: the image bakes one flattened
     // dir, but an in-repo run points at the shipped sibling families (core:audit:deploy) —
-    // `collect_migrations` interleaves multiple roots into one global V-number order.
-    let migration_roots: Vec<PathBuf> = std::env::var("SUTRA_DB_MIGRATIONS")
-        .map(|v| v.split(':').map(PathBuf::from).collect())
-        .unwrap_or_else(|_| vec![PathBuf::from("/opt/sutra/db/migration")]);
+    // `collect_migrations` interleaves multiple roots into one global V-number order. The engine
+    // database takes every family except audit (V2xx), which only the audit database takes.
+    let migration_roots = migration_roots_from_env("SUTRA_DB_MIGRATIONS");
     let (present, missing): (Vec<PathBuf>, Vec<PathBuf>) =
         migration_roots.into_iter().partition(|r| r.is_dir());
     for root in &missing {
@@ -887,9 +1032,15 @@ async fn init_engine_db(
         // Send under the current rustc — the same posture as the datastore migrations).
         let opts = options.clone();
         let roots = present.clone();
-        let applied = tokio::task::spawn_blocking(move || run_engine_migrations(opts, &roots))
-            .await
-            .map_err(|e| format!("engine migration task failed: {e}"))??;
+        let applied = tokio::task::spawn_blocking(move || {
+            run_engine_migrations(
+                opts,
+                &roots,
+                sutra_persistence::migrate::MigrationFamily::Engine,
+            )
+        })
+        .await
+        .map_err(|e| format!("engine migration task failed: {e}"))??;
         info!(
             roots = %present
                 .iter()
@@ -938,25 +1089,186 @@ fn engine_pool_options(max_connections: u32) -> PgPoolOptions {
         })
 }
 
-/// Blocking-thread body: dedicated connection + the ordered `V<number>__*.sql` runner.
-fn run_engine_migrations(options: PgConnectOptions, roots: &[PathBuf]) -> Result<u32, String> {
+/// The migration roots named by a `:`-separated list in `var`, defaulting to the image's
+/// flattened directory.
+fn migration_roots_from_env(var: &str) -> Vec<PathBuf> {
+    std::env::var(var)
+        .map(|v| v.split(':').map(PathBuf::from).collect())
+        .unwrap_or_else(|_| vec![PathBuf::from("/opt/sutra/db/migration")])
+}
+
+/// Blocking-thread body: dedicated connection + the ordered `V<number>__*.sql` runner, over the
+/// scripts of one family.
+fn run_engine_migrations(
+    options: PgConnectOptions,
+    roots: &[PathBuf],
+    family: sutra_persistence::migrate::MigrationFamily,
+) -> Result<u32, String> {
+    run_family_migrations(options, roots, family).map_err(|e| e.to_string())
+}
+
+/// Why a family's migrations did not apply: the database could not be reached, or a script
+/// (or the discovery) failed.
+#[derive(Debug)]
+enum FamilyMigrationError {
+    Connect(String),
+    Failed(String),
+}
+
+impl std::fmt::Display for FamilyMigrationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FamilyMigrationError::Connect(e) | FamilyMigrationError::Failed(e) => f.write_str(e),
+        }
+    }
+}
+
+fn run_family_migrations(
+    options: PgConnectOptions,
+    roots: &[PathBuf],
+    family: sutra_persistence::migrate::MigrationFamily,
+) -> Result<u32, FamilyMigrationError> {
     let root_refs: Vec<&std::path::Path> = roots.iter().map(PathBuf::as_path).collect();
-    let scripts = sutra_persistence::migrate::collect_migrations(&root_refs)
-        .map_err(|e| format!("engine migration discovery failed: {e}"))?;
+    let scripts = sutra_persistence::migrate::collect_family(&root_refs, family).map_err(|e| {
+        FamilyMigrationError::Failed(format!("{family:?} migration discovery failed: {e}"))
+    })?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .map_err(|e| format!("engine migration runtime failed: {e}"))?;
+        .map_err(|e| FamilyMigrationError::Failed(format!("migration runtime failed: {e}")))?;
     runtime.block_on(async move {
-        let mut conn = options
-            .connect()
-            .await
-            .map_err(|e| format!("engine datasource connect failed: {e}"))?;
+        let mut conn = options.connect().await.map_err(|e| {
+            FamilyMigrationError::Connect(format!("{family:?} database connect failed: {e}"))
+        })?;
         let applied = sutra_persistence::migrate::apply_migrations(&mut conn, &scripts)
             .await
-            .map_err(|e| format!("engine migrations failed: {e}"))?;
+            .map_err(|e| {
+                FamilyMigrationError::Failed(format!("{family:?} migrations failed: {e}"))
+            })?;
         Ok(applied)
     })
+}
+
+/// How long the audit database migration retry waits between attempts while the database is
+/// unreachable.
+const AUDIT_MIGRATION_RETRY: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Open the SQL audit store's pool on its own database (`sutra.audit.sql.url`) and apply the
+/// audit migration family (V2xx) there, from `SUTRA_AUDIT_DB_MIGRATIONS` (default: the value of
+/// `SUTRA_DB_MIGRATIONS`, then the image directory). The audit database keeps its own
+/// `sutra_schema_history`.
+///
+/// An unreachable audit database is not fatal: the pool is lazy, the shipper retries and the
+/// spool absorbs the backlog, and the migrations are applied by a background task as soon as the
+/// database answers. A failed migration at startup is fatal, like the engine database's. Returns
+/// the pool and whether the database answered at startup.
+async fn connect_audit_pool(
+    url: &str,
+    config: &EngineConfig,
+) -> Result<(PgPool, bool), Box<dyn std::error::Error>> {
+    let sql = &config.audit.sql;
+    let mut options = PgConnectOptions::from_str(url)
+        .map_err(|e| format!("sutra.audit.sql.url '{url}' is invalid: {e}"))?;
+    if let Some(user) = &sql.username {
+        let user = crate::envref::resolve_value(user)
+            .map_err(|e| format!("sutra.audit.sql.username: {e}"))?;
+        options = options.username(&user);
+    }
+    if let Some(password) = &sql.password {
+        let password = crate::envref::resolve_value(password)
+            .map_err(|e| format!("sutra.audit.sql.password: {e}"))?;
+        options = options.password(&password);
+    }
+    if sql.legacy_flag == Some(true) {
+        warn!(
+            "sutra.audit.sql is deprecated: the SQL audit store is on because \
+             sutra.audit.sql.url is set; remove sutra.audit.sql"
+        );
+    }
+    let placement = crate::config::audit_db_placement(
+        config.datasource_url.as_deref(),
+        config.datasource_username.as_deref(),
+        url,
+        Some(options.get_username()),
+    )?;
+    if placement == crate::config::AuditDbPlacement::SameServer {
+        warn!(
+            code = crate::config::AUDIT_SAME_SERVER,
+            host = options.get_host(),
+            port = options.get_port(),
+            "the audit database is on the engine datasource's server (another database): \
+             production needs a separate instance"
+        );
+    }
+
+    let roots = match std::env::var("SUTRA_AUDIT_DB_MIGRATIONS") {
+        Ok(_) => migration_roots_from_env("SUTRA_AUDIT_DB_MIGRATIONS"),
+        Err(_) => migration_roots_from_env("SUTRA_DB_MIGRATIONS"),
+    };
+    let (present, missing): (Vec<PathBuf>, Vec<PathBuf>) =
+        roots.into_iter().partition(|r| r.is_dir());
+    for root in &missing {
+        warn!(
+            root = %root.display(),
+            "audit migration root missing — assuming the audit database was provisioned \
+             externally (sutra migrate --audit-url)"
+        );
+    }
+    let mut reachable = true;
+    if !present.is_empty() {
+        let family = sutra_persistence::migrate::MigrationFamily::Audit;
+        let (opts, roots) = (options.clone(), present.clone());
+        let first =
+            tokio::task::spawn_blocking(move || run_family_migrations(opts, &roots, family))
+                .await
+                .map_err(|e| format!("audit migration task failed: {e}"))?;
+        match first {
+            Ok(applied) => info!(applied, "audit database migrations applied"),
+            Err(FamilyMigrationError::Failed(e)) => return Err(e.into()),
+            Err(FamilyMigrationError::Connect(e)) => {
+                reachable = false;
+                warn!(
+                    error = %e,
+                    "the audit database is unreachable at startup — audit is held in the spool \
+                     until it answers; its migrations are retried in the background"
+                );
+                let options = options.clone();
+                tokio::spawn(async move {
+                    loop {
+                        tokio::time::sleep(AUDIT_MIGRATION_RETRY).await;
+                        let (opts, roots) = (options.clone(), present.clone());
+                        let attempt = tokio::task::spawn_blocking(move || {
+                            run_family_migrations(opts, &roots, family)
+                        })
+                        .await;
+                        match attempt {
+                            Ok(Ok(applied)) => {
+                                info!(applied, "audit database migrations applied");
+                                break;
+                            }
+                            Ok(Err(FamilyMigrationError::Connect(_))) => continue,
+                            Ok(Err(FamilyMigrationError::Failed(e))) => {
+                                tracing::error!(
+                                    error = %e,
+                                    "audit database migrations failed; the SQL audit store \
+                                     cannot write until this is fixed and the engine restarts"
+                                );
+                                break;
+                            }
+                            Err(e) => {
+                                tracing::error!(error = %e, "audit migration task failed");
+                                break;
+                            }
+                        }
+                    }
+                });
+            }
+        }
+    }
+    Ok((
+        engine_pool_options(sql.max_connections).connect_lazy_with(options),
+        reachable,
+    ))
 }
 
 /// Liveness — the process is up AND every actor lane is alive (SmallRye-compatible JSON
@@ -1004,6 +1316,20 @@ async fn readiness(State(state): State<AppState>) -> impl IntoResponse {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(health_body("DOWN", "sutra-engine", "DOWN")),
+        )
+            .into_response();
+    }
+    // An audit spool that cannot sync, or holds more than `max-bytes` unshipped, fails every step
+    // commit: report DOWN until it recovers, which it does by itself once the disk is writable
+    // again or the stores catch up (`sutra.audit.spool.healthy`, `…unshipped_bytes`).
+    if state
+        .audit_spool
+        .as_ref()
+        .is_some_and(|spool| !spool.accepting())
+    {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(health_body("DOWN", "sutra-audit-spool", "DOWN")),
         )
             .into_response();
     }
@@ -1102,6 +1428,7 @@ pub(crate) async fn deploy_response(
                 "phase": "Active",
             });
             attach_deploy_warnings(&mut response, &out.warnings);
+            attach_deploy_diagnostics(&mut response, &out.diagnostics);
             (StatusCode::OK, Json(response)).into_response()
         }
         Err(e) => deploy_refusal_response(e),
@@ -1117,6 +1444,20 @@ fn attach_deploy_warnings(
         response["warnings"] = warnings
             .iter()
             .map(crate::deployment_facts::DeployWarning::to_json)
+            .collect();
+    }
+}
+
+/// The deploy's non-refusing findings (audit destinations), as `diagnostics`, only when there is
+/// one to report.
+fn attach_deploy_diagnostics(
+    response: &mut serde_json::Value,
+    diagnostics: &[crate::deploy::DeployDiagnostic],
+) {
+    if !diagnostics.is_empty() {
+        response["diagnostics"] = diagnostics
+            .iter()
+            .map(crate::deploy::DeployDiagnostic::to_json)
             .collect();
     }
 }
@@ -1300,6 +1641,7 @@ pub(crate) async fn deploy_async_response(
                 "statusUrl": format!("/sutra/deployments/{}", acc.deployment_id),
             });
             attach_deploy_warnings(&mut response, &acc.warnings);
+            attach_deploy_diagnostics(&mut response, &acc.diagnostics);
             (StatusCode::ACCEPTED, Json(response)).into_response()
         }
         Err(e) => deploy_refusal_response(e),
@@ -1422,8 +1764,8 @@ pub const PLATFORM_ROUTES: &[(&str, &str)] = &[
     ("GET", "/admin/instances/by-alias/{key}/{value}"),
     // The execution HISTORY of one instance: its `audit_event` journal, seq-ordered and
     // cursor-paged. Admin-only — an audit row carries the captured business payload, the same
-    // posture a dead letter's bytes get. The journal itself stays OPT-IN
-    // (`sutra.audit.sql` + `<q:audit>`); this route only finally READS it.
+    // posture a dead letter's bytes get. It is read from the SQL audit store's own database
+    // (`sutra.audit.sql.url`); without one the route answers 409.
     ("GET", "/admin/instances/{id}/history"),
     ("POST", "/admin/instances/{id}/cancel"),
     // Instance MIGRATION: re-pin one live instance onto another ACTIVE deployment, rewriting every
@@ -1915,6 +2257,101 @@ fn parse_migration_plan(body: &serde_json::Value) -> Result<crate::migrate::Migr
     Ok(plan)
 }
 
+/// How long the journal carry waits for the SQL audit store to hold everything spooled.
+const AUDIT_CARRY_SHIP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Append an audit event the engine writes outside any step commit (the migration's and the
+/// erasure's own events) through the spool, like every other audit event, and wait for its sync:
+/// nothing writes an audit store directly. The SQL store ships it from there.
+pub(crate) async fn spool_engine_audit_event(
+    spool: &sutra_channels::AuditSpoolSender,
+    sink: &str,
+    row: &sutra_persistence::stores::AuditEventRow,
+) -> Result<(), String> {
+    spool.append(sutra_channels::AuditEvent {
+        sink: sink.to_owned(),
+        deployment_id: row.deployment.as_str().to_owned(),
+        tenant: String::new(),
+        instance_id: row.instance_id.map(|id| id.to_string()).unwrap_or_default(),
+        seq: u32::try_from(row.seq).unwrap_or(0),
+        at: row
+            .at
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_default(),
+        event_type: row.event_type.clone(),
+        node_id: row.node_id.clone(),
+        diagnostic_code: row.diagnostic_code.clone(),
+        diagnostic_json: row.diagnostic_json.clone(),
+        payload_json: row.payload_json.clone(),
+        correlation: Default::default(),
+        attempt: None,
+    });
+    spool
+        .barrier()
+        .await
+        .map_err(|e| format!("the audit spool did not sync the event: {e}"))
+}
+
+/// Move a migrated instance's journal in the SQL audit store from `from` to `to`, then record the
+/// migration's own event under `to`, so the journal opens with how the instance got there. Runs
+/// after the instance move has committed, and only once the SQL store's shipper has shipped
+/// everything the spool holds, so no row of the instance is still on its way under `from`. The
+/// migration event goes through the spool like every audit event. `Ok(rows carried)`; `Ok(0)`
+/// with no SQL audit store (there is no journal to carry). An `Err` leaves the instance migrated
+/// and its journal where it was: the caller reports it, and the instance itself is not touched
+/// again.
+pub(crate) async fn carry_migrated_journal(
+    audit: Option<&PgPool>,
+    spool: Option<&sutra_channels::AuditSpoolSender>,
+    sql_shipped: Option<&sutra_channels::ShipperProgress>,
+    from: &PersistDeploymentId,
+    to: &PersistDeploymentId,
+    instance: Uuid,
+    event: &sutra_persistence::stores::AuditEventRow,
+) -> Result<u64, String> {
+    let Some(audit) = audit else {
+        return Ok(0);
+    };
+    if let (Some(spool), Some(shipped)) = (spool, sql_shipped) {
+        spool
+            .barrier()
+            .await
+            .map_err(|e| format!("the audit spool did not sync before the journal carry: {e}"))?;
+        shipped
+            .ship_through(spool.durable_through(), AUDIT_CARRY_SHIP_TIMEOUT)
+            .await
+            .map_err(|d| {
+                format!(
+                    "the instance migrated but its journal did not move: {}",
+                    d.message
+                )
+            })?;
+    }
+    let carried = sutra_persistence::step::carry_instance_journal(audit, from, to, instance)
+        .await
+        .map_err(|e| format!("the instance migrated but its journal did not move: {e}"))?;
+    match spool {
+        Some(spool) => spool_engine_audit_event(spool, "sql", event).await,
+        // A SQL pool with no spool is a test wiring only; record the event directly there.
+        None => PgAuditEventStore::new(audit.clone())
+            .insert(event)
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string()),
+    }
+    .map_err(|e| format!("the journal moved but the migration event was not recorded: {e}"))?;
+    if carried > 0 {
+        info!(
+            instance_id = %instance,
+            from = from.as_str(),
+            to = to.as_str(),
+            rows = carried,
+            "instance journal carried in the audit database"
+        );
+    }
+    Ok(carried)
+}
+
 /// Everything one migrate call resolves ONCE, then applies to each instance it touches.
 struct MigrateContext<'a> {
     state: &'a AppState,
@@ -2267,6 +2704,8 @@ async fn migrate_one(
             .to_string(),
         ),
         payload_json: "{}".to_owned(),
+        spool_ref: None,
+        attempt: None,
     };
     let migration = sutra_persistence::step::InstanceMigration {
         from: source.clone(),
@@ -2277,13 +2716,29 @@ async fn migrate_one(
         process_id: cross_process.then(|| target_process_id.clone()),
         rearm_parks,
         claim_owner: claim_owner.clone(),
-        // Always carry the journal: the history endpoint resolves scope from the row's owning
-        // deployment, so a trail left behind would be silently unreachable.
-        carry_journal: true,
-        audit: Some(audit),
     };
     match sutra_persistence::step::commit_instance_migration(&pool, &migration).await {
-        Ok(outcome) => {
+        Ok(mut outcome) => {
+            // The journal is in the audit database: it moves after the instance has, always —
+            // the history endpoint resolves scope from the row's owning deployment, so a trail
+            // left behind would be silently unreachable.
+            let carry = carry_migrated_journal(
+                ctx.state.audit_pool.as_ref(),
+                ctx.state.audit_spool.as_ref(),
+                ctx.state.audit_sql_shipped.as_ref(),
+                &source,
+                &ctx.target,
+                instance_id,
+                &audit,
+            )
+            .await;
+            outcome.audit_rows = carry.as_ref().copied().unwrap_or(0);
+            if let (Err(e), Some(map)) = (&carry, response.as_object_mut()) {
+                map.insert(
+                    "auditCarryError".to_owned(),
+                    serde_json::Value::String(e.clone()),
+                );
+            }
             info!(
                 instance_id = %id,
                 from = source.as_str(),
@@ -2297,7 +2752,8 @@ async fn migrate_one(
                 rearmed = outcome.rearmed_rows,
                 resumed = plan.resume,
                 "instance MIGRATED (snapshot re-pinned + node ids rewritten + waits/aliases/\
-                 subjects/journal moved in one two-scope transaction)"
+                 subjects moved in one two-scope transaction; journal carried in the audit \
+                 database)"
             );
             if let Some(map) = response.as_object_mut() {
                 map.insert("migrated".to_owned(), serde_json::Value::Bool(true));
@@ -2806,11 +3262,11 @@ fn history_paging(params: &HashMap<String, String>) -> (HistoryCursor, i64) {
 /// variables it was last durably parked; the journal says how it got there, one token move at a
 /// time, with whatever payload the process chose to capture.
 ///
-/// **The journal stays OPT-IN — this route only reads it.** It is enabled twice over: engine-side
-/// by `sutra.audit.sql`, and per-process by `<q:audit>`. An instance with either switch off has no
-/// rows, and an empty page therefore means "nothing was recorded", never "the history was lost".
-/// Because those are very different facts for an operator staring at an empty list, the response
-/// always carries `auditEnabled`, and an empty page carries a `note` naming the reason.
+/// **The journal is read from the SQL audit store** — a database of its own
+/// (`sutra.audit.sql.url`), never the engine's. Without one there is no journal to read and the
+/// route answers `409` [`ADMIN_AUDIT_NO_SQL_STORE`]: the audit may be going to the file store,
+/// which cannot be queried here. With one, a process without `<q:audit>` still has no rows, so an
+/// empty page carries a `note` naming the reason, never implying the history was lost.
 ///
 /// **Scope resolution outlives the instance.** The journal is NOT purged by
 /// `sutra.instance.retention` (see [`crate::sweeper::TerminalRetentionSweeper`]), so an instance
@@ -2827,11 +3283,14 @@ pub(crate) async fn instance_history_response(
         return bad_uuid(id).into_response();
     };
     let (cursor, limit) = history_paging(params);
+    let Some(audit_pool) = state.audit_pool.clone() else {
+        return no_sql_audit_store(id).into_response();
+    };
     let Some(pool) = state.pool.clone() else {
         return instance_not_found(id).into_response();
     };
-    let instances = PgInstanceStore::new(pool.clone());
-    let audit = PgAuditEventStore::new(pool);
+    let instances = PgInstanceStore::new(pool);
+    let audit = PgAuditEventStore::new(audit_pool);
 
     // Prefer the deployment that still owns the instance row; fall back to the whole live set for
     // an instance whose snapshot was already purged.
@@ -2925,17 +3384,12 @@ pub(crate) async fn instance_history_response(
         "limit": limit,
         "nextAfterOrdinal": next_after_ordinal,
         "nextAfterSeq": next_after_seq,
-        "auditEnabled": state.audit_sql_enabled,
+        "auditEnabled": true,
     });
     if records.is_empty() {
-        let note = if state.audit_sql_enabled {
-            "no audit events are recorded for this instance — the durable journal is enabled \
-             engine-wide (sutra.audit.sql), so either this process declares no <q:audit>, or the \
-             requested page starts past the end of its journal"
-        } else {
-            "the durable audit journal is DISABLED (sutra.audit.sql is not set), so no execution \
-             history was ever recorded for this instance — this is an empty journal, not a lost one"
-        };
+        let note = "no audit events are recorded for this instance in the SQL audit store — \
+                    either this process declares no <q:audit>, its audit goes to another store, \
+                    or the requested page starts past the end of its journal";
         if let Some(map) = body.as_object_mut() {
             map.insert(
                 "note".to_owned(),
@@ -3394,6 +3848,24 @@ fn parse_uuid(id: &str) -> Option<Uuid> {
     Uuid::parse_str(id).ok()
 }
 
+/// `SUTRA.ADMIN.AUDIT.NO_SQL_STORE`: a feature that reads the audit journal was asked for on an
+/// engine with no SQL audit store (`sutra.audit.sql.url`).
+pub(crate) const ADMIN_AUDIT_NO_SQL_STORE: &str = "SUTRA.ADMIN.AUDIT.NO_SQL_STORE";
+
+/// `409` for a history read with no SQL audit store to read from.
+fn no_sql_audit_store(id: &str) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::CONFLICT,
+        Json(serde_json::json!({
+            "instanceId": id,
+            "code": ADMIN_AUDIT_NO_SQL_STORE,
+            "error": "this engine has no SQL audit store (sutra.audit.sql.url), so there is no \
+                      journal to read; audit written to the file store is read with \
+                      `sutra audit-replay --from-jsonl`",
+        })),
+    )
+}
+
 fn bad_uuid(id: &str) -> (StatusCode, Json<serde_json::Value>) {
     (
         StatusCode::BAD_REQUEST,
@@ -3553,7 +4025,28 @@ pub(crate) async fn subject_erase_response(
     let subjects = PgSubjectIndexStore::new(pool.clone());
     let instances = PgInstanceStore::new(pool.clone());
     let aliases = PgAliasStore::new(pool.clone());
-    let audit = PgAuditEventStore::new(pool.clone());
+    // The journal is in the SQL audit store, a database of its own. Without one there is nothing
+    // to redact here (the file store is append-only), and the response says so.
+    let audit = state.audit_pool.clone().map(PgAuditEventStore::new);
+    // Redaction amends rows in the audit database, so it waits until the SQL store holds
+    // everything spooled: a row still on its way would escape the redaction.
+    if let (Some(spool), Some(shipped)) = (&state.audit_spool, &state.audit_sql_shipped) {
+        let flushed = match spool.barrier().await {
+            Ok(()) => shipped
+                .ship_through(spool.durable_through(), AUDIT_CARRY_SHIP_TIMEOUT)
+                .await
+                .map_err(|d| d.message),
+            Err(e) => Err(e.to_string()),
+        };
+        if let Err(e) = flushed {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": format!("the SQL audit store is behind the spool; nothing was erased: {e}"),
+                })),
+            );
+        }
+    }
 
     let mut all_ids: Vec<String> = Vec::new();
     let mut erased_total = 0usize;
@@ -3592,6 +4085,9 @@ pub(crate) async fn subject_erase_response(
         let mut media_amendments: std::collections::HashMap<Uuid, Vec<(i64, String)>> =
             std::collections::HashMap::new();
         for id in &ids {
+            let Some(audit) = &audit else {
+                break;
+            };
             let rows = match audit.list_media_for_instance(&deployment, *id).await {
                 Ok(rows) => rows,
                 Err(e) => {
@@ -3641,9 +4137,11 @@ pub(crate) async fn subject_erase_response(
                 instances.delete(&deployment, *id).await?;
                 aliases.delete(&deployment, *id).await?;
                 let amended = media_amendments.get(id).map(Vec::as_slice).unwrap_or(&[]);
-                audit
-                    .redact_instance_payloads_amending(&deployment, *id, amended)
-                    .await?;
+                if let Some(audit) = &audit {
+                    audit
+                        .redact_instance_payloads_amending(&deployment, *id, amended)
+                        .await?;
+                }
                 subjects.delete(&deployment, *id).await?;
                 Ok::<(), sutra_persistence::PersistenceError>(())
             };
@@ -3677,8 +4175,23 @@ pub(crate) async fn subject_erase_response(
                 .to_string(),
             ),
             payload_json: "{}".to_string(),
+            spool_ref: None,
+            attempt: None,
         };
-        if let Err(e) = audit.insert(&event).await {
+        let Some(audit) = &audit else {
+            continue;
+        };
+        // Through the spool, like every audit event; directly only in a test wiring with a SQL
+        // pool and no spool.
+        let recorded = match &state.audit_spool {
+            Some(spool) => spool_engine_audit_event(spool, "sql", &event).await,
+            None => audit
+                .insert(&event)
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string()),
+        };
+        if let Err(e) = recorded {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({
@@ -3699,6 +4212,8 @@ pub(crate) async fn subject_erase_response(
             "matched": all_ids.len(),
             "erasedCount": if dry_run { 0 } else { erased_total },
             "instanceIds": all_ids,
+            "auditRedacted": audit.is_some() && !dry_run,
+            "reason": if audit.is_none() { Some("no SQL audit store") } else { None },
         })),
     )
 }
@@ -3719,7 +4234,9 @@ pub(crate) fn app_state_for_test() -> AppState {
         key_provider: None,
         engine: None,
         instance_retention: crate::bridge::DEFAULT_INSTANCE_RETENTION,
-        audit_sql_enabled: false,
+        audit_pool: None,
+        audit_spool: None,
+        audit_sql_shipped: None,
     }
 }
 
@@ -4156,6 +4673,9 @@ mod tests {
         }
 
         fn state_with(pool: PgPool, retention: std::time::Duration, audit_sql: bool) -> AppState {
+            // The journal tests that predate the separate audit database keep both on one
+            // database; the audit-database tests below give it a database of its own.
+            let audit_pool = audit_sql.then(|| pool.clone());
             AppState {
                 ready: Arc::new(AtomicBool::new(true)),
                 deployments: LiveDeploymentSet::new(vec![
@@ -4169,8 +4689,353 @@ mod tests {
                 key_provider: None,
                 engine: None,
                 instance_retention: retention,
-                audit_sql_enabled: audit_sql,
+                audit_pool,
+                audit_spool: None,
+                audit_sql_shipped: None,
             }
+        }
+
+        /// A fresh database with the AUDIT family only (V2xx), as a separate audit database is
+        /// migrated at startup.
+        async fn fresh_audit_pool() -> PgPool {
+            let port = container_port();
+            let admin = PgPoolOptions::new()
+                .max_connections(1)
+                .connect(&format!(
+                    "postgres://postgres:postgres@127.0.0.1:{port}/postgres"
+                ))
+                .await
+                .expect("admin pool");
+            let db = format!(
+                "retention_audit_{}",
+                DB_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            );
+            sqlx::query(&format!("CREATE DATABASE {db}"))
+                .execute(&admin)
+                .await
+                .expect("create database");
+            drop(admin);
+            let options = sqlx::postgres::PgConnectOptions::new()
+                .host("127.0.0.1")
+                .port(port)
+                .username("postgres")
+                .password("postgres")
+                .database(&db);
+            let roots = shipped_roots();
+            let applied = tokio::task::spawn_blocking(move || {
+                run_engine_migrations(
+                    options,
+                    &roots,
+                    sutra_persistence::migrate::MigrationFamily::Audit,
+                )
+            })
+            .await
+            .unwrap()
+            .expect("audit migrations");
+            assert!(applied > 0);
+            PgPoolOptions::new()
+                .max_connections(4)
+                .connect(&format!(
+                    "postgres://postgres:postgres@127.0.0.1:{port}/{db}"
+                ))
+                .await
+                .expect("pool")
+        }
+
+        fn shipped_roots() -> Vec<PathBuf> {
+            let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .ancestors()
+                .nth(3)
+                .expect("repo root")
+                .to_path_buf();
+            vec![
+                repo.join("rust/crates/sutra-persistence/migrations/shipped/core"),
+                repo.join("rust/crates/sutra-persistence/migrations/shipped/audit"),
+                repo.join("rust/crates/sutra-persistence/migrations/shipped/deploy"),
+            ]
+        }
+
+        async fn table_exists(pool: &PgPool, table: &str) -> bool {
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM pg_tables WHERE tablename = $1")
+                .bind(table)
+                .fetch_one(pool)
+                .await
+                .unwrap()
+                == 1
+        }
+
+        /// The engine database gets every family but audit.
+        #[ignore = "docker"]
+        #[tokio::test]
+        async fn engine_db_gets_no_audit_event_table() {
+            let port = container_port();
+            let admin = PgPoolOptions::new()
+                .max_connections(1)
+                .connect(&format!(
+                    "postgres://postgres:postgres@127.0.0.1:{port}/postgres"
+                ))
+                .await
+                .expect("admin pool");
+            let db = format!(
+                "retention_engine_{}",
+                DB_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            );
+            sqlx::query(&format!("CREATE DATABASE {db}"))
+                .execute(&admin)
+                .await
+                .expect("create database");
+            drop(admin);
+            let options = sqlx::postgres::PgConnectOptions::new()
+                .host("127.0.0.1")
+                .port(port)
+                .username("postgres")
+                .password("postgres")
+                .database(&db);
+            let roots = shipped_roots();
+            tokio::task::spawn_blocking(move || {
+                run_engine_migrations(
+                    options,
+                    &roots,
+                    sutra_persistence::migrate::MigrationFamily::Engine,
+                )
+            })
+            .await
+            .unwrap()
+            .expect("engine migrations");
+            let pool = PgPoolOptions::new()
+                .max_connections(1)
+                .connect(&format!(
+                    "postgres://postgres:postgres@127.0.0.1:{port}/{db}"
+                ))
+                .await
+                .expect("pool");
+            assert!(table_exists(&pool, "instance_state").await);
+            assert!(
+                !table_exists(&pool, "audit_event").await,
+                "audit never shares the engine database"
+            );
+        }
+
+        /// History reads the journal from the audit database, not the engine's.
+        #[ignore = "docker"]
+        #[tokio::test]
+        async fn history_reads_audit_pool() {
+            let pool = fresh_pool().await;
+            let audit = fresh_audit_pool().await;
+            let id = park(&pool).await;
+            audit_event(&audit, id, 1, "INSTANCE_STARTED", "{}".to_owned()).await;
+            let mut state = state_with(pool, std::time::Duration::from_secs(3600), false);
+            state.audit_pool = Some(audit);
+            let body =
+                body_of(instance_history_response(&state, &id.to_string(), &HashMap::new()).await)
+                    .await;
+            let events = body["events"].as_array().unwrap();
+            assert_eq!(events.len(), 1, "{body}");
+            assert_eq!(events[0]["eventType"], "INSTANCE_STARTED");
+        }
+
+        /// With no SQL audit store there is no journal to read: 409.
+        #[ignore = "docker"]
+        #[tokio::test]
+        async fn history_without_sql_store_is_409() {
+            let pool = fresh_pool().await;
+            let id = park(&pool).await;
+            let state = state_with(pool, std::time::Duration::from_secs(3600), false);
+            let response =
+                instance_history_response(&state, &id.to_string(), &HashMap::new()).await;
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            let body = body_of(response).await;
+            assert_eq!(body["code"], ADMIN_AUDIT_NO_SQL_STORE);
+        }
+
+        /// A migration carries the journal inside the audit database and opens the target
+        /// journal with the migration's own event.
+        #[ignore = "docker"]
+        #[tokio::test]
+        async fn migration_carries_journal_in_audit_db() {
+            let audit = fresh_audit_pool().await;
+            let id = Uuid::new_v4();
+            audit_event(&audit, id, 1, "NODE_ENTERED", "{}".to_owned()).await;
+            audit_event(&audit, id, 2, "NODE_LEFT", "{}".to_owned()).await;
+            let target = PersistDeploymentId::new("dep-000000000000000000000043").unwrap();
+            let event = AuditEventRow {
+                deployment: target.clone(),
+                instance_id: Some(id),
+                seq: 3,
+                at: time::OffsetDateTime::now_utc(),
+                event_type: "SUTRA.INSTANCE_MIGRATED".to_owned(),
+                node_id: None,
+                diagnostic_code: None,
+                diagnostic_json: Some("{}".to_owned()),
+                payload_json: "{}".to_owned(),
+                spool_ref: None,
+                attempt: None,
+            };
+            let carried =
+                carry_migrated_journal(Some(&audit), None, None, &dep(), &target, id, &event)
+                    .await
+                    .expect("carry");
+            assert_eq!(carried, 2);
+            let moved = PgAuditEventStore::new(audit.clone())
+                .list_for_instance(&target, id, 0, 100)
+                .await
+                .unwrap();
+            assert_eq!(
+                moved
+                    .iter()
+                    .map(|r| r.event_type.as_str())
+                    .collect::<Vec<_>>(),
+                ["NODE_ENTERED", "NODE_LEFT", "SUTRA.INSTANCE_MIGRATED"]
+            );
+            assert!(
+                payloads(&audit, id).await.is_empty(),
+                "nothing left under the source"
+            );
+            assert_eq!(
+                carry_migrated_journal(None, None, None, &dep(), &target, id, &event)
+                    .await
+                    .unwrap(),
+                0,
+                "no SQL audit store, no journal to carry"
+            );
+        }
+
+        async fn aged_audit_event(pool: &PgPool, id: Uuid, seq: i32, payload: String, age_s: i64) {
+            PgAuditEventStore::new(pool.clone())
+                .insert(&AuditEventRow {
+                    deployment: dep(),
+                    instance_id: Some(id),
+                    seq,
+                    at: time::OffsetDateTime::now_utc() - time::Duration::seconds(age_s),
+                    event_type: "NODE_LEFT".to_owned(),
+                    node_id: None,
+                    diagnostic_code: None,
+                    diagnostic_json: None,
+                    payload_json: payload,
+                    spool_ref: None,
+                    attempt: None,
+                })
+                .await
+                .expect("audit insert");
+        }
+
+        fn audit_sweeper(
+            audit: &PgPool,
+            retention: Option<std::time::Duration>,
+        ) -> Option<crate::sweeper::AuditRetentionSweeper> {
+            crate::sweeper::AuditRetentionSweeper::new(
+                audit.clone(),
+                LiveDeploymentSet::new(vec![
+                    sutra_executor::DeploymentId::of(DEP).expect("deployment id")
+                ]),
+                Arc::new(sutra_channels::AlwaysLeading),
+                crate::config::AuditRetentionConfig {
+                    retention,
+                    sweep_interval: std::time::Duration::from_secs(600),
+                    batch: 2,
+                },
+            )
+        }
+
+        /// Without `sutra.audit.retention` no sweeper exists and old audit is kept.
+        #[ignore = "docker"]
+        #[tokio::test]
+        async fn sweeper_keeps_audit_without_retention() {
+            let audit = fresh_audit_pool().await;
+            let id = Uuid::new_v4();
+            aged_audit_event(&audit, id, 1, "{}".to_owned(), 86_400 * 400).await;
+            assert!(audit_sweeper(&audit, None).is_none());
+            assert_eq!(payloads(&audit, id).await.len(), 1);
+        }
+
+        /// Rows past the retention are deleted batch by batch (batch 2, five rows), newer
+        /// rows are kept.
+        #[ignore = "docker"]
+        #[tokio::test]
+        async fn sweeper_deletes_audit_past_retention() {
+            let audit = fresh_audit_pool().await;
+            let id = Uuid::new_v4();
+            for seq in 1..=5 {
+                aged_audit_event(&audit, id, seq, "{}".to_owned(), 7_200).await;
+            }
+            aged_audit_event(&audit, id, 6, "{}".to_owned(), 0).await;
+            let sweeper = audit_sweeper(&audit, Some(std::time::Duration::from_secs(3600)))
+                .expect("a retention builds a sweeper");
+            assert_eq!(sweeper.sweep_once().await, 5);
+            assert_eq!(payloads(&audit, id).await.len(), 1, "the recent row stays");
+        }
+
+        /// A media event whose object is not erased yet is never deleted; once it
+        /// is amended as erased, it goes like any other row.
+        #[ignore = "docker"]
+        #[tokio::test]
+        async fn sweeper_keeps_pending_media() {
+            let audit = fresh_audit_pool().await;
+            let id = Uuid::new_v4();
+            let media = serde_json::json!({"media": [{"kind": "media", "uri": "s3://b/k"}]});
+            aged_audit_event(&audit, id, 1, media.to_string(), 7_200).await;
+            let erased = serde_json::json!({"media": [], crate::media::MEDIA_ERASURE_KEY: {"reason": "retention"}});
+            aged_audit_event(&audit, id, 2, erased.to_string(), 7_200).await;
+            let sweeper =
+                audit_sweeper(&audit, Some(std::time::Duration::from_secs(3600))).expect("sweeper");
+            assert_eq!(
+                sweeper.sweep_once().await,
+                1,
+                "only the erased media event goes"
+            );
+            let left = payloads(&audit, id).await;
+            assert_eq!(left, vec![media], "the pending media event stays");
+        }
+
+        /// Erasure redacts the journal in the audit database; without one it says the
+        /// audit was not redacted, and why.
+        #[ignore = "docker"]
+        #[tokio::test]
+        async fn erasure_redacts_in_audit_db() {
+            use sutra_crypto::KeyProvider;
+            use sutra_persistence::stores::{PgSubjectIndexStore, SubjectIndexStore};
+            let pool = fresh_pool().await;
+            let audit = fresh_audit_pool().await;
+            let provider = Arc::new(sutra_crypto::HkdfKeyProvider::new(b"erasure-audit-db"));
+            let mut state = state_with(pool.clone(), std::time::Duration::from_secs(3600), false);
+            state.key_provider = Some(provider.clone() as Arc<dyn KeyProvider + Send + Sync>);
+            state.audit_pool = Some(audit.clone());
+            let id = park(&pool).await;
+            let blind = provider.blind_index_key("acme").unwrap().blind("caller-9");
+            PgSubjectIndexStore::new(pool.clone())
+                .record(&dep(), id, "caller", &blind)
+                .await
+                .unwrap();
+            audit_event(
+                &audit,
+                id,
+                1,
+                "NODE_ENTERED",
+                serde_json::json!({"ssn": "000-00-0000"}).to_string(),
+            )
+            .await;
+            let body = serde_json::json!({"keyId": "acme", "subjectName": "caller",
+                "value": "caller-9", "deploymentId": DEP});
+            let (status, Json(answer)) = subject_erase_response(&state, body).await;
+            assert_eq!(status, StatusCode::OK, "{answer}");
+            assert_eq!(answer["auditRedacted"], true);
+            assert_eq!(payloads(&audit, id).await, vec![serde_json::json!({})]);
+
+            // No SQL audit store: the erasure still runs, and reports the audit untouched.
+            let id = park(&pool).await;
+            let blind = provider.blind_index_key("acme").unwrap().blind("caller-10");
+            PgSubjectIndexStore::new(pool.clone())
+                .record(&dep(), id, "caller", &blind)
+                .await
+                .unwrap();
+            state.audit_pool = None;
+            let body = serde_json::json!({"keyId": "acme", "subjectName": "caller",
+                "value": "caller-10", "deploymentId": DEP});
+            let (status, Json(answer)) = subject_erase_response(&state, body).await;
+            assert_eq!(status, StatusCode::OK, "{answer}");
+            assert_eq!(answer["erasedCount"], 1);
+            assert_eq!(answer["auditRedacted"], false);
+            assert_eq!(answer["reason"], "no SQL audit store");
         }
 
         fn dep() -> PersistDeploymentId {
@@ -4434,6 +5299,8 @@ mod tests {
                         diagnostic_code: None,
                         diagnostic_json: None,
                         payload_json: format!("{{\"step\":{seq}}}"),
+                        spool_ref: None,
+                        attempt: None,
                     })
                     .await
                     .expect("audit insert");
@@ -4540,6 +5407,8 @@ mod tests {
                     diagnostic_code: None,
                     diagnostic_json: None,
                     payload_json: "{}".to_owned(),
+                    spool_ref: None,
+                    attempt: None,
                 })
                 .await
                 .expect("audit insert");
@@ -4663,6 +5532,8 @@ mod tests {
                     diagnostic_code: None,
                     diagnostic_json: None,
                     payload_json: payload,
+                    spool_ref: None,
+                    attempt: None,
                 })
                 .await
                 .expect("audit insert");
@@ -4830,6 +5701,7 @@ mod tests {
 
             let sweeper = crate::sweeper::TerminalRetentionSweeper::new(
                 pool.clone(),
+                Some(pool.clone()),
                 LiveDeploymentSet::new(vec![
                     sutra_executor::DeploymentId::of(DEP).expect("deployment id")
                 ]),
@@ -4998,6 +5870,7 @@ mod tests {
 
             let sweeper = crate::sweeper::TerminalRetentionSweeper::new(
                 pool.clone(),
+                Some(pool.clone()),
                 LiveDeploymentSet::new(vec![
                     sutra_executor::DeploymentId::of(DEP).expect("deployment id")
                 ]),
@@ -5024,15 +5897,14 @@ mod tests {
             let pool = fresh_pool().await;
             let id = park(&pool).await;
 
+            // No SQL audit store: nothing to read (409), never an empty page that could read as
+            // "this instance did nothing".
             let off = state_with(pool.clone(), std::time::Duration::from_secs(3600), false);
-            let body =
-                body_of(instance_history_response(&off, &id.to_string(), &HashMap::new()).await)
-                    .await;
-            assert_eq!(body["auditEnabled"], serde_json::json!(false));
-            assert!(body["events"].as_array().unwrap().is_empty());
-            assert!(
-                body["note"].as_str().unwrap().contains("DISABLED"),
-                "an empty page must say the journal is off: {body}"
+            assert_eq!(
+                instance_history_response(&off, &id.to_string(), &HashMap::new())
+                    .await
+                    .status(),
+                StatusCode::CONFLICT
             );
 
             // With the journal ON but the process not declaring `<q:audit>`, the note differs.

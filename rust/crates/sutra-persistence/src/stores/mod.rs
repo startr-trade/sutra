@@ -28,8 +28,8 @@ mod wait_state;
 
 pub use alias::{AliasRow, AliasStore, PgAliasStore};
 pub use audit_event::{
-    AuditEventRecord, AuditEventRow, PgAuditEventStore, AUDIT_HISTORY_PAGE_DEFAULT,
-    AUDIT_HISTORY_PAGE_MAX,
+    list_media_page_sql, AuditEventRecord, AuditEventRow, AuditRowAttempt, PendingMediaRow,
+    PgAuditEventStore, AUDIT_HISTORY_PAGE_DEFAULT, AUDIT_HISTORY_PAGE_MAX,
 };
 pub use capacity::{
     PgCapacitySlotStore, SlotClaim, SlotGrant, SlotSelection, SLOT_INBOUND, SLOT_OUTBOUND,

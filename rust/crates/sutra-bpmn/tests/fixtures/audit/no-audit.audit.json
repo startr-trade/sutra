@@ -1,0 +1,67 @@
+{
+  "processId": "flow",
+  "declared": null,
+  "pool": "not audited",
+  "elements": [
+    {
+      "id": "A",
+      "disposition": "notAudited",
+      "rule": "process declares no q:audit"
+    },
+    {
+      "id": "E",
+      "disposition": "notAudited",
+      "rule": "process declares no q:audit"
+    },
+    {
+      "id": "F",
+      "disposition": "notAudited",
+      "rule": "process declares no q:audit"
+    },
+    {
+      "id": "G",
+      "disposition": "notAudited",
+      "rule": "process declares no q:audit"
+    },
+    {
+      "id": "J",
+      "disposition": "notAudited",
+      "rule": "process declares no q:audit"
+    },
+    {
+      "id": "M",
+      "disposition": "notAudited",
+      "rule": "process declares no q:audit"
+    },
+    {
+      "id": "S",
+      "disposition": "notAudited",
+      "rule": "process declares no q:audit"
+    },
+    {
+      "id": "SE",
+      "disposition": "notAudited",
+      "rule": "process declares no q:audit"
+    },
+    {
+      "id": "SS",
+      "disposition": "notAudited",
+      "rule": "process declares no q:audit"
+    },
+    {
+      "id": "Sub",
+      "disposition": "notAudited",
+      "rule": "process declares no q:audit"
+    },
+    {
+      "id": "T",
+      "disposition": "notAudited",
+      "rule": "process declares no q:audit"
+    },
+    {
+      "id": "X",
+      "disposition": "notAudited",
+      "rule": "process declares no q:audit"
+    }
+  ]
+}

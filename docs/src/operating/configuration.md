@@ -293,20 +293,36 @@ so keep such an engine where only operators can reach it. See [Upgrading to
 
 ## Audit sinks
 
-| `sutra.*` key | env |
-|---|---|
-| `sutra.audit.jsonl.path` | `SUTRA_AUDIT_JSONL` |
-| `sutra.audit.otel.endpoint` | `SUTRA_AUDIT_OTEL_ENDPOINT` |
-| `sutra.audit.otel.service-name` | `SUTRA_AUDIT_OTEL_SERVICE_NAME` (default `sutra-audit`, 0.6.12) |
-| `sutra.audit.sql` | `SUTRA_AUDIT_SQL` |
+| Key | Default | Meaning |
+|---|---|---|
+| `sutra.audit.sql.url` | — (no SQL store) | A `postgres://` URL of the **audit database**, which is never the engine's own (`SUTRA_AUDIT_SQL_URL`). Setting it turns the SQL store on; it serves `/admin/instances/{id}/history`. The URL naming the engine's own database is refused at startup (`SUTRA.CONFIG.AUDIT.SHARES_ENGINE_DB`); the same server with another database is allowed with a warning. The engine applies the audit migrations (V2xx) to it at boot (`SUTRA_AUDIT_DB_MIGRATIONS`, default `SUTRA_DB_MIGRATIONS`); `sutra migrate --audit-url` does it by hand. If it is unreachable at boot, the engine retries every 5 s and the spool holds the events. |
+| `sutra.audit.sql.username` / `sutra.audit.sql.password` | the URL's | Override the URL's login; secret references (`env:`, `secret:`, …). |
+| `sutra.audit.sql.max-connections` | `4` | The audit pool's size. |
+| `sutra.audit.sql` | — | **Deprecated** boolean. `true` without `sutra.audit.sql.url` is the startup error `SUTRA.CONFIG.AUDIT.SQL_URL_REQUIRED`; `false` with a URL is `SUTRA.CONFIG.AUDIT.SQL_CONFLICT`. Set the URL and drop it. |
+| `sutra.audit.jsonl.dir` | — (no file store) | Directory of the JSONL file store (`SUTRA_AUDIT_JSONL_DIR`): `audit-<spoolId>-<UTC time>.jsonl`, one event per line, readable by `sutra audit-replay --from-jsonl` and `jq`. Setting it turns the store on. |
+| `sutra.audit.jsonl.rotate-bytes` / `.rotate-interval` | `268435456` (256 MiB) / `PT1H` | A file rotates once it is that big or that old. |
+| `sutra.audit.jsonl.dedup-window` | `PT15M` | A step re-run after a crash re-emits its events; within this window the second copy is dropped. Readers dedupe on `(deploymentId, instanceId, seq)` beyond it. |
+| `sutra.audit.jsonl.retention` | — (keep all) | Closed files older than this are deleted (the open file never). |
+| `sutra.audit.jsonl.path` | — | **Deprecated** single-file form of the JSONL sink; setting it together with `sutra.audit.jsonl.dir` is a startup error. |
+| `sutra.audit.spool.dir` | `/var/lib/sutra/audit-spool` | The durable spool (`SUTRA_AUDIT_SPOOL_DIR`). Every audit event is appended and fsynced here before the step that produced it commits; a shipper then loads it into each configured store. **Mount it on persistent storage** (a volume per replica; a StatefulSet's PVC), or crash durability is only as good as the container's disk. Opened only when at least one store is configured. A second engine on the same directory fails with `SUTRA.AUDIT.SPOOL.LOCKED`. |
+| `sutra.audit.spool.segment-bytes` | `67108864` (64 MiB) | Size of a spool segment. |
+| `sutra.audit.spool.sync-linger-ms` | `5` | Group sync: how long the spool waits to batch fsyncs. `0` syncs at once. |
+| `sutra.audit.spool.max-bytes` | `8589934592` (8 GiB) | Unshipped bytes the spool accepts. Above it, readiness goes DOWN and step commits fail until the shipper catches up; events are never dropped. |
+| `sutra.audit.spool.sync-timeout` | `PT30S` | How long a commit waits for its events to be durable. A failed or timed-out sync fails the commit (readiness is DOWN while the spool is unhealthy), so an event is either durable or its step did not commit: audit is never lost. |
+| `sutra.audit.spool.retain` | `PT1H` | How long a fully shipped segment is kept before it is deleted. Unshipped segments are never deleted. |
+| `sutra.audit.batch-max` / `sutra.audit.batch-linger-ms` | `256` / `5` | The shipper's batch: up to this many records, or what arrived within the linger. |
+| `sutra.audit.default-sink` | the only configured store | The store a process audits into when neither its package nor its manifest names one. With several stores configured and none named, deploy warns (`SUTRA.DEPLOY.AUDIT.SINK_MISSING`) and the events are counted `sutra.audit.undeliverable`, never rerouted. |
+| `sutra.audit.shutdown-timeout` | `PT10S` | How long shutdown waits for each store to ship what the spool holds. |
+| `sutra.audit.retention` | — (keep all) | How long a row stays in the audit database; the audit sweeper deletes older ones. |
+| `sutra.audit.retention-sweep-interval` / `sutra.audit.retention-batch` | `PT10M` / `10000` | How often retention runs (also for the JSONL files), and rows deleted per statement. |
+| `sutra.audit.otel.endpoint` | — | The OTLP audit store. |
+| `sutra.audit.otel.service-name` | `sutra-audit` | `service.name` of the OTLP audit pipeline's resource (0.6.12). The rest of its resource is the engine telemetry's: `OTEL_RESOURCE_ATTRIBUTES` plus `sutra.telemetry.resource-attributes`. |
+| `sutra.admin.auth.*` / `sutra.admin.oidc.*` | fail-closed | The `/admin/*` gate, which also covers `GET /sutra/instances` and `GET /sutra/instances/{id}` once either is configured (those two stay open when admin auth is off): static key/secret (`auth.*`) or OIDC bearer-JWT (`oidc.*`); unconfigured ⇒ `/admin/*` is 503, never open; dev bypass only via the explicit `sutra.admin.oidc.dev-disabled=true`. |
 
-The SQL sink writes the audit journal behind execution and best-effort: an event is queued and
-written by the audit writer, not inside the transaction of the step that produced it, so a crash
-can lose events not yet written. *Since 0.8.1* the writer takes whatever queued while its previous
-write ran, up to 256 events, and writes it as one multi-row insert per deployment in one
-transaction, where it used to commit every event on its own. On a durable PostgreSQL that is what
-lets the journal keep up with a busy engine. The journal is the same: each instance's events in
-order, deduplicated, and a batch that fails is written again event by event. Nothing to configure.
+Audit is declared in the BPMN (`<q:audit>`), and these keys say where it goes. Every event is made
+durable in the spool before its step commits, then shipped to each configured store. Audit never
+shares the engine's database. See [Upgrading to 0.9](upgrading-0-9.md) and [Recording audit
+points](../building/recording-audit-points.md).
 
 See [Logging and audit](logging.md).
 

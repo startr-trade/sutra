@@ -166,3 +166,11 @@ pub const CONFIG_BPMN_TIMER_EXPRESSION_UNKNOWN_NAME: &str =
 /// of the wrong type, an unparseable string, a negative or calendar-length duration, or a
 /// zone-less instant. The instance fails once; a start timer fails its deployment's activation.
 pub const RUNTIME_TIMER_EXPRESSION_INVALID: &str = "SUTRA.RUNTIME.TIMER.EXPRESSION_INVALID";
+/// A `<q:audit>` (process or node level) carries `sink` or `target`. Both were removed in 0.9:
+/// where audit is stored is a deployment setting (`audit.sink` / `audit.sinks` in the package
+/// manifest), never a BPMN one. A load error rather than a silent ignore, because ignoring the
+/// attribute would silently re-route the trail. `sutra lint --fix audit` moves the value into the
+/// manifest.
+pub const BPMN_AUDIT_SINK_REMOVED: &str = "SUTRA.BPMN.AUDIT.SINK_REMOVED";
+/// A process-level `<q:audit events>` is not one of `all`, `points` or `instance`.
+pub const BPMN_AUDIT_EVENTS_INVALID: &str = "SUTRA.BPMN.AUDIT.EVENTS_INVALID";

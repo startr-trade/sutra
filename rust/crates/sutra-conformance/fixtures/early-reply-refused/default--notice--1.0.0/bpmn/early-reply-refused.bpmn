@@ -15,6 +15,7 @@
                   id="Definitions_early_reply_refused"
                   targetNamespace="urn:sutra:module:notice:1.0.0">
   <bpmn:process id="early-reply-refused" isExecutable="true">
+    <bpmn:extensionElements><q:audit events="all" capture="metadata"/></bpmn:extensionElements>
     <bpmn:startEvent id="Start">
       <bpmn:extensionElements><q:source channel="notice-start" name="req"/></bpmn:extensionElements>
       <bpmn:outgoing>F1</bpmn:outgoing>

@@ -8,7 +8,7 @@
   <bpmn:dataStore id="usersStore" name="users"/>
   <bpmn:process id="sign-in" isExecutable="true">
     <bpmn:extensionElements>
-      <q:audit sink="jsonl" capture="payload"/>
+      <q:audit events="all" capture="payload"/>
       <q:variables>
         <q:variable name="creds" type="object" transient="true" sensitive="true"/>
         <q:variable name="user" type="object"/>

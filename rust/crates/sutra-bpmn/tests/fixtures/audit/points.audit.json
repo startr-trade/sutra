@@ -1,0 +1,76 @@
+{
+  "processId": "flow",
+  "declared": {
+    "events": "points",
+    "capture": "metadata"
+  },
+  "pool": "points · metadata",
+  "elements": [
+    {
+      "id": "A",
+      "disposition": "notAudited",
+      "rule": "unbound service task (not a point)"
+    },
+    {
+      "id": "E",
+      "disposition": "desugared",
+      "rule": "end event",
+      "entered": false
+    },
+    {
+      "id": "F",
+      "disposition": "notAudited",
+      "rule": "parallel gateway (not a point)"
+    },
+    {
+      "id": "G",
+      "disposition": "notAudited",
+      "rule": "exclusive gateway (not a point)"
+    },
+    {
+      "id": "J",
+      "disposition": "notAudited",
+      "rule": "parallel gateway (not a point)"
+    },
+    {
+      "id": "M",
+      "disposition": "notAudited",
+      "rule": "plain task (not a point)"
+    },
+    {
+      "id": "S",
+      "disposition": "desugared",
+      "rule": "start event",
+      "entered": false
+    },
+    {
+      "id": "SE",
+      "disposition": "desugared",
+      "rule": "end event",
+      "entered": false
+    },
+    {
+      "id": "SS",
+      "disposition": "desugared",
+      "rule": "start event",
+      "entered": false
+    },
+    {
+      "id": "Sub",
+      "disposition": "desugared",
+      "rule": "sub-process boundary",
+      "entered": false
+    },
+    {
+      "id": "T",
+      "disposition": "notAudited",
+      "rule": "unbound service task (not a point)"
+    },
+    {
+      "id": "X",
+      "disposition": "desugared",
+      "rule": "intermediate throw event",
+      "entered": false
+    }
+  ]
+}

@@ -13,7 +13,7 @@
                   targetNamespace="urn:sutra:module:audited:1.0.0">
   <bpmn:process id="audited-otel" name="Audited to otel" isExecutable="true">
     <bpmn:extensionElements>
-      <q:audit sink="otel" capture="metadata"/>
+      <q:audit events="all" capture="metadata"/>
       <q:variables>
         <q:variable name="holder" type="string" sensitive="true"/>
       </q:variables>

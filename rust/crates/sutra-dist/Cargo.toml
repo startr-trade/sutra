@@ -71,6 +71,9 @@ tikv-jemallocator = { version = "0.6", optional = true }
 # jemalloc as the process allocator (see `GLOBAL_ALLOCATOR` in main.rs). On by default; a build
 # without it falls back to the system allocator. MSVC targets never link it.
 jemalloc = ["dep:tikv-jemallocator"]
+# Heap profiling for leak hunts (never in a shipped image): jemalloc built with `--enable-prof`, so
+# `MALLOC_CONF=prof:true,...` records sampled allocation stacks that `jeprof` reads.
+heap-profile = ["jemalloc", "tikv-jemallocator/profiling"]
 default = ["jemalloc", "http", "kafka", "rabbitmq", "aws-sqs", "gcp-pubsub", "amqp", "file", "dapr", "knative", "llm-openai", "llm-anthropic", "llm-bedrock", "llm-gemini"]
 http = ["dep:sutra-transport-http"]
 kafka = ["dep:sutra-transport-kafka"]

@@ -11,7 +11,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use sutra_persistence::snapshot::InstanceSnapshot;
-use sutra_persistence::step::{commit_instance_migration, InstanceMigration};
+use sutra_persistence::step::{
+    carry_instance_journal, commit_instance_migration, InstanceMigration,
+};
 use sutra_persistence::stores::{
     AliasStore, AuditEventRow, InstanceState, InstanceStore, PgAliasStore, PgAuditEventStore,
     PgInstanceStore, PgSubjectIndexStore, PgWaitStateStore, SubjectIndexStore, WaitStateStore,
@@ -92,6 +94,8 @@ async fn parked(pool: &sqlx::PgPool, instance: Uuid) {
                 diagnostic_code: None,
                 diagnostic_json: None,
                 payload_json: "{}".to_owned(),
+                spool_ref: None,
+                attempt: None,
             })
             .await
             .expect("journal row");
@@ -123,18 +127,6 @@ fn migration(instance: Uuid, mapping: &[(&str, &str)]) -> InstanceMigration {
         process_id: None,
         rearm_parks: None,
         claim_owner: OWNER.to_owned(),
-        carry_journal: true,
-        audit: Some(AuditEventRow {
-            deployment: dep_b(),
-            instance_id: Some(instance),
-            seq: 4,
-            at: now_micros(),
-            event_type: "SUTRA.INSTANCE_MIGRATED".to_owned(),
-            node_id: None,
-            diagnostic_code: None,
-            diagnostic_json: Some("{}".to_owned()),
-            payload_json: "{}".to_owned(),
-        }),
     }
 }
 
@@ -162,9 +154,13 @@ async fn the_move_carries_every_row_class_across_the_pin_in_one_transaction() {
     assert_eq!(outcome.alias_rows, 1);
     assert_eq!(outcome.subject_rows, 1);
     assert_eq!(
-        outcome.audit_rows, 3,
-        "the journal travels with the instance"
+        outcome.audit_rows, 0,
+        "the journal is the audit database's, carried separately"
     );
+    let carried = carry_instance_journal(&pool, &dep_a(), &dep_b(), instance)
+        .await
+        .expect("journal carry commits");
+    assert_eq!(carried, 3, "the journal travels with the instance");
 
     // The source pin is EMPTY — no orphan rows left behind.
     let instances = PgInstanceStore::new(pool.clone());
@@ -224,18 +220,21 @@ async fn the_move_carries_every_row_class_across_the_pin_in_one_transaction() {
         vec![instance],
         "GDPR erasure must keep finding it"
     );
-    // Journal: the three carried rows PLUS the migration event, and the carried rows keep the node
-    // ids they were WRITTEN with — a trail names where a move happened, not where it now maps.
+    // Journal: the three carried rows, keeping the node ids they were WRITTEN with — a trail names
+    // where a move happened, not where it now maps — and none left under the source.
     let journal = PgAuditEventStore::new(pool.clone())
         .list_for_instance(&dep_b(), instance, 0, 100)
         .await
         .unwrap();
-    assert_eq!(journal.len(), 4);
+    assert_eq!(journal.len(), 3);
     assert!(journal
         .iter()
-        .filter(|r| r.event_type == "NODE_ENTERED")
-        .all(|r| r.node_id.as_deref() == Some("waitApproval")));
-    assert_eq!(journal[3].event_type, "SUTRA.INSTANCE_MIGRATED");
+        .all(|r| r.event_type == "NODE_ENTERED" && r.node_id.as_deref() == Some("waitApproval")));
+    assert!(PgAuditEventStore::new(pool.clone())
+        .list_for_instance(&dep_a(), instance, 0, 100)
+        .await
+        .unwrap()
+        .is_empty());
 
     // The migrated row is UNOWNED — the claim died with the source row, so it is immediately
     // resumable without waiting out a sweep.
@@ -614,4 +613,11 @@ async fn the_two_scope_move_commits_under_an_enforcing_rls_role_where_a_plain_up
     let instances = PgInstanceStore::new(app.clone());
     assert!(instances.load(&dep_a(), instance).await.unwrap().is_none());
     assert!(instances.load(&dep_b(), instance).await.unwrap().is_some());
+    // The journal carry takes the same two-scope shape, and commits under enforcing RLS too.
+    assert_eq!(
+        carry_instance_journal(&app, &dep_a(), &dep_b(), instance)
+            .await
+            .expect("the two-scope journal carry commits under enforcing RLS"),
+        3
+    );
 }

@@ -32,6 +32,10 @@ CREATE ROLE "${ENGINE_DB_USER}"
 ALTER DATABASE "${POSTGRES_DB}" OWNER TO "${ENGINE_DB_USER}";
 ALTER SCHEMA public OWNER TO "${ENGINE_DB_USER}";
 GRANT ALL ON SCHEMA public TO "${ENGINE_DB_USER}";
+
+-- Audit never shares the engine's operational database: a second database, same plain role.
+-- (A production deployment puts it on a separate server; the engine warns when it is not.)
+CREATE DATABASE "${POSTGRES_DB}_audit" OWNER "${ENGINE_DB_USER}";
 SQL
 
 echo "engine role '${ENGINE_DB_USER}' created (NOSUPERUSER, NOBYPASSRLS; owns schema public)"

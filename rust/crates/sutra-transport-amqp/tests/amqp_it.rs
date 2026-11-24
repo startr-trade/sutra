@@ -250,6 +250,62 @@ async fn round_trip_from_sink_to_source_carries_outbox_key_body_and_content_type
     sink.drain().await;
 }
 
+/// What a receiving flow's `dedupKey="amqp.message-id"` relies on when the sender puts no
+/// application properties (`application-properties=none`, for a receiver that must see a message
+/// with none of its own): the outbox sends one row again when it cannot tell the first send
+/// arrived, and both copies reach the receiver with the row's outbox key as their message id. The
+/// copies carry no `sutra-outbox-key`, so neither is an explicit key by itself: only the declared
+/// `amqp.message-id` makes the second a duplicate.
+#[ignore = "docker"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_resend_with_no_application_properties_carries_the_outbox_key_as_its_message_id() {
+    let port = broker_port();
+    let queue = fresh_queue();
+    let intake = ScriptedIntake::always(AckDecision::Ack);
+    let source = source_for(port, &queue, "payments-in");
+    source
+        .start(intake.clone(), Arc::new(sutra_channels::AlwaysLeading))
+        .await
+        .expect("start");
+
+    let sink = sink_for();
+    let message = OutboundMessage {
+        destination: format!(
+            "amqp10://127.0.0.1:{port}/{queue}?body=text&application-properties=none"
+        ),
+        headers: BTreeMap::new(),
+        body: b"<Document/>".to_vec(),
+        content_type: Some("application/xml".to_string()),
+        outbox_key: "ob-resent-1".to_string(),
+        traceparent: None,
+    };
+    for attempt in 0..2 {
+        match sink.send(&message).await {
+            SendOutcome::Delivered => {}
+            other => panic!("send {attempt} failed: {other:?}"),
+        }
+    }
+
+    wait_until("both copies", Duration::from_secs(45), || {
+        intake.delivered_count() >= 2
+    })
+    .await;
+    for copy in 0..2 {
+        let m = intake.delivered_at(copy);
+        assert!(!m.explicit_event_id, "copy {copy}: no outbox-key property");
+        assert_eq!(
+            m.headers
+                .get(sutra_channels::NATIVE_MESSAGE_ID_HEADER)
+                .map(String::as_str),
+            Some("ob-resent-1"),
+            "copy {copy}"
+        );
+    }
+
+    source.stop().await.expect("stop");
+    sink.drain().await;
+}
+
 // ---- outbound wire projection --------------------------------------------------------------
 
 #[ignore = "docker"]

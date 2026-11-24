@@ -7,6 +7,12 @@ mod support;
 
 #[path = "all/async_lane_loop_test.rs"]
 mod async_lane_loop_test;
+#[path = "all/audit_files.rs"]
+mod audit_files;
+#[path = "all/audit_shipper.rs"]
+mod audit_shipper;
+#[path = "all/audit_spool.rs"]
+mod audit_spool;
 #[path = "all/capacity_pool_test.rs"]
 mod capacity_pool_test;
 #[path = "all/channel_call_retry_dispatch_test.rs"]

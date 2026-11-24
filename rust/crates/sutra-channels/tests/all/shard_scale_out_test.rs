@@ -23,12 +23,11 @@ use std::sync::{Arc, Mutex};
 
 use sutra_bpmn::BpmnModelLoader;
 use sutra_channels::{
-    codes, shard_index_of, spawn_engine_sharded, AliasRecord, AuditEvent, AuditListener,
-    ChannelBinding, ChannelEngine, CodecRegistry, DeferredAckListener, DeferredAckRegistry,
-    DeferredDispatch, DeferredSettle, Diagnostic, DispatchOutcome, DrainingSink, EngineHandle,
-    EngineShard, InboundChain, InboundMessage, InstanceBridge, InstanceClaimOutcome, Namespace,
-    OutboxEmission, ResolvedResume, ShardLaneMetrics, SuspendedInstance, TimerWaitRecord,
-    ValidatorRegistry,
+    codes, shard_index_of, spawn_engine_sharded, AliasRecord, AuditListener, ChannelBinding,
+    ChannelEngine, CodecRegistry, DeferredAckListener, DeferredAckRegistry, DeferredDispatch,
+    DeferredSettle, Diagnostic, DispatchOutcome, DrainingSink, EngineHandle, EngineShard,
+    InboundChain, InboundMessage, InstanceBridge, InstanceClaimOutcome, Namespace, OutboxEmission,
+    ResolvedResume, ShardLaneMetrics, SuspendedInstance, TimerWaitRecord, ValidatorRegistry,
 };
 use sutra_executor::{DeploymentId, TaskRegistry, TokenExecutor, Variables};
 
@@ -46,14 +45,14 @@ fn deployment() -> DeploymentId {
 }
 
 /// hold: start(`start-in`, correlate alias e2eId=event.body) → userTask(`relay-in`) → end,
-/// AUDITED (`<q:audit sink="jsonl">`) so the per-instance audit seq — persisted into the
+/// AUDITED (`<q:audit events="all">`) so the per-instance audit seq — persisted into the
 /// snapshot at park, seeded back on the owner lane at resume — is observable.
 const HOLD_BPMN: &str = r#"<?xml version="1.0"?>
 <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
                   xmlns:q="urn:sutra:q:1.0">
   <bpmn:process id="hold">
     <bpmn:extensionElements>
-      <q:audit sink="jsonl"/>
+      <q:audit events="all"/>
     </bpmn:extensionElements>
     <bpmn:startEvent id="S">
       <bpmn:extensionElements>
@@ -367,7 +366,7 @@ struct LaneParts {
     /// executor listener and park arm share it). `None` = no deferral capability.
     deferred: Option<Arc<DeferredAckRegistry>>,
     /// One audit channel across all lanes — each lane's listener sends into it.
-    audit_tx: Option<tokio::sync::mpsc::UnboundedSender<AuditEvent>>,
+    audit_tx: Option<sutra_channels::AuditSpoolSender>,
     park_gate: Option<Arc<ParkGate>>,
     /// V2 flip marker: also register the `flow2-in` process + binding.
     with_v2_flow: bool,
@@ -378,9 +377,14 @@ fn build_lane(
     shard: EngineShard,
     metrics: Arc<ShardLaneMetrics>,
 ) -> ChannelEngine {
+    // The deploy resolves each audited process's destination; here the only store is `sql`.
     let hold = BpmnModelLoader::new()
         .load(HOLD_BPMN.as_bytes())
-        .expect("hold BPMN loads");
+        .expect("hold BPMN loads")
+        .with_audit_destinations(&sutra_bpmn::AuditDestinations {
+            default: Some("sql".to_string()),
+            per_process: Default::default(),
+        });
     let run = BpmnModelLoader::new()
         .load(RUN_BPMN.as_bytes())
         .expect("run BPMN loads");
@@ -520,7 +524,24 @@ fn resolved_resume(instance_id: &str) -> ResolvedResume {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_relays_to_one_instance_stay_strictly_serial_at_n4() {
     let state = Arc::new(Mutex::new(BridgeState::default()));
-    let (audit_tx, mut audit_rx) = sutra_channels::audit_channel();
+    let spool_dir = std::env::temp_dir().join(format!(
+        "sutra-scale-out-audit-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let spool = sutra_channels::AuditSpool::open(sutra_channels::AuditSpoolConfig {
+        dir: spool_dir.clone(),
+        sync_linger: std::time::Duration::ZERO,
+        sinks: ["sql".to_string(), "jsonl".to_string()]
+            .into_iter()
+            .collect(),
+        ..Default::default()
+    })
+    .expect("audit spool opens");
+    let audit_tx = spool.sender();
     let handle = spawn_router(
         LaneParts {
             state: Arc::clone(&state),
@@ -628,10 +649,15 @@ async fn concurrent_relays_to_one_instance_stay_strictly_serial_at_n4() {
     // (owner lane's listener, seeded from the snapshot) form ONE strictly-increasing
     // per-instance sequence — a duplicate or a reset would betray an interleaved resume
     // or a broken seed.
+    spool.sender().barrier().await.expect("audit spool syncs");
     let mut seqs = Vec::new();
-    while let Ok(event) = audit_rx.try_recv() {
-        if event.instance_id == id {
-            seqs.push(event.seq);
+    for record in spool
+        .reader(0)
+        .next_batch(100_000, spool.durable_through())
+        .expect("audit spool reads")
+    {
+        if record.event.instance_id == id {
+            seqs.push(record.event.seq);
         }
     }
     assert!(
@@ -720,6 +746,86 @@ async fn a_cross_lane_relay_hands_off_and_resumes_on_the_owner_lane() {
         observed_handoff,
         "20 park/relay rounds never crossed lanes — the handoff path did not run"
     );
+}
+
+/// Many instances park on their arrival lane and resume on their owner lane (the same lane for
+/// about a quarter of them): each instance's audit seq is still exactly 1..n. The listeners now
+/// forget an instance when its high-water goes into the snapshot, so this pins that every resume,
+/// same-lane or cross-lane, continues from the persisted value and none restarts at 1.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn audit_seqs_stay_contiguous_when_listeners_forget_parked_instances() {
+    let state = Arc::new(Mutex::new(BridgeState::default()));
+    let spool_dir = std::env::temp_dir().join(format!(
+        "sutra-scale-out-forget-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let spool = sutra_channels::AuditSpool::open(sutra_channels::AuditSpoolConfig {
+        dir: spool_dir.clone(),
+        sync_linger: std::time::Duration::ZERO,
+        sinks: ["sql".to_string(), "jsonl".to_string()]
+            .into_iter()
+            .collect(),
+        ..Default::default()
+    })
+    .expect("audit spool opens");
+    let audit_tx = spool.sender();
+    let handle = spawn_router(
+        LaneParts {
+            state: Arc::clone(&state),
+            deferred: None,
+            audit_tx: Some(audit_tx),
+            park_gate: None,
+            with_v2_flow: false,
+        },
+        None,
+    );
+    let mut ids = Vec::new();
+    for i in 0..40 {
+        let key = format!("F-{i}");
+        let id = completed_instance(
+            handle
+                .dispatch(inbound("start-in", key.as_bytes(), &format!("f-s{i}")))
+                .await
+                .expect("spawn parks"),
+        );
+        let resumed = completed_instance(
+            handle
+                .dispatch(inbound("relay-in", key.as_bytes(), &format!("f-r{i}")))
+                .await
+                .expect("relay resumes to completion"),
+        );
+        assert_eq!(resumed, id);
+        ids.push(id);
+    }
+    let mut by_instance: std::collections::HashMap<String, Vec<u32>> = Default::default();
+    spool.sender().barrier().await.expect("audit spool syncs");
+    for record in spool
+        .reader(0)
+        .next_batch(100_000, spool.durable_through())
+        .expect("audit spool reads")
+    {
+        by_instance
+            .entry(record.event.instance_id)
+            .or_default()
+            .push(record.event.seq);
+    }
+    for id in &ids {
+        let mut seqs = by_instance.remove(id).expect("the instance was audited");
+        seqs.sort_unstable();
+        let expected: Vec<u32> = (1..=seqs.len() as u32).collect();
+        assert!(seqs.len() >= 4, "{id}: park and resume events: {seqs:?}");
+        assert_eq!(
+            seqs, expected,
+            "{id}: one contiguous seq, no reset, no duplicate"
+        );
+    }
+    drop(handle);
+    drop(spool);
+    let _ = std::fs::remove_dir_all(spool_dir);
 }
 
 // =======================================================================================
@@ -1069,9 +1175,14 @@ fn a_mis_routed_resume_bounces_claim_held_and_counts_on_the_split_bounce_meters(
     // exactly this the shape of any real mis-route. The bounce must be visible, the
     // execution zero.
     let trace = Arc::new(Mutex::new(Vec::new()));
+    // The deploy resolves each audited process's destination; here the only store is `sql`.
     let hold = BpmnModelLoader::new()
         .load(HOLD_BPMN.as_bytes())
-        .expect("hold BPMN loads");
+        .expect("hold BPMN loads")
+        .with_audit_destinations(&sutra_bpmn::AuditDestinations {
+            default: Some("sql".to_string()),
+            per_process: Default::default(),
+        });
     let sink = Rc::new(DrainingSink::new());
     let executor = TokenExecutor::builder(TaskRegistry::new())
         .with_feel()

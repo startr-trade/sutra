@@ -290,7 +290,8 @@ impl ExecutionListener for PayloadRecorder {
     }
 }
 
-/// B1 — process-level `<q:audit sink capture>` drives single-sink routing + payload capture; the
+/// Process-level `<q:audit capture>` (with the deploy-resolved sink) drives single-sink routing +
+/// payload capture; the
 /// ONLY node-level override is `capture="none"` (suppression). A `@sensitive` variable is masked.
 #[tokio::test]
 async fn process_audit_routes_to_one_sink_captures_payload_and_node_none_suppresses() {
@@ -299,7 +300,7 @@ async fn process_audit_routes_to_one_sink_captures_payload_and_node_none_suppres
                           xmlns:q="urn:sutra:q:1.0">
           <bpmn:process id="p1">
             <bpmn:extensionElements>
-              <q:audit sink="jsonl" capture="payload"/>
+              <q:audit events="all" capture="payload"/>
               <q:variable name="amount"/>
               <q:variable name="ssn" sensitive="true"/>
             </bpmn:extensionElements>
@@ -314,10 +315,11 @@ async fn process_audit_routes_to_one_sink_captures_payload_and_node_none_suppres
             <bpmn:sequenceFlow id="f3" sourceRef="U" targetRef="E"/>
           </bpmn:process>
         </bpmn:definitions>"#;
-    let process = proc(bpmn, "p1");
-    // The process-level policy is parsed and pinned.
+    let mut process = proc(bpmn, "p1");
+    // The process-level declaration is parsed; its destination is the deployment's, set at deploy.
     let audit = process.audit.as_ref().expect("process declares <q:audit>");
-    assert_eq!(audit.sink, "jsonl");
+    assert_eq!(audit.sink, None);
+    process.set_audit_sink(Some("jsonl".to_string()));
 
     let registry = TaskRegistry::new().register("noop", |_, _| ok_map(&[]));
     let recorder = Rc::new(PayloadRecorder {
@@ -442,7 +444,7 @@ async fn audited_events_carry_the_instance_correlation_keys() {
         events
     };
 
-    let audited = run(bpmn(r#"<q:audit sink="jsonl" capture="metadata"/>"#)).await;
+    let audited = run(bpmn(r#"<q:audit events="all" capture="metadata"/>"#)).await;
     assert_eq!(audited.len(), 5, "{audited:?}");
     for (event, keys) in &audited {
         assert_eq!(
@@ -475,7 +477,7 @@ async fn media_capture_audits_media_references_and_nothing_else() {
                           xmlns:q="urn:sutra:q:1.0">
           <bpmn:process id="p1">
             <bpmn:extensionElements>
-              <q:audit sink="jsonl" capture="media"/>
+              <q:audit events="all" capture="media"/>
               <q:variable name="hidden" sensitive="true"/>
             </bpmn:extensionElements>
             <bpmn:startEvent id="S"/>
@@ -894,8 +896,8 @@ impl ExecutionListener for SinkRecorder {
     }
 }
 
-/// `S → T → E` with `audit` in the process's extension elements, run on an executor whose engine
-/// default sink is `sql`; returns every recorded event with its sink.
+/// `S → T → E` with `audit` in the process's extension elements, its destination resolved to
+/// `jsonl` as a deploy would; returns every recorded event with its sink.
 async fn run_with_process_audit(audit: &str) -> Vec<(String, Option<String>)> {
     let bpmn = format!(
         r#"<?xml version="1.0"?>
@@ -911,14 +913,14 @@ async fn run_with_process_audit(audit: &str) -> Vec<(String, Option<String>)> {
           </bpmn:process>
         </bpmn:definitions>"#
     );
-    let process = proc(&bpmn, "p1");
+    let mut process = proc(&bpmn, "p1");
+    process.set_audit_sink(Some("jsonl".to_string()));
     let registry = TaskRegistry::new().register("noop", |_, _| ok_map(&[]));
     let recorder = Rc::new(SinkRecorder {
         events: RefCell::new(Vec::new()),
     });
     let executor = TokenExecutor::builder(registry)
         .with_listener(Rc::clone(&recorder) as Rc<dyn ExecutionListener>)
-        .with_default_audit_sink(Some("sql".to_string()))
         .build();
     executor.execute_sync(&process, vars(&[])).await.unwrap();
     let events = recorder.events.borrow().clone();
@@ -926,11 +928,11 @@ async fn run_with_process_audit(audit: &str) -> Vec<(String, Option<String>)> {
 }
 
 /// A process-level `<q:audit capture="none"/>` switches off every `INSTANCE_*` and `NODE_*`
-/// event of that process, even with an engine default sink configured; any other capture keeps
-/// them routed.
+/// event of that process; any other capture keeps them routed; and a process with no
+/// `<q:audit>` routes nothing, whatever its deployment configures.
 #[tokio::test]
 async fn process_capture_none_suppresses_every_event() {
-    let silenced = run_with_process_audit(r#"<q:audit sink="sql" capture="none"/>"#).await;
+    let silenced = run_with_process_audit(r#"<q:audit events="all" capture="none"/>"#).await;
     assert!(
         silenced.iter().any(|(e, _)| e == "INSTANCE_STARTED")
             && silenced.iter().any(|(e, _)| e.starts_with("NODE_ENTERED")),
@@ -941,7 +943,7 @@ async fn process_capture_none_suppresses_every_event() {
         "capture none routes nothing: {silenced:?}"
     );
 
-    let audited = run_with_process_audit(r#"<q:audit sink="jsonl" capture="metadata"/>"#).await;
+    let audited = run_with_process_audit(r#"<q:audit events="all" capture="metadata"/>"#).await;
     assert!(
         audited
             .iter()
@@ -949,11 +951,9 @@ async fn process_capture_none_suppresses_every_event() {
         "{audited:?}"
     );
 
-    let defaulted = run_with_process_audit("").await;
+    let undeclared = run_with_process_audit("").await;
     assert!(
-        defaulted
-            .iter()
-            .all(|(_, sink)| sink.as_deref() == Some("sql")),
-        "no <q:audit> takes the engine default: {defaulted:?}"
+        undeclared.iter().all(|(_, sink)| sink.is_none()),
+        "no <q:audit>, no audit: {undeclared:?}"
     );
 }

@@ -44,7 +44,7 @@ fn fixture() -> &'static Fixture {
                 // The deployment configuration, from the engine's environment.
                 .env("TE_RETRY_DELAY", "PT4S")
                 .env("TE_START_AFTER", "PT3S")
-                .env("SUTRA_AUDIT_SQL", "true")
+                .sql_audit(&pg)
                 .expected_deployments(1)
                 .start(&assemble_fixture());
             Fixture { pg, engine }
@@ -326,6 +326,12 @@ async fn instance_for(id: &str) -> String {
 }
 
 fn sql(query: &str) -> String {
+    // The journal is in the SQL audit store's own database; everything else in the engine's.
+    let database = if query.contains("audit_event") {
+        sutra_testkit::conformance::engine::AUDIT_DATABASE
+    } else {
+        "postgres"
+    };
     let out = Command::new("docker")
         .args([
             "exec",
@@ -334,7 +340,7 @@ fn sql(query: &str) -> String {
             "-U",
             "postgres",
             "-d",
-            "postgres",
+            database,
             "-tAc",
             query,
         ])

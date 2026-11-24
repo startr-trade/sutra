@@ -13,7 +13,7 @@
                   targetNamespace="urn:sutra:module:audited:1.0.0">
   <bpmn:process id="audited-jsonl" name="Audited to jsonl" isExecutable="true">
     <bpmn:extensionElements>
-      <q:audit sink="jsonl" capture="metadata"/>
+      <q:audit events="all" capture="metadata"/>
       <q:variables>
         <q:variable name="holder" type="string" sensitive="true"/>
       </q:variables>

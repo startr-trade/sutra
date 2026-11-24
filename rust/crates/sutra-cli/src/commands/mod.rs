@@ -27,6 +27,7 @@ pub(crate) mod endpoint_check;
 pub mod explain;
 pub mod generate;
 pub mod lint;
+pub mod lint_audit;
 pub mod migrate;
 pub mod openapi;
 pub mod package;

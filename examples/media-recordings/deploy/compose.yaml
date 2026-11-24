@@ -13,7 +13,7 @@ name: sutra-media-recordings
 services:
   engine:
     # 0.6.0 or later. Override with SUTRA_ENGINE_IMAGE to run a locally built tag.
-    image: ${SUTRA_ENGINE_IMAGE:-ghcr.io/startr-trade/sutra:0.8.5}
+    image: ${SUTRA_ENGINE_IMAGE:-ghcr.io/startr-trade/sutra:0.9.0}
     environment:
       SUTRA_DEPLOYMENTS_DIR: /deployments
       SUTRA_HTTP_PORT: "8080"
@@ -40,7 +40,12 @@ services:
       # --- audit, subjects, retention --------------------------------------------------------
       # The SQL audit sink: q:audit events land in the engine's `audit_event` table, which is what
       # GET /admin/instances/{id}/history reads.
-      SUTRA_AUDIT_SQL: "true"
+      # The audit store is a database of its own (here a second database on the same server, so the
+      # engine logs a warning; production uses a separate server). Needs `sutra.audit.spool.dir` on a
+      # volume to be durable across restarts.
+      SUTRA_AUDIT_SQL_URL: postgres://engine-db:5432/sutra_audit
+      SUTRA_AUDIT_SQL_USERNAME: ${ENGINE_DB_USER:-sutra_engine}
+      SUTRA_AUDIT_SQL_PASSWORD: ${ENGINE_DB_PASSWORD:-sutra-dev-only}
       # Blind-indexes `subjectKey` variables so POST /admin/subjects/erase can find an instance,
       # and encrypts `sensitive` variables at rest. A reference like every secret: here to the
       # variable below, a dev-only placeholder; a real engine names its secret store (secret:,

@@ -552,6 +552,15 @@ fn render() -> String {
          instance variables plus `config` (the `package.yaml` `properties:`). A result that is\n\
          not a usable interval fails the instance once with\n\
          `SUTRA.RUNTIME.TIMER.EXPRESSION_INVALID`.\n\n\
+         Audit is declared in the BPMN and nowhere else: a process is audited only when it\n\
+         carries a process-level `<q:audit>`, and a process without one emits no audit event,\n\
+         whatever the engine or the package configure. A bare `<q:audit/>` means\n\
+         `events=\"points\"` (the audit points listed in `xsd/audit-point-rules.json`) and\n\
+         `capture=\"metadata\"`; `events=\"all\"` records every node and `events=\"instance\"`\n\
+         the lifecycle only. A node-level `<q:audit capture=\"none\"/>` opts that node out. The\n\
+         element has no `sink` or `target`: where audit is stored is chosen by the package\n\
+         (`audit.sink`, `audit.sinks`) and the engine, and a BPMN that still carries either\n\
+         attribute fails to load with `SUTRA.BPMN.AUDIT.SINK_REMOVED`.\n\n\
          One of those contracts changes what a transport does, so it is stated here: a process's\n\
          `<q:audit capture>` is `none`, `metadata` (the default), `payload` (events carry the\n\
          redacted variable snapshot) or `media` (metadata-level events, every request the process\n\
@@ -587,6 +596,30 @@ fn bpmn_support_doc_is_in_sync() {
         return;
     }
 
+    let on_disk = std::fs::read_to_string(&path).unwrap_or_default();
+    assert_eq!(
+        on_disk,
+        rendered,
+        "\n{} is out of sync with the engine.\nRe-bless it with:\n  \
+         SUTRA_BLESS=1 cargo test -p sutra-bpmn --test all bpmn_support_doc\n",
+        path.display()
+    );
+}
+
+fn audit_point_rules_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../xsd/audit-point-rules.json")
+}
+
+/// `xsd/audit-point-rules.json` is the published form of the audit-point rule; it is generated
+/// with this page and re-blessed the same way (`SUTRA_BLESS=1`).
+#[test]
+fn audit_point_rules_json_fresh() {
+    let rendered = sutra_bpmn::audit_point_rules_json();
+    let path = audit_point_rules_path();
+    if std::env::var_os("SUTRA_BLESS").is_some() {
+        std::fs::write(&path, &rendered).expect("write audit-point-rules.json");
+        return;
+    }
     let on_disk = std::fs::read_to_string(&path).unwrap_or_default();
     assert_eq!(
         on_disk,

@@ -159,10 +159,16 @@ async fn surfaces_showing(secret: &str, instance: &str) -> Vec<&'static str> {
         "SELECT position(convert_to('{secret}','UTF8') in serialised) > 0 \
          FROM instance_state WHERE instance_id = '{instance}'"
     ));
-    let audit_table = sql(&format!(
-        "SELECT count(*) FROM audit_event a \
-         WHERE a.instance_id = '{instance}' AND a::text LIKE '%{secret}%'"
-    ));
+    // Audit never lives in the engine's database (this engine audits to the file store): the
+    // table is a surface only where it exists.
+    let audit_table = if sql("SELECT to_regclass('audit_event') IS NOT NULL") == "t" {
+        sql(&format!(
+            "SELECT count(*) FROM audit_event a \
+             WHERE a.instance_id = '{instance}' AND a::text LIKE '%{secret}%'"
+        ))
+    } else {
+        "0".to_string()
+    };
     let mut showing = Vec::new();
     if inspect.contains(secret) {
         showing.push("inspect");

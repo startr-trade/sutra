@@ -772,6 +772,92 @@ pub struct DispatchStats {
     pub waiting: u32,
 }
 
+/// The outbox dispatcher's work counts since it was built: what it asked the store for and what
+/// it sent. Maintained on every path whether or not anything reads them, so a test that asserts
+/// on them checks exactly what production does. Read them with [`Self::snapshot`].
+#[derive(Debug, Default)]
+pub struct OutboxWorkCounters {
+    claim_queries: std::sync::atomic::AtomicU64,
+    claim_rows: std::sync::atomic::AtomicU64,
+    empty_claims: std::sync::atomic::AtomicU64,
+    handed_off: std::sync::atomic::AtomicU64,
+    sends: std::sync::atomic::AtomicU64,
+    delivered: std::sync::atomic::AtomicU64,
+}
+
+/// A point-in-time copy of [`OutboxWorkCounters`]. Subtract two snapshots for the work done in
+/// between.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OutboxWorkSnapshot {
+    /// Claim statements issued.
+    pub claim_queries: u64,
+    /// Rows those claim statements returned.
+    pub claim_rows: u64,
+    /// Claims that returned no row.
+    pub empty_claims: u64,
+    /// Rows handed straight from a step commit to the concurrent dispatcher, without a claim.
+    pub handed_off: u64,
+    /// Send attempts (one per row handed to a sink).
+    pub sends: u64,
+    /// Rows whose delivery committed (the row was removed after its sink accepted it).
+    pub delivered: u64,
+}
+
+impl OutboxWorkCounters {
+    /// The counts right now.
+    pub fn snapshot(&self) -> OutboxWorkSnapshot {
+        use std::sync::atomic::Ordering::Relaxed;
+        OutboxWorkSnapshot {
+            claim_queries: self.claim_queries.load(Relaxed),
+            claim_rows: self.claim_rows.load(Relaxed),
+            empty_claims: self.empty_claims.load(Relaxed),
+            handed_off: self.handed_off.load(Relaxed),
+            sends: self.sends.load(Relaxed),
+            delivered: self.delivered.load(Relaxed),
+        }
+    }
+
+    fn record_claim(&self, rows: usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.claim_queries.fetch_add(1, Relaxed);
+        self.claim_rows.fetch_add(rows as u64, Relaxed);
+        if rows == 0 {
+            self.empty_claims.fetch_add(1, Relaxed);
+        }
+    }
+
+    fn record_handed_off(&self) {
+        self.handed_off
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn record_send(&self) {
+        self.sends
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn record_delivered(&self, rows: usize) {
+        self.delivered
+            .fetch_add(rows as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl std::ops::Sub for OutboxWorkSnapshot {
+    type Output = OutboxWorkSnapshot;
+
+    /// The work done between `rhs` (earlier) and `self` (later); saturating, never negative.
+    fn sub(self, rhs: OutboxWorkSnapshot) -> OutboxWorkSnapshot {
+        OutboxWorkSnapshot {
+            claim_queries: self.claim_queries.saturating_sub(rhs.claim_queries),
+            claim_rows: self.claim_rows.saturating_sub(rhs.claim_rows),
+            empty_claims: self.empty_claims.saturating_sub(rhs.empty_claims),
+            handed_off: self.handed_off.saturating_sub(rhs.handed_off),
+            sends: self.sends.saturating_sub(rhs.sends),
+            delivered: self.delivered.saturating_sub(rhs.delivered),
+        }
+    }
+}
+
 /// What one claimed entry came to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RowOutcome {
@@ -821,6 +907,8 @@ pub struct OutboxDispatcher {
     lag_warn: Option<std::time::Duration>,
     /// The WARN's rate limit: when it last fired, and how many rows crossed the threshold since.
     lag_warn_state: std::sync::Mutex<LagWarnState>,
+    /// Claims, sends and deliveries so far ([`OutboxDispatcher::work_counters`]).
+    work: Arc<OutboxWorkCounters>,
 }
 
 /// One row a sink accepted, as handed to the delivery observer
@@ -897,7 +985,14 @@ impl OutboxDispatcher {
             delivery_observer: None,
             lag_warn: None,
             lag_warn_state: std::sync::Mutex::new(LagWarnState::default()),
+            work: Arc::default(),
         }
+    }
+
+    /// The dispatcher's work counts (claims, sends, deliveries). The handle stays live: read it
+    /// with [`OutboxWorkCounters::snapshot`] at any time.
+    pub fn work_counters(&self) -> Arc<OutboxWorkCounters> {
+        Arc::clone(&self.work)
     }
 
     /// Observe every delivered row: `observe` is called once per row a sink accepted, with the
@@ -1063,7 +1158,10 @@ impl OutboxDispatcher {
         let mut exhausted: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         for round in 0..=MAX_CLAIMS_PAST_WAITING {
             let claimed = match self.store.claim_due(deployment, now, self.batch_size).await {
-                Ok(claimed) => claimed,
+                Ok(claimed) => {
+                    self.work.record_claim(claimed.len());
+                    claimed
+                }
                 Err(diagnostic) => {
                     warn!(
                         deployment = %deployment.value(),
@@ -1281,6 +1379,7 @@ impl OutboxDispatcher {
     ) -> bool {
         match self.store.delete(deployment, &row.entry_id).await {
             Ok(()) => {
+                self.work.record_delivered(1);
                 self.release_finished_call(deployment, row).await;
                 true
             }
@@ -1351,6 +1450,7 @@ impl OutboxDispatcher {
                 row.instance_id.clone(),
             );
         }
+        self.work.record_send();
         let outcome = match self.send_context(row) {
             Some(context) => {
                 crate::connectivity::with_send_context(context, sink.send(&message)).await
@@ -1713,6 +1813,8 @@ pub struct OutboxDispatcherHandle {
     task: tokio::task::JoinHandle<()>,
     /// The concurrent dispatcher's live counts; `None` for the serial tick loop.
     gauges: Option<Arc<crate::outbox_scheduler::SchedulerGauges>>,
+    /// The dispatcher's work counts.
+    work: Arc<OutboxWorkCounters>,
 }
 
 impl OutboxDispatcherHandle {
@@ -1728,6 +1830,12 @@ impl OutboxDispatcherHandle {
     pub fn gauge_reader(&self) -> impl Fn() -> (usize, usize) + Send + Sync + 'static {
         let gauges = self.gauges.clone();
         move || gauges.as_ref().map_or((0, 0), |g| g.read())
+    }
+
+    /// The dispatcher's work counts (claims, sends, deliveries); see
+    /// [`OutboxDispatcher::work_counters`].
+    pub fn work_counters(&self) -> Arc<OutboxWorkCounters> {
+        Arc::clone(&self.work)
     }
 
     /// Drain-aware hook: refuse every subsequent tick. Idempotent.
@@ -1780,6 +1888,7 @@ pub fn spawn_dispatch_loop(
 ) -> OutboxDispatcherHandle {
     let (drain, mut drained) = tokio::sync::watch::channel(false);
     let interval_duration = tick_interval.max(std::time::Duration::from_millis(1));
+    let work = dispatcher.work_counters();
     let task = runtime.spawn(async move {
         let mut interval = tokio::time::interval(interval_duration);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1819,6 +1928,7 @@ pub fn spawn_dispatch_loop(
         drain,
         task,
         gauges: None,
+        work,
     }
 }
 
@@ -2163,6 +2273,7 @@ impl OutboxDispatcher {
             let ids: Vec<String> = rows.iter().map(|r| r.entry_id.clone()).collect();
             match self.store.delete_many(&deployment, &ids).await {
                 Ok(()) => {
+                    self.work.record_delivered(ids.len());
                     for row in &rows {
                         self.release_finished_call(&deployment, row).await;
                     }
@@ -2224,6 +2335,7 @@ pub fn spawn_concurrent_dispatch_loop(
     let (drain, mut drained) = tokio::sync::watch::channel(false);
     let interval_duration = tick_interval.max(std::time::Duration::from_millis(1));
     let batch_size = dispatcher.batch_size();
+    let work = dispatcher.work_counters();
     let rt = runtime.clone();
     let (delete_tx, mut delete_rx) =
         tokio::sync::mpsc::unbounded_channel::<(DeploymentId, ClaimedOutboxRow)>();
@@ -2278,6 +2390,7 @@ pub fn spawn_concurrent_dispatch_loop(
                     let Some((deployment, row)) = handed else {
                         break;
                     };
+                    dispatcher.work.record_handed_off();
                     if row.headers.contains_key(CAPACITY_POOL_HEADER) {
                         scheduler.submit_pooled(deployment, row, (dispatcher.now)());
                     } else {
@@ -2375,7 +2488,10 @@ pub fn spawn_concurrent_dispatch_loop(
                         .claim_due_excluding(&deployment, now, batch_size, &exclude)
                         .await
                     {
-                        Ok(claimed) => claimed,
+                        Ok(claimed) => {
+                            dispatcher.work.record_claim(claimed.len());
+                            claimed
+                        }
                         Err(diagnostic) => {
                             warn!(
                                 deployment = %deployment.value(),
@@ -2420,6 +2536,7 @@ pub fn spawn_concurrent_dispatch_loop(
         drain,
         task,
         gauges: Some(gauges),
+        work,
     }
 }
 
@@ -2725,6 +2842,58 @@ mod tests {
             zero.next_attempt(t0(), 3),
             t0() + time::Duration::seconds(1)
         );
+    }
+
+    // ---- work counters ---------------------------------------------------------------------
+
+    mod work_counters_tests {
+        use super::*;
+
+        /// 120 due rows, 50 a claim: three claims carry them (50, 50, 20), a fourth finds the
+        /// outbox empty, and every row is sent and deleted exactly once.
+        #[tokio::test]
+        async fn claims_are_batched() {
+            let store = Arc::new(InMemoryRows::default());
+            for n in 0..120 {
+                store.enqueue(row(&format!("e{n}"), "http://reply.example/cb", 0), t0());
+            }
+            let sink = Arc::new(FixedSink::always("http", SendOutcome::Delivered));
+            let d = dispatcher(Arc::clone(&store), Arc::clone(&sink), 50);
+            let counters = d.work_counters();
+            let before = counters.snapshot();
+
+            for _ in 0..4 {
+                d.dispatch_deployment(&dep()).await;
+            }
+
+            let work = counters.snapshot() - before;
+            assert_eq!(
+                work,
+                OutboxWorkSnapshot {
+                    claim_queries: 4,
+                    claim_rows: 120,
+                    empty_claims: 1,
+                    handed_off: 0,
+                    sends: 120,
+                    delivered: 120,
+                }
+            );
+            assert!(store.snapshot().is_empty(), "every row deleted");
+        }
+
+        #[test]
+        fn snapshot_difference_saturates() {
+            let later = OutboxWorkSnapshot {
+                claim_queries: 1,
+                ..Default::default()
+            };
+            let earlier = OutboxWorkSnapshot {
+                claim_queries: 3,
+                sends: 2,
+                ..Default::default()
+            };
+            assert_eq!(later - earlier, OutboxWorkSnapshot::default());
+        }
     }
 
     // ---- dispatcher outcomes ---------------------------------------------------------------

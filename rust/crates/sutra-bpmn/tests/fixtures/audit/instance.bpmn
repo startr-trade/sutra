@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0"
+                  id="Definitions_audit" targetNamespace="urn:sutra:module:audit:1.0.0">
+  <bpmn:process id="flow" isExecutable="true">
+    <bpmn:extensionElements><q:audit events="instance"/></bpmn:extensionElements>
+    <bpmn:startEvent id="S"/>
+    <bpmn:exclusiveGateway id="G"/>
+    <bpmn:serviceTask id="T" implementation="${noop}">
+    </bpmn:serviceTask>
+    <bpmn:intermediateThrowEvent id="X"/>
+    <bpmn:subProcess id="Sub">
+      <bpmn:startEvent id="SS"/>
+      <bpmn:endEvent id="SE"/>
+      <bpmn:sequenceFlow id="s1" sourceRef="SS" targetRef="SE"/>
+    </bpmn:subProcess>
+    <bpmn:parallelGateway id="F"/>
+    <bpmn:serviceTask id="A" implementation="${noop}"/>
+    <bpmn:manualTask id="M"/>
+    <bpmn:parallelGateway id="J"/>
+    <bpmn:endEvent id="E"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="S" targetRef="G"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="G" targetRef="T"/>
+    <bpmn:sequenceFlow id="f3" sourceRef="T" targetRef="X"/>
+    <bpmn:sequenceFlow id="f4" sourceRef="X" targetRef="Sub"/>
+    <bpmn:sequenceFlow id="f5" sourceRef="Sub" targetRef="F"/>
+    <bpmn:sequenceFlow id="f6" sourceRef="F" targetRef="A"/>
+    <bpmn:sequenceFlow id="f7" sourceRef="F" targetRef="M"/>
+    <bpmn:sequenceFlow id="f8" sourceRef="A" targetRef="J"/>
+    <bpmn:sequenceFlow id="f9" sourceRef="M" targetRef="J"/>
+    <bpmn:sequenceFlow id="f10" sourceRef="J" targetRef="E"/>
+  </bpmn:process>
+</bpmn:definitions>

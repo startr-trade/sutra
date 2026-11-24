@@ -1,77 +1,35 @@
 /**
  * <q:audit> group — bound to bpmn:Process plus any flow node.
  *
- * Process-level <q:audit> provides defaults for the whole process. Per-node <q:audit>
- * overlays override those defaults on the specific node — and `target` is used as the
- * emitted AuditEvent.eventType override (e.g. `ORDER_ACCEPTED`).
+ * A process-level <q:audit/> turns audit on; a node-level <q:audit capture="none"/> only
+ * opts that node out. Storage is chosen in the package manifest (audit.sink / audit.sinks),
+ * not in the BPMN: `sink` and `target` are removed and rejected at load.
  *
  * Per xsd/q.xsd AuditType:
- *   - sink     (select)  : sql | jsonl | custom...
- *   - target   (text)    : event-type override (per-node)
- *   - capture  (select)  : none | metadata | payload  (default "payload")
- *
- * Note: "Data class" and "Redactors" historically lived here but per xsd/q.xsd they are
- * SourceType attributes; they are now exclusively edited from QSourceGroup.
+ *   - events   (select)  : points | all | instance  (default "points"; process scope)
+ *   - capture  (select)  : none | metadata | payload  (default "metadata")
  */
 
 import { getExtensionElement } from '../util/extensionElements.js';
 
 const Q_AUDIT_TYPE = 'q:Audit';
 
-const KNOWN_SINKS = [ 'sql', 'jsonl' ];
-
-function sinkEntry(element) {
+function eventsEntry(element) {
   return {
-    id: 'q-audit-sink',
+    id: 'q-audit-events',
     component: SelectEntryStub,
-    label: 'Sink',
-    description: 'Where audit events land. Built-ins: sql, jsonl. Custom sink ids are accepted as free text.',
+    label: 'Events',
+    description: 'Which events are audited (process scope): points = declared audit points only, all = every engine event, instance = instance lifecycle only',
     options: [
-      { value: 'sql',    label: 'SQL (default)' },
-      { value: 'jsonl',  label: 'JSON-lines' },
-      { value: 'custom', label: 'Custom…' }
+      { value: 'points',   label: 'Points (default)' },
+      { value: 'all',      label: 'All events' },
+      { value: 'instance', label: 'Instance lifecycle only' }
     ],
     get: () => {
       const a = getExtensionElement(element, Q_AUDIT_TYPE);
-      const raw = a ? (a.get('sink') || 'sql') : 'sql';
-      // If the stored value isn't one of the built-ins, surface it as "custom" so the
-      // accompanying free-text entry below can edit it.
-      return { value: KNOWN_SINKS.includes(raw) ? raw : 'custom' };
+      return { value: a ? (a.get('events') || 'points') : 'points' };
     },
-    set: (state, value) => ({ sink: value }),
-    element
-  };
-}
-
-function sinkCustomEntry(element) {
-  return {
-    id: 'q-audit-sink-custom',
-    component: TextEntryStub,
-    label: 'Custom sink id',
-    description: 'Free-text sink identifier resolved against registered AuditSink beans (used when Sink = Custom…)',
-    get: () => {
-      const a = getExtensionElement(element, Q_AUDIT_TYPE);
-      const raw = a ? (a.get('sink') || '') : '';
-      return { value: KNOWN_SINKS.includes(raw) ? '' : raw };
-    },
-    set: (state, value) => ({ sink: value }),
-    element
-  };
-}
-
-function targetEntry(element) {
-  return {
-    id: 'q-audit-target',
-    component: TextEntryStub,
-    label: 'Event-type override',
-    description:
-      'When set on a flow-node overlay, overrides the emitted AuditEvent.eventType ' +
-      '(e.g. "ORDER_ACCEPTED"). At process scope this is the default sink target.',
-    get: () => {
-      const a = getExtensionElement(element, Q_AUDIT_TYPE);
-      return { value: a ? (a.get('target') || '') : '' };
-    },
-    set: (state, value) => ({ target: value }),
+    set: (state, value) => ({ events: value }),
     element
   };
 }
@@ -89,7 +47,7 @@ function captureEntry(element) {
     ],
     get: () => {
       const a = getExtensionElement(element, Q_AUDIT_TYPE);
-      return { value: a ? (a.get('capture') || 'payload') : 'payload' };
+      return { value: a ? (a.get('capture') || 'metadata') : 'metadata' };
     },
     set: (state, value) => ({ capture: value }),
     element
@@ -104,9 +62,7 @@ export function QAuditGroup(element, translate) {
     id: 'q-audit',
     label: translate ? translate('q:audit — audit policy') : 'q:audit — audit policy',
     entries: [
-      sinkEntry(element),
-      sinkCustomEntry(element),
-      targetEntry(element),
+      eventsEntry(element),
       captureEntry(element)
     ]
   };

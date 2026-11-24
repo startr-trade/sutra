@@ -45,7 +45,7 @@ fn fixture() -> &'static Fixture {
             let pg = engine::start_postgres("uncorrelated");
             let engine = EngineBuilder::new("uncorrelated", &pg)
                 .env("UNCORRELATED_API_KEY", API_KEY)
-                .env("SUTRA_AUDIT_SQL", "true")
+                .sql_audit(&pg)
                 .expected_deployments(1)
                 .start(&assemble_fixture());
             Fixture { pg, engine }
@@ -262,6 +262,12 @@ fn engine_logs() -> String {
 }
 
 fn sql(query: &str) -> String {
+    // The journal is in the SQL audit store's own database; everything else in the engine's.
+    let database = if query.contains("audit_event") {
+        sutra_testkit::conformance::engine::AUDIT_DATABASE
+    } else {
+        "postgres"
+    };
     let out = Command::new("docker")
         .args([
             "exec",
@@ -270,7 +276,7 @@ fn sql(query: &str) -> String {
             "-U",
             "postgres",
             "-d",
-            "postgres",
+            database,
             "-tAc",
             query,
         ])
