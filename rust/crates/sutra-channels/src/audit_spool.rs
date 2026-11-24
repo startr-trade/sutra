@@ -405,6 +405,7 @@ pub(crate) fn sync_dir(dir: &Path) -> std::io::Result<()> {
 
 /// Create `dir` (and its parents) with mode `0700` where the platform has modes.
 pub(crate) fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
     let existed = dir.is_dir();
     std::fs::create_dir_all(dir)?;
     #[cfg(unix)]
@@ -430,6 +431,7 @@ pub(crate) fn create_private_dir(dir: &Path) -> std::io::Result<()> {
 
 /// Open options for a new private file (mode `0600` where the platform has modes).
 pub(crate) fn private_file_options() -> std::fs::OpenOptions {
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut options = std::fs::OpenOptions::new();
     #[cfg(unix)]
     {
